@@ -1,9 +1,10 @@
 //! HTTP API and web UI.
 //!
 //! Routes under `/api` return JSON, except `/api/events`, which streams
-//! [`ApiEvent`]s as server-sent events. Everything else is served from the
-//! embedded web UI build with an `index.html` fallback for client-side
-//! routing.
+//! [`ApiEvent`]s as server-sent events. On the TCP listener ([`router`])
+//! everything else is served from the embedded web UI build with an
+//! `index.html` fallback for client-side routing; on the Unix socket
+//! ([`api_router`]) everything else is a JSON 404.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,11 +46,23 @@ impl FromRef<Api> for State {
     }
 }
 
-/// Build the full router: API, CORS for the desktop shell, and the web UI.
+/// Build the API router: `/api` routes only, with no web UI and no CORS.
 ///
-/// Event streams end once `shutdown` becomes `true` (or its sender is
-/// dropped), so open `/api/events` connections do not hold up graceful
-/// shutdown.
+/// This is what the per-user Unix socket serves. Anything outside `/api`
+/// is a JSON 404. Event streams end once `shutdown` becomes `true` (or its
+/// sender is dropped), so open `/api/events` connections do not hold up
+/// graceful shutdown.
+pub fn api_router(state: State, shutdown: watch::Receiver<bool>) -> Router {
+    Router::new()
+        .nest(
+            alchemy_api::API_PREFIX,
+            api(state, events::topics(), shutdown),
+        )
+        .fallback(api_not_found)
+}
+
+/// Build the full router for the TCP listener: the [`api_router`] routes,
+/// CORS for the desktop shell, and the web UI.
 pub fn router(state: State, shutdown: watch::Receiver<bool>) -> Router {
     router_with_topics(state, events::topics(), shutdown)
 }
@@ -61,7 +74,15 @@ pub fn router_with_topics(
     topics: Vec<Topic>,
     shutdown: watch::Receiver<bool>,
 ) -> Router {
-    let api = Router::new()
+    Router::new()
+        .nest(alchemy_api::API_PREFIX, api(state, topics, shutdown))
+        .fallback(crate::web::serve)
+        .layer(cors())
+}
+
+/// The routes under `/api`, shared by [`api_router`] and [`router`].
+fn api(state: State, topics: Vec<Topic>, shutdown: watch::Receiver<bool>) -> Router {
+    Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/engine", get(engine))
@@ -72,12 +93,7 @@ pub fn router_with_topics(
             state,
             topics: topics.into(),
             shutdown,
-        });
-
-    Router::new()
-        .nest(alchemy_api::API_PREFIX, api)
-        .fallback(crate::web::serve)
-        .layer(cors())
+        })
 }
 
 fn cors() -> CorsLayer {
@@ -386,6 +402,45 @@ mod tests {
             "{}",
             resp.status()
         );
+    }
+
+    #[tokio::test]
+    async fn api_router_answers_api_routes_only() {
+        for (uri, status) in [
+            ("/api/health", StatusCode::OK),
+            ("/api/version", StatusCode::OK),
+            ("/api/engine", StatusCode::OK),
+            ("/api/nope", StatusCode::NOT_FOUND),
+            ("/", StatusCode::NOT_FOUND),
+            ("/machines", StatusCode::NOT_FOUND),
+            ("/theme.js", StatusCode::NOT_FOUND),
+        ] {
+            let (_stop, rx) = watch::channel(false);
+            let resp = api_router(State::new(), rx)
+                .oneshot(
+                    Request::get(uri)
+                        .header(header::ORIGIN, "tauri://localhost")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), status, "{uri}");
+            assert!(
+                resp.headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .is_none(),
+                "{uri}"
+            );
+            if status == StatusCode::NOT_FOUND {
+                let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                    serde_json::json!({ "error": "not found", "code": "not_found" }),
+                    "{uri}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

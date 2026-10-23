@@ -35,7 +35,7 @@ and the daemon serves no UI until it exists.
 
 | Command                          | What it does                                                         |
 | -------------------------------- | -------------------------------------------------------------------- |
-| `cargo run -p alchemyd`          | Daemon on `127.0.0.1:7240` plus the IPC socket                       |
+| `cargo run -p alchemyd`          | Daemon on `127.0.0.1:7240` plus the API on a Unix socket             |
 | `cargo run -p alchemy -- status` | CLI; talks to the daemon over IPC                                    |
 | `pnpm dev`                       | Web UI dev server on `localhost:5173`, proxying `/api` to the daemon |
 | `pnpm gui`                       | Tauri desktop shell in dev mode (starts the web dev server)          |

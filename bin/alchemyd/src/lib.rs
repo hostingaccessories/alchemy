@@ -1,12 +1,12 @@
 //! The Alchemy daemon.
 //!
-//! `alchemyd` is the single source of truth. It serves two front doors
-//! over the same state:
+//! `alchemyd` is the single source of truth. It serves the same HTTP API
+//! ([`http`]) through two front doors over the same state:
 //!
-//! - an HTTP API plus the embedded web UI ([`http`]), used by browsers
-//!   and the Tauri shell, and
-//! - a local IPC socket ([`ipc`]), used by the `alchemy` CLI and
-//!   `alchemy-helper`.
+//! - a TCP listener, which adds the embedded web UI and CORS for the
+//!   Tauri shell, used by browsers and the shell, and
+//! - a per-user Unix socket ([`socket`]) serving the API alone, used by
+//!   the `alchemy` CLI and `alchemy-helper`.
 //!
 //! It talks to the Docker engine through [`engine`], and keeps what it
 //! learns in [`State`].
@@ -15,14 +15,14 @@ pub mod compose;
 pub mod engine;
 pub mod events;
 pub mod http;
-pub mod ipc;
 mod secure_fs;
+pub mod socket;
 mod state;
 mod web;
 
 pub use state::State;
 
-use std::future::Future;
+use std::future::{Future, IntoFuture as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -40,7 +40,7 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:7240";
 pub struct Config {
     /// Address for the HTTP API and web UI.
     pub listen: SocketAddr,
-    /// Path of the local IPC socket.
+    /// Path of the per-user Unix socket the API is served on.
     pub socket: PathBuf,
 }
 
@@ -94,8 +94,8 @@ pub async fn run_with(
         );
     }
 
-    let ipc_listener = ipc::bind(&config.socket)
-        .with_context(|| format!("binding IPC socket {}", config.socket.display()))?;
+    let (socket_listener, socket_file) = socket::bind(&config.socket)
+        .with_context(|| format!("binding API socket {}", config.socket.display()))?;
     let http_listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("binding HTTP listener {}", config.listen))?;
@@ -109,29 +109,33 @@ pub async fn run_with(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let engine_task = tokio::spawn(deps.engine.run(deps.state.clone(), shutdown_rx.clone()));
-    let ipc_task = tokio::spawn(ipc::serve(
-        ipc_listener,
-        deps.state.clone(),
-        shutdown_rx.clone(),
-    ));
-    let router = http::router(deps.state, shutdown_rx.clone());
-    let mut http_shutdown = shutdown_rx;
-    let http_task = tokio::spawn(async move {
-        axum::serve(http_listener, router)
-            .with_graceful_shutdown(async move {
-                let _ = http_shutdown.wait_for(|stop| *stop).await;
-            })
-            .await
-    });
+    let socket_task = tokio::spawn(
+        axum::serve(
+            socket_listener,
+            http::api_router(deps.state.clone(), shutdown_rx.clone()),
+        )
+        .with_graceful_shutdown(stopped(shutdown_rx.clone()))
+        .into_future(),
+    );
+    let http_task = tokio::spawn(
+        axum::serve(http_listener, http::router(deps.state, shutdown_rx.clone()))
+            .with_graceful_shutdown(stopped(shutdown_rx))
+            .into_future(),
+    );
 
     shutdown.await;
     shutdown_tx.send_replace(true);
 
     let engine_result = engine_task.await;
-    let ipc_result = ipc_task.await;
+    let socket_result = socket_task.await;
     let http_result = http_task.await;
+    drop(socket_file);
     engine_result.context("engine task failed")?;
-    ipc_result.context("IPC task failed")?;
+    socket_result.context("API socket task failed")??;
     http_result.context("HTTP task failed")??;
     Ok(())
+}
+
+async fn stopped(mut shutdown: watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|stop| *stop).await;
 }

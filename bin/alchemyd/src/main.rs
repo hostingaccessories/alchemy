@@ -17,8 +17,8 @@ struct Cli {
     #[arg(long, env = "ALCHEMY_LISTEN", default_value = alchemyd::DEFAULT_LISTEN)]
     listen: SocketAddr,
 
-    /// Path of the local IPC socket. Defaults to the per-user runtime dir.
-    #[arg(long, env = alchemy_ipc::SOCKET_ENV)]
+    /// Path of the API socket for the CLI. Defaults to the per-user runtime dir.
+    #[arg(long, env = alchemy_api::SOCKET_ENV)]
     socket: Option<PathBuf>,
 }
 
@@ -34,7 +34,7 @@ fn main() -> ExitCode {
 
     let config = alchemyd::Config {
         listen: cli.listen,
-        socket: cli.socket.unwrap_or_else(alchemy_ipc::default_socket_path),
+        socket: cli.socket.unwrap_or_else(alchemy_api::default_socket_path),
     };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()

@@ -91,13 +91,11 @@ version = "0.1.0"
 dependencies = [
  "alchemy-api",
  "alchemy-core",
- "alchemy-ipc",
  "anyhow",
  "axum",
  "bollard",
  "clap",
  "futures-util",
- "interprocess",
  "rust-embed",
  "serde_json",
  "tempfile",
