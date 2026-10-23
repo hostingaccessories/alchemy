@@ -31,7 +31,8 @@ pub use output::Color;
 pub use target::DAEMON_ENV;
 pub use transport::exchange_at;
 
-/// Manage Docker Compose stacks through alchemyd.
+/// Manage Alchemy from the command line. clap shows the package
+/// description instead of this, so keep the two in step.
 #[derive(Debug, Parser)]
 #[command(name = "alchemy", version, about)]
 pub struct Cli {
