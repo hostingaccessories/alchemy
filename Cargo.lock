@@ -40,6 +40,7 @@ name = "alchemy-api"
 version = "0.1.0"
 dependencies = [
  "alchemy-core",
+ "rustix",
  "serde",
  "serde_json",
 ]
@@ -76,8 +77,8 @@ dependencies = [
 name = "alchemy-ipc"
 version = "0.1.0"
 dependencies = [
+ "alchemy-api",
  "alchemy-core",
- "rustix",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

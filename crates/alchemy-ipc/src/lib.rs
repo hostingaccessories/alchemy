@@ -5,8 +5,9 @@
 //! the daemon's HTTP API (see `alchemy-api`).
 //!
 //! The default build is pure: no sockets, no async, no I/O. Enable the
-//! `transport` feature for the `tokio`-based helpers and socket-path
-//! resolution shared by the daemon and its clients.
+//! `transport` feature for the `tokio`-based helpers and the socket-path
+//! resolution shared by the daemon and its clients, re-exported from
+//! `alchemy-api`.
 //!
 //! ## Wire format
 //!
@@ -28,8 +29,6 @@ mod request;
 mod response;
 
 #[cfg(feature = "transport")]
-mod socket;
-#[cfg(feature = "transport")]
 mod transport;
 
 /// The current IPC protocol version.
@@ -42,6 +41,6 @@ pub use request::Request;
 pub use response::{ErrorCode, Response};
 
 #[cfg(feature = "transport")]
-pub use socket::{SOCKET_ENV, SOCKET_FILE, default_socket_path, runtime_dir};
+pub use alchemy_api::{SOCKET_ENV, SOCKET_FILE, default_socket_path, runtime_dir};
 #[cfg(feature = "transport")]
 pub use transport::{read_frame, read_message, write_message};

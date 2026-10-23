@@ -7,9 +7,18 @@
 //! `GET /api/engine` returns an [`EngineStatus`], re-exported from
 //! `alchemy-core` so the wire type and the domain type cannot drift.
 //! `GET /api/events` streams [`ApiEvent`]s.
+//!
+//! The default build is pure. Enable the `socket` feature for the daemon
+//! socket path shared by `alchemyd` and its local clients.
 
 pub use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
 use serde::{Deserialize, Serialize, Serializer};
+
+#[cfg(feature = "socket")]
+mod socket;
+
+#[cfg(feature = "socket")]
+pub use socket::{SOCKET_ENV, SOCKET_FILE, default_socket_path, runtime_dir};
 
 /// Path prefix for every API route.
 pub const API_PREFIX: &str = "/api";

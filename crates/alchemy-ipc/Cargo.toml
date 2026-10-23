@@ -10,15 +10,15 @@ publish.workspace      = true
 
 [dependencies]
 alchemy-core = { workspace = true }
+alchemy-api  = { workspace = true, optional = true, features = ["socket"] }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 thiserror    = { workspace = true }
 tokio        = { workspace = true, optional = true, features = ["io-util"] }
-rustix       = { workspace = true, optional = true }
 
 [features]
 default   = []
-transport = ["dep:tokio", "dep:rustix"]
+transport = ["dep:tokio", "dep:alchemy-api"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
