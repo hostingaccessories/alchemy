@@ -5,6 +5,8 @@ use thiserror::Error;
 
 /// `sysexits.h` `EX_UNAVAILABLE`.
 const EX_UNAVAILABLE: u8 = 69;
+/// `sysexits.h` `EX_IOERR`.
+const EX_IOERR: u8 = 74;
 /// `sysexits.h` `EX_PROTOCOL`.
 const EX_PROTOCOL: u8 = 76;
 
@@ -18,6 +20,10 @@ pub enum ClientError {
     /// The daemon closed the connection before answering.
     #[error("alchemyd closed the connection without responding")]
     ConnectionClosed,
+    /// The daemon ended a stream the CLI was following, usually because
+    /// it stopped.
+    #[error("alchemyd closed the connection; is it still running?")]
+    Disconnected,
     /// The exchange failed below the message layer.
     #[error(transparent)]
     Ipc(#[from] IpcError),
@@ -27,6 +33,19 @@ pub enum ClientError {
     /// The daemon answered with a response this command did not expect.
     #[error("unexpected response from alchemyd: {0}")]
     Unexpected(String),
+    /// The daemon predates a request this command needs and answered it
+    /// as a bad request.
+    #[error(
+        "alchemyd {daemon} is too old to report Docker status; upgrade it to match alchemy {cli} and restart it",
+        cli = env!("CARGO_PKG_VERSION")
+    )]
+    DaemonTooOld {
+        /// The daemon's reported version.
+        daemon: String,
+    },
+    /// Writing the command's output failed.
+    #[error("cannot write output: {0}")]
+    Output(#[from] std::io::Error),
 }
 
 impl ClientError {
@@ -41,8 +60,12 @@ impl ClientError {
     /// The process exit code for this error.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::DaemonUnreachable(_) => EX_UNAVAILABLE,
-            Self::ConnectionClosed | Self::Ipc(_) | Self::Unexpected(_) => EX_PROTOCOL,
+            Self::DaemonUnreachable(_) | Self::Disconnected => EX_UNAVAILABLE,
+            Self::ConnectionClosed
+            | Self::Ipc(_)
+            | Self::Unexpected(_)
+            | Self::DaemonTooOld { .. } => EX_PROTOCOL,
+            Self::Output(_) => EX_IOERR,
             Self::Daemon(_) => 1,
         }
     }

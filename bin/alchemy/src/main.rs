@@ -4,6 +4,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+/// Shell convention for a process ended by `SIGINT`: 128 + 2.
+const EXIT_INTERRUPTED: u8 = 130;
+
 fn main() -> ExitCode {
     let cli = alchemy::Cli::parse();
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -16,14 +19,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(alchemy::run(cli)) {
-        Ok(output) => {
-            println!("{output}");
-            ExitCode::SUCCESS
+    let mut stdout = std::io::stdout();
+    let outcome = runtime.block_on(async {
+        tokio::select! {
+            result = alchemy::run(cli, &mut stdout) => Some(result),
+            Ok(()) = tokio::signal::ctrl_c() => None,
         }
-        Err(e) => {
+    });
+    match outcome {
+        Some(Ok(())) => ExitCode::SUCCESS,
+        Some(Err(e)) => {
             eprintln!("alchemy: {e}");
             ExitCode::from(e.exit_code())
         }
+        None => ExitCode::from(EXIT_INTERRUPTED),
     }
 }
