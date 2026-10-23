@@ -2,8 +2,8 @@
 
 /*
  * Theme. Style with these tokens (`bg-surface`, `text-muted`, `border-border`,
- * `text-accent`, ...), never with palette colours. Values are Tailwind's stone,
- * amber, emerald, and rose scales.
+ * `text-accent`, ...). Tailwind's own palette is switched off; the values
+ * below come from its stone, amber, emerald, and rose scales.
  *
  * The theme follows the OS unless `<html data-theme="light|dark">` overrides
  * it: `public/theme.js` sets the attribute before first paint, and `useTheme`
@@ -21,6 +21,9 @@
 }
 
 @theme {
+  /* Drop Tailwind's palette so only the tokens below generate colour utilities. */
+  --color-*: initial;
+
   /* Page background. */
   --color-surface: oklch(97% 0.001 106.424);
   /* Cards, panels, dialogs. */

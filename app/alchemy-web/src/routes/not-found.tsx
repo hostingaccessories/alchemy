@@ -7,9 +7,9 @@ export function NotFound() {
   return (
     <div className="flex flex-col gap-2">
       <PageHeader title="Not found" />
-      <p className="text-stone-400">There's nothing at this address.</p>
+      <p className="text-muted">There's nothing at this address.</p>
       <p>
-        <Link to="/apps" className="text-amber-400 underline">
+        <Link to="/apps" className="text-accent underline">
           Go to Apps
         </Link>
       </p>

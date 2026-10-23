@@ -30,7 +30,7 @@ function MachinesPage() {
           <EngineStatusView status={engine.data ?? null} />
         </div>
       ) : (
-        <p className="text-stone-400">Docker status appears once alchemyd is reachable.</p>
+        <p className="text-muted">Docker status appears once alchemyd is reachable.</p>
       )}
     </section>
   );

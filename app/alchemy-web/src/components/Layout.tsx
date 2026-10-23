@@ -23,10 +23,10 @@ export function Layout() {
   const daemon = useDaemonConnection();
 
   return (
-    <div className="flex h-screen bg-stone-950 text-stone-100">
-      <aside className="flex w-48 shrink-0 flex-col gap-6 border-r border-stone-800 px-3 py-4">
+    <div className="flex h-screen bg-surface text-text">
+      <aside className="flex w-48 shrink-0 flex-col gap-6 border-r border-border px-3 py-4">
         <div className="flex items-center gap-2 px-2">
-          <FlaskConical className="size-6 text-amber-500" aria-hidden />
+          <FlaskConical className="size-6 text-accent" aria-hidden />
           <span className="text-lg font-semibold tracking-tight">Alchemy</span>
         </div>
         <nav aria-label="Main">
@@ -35,8 +35,8 @@ export function Layout() {
               <li key={to}>
                 <Link
                   to={to}
-                  className="flex items-center gap-2 rounded-md px-2 py-1.5 text-stone-400 hover:bg-stone-900 hover:text-stone-100"
-                  activeProps={{ className: "bg-stone-800 text-stone-100" }}
+                  className="flex items-center gap-2 rounded-md px-2 py-1.5 text-muted hover:bg-surface-muted hover:text-text"
+                  activeProps={{ className: "bg-surface-muted font-medium text-text" }}
                 >
                   <Icon className="size-4" aria-hidden />
                   {label}
@@ -47,7 +47,7 @@ export function Layout() {
         </nav>
       </aside>
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-14 shrink-0 items-center gap-4 border-b border-stone-800 px-6">
+        <header className="flex h-14 shrink-0 items-center gap-4 border-b border-border px-6">
           <div ref={setSlot} className="flex min-w-0 flex-1 items-center gap-4" />
           <div role="status" aria-label="alchemyd" className="shrink-0 text-sm">
             <DaemonStatus state={daemon} />
