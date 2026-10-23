@@ -1,7 +1,7 @@
 //! HTTP API types shared by `alchemyd` and its web and desktop clients.
 //!
-//! Every route lives under [`API_PREFIX`]. Like the IPC protocol, these
-//! shapes only grow additively; the JSON is pinned in
+//! Every route lives under [`API_PREFIX`]. These shapes are a stable
+//! contract and only grow additively; the JSON is pinned in
 //! `tests/wire_stability.rs`. Bump [`API_VERSION`] on any breaking change.
 //!
 //! `GET /api/engine` returns an [`EngineStatus`], re-exported from

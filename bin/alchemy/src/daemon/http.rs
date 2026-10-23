@@ -159,8 +159,8 @@ async fn with_timeout<T>(
 
 /// A daemon that closes the connection before answering has gone away
 /// mid-request; an I/O failure keeps only its kind; anything else is HTTP
-/// this client does not understand, such as a daemon that still speaks
-/// the framed IPC protocol.
+/// this client does not understand, such as an older alchemyd that
+/// predates HTTP on the socket.
 fn from_hyper(err: &hyper::Error) -> ClientError {
     if err.is_incomplete_message() {
         return ClientError::ConnectionClosed;
