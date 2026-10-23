@@ -93,7 +93,8 @@ a socket that doesn't exist:
 DOCKER_HOST=unix:///nonexistent/docker.sock cargo run -p alchemyd
 ```
 
-`status` then reports `Docker isn't running at unix:///nonexistent/docker.sock`.
+`status` then reports `Docker isn't running at unix:///nonexistent/docker.sock`,
+or `Docker Desktop isn't running at …` when Docker Desktop is installed.
 `DOCKER_HOST=tcp://127.0.0.1:2375` exercises the unsupported path. Stopping
 Docker Desktop or the engine service while the daemon runs shows the
 transitions live.

@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use alchemy_core::engine::{
-    ContainerEvent, EngineProbe, EngineState, EngineStatus, SocketProbe, classify, reconnect_delay,
+    ContainerEvent, EngineFlavor, EngineProbe, EngineState, EngineStatus, SocketProbe, classify,
+    not_ready_flavor, reconnect_delay,
 };
 use futures_util::StreamExt as _;
 use tokio::sync::watch;
@@ -106,7 +107,7 @@ where
         }
     }
 
-    async fn cycle(&self, state: &State) -> Outcome {
+    async fn cycle(&self, state: &State, last_ready: &mut Option<LastReady>) -> Outcome {
         let home = self.env.home.as_deref();
         let binaries = docker_binary_candidates(self.env.path.as_deref(), home, self.os);
         let cli = find_docker_binary(&self.probe, &binaries).map(|b| self.connector.cli(b));
@@ -120,7 +121,11 @@ where
             Ok(endpoint) => endpoint,
             Err(error) => {
                 tracing::debug!(error = %error, "no usable Docker endpoint");
-                publish_not_ready(state, unusable_endpoint_status(&error, installed));
+                let status = unusable_endpoint_status(&error, installed);
+                publish_not_ready(
+                    state,
+                    with_not_ready_flavor(status, installed, last_ready.as_ref()),
+                );
                 return Outcome::NotReady;
             }
         };
@@ -139,7 +144,10 @@ where
         let mut status = EngineStatus::new(classify(&installed.probe(socket)));
         status.endpoint = Some(endpoint.to_string());
         let (Some(api), EngineState::Ready) = (api, status.state) else {
-            publish_not_ready(state, status);
+            publish_not_ready(
+                state,
+                with_not_ready_flavor(status, installed, last_ready.as_ref()),
+            );
             return Outcome::NotReady;
         };
 
@@ -153,6 +161,12 @@ where
                 Err(error) => tracing::debug!(error = %error, "Docker Compose version unavailable"),
             }
         }
+        if let Some(flavor) = status.flavor {
+            *last_ready = Some(LastReady {
+                endpoint: endpoint.to_string(),
+                flavor,
+            });
+        }
         publish_engine(state, status);
         follow(&api, state).await
     }
@@ -165,11 +179,12 @@ where
 {
     async fn run(self, state: State, mut shutdown: watch::Receiver<bool>) {
         let mut backoff = Backoff::default();
+        let mut last_ready = None;
         loop {
             let outcome = tokio::select! {
                 biased;
                 _ = shutdown.wait_for(|stop| *stop) => return,
-                outcome = self.cycle(&state) => outcome,
+                outcome = self.cycle(&state, &mut last_ready) => outcome,
             };
             let delay = backoff.next(outcome);
             tokio::select! {
@@ -271,6 +286,27 @@ impl Installed {
     }
 }
 
+/// The flavor an endpoint reported the last time it was ready.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LastReady {
+    endpoint: String,
+    flavor: EngineFlavor,
+}
+
+/// `status` with the flavor [`not_ready_flavor`] infers, using `last_ready`
+/// only when it was seen at the same endpoint.
+fn with_not_ready_flavor(
+    mut status: EngineStatus,
+    installed: Installed,
+    last_ready: Option<&LastReady>,
+) -> EngineStatus {
+    let last_known = last_ready
+        .filter(|last| status.endpoint.as_deref() == Some(last.endpoint.as_str()))
+        .map(|last| last.flavor);
+    status.flavor = not_ready_flavor(status.state, installed.desktop, last_known);
+    status
+}
+
 /// The status for an endpoint discovery rejected: `Unsupported` for a
 /// remote transport, otherwise whatever a missing socket classifies as.
 fn unusable_endpoint_status(error: &EndpointError, installed: Installed) -> EngineStatus {
@@ -356,6 +392,48 @@ mod tests {
                 Duration::from_secs(secs),
                 "step {i}: {outcome:?}"
             );
+        }
+    }
+
+    #[test]
+    fn not_ready_flavor_uses_the_last_ready_flavor_of_the_same_endpoint() {
+        let here = "unix:///var/run/docker.sock";
+        let elsewhere = "unix:///home/me/.colima/docker.sock";
+        let engine = LastReady {
+            endpoint: here.into(),
+            flavor: EngineFlavor::DockerEngine,
+        };
+        let cli = Installed {
+            cli: true,
+            desktop: false,
+        };
+        let desktop = Installed {
+            cli: true,
+            desktop: true,
+        };
+        let cases = [
+            (here, cli, None, None),
+            (here, desktop, None, Some(EngineFlavor::DockerDesktop)),
+            (here, cli, Some(&engine), Some(EngineFlavor::DockerEngine)),
+            (
+                here,
+                desktop,
+                Some(&engine),
+                Some(EngineFlavor::DockerEngine),
+            ),
+            (elsewhere, cli, Some(&engine), None),
+            (
+                elsewhere,
+                desktop,
+                Some(&engine),
+                Some(EngineFlavor::DockerDesktop),
+            ),
+        ];
+        for (endpoint, installed, last_ready, want) in cases {
+            let mut status = EngineStatus::new(EngineState::NotRunning);
+            status.endpoint = Some(endpoint.into());
+            let got = with_not_ready_flavor(status, installed, last_ready);
+            assert_eq!(got.flavor, want, "{endpoint} {installed:?} {last_ready:?}");
         }
     }
 

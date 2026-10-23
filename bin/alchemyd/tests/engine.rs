@@ -700,6 +700,36 @@ async fn monitor_reconnects_and_resyncs_when_the_stream_drops() {
     let status = engine_until(&run.state, |s| s.state != EngineState::Ready).await;
     assert_eq!(status.state, EngineState::NotRunning);
     assert!(run.state.containers().is_empty());
+    assert_eq!(
+        status.flavor,
+        Some(EngineFlavor::DockerEngine),
+        "keeps the flavor the endpoint reported while ready"
+    );
+
+    run.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitor_reports_docker_desktop_while_an_installed_desktop_is_down() {
+    let (host, monitor) = scripted_monitor(&unix(SOCKET));
+    {
+        let mut h = host.lock().unwrap();
+        h.existing.push(PathBuf::from("/opt/docker-desktop"));
+        h.existing.push(PathBuf::from(SOCKET));
+        h.connect = Some(SocketConnect::Refused);
+    }
+    let run = spawn_monitor(monitor);
+
+    let status = engine_until(&run.state, |s| s.endpoint.is_some()).await;
+    let mut want = EngineStatus::new(EngineState::NotRunning);
+    want.flavor = Some(EngineFlavor::DockerDesktop);
+    want.endpoint = Some(unix(SOCKET));
+    assert_eq!(status, want);
+
+    host.lock().unwrap().connect = Some(SocketConnect::Connected);
+    let status = engine_until(&run.state, |s| s.state != EngineState::NotRunning).await;
+    assert_eq!(status.state, EngineState::Starting);
+    assert_eq!(status.flavor, Some(EngineFlavor::DockerDesktop));
 
     run.stop().await;
 }

@@ -53,7 +53,8 @@ pub enum EngineFlavor {
 /// A snapshot of the engine as reported to clients.
 ///
 /// Fields other than `state` are `None` until the engine has answered
-/// enough requests to know them.
+/// enough requests to know them, except `flavor`, which the daemon may
+/// infer for an engine that is not ready with [`not_ready_flavor`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct EngineStatus {
@@ -131,6 +132,27 @@ pub fn classify(probe: &EngineProbe) -> EngineState {
                 EngineState::NotInstalled
             }
         }
+    }
+}
+
+/// The flavor to report for an engine that is not ready, so clients can
+/// name what to start.
+///
+/// Only `NotRunning` and `Starting` get one. `last_known` is the flavor the
+/// same endpoint reported when it was last ready and wins, because it was
+/// observed rather than inferred. Otherwise an installed Docker Desktop is
+/// assumed to be the engine. With neither, the flavor stays unknown, as on
+/// a Linux host with only Docker Engine that has not been ready yet.
+pub fn not_ready_flavor(
+    state: EngineState,
+    desktop_installed: bool,
+    last_known: Option<EngineFlavor>,
+) -> Option<EngineFlavor> {
+    match state {
+        EngineState::NotRunning | EngineState::Starting => {
+            last_known.or_else(|| desktop_installed.then_some(EngineFlavor::DockerDesktop))
+        }
+        EngineState::NotInstalled | EngineState::Ready | EngineState::Unsupported => None,
     }
 }
 
@@ -212,6 +234,33 @@ mod tests {
                 desktop_installed,
             };
             assert_eq!(classify(&probe), want, "{probe:?}");
+        }
+    }
+
+    #[test]
+    fn not_ready_flavor_prefers_observed_over_installed() {
+        use EngineFlavor::{DockerDesktop, DockerEngine, Other};
+        use EngineState::{NotInstalled, NotRunning, Ready, Starting, Unsupported};
+        let cases = [
+            (NotRunning, false, None, None),
+            (NotRunning, true, None, Some(DockerDesktop)),
+            (NotRunning, false, Some(DockerEngine), Some(DockerEngine)),
+            (NotRunning, true, Some(DockerEngine), Some(DockerEngine)),
+            (NotRunning, true, Some(Other), Some(Other)),
+            (Starting, false, None, None),
+            (Starting, true, None, Some(DockerDesktop)),
+            (Starting, false, Some(DockerEngine), Some(DockerEngine)),
+            (NotInstalled, true, Some(DockerDesktop), None),
+            (NotInstalled, false, None, None),
+            (Unsupported, true, Some(DockerDesktop), None),
+            (Ready, true, Some(DockerDesktop), None),
+        ];
+        for (state, desktop_installed, last_known, want) in cases {
+            assert_eq!(
+                not_ready_flavor(state, desktop_installed, last_known),
+                want,
+                "{state:?} desktop={desktop_installed} last={last_known:?}"
+            );
         }
     }
 
