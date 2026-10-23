@@ -5,14 +5,15 @@ use std::path::Path;
 
 use alchemy_ipc::{
     DEFAULT_MAX_FRAME, ErrorCode, FrameDecoder, IpcError, PROTOCOL_VERSION, Request, Response,
-    read_message, write_message,
+    read_frame, read_message, write_message,
 };
-use interprocess::local_socket::tokio::{Listener, Stream};
+use interprocess::local_socket::tokio::Listener;
 use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
-use crate::secure_fs;
+use crate::{State, secure_fs};
 
 /// Bind the IPC socket at `path`.
 ///
@@ -66,15 +67,21 @@ fn remove_stale_socket(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Accept connections until `shutdown` flips to `true`.
-pub async fn serve(listener: Listener, mut shutdown: watch::Receiver<bool>) {
+/// Accept connections until `shutdown` flips to `true`, answering each
+/// from `state`.
+///
+/// Connections already open when `shutdown` flips finish their current
+/// exchange; engine watch streams end at once.
+pub async fn serve(listener: Listener, state: State, shutdown: watch::Receiver<bool>) {
+    let mut stop = shutdown.clone();
     loop {
         tokio::select! {
             biased;
-            _ = shutdown.wait_for(|stop| *stop) => break,
+            _ = stop.wait_for(|stop| *stop) => break,
             accepted = listener.accept() => match accepted {
                 Ok(stream) => {
-                    tokio::spawn(handle_client(stream));
+                    let (reader, writer) = stream.split();
+                    tokio::spawn(handle_client(reader, writer, state.clone(), shutdown.clone()));
                 }
                 Err(e) => tracing::debug!(error = %e, "ipc accept failed"),
             },
@@ -82,12 +89,22 @@ pub async fn serve(listener: Listener, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
-async fn handle_client(stream: Stream) {
-    let (mut reader, mut writer) = stream.split();
+async fn handle_client<R, W>(
+    mut reader: R,
+    mut writer: W,
+    state: State,
+    shutdown: watch::Receiver<bool>,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut decoder = FrameDecoder::new();
     loop {
         let (resp, keep_open) = match read_message::<_, Request>(&mut reader, &mut decoder).await {
-            Ok(Some(req)) => (dispatch(&req), true),
+            Ok(Some(Request::WatchEngine)) => {
+                return stream_engine(reader, decoder, writer, &state, shutdown).await;
+            }
+            Ok(Some(req)) => (dispatch(&state, &req), true),
             Ok(None) => return,
             Err(IpcError::Decode(e)) => (
                 Response::Error {
@@ -111,14 +128,64 @@ async fn handle_client(stream: Stream) {
     }
 }
 
+/// Answer [`Request::WatchEngine`]: send the current engine status, then
+/// one frame per change, until the client hangs up or `shutdown` flips.
+///
+/// The client sends nothing after subscribing, so the read half is only
+/// watched for EOF. Without that, a client that disconnects while the
+/// engine is idle would hold its subscription until the next change.
+async fn stream_engine<R, W>(
+    mut reader: R,
+    mut decoder: FrameDecoder,
+    mut writer: W,
+    state: &State,
+    mut shutdown: watch::Receiver<bool>,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut engine = state.watch_engine();
+    let hung_up =
+        async move { while let Ok(Some(_)) = read_frame(&mut reader, &mut decoder).await {} };
+    tokio::pin!(hung_up);
+    loop {
+        let frame = Response::Engine(engine.borrow_and_update().clone());
+        tokio::select! {
+            biased;
+            _ = shutdown.wait_for(|stop| *stop) => return,
+            () = &mut hung_up => return,
+            sent = write_message(&mut writer, &frame, DEFAULT_MAX_FRAME) => {
+                if let Err(e) = sent {
+                    tracing::debug!(error = %e, "ipc engine stream write failed");
+                    return;
+                }
+            }
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.wait_for(|stop| *stop) => return,
+            () = &mut hung_up => return,
+            changed = engine.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Answer a single request.
-pub fn dispatch(req: &Request) -> Response {
+///
+/// [`Request::WatchEngine`] is a stream, not a single answer; the
+/// connection handler serves it, and this answers it with an error.
+pub fn dispatch(state: &State, req: &Request) -> Response {
     match req {
         Request::Ping => Response::Pong,
         Request::Version => Response::Version {
             daemon: alchemy_core::VERSION.to_owned(),
             protocol: PROTOCOL_VERSION,
         },
+        Request::Engine => Response::Engine(state.engine()),
         _ => Response::Error {
             code: ErrorCode::BadRequest,
             message: "request not supported by this daemon".to_owned(),
@@ -135,17 +202,136 @@ pub fn dispatch(req: &Request) -> Response {
 )]
 mod tests {
     use super::*;
+    use alchemy_core::engine::{EngineState, EngineStatus};
+    use std::time::Duration;
+    use tokio::io::{DuplexStream, duplex};
+    use tokio::task::JoinHandle;
+
+    const DEADLINE: Duration = Duration::from_secs(5);
 
     #[test]
     fn dispatch_answers_ping_and_version() {
-        assert_eq!(dispatch(&Request::Ping), Response::Pong);
+        let state = State::new();
+        assert_eq!(dispatch(&state, &Request::Ping), Response::Pong);
         assert_eq!(
-            dispatch(&Request::Version),
+            dispatch(&state, &Request::Version),
             Response::Version {
                 daemon: alchemy_core::VERSION.to_owned(),
                 protocol: PROTOCOL_VERSION,
             }
         );
+    }
+
+    #[test]
+    fn dispatch_answers_engine_from_state() {
+        let state = State::new();
+        state.set_engine(EngineStatus::new(EngineState::Ready));
+        assert_eq!(
+            dispatch(&state, &Request::Engine),
+            Response::Engine(EngineStatus::new(EngineState::Ready))
+        );
+    }
+
+    #[test]
+    fn dispatch_refuses_watch_engine_as_a_single_answer() {
+        let resp = dispatch(&State::new(), &Request::WatchEngine);
+        assert!(
+            matches!(
+                resp,
+                Response::Error {
+                    code: ErrorCode::BadRequest,
+                    ..
+                }
+            ),
+            "{resp:?}"
+        );
+    }
+
+    fn spawn_client(
+        state: &State,
+        shutdown: watch::Receiver<bool>,
+    ) -> (DuplexStream, JoinHandle<()>) {
+        let (client, server) = duplex(4096);
+        let (reader, writer) = tokio::io::split(server);
+        let task = tokio::spawn(handle_client(reader, writer, state.clone(), shutdown));
+        (client, task)
+    }
+
+    async fn next(client: &mut DuplexStream, decoder: &mut FrameDecoder) -> Option<Response> {
+        tokio::time::timeout(DEADLINE, read_message(client, decoder))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn watch_engine(
+        state: &State,
+        shutdown: watch::Receiver<bool>,
+    ) -> (DuplexStream, FrameDecoder, JoinHandle<()>) {
+        let (mut client, task) = spawn_client(state, shutdown);
+        write_message(&mut client, &Request::WatchEngine, DEFAULT_MAX_FRAME)
+            .await
+            .unwrap();
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            next(&mut client, &mut decoder).await,
+            Some(Response::Engine(state.engine()))
+        );
+        (client, decoder, task)
+    }
+
+    #[tokio::test]
+    async fn watch_engine_sends_current_status_then_each_change() {
+        let state = State::new();
+        let (_stop, stop_rx) = watch::channel(false);
+        let (mut client, mut decoder, _task) = watch_engine(&state, stop_rx).await;
+        for engine in [
+            EngineState::Starting,
+            EngineState::Ready,
+            EngineState::NotRunning,
+        ] {
+            state.set_engine(EngineStatus::new(engine));
+            assert_eq!(
+                next(&mut client, &mut decoder).await,
+                Some(Response::Engine(EngineStatus::new(engine)))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_engine_stops_when_the_client_hangs_up() {
+        let state = State::new();
+        let (_stop, stop_rx) = watch::channel(false);
+        let (client, _decoder, task) = watch_engine(&state, stop_rx).await;
+        drop(client);
+        tokio::time::timeout(DEADLINE, task).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn watch_engine_stops_on_shutdown() {
+        let state = State::new();
+        let (stop, stop_rx) = watch::channel(false);
+        let (mut client, mut decoder, task) = watch_engine(&state, stop_rx).await;
+        stop.send_replace(true);
+        tokio::time::timeout(DEADLINE, task).await.unwrap().unwrap();
+        assert_eq!(next(&mut client, &mut decoder).await, None);
+    }
+
+    #[tokio::test]
+    async fn engine_request_keeps_the_connection_open() {
+        let state = State::new();
+        let (_stop, stop_rx) = watch::channel(false);
+        let (mut client, _task) = spawn_client(&state, stop_rx);
+        let mut decoder = FrameDecoder::new();
+        for req in [Request::Engine, Request::Ping] {
+            write_message(&mut client, &req, DEFAULT_MAX_FRAME)
+                .await
+                .unwrap();
+            assert_eq!(
+                next(&mut client, &mut decoder).await,
+                Some(dispatch(&state, &req))
+            );
+        }
     }
 
     #[test]

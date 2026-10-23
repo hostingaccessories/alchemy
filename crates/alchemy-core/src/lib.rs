@@ -4,6 +4,7 @@
 //! sockets, or the Docker engine lives in the binaries and is passed
 //! in as plain values.
 
+pub mod engine;
 mod stack;
 
 pub use stack::{StackName, StackNameError};

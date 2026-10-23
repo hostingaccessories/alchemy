@@ -36,7 +36,7 @@ Everything below follows from the line at the top of this page.
 
 | Crate            | Path                  | Role                                                                          |
 | ---------------- | --------------------- | ----------------------------------------------------------------------------- |
-| `alchemy-core`   | `crates/alchemy-core` | Pure domain model (stacks and their invariants)                               |
+| `alchemy-core`   | `crates/alchemy-core` | Pure domain model (stacks, the Docker engine, and their invariants)           |
 | `alchemy-ipc`    | `crates/alchemy-ipc`  | IPC protocol, framing, codec; socket transport behind the `transport` feature |
 | `alchemy-api`    | `crates/alchemy-api`  | HTTP API types shared by the daemon and its web clients                       |
 | `alchemyd`       | `bin/alchemyd`        | Daemon: HTTP API, embedded web UI, IPC socket                                 |

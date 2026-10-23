@@ -33,10 +33,14 @@ done
 tmp="$(mktemp -d)"
 socket="${tmp}/alchemyd.sock"
 daemon_pid=""
+events_pid=""
 
 cleanup() {
   if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
     kill -KILL "$daemon_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$events_pid" ]] && kill -0 "$events_pid" 2>/dev/null; then
+    kill -KILL "$events_pid" 2>/dev/null || true
   fi
   rm -rf "$tmp"
 }
@@ -64,6 +68,21 @@ fi
 log "Checking /api/health"
 health="$(curl -fsS "${base}/api/health")"
 [[ "$health" == *'"ok"'* ]] || fail "unexpected health response: ${health}"
+
+log "Checking /api/engine"
+engine="$(curl -fsS "${base}/api/engine")"
+[[ "$engine" == *'"state":'* ]] || fail "unexpected engine response: ${engine}"
+
+log "Opening /api/events"
+curl -fsSN -H 'Origin: tauri://localhost' "${base}/api/events" \
+  >"${tmp}/events.txt" 2>/dev/null &
+events_pid=$!
+for _ in $(seq 1 50); do
+  grep -q '^event: engine' "${tmp}/events.txt" && break
+  sleep 0.2
+done
+grep -q '^event: engine' "${tmp}/events.txt" \
+  || fail "no engine event on /api/events: $(cat "${tmp}/events.txt")"
 
 log "Checking embedded web UI"
 index="$(curl -fsS "${base}/")" || fail "GET / failed (web UI not embedded?)"
@@ -95,5 +114,9 @@ set -e
 daemon_pid=""
 [[ "$code" -eq 0 ]] || { cat "${tmp}/alchemyd.log" >&2; fail "alchemyd exited ${code}"; }
 [[ ! -e "$socket" ]] || fail "socket ${socket} left behind after shutdown"
+set +e
+wait "$events_pid"
+set -e
+events_pid=""
 
 log "Release smoke test passed"
