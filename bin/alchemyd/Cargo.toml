@@ -1,0 +1,40 @@
+[package]
+name                   = "alchemyd"
+description            = "Alchemy daemon: owns Compose stacks and serves the HTTP API, web UI, and local IPC socket."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+[[bin]]
+name = "alchemyd"
+path = "src/main.rs"
+
+[lib]
+name = "alchemyd"
+path = "src/lib.rs"
+
+[dependencies]
+alchemy-api        = { workspace = true }
+alchemy-core       = { workspace = true }
+alchemy-ipc        = { workspace = true, features = ["transport"] }
+anyhow             = { workspace = true }
+axum               = { workspace = true }
+clap               = { workspace = true }
+interprocess       = { workspace = true }
+rust-embed         = { workspace = true }
+thiserror          = { workspace = true }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync", "io-util"] }
+tower-http         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile   = { workspace = true }
+tower      = { workspace = true }
+
+[lints]
+workspace = true

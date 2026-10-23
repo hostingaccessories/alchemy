@@ -1,0 +1,33 @@
+[package]
+name                   = "alchemy"
+description            = "Alchemy CLI: a local IPC client of alchemyd."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+[[bin]]
+name = "alchemy"
+path = "src/main.rs"
+
+[lib]
+name = "alchemy"
+path = "src/lib.rs"
+
+[dependencies]
+alchemy-ipc  = { workspace = true, features = ["transport"] }
+clap         = { workspace = true }
+interprocess = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+tokio        = { workspace = true, features = ["rt", "net", "io-util", "time"] }
+
+[dev-dependencies]
+alchemyd = { workspace = true }
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+[package]
+name                   = "alchemy-gui"
+description            = "Alchemy desktop shell. Bundles alchemy-web and talks to alchemyd over HTTP; holds no business logic."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+[[bin]]
+name = "alchemy-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+tauri                        = { version = "2.12", features = [] }
+tauri-plugin-opener          = "2.7"
+tauri-plugin-single-instance = "2.5"
+
+[lints]
+workspace = true

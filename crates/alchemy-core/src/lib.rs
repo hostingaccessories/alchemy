@@ -1,0 +1,12 @@
+//! Pure domain model for Alchemy.
+//!
+//! This crate performs no I/O. Anything that touches the filesystem,
+//! sockets, or the Docker engine lives in the binaries and is passed
+//! in as plain values.
+
+mod stack;
+
+pub use stack::{StackName, StackNameError};
+
+/// The Alchemy release version, shared by every crate in the workspace.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
