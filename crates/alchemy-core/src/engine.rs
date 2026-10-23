@@ -29,6 +29,12 @@ pub enum EngineState {
     Starting,
     /// The engine answered a ping.
     Ready,
+    /// The configured endpoint uses a transport Alchemy does not support,
+    /// such as `tcp://` or `ssh://`.
+    ///
+    /// [`classify`] never returns this: the daemon reports it, with the
+    /// endpoint in [`EngineStatus::endpoint`], before probing a socket.
+    Unsupported,
 }
 
 /// Which Docker distribution serves the engine.
@@ -283,6 +289,7 @@ mod tests {
             (EngineState::NotRunning, "\"not_running\""),
             (EngineState::Starting, "\"starting\""),
             (EngineState::Ready, "\"ready\""),
+            (EngineState::Unsupported, "\"unsupported\""),
         ];
         for (state, want) in cases {
             assert_eq!(serde_json::to_string(&state).unwrap(), want);
