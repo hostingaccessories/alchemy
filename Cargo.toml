@@ -27,7 +27,9 @@ alchemyd     = { path = "bin/alchemyd" }
 anyhow             = "1"
 axum               = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 bollard            = { version = "0.21", default-features = false, features = ["pipe"] }
-clap               = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
+clap               = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env", "string"] }
+clap_complete      = { version = "4.6", default-features = false }
+clap_mangen        = { version = "0.3", default-features = false, features = ["env"] }
 futures-util       = { version = "0.3", default-features = false, features = ["alloc"] }
 interprocess       = { version = "2", features = ["tokio"] }
 rust-embed         = { version = "8", features = ["mime-guess"] }
