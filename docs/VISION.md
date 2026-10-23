@@ -60,11 +60,11 @@ A Docker Compose management platform that:
 Docker itself is no longer the main way Alchemy is installed. Every option
 ships the same web interface.
 
-| Option | Mainly for | Notes |
-|---|---|---|
-| **Desktop app** | The Novice | Installed alongside Docker Desktop on macOS or Linux. Windows later. Open it and start installing apps. |
-| **Native CLI** | The Tinkerer | OS-native install of the `alchemy` CLI and background service, with the web interface bundled in. |
-| **Container image** | The Tinkerer | The same software running in Docker, for machines where everything runs in containers. |
+| Option              | Mainly for   | Notes                                                                                                   |
+| ------------------- | ------------ | ------------------------------------------------------------------------------------------------------- |
+| **Desktop app**     | The Novice   | Installed alongside Docker Desktop on macOS or Linux. Windows later. Open it and start installing apps. |
+| **Native CLI**      | The Tinkerer | OS-native install of the `alchemy` CLI and background service, with the web interface bundled in.       |
+| **Container image** | The Tinkerer | The same software running in Docker, for machines where everything runs in containers.                  |
 
 The Tinkerer can pick whichever fits the machine, including the desktop app.
 
@@ -80,10 +80,10 @@ needs to know it exists.
 
 ## 6. Names and addresses
 
-| Mode | Example | Who uses it |
-|---|---|---|
-| **Local** (default) | `http://immich.local` | The Novice almost always. The Tinkerer often, because it's easy. |
-| **Own domain** | `https://immich.home.example.com` | The Tinkerer, when they want their own domain. TLS is optional, through a supported DNS provider (Cloudflare and DigitalOcean first, more later). |
+| Mode                | Example                           | Who uses it                                                                                                                                       |
+| ------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Local** (default) | `http://immich.local`             | The Novice almost always. The Tinkerer often, because it's easy.                                                                                  |
+| **Own domain**      | `https://immich.home.example.com` | The Tinkerer, when they want their own domain. TLS is optional, through a supported DNS provider (Cloudflare and DigitalOcean first, more later). |
 
 Local mode uses mDNS and needs no setup. Every app also gets a plain
 `IP:port` address for devices that don't resolve `.local` names.
