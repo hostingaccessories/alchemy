@@ -132,7 +132,11 @@ fn accept(resp: Response, daemon: &str, command: &'static str) -> Result<Respons
 impl<D: Daemon> Context<D, Vec<u8>> {
     /// A context for `command` that writes to a buffer.
     pub(crate) fn buffered(daemon: D, json: bool, command: &'static str) -> Self {
-        Self::new(daemon, Output::new(Vec::new(), json), command)
+        Self::new(
+            daemon,
+            Output::new(Vec::new(), json, crate::output::Color::Off),
+            command,
+        )
     }
 
     /// Everything written to the output so far.
@@ -215,11 +219,7 @@ mod tests {
             matches!(&err, ClientError::DaemonTooOld { daemon, command: "app up" } if daemon == "0.0.1"),
             "{err:?}"
         );
-        assert!(
-            err.to_string()
-                .starts_with("alchemyd 0.0.1 is too old for `app up`; upgrade it"),
-            "{err}"
-        );
+        assert_eq!(err.to_string(), "alchemyd 0.0.1 is too old for `app up`");
 
         let mut stream = ctx.stream(&Request::WatchEngine).await.unwrap();
         let err = stream.next().await.unwrap_err();

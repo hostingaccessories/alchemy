@@ -275,6 +275,10 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("M13"), "{msg}");
         assert!(msg.contains("issues/16"), "{msg}");
-        assert!(msg.contains("--socket"), "{msg}");
+        assert!(
+            err.to_text()
+                .contains("\nhint: forward the remote socket over SSH"),
+            "{msg}"
+        );
     }
 }

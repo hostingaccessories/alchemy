@@ -15,7 +15,7 @@ use std::process::Output;
 use std::time::Duration;
 
 use alchemy::commands::status;
-use alchemy::{Cli, ClientError, Command, DAEMON_ENV};
+use alchemy::{Cli, ClientError, Color, Command, DAEMON_ENV};
 use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
 use alchemy_ipc::{
     DEFAULT_MAX_FRAME, ErrorCode, FrameDecoder, PROTOCOL_VERSION, Request, Response, read_frame,
@@ -102,7 +102,7 @@ fn cli(socket: &Path, json: bool, watch: bool) -> Cli {
 
 async fn run(cli: Cli) -> Result<String, ClientError> {
     let mut out = Vec::new();
-    alchemy::run(cli, &mut out).await?;
+    alchemy::run(cli, &mut out, Color::Off).await?;
     Ok(String::from_utf8(out).unwrap())
 }
 
@@ -142,7 +142,7 @@ impl Watch {
                 buf: Vec::new(),
                 lines: tx,
             };
-            alchemy::run(cli, &mut sink).await
+            alchemy::run(cli, &mut sink, Color::Off).await
         });
         Self { lines, task }
     }
