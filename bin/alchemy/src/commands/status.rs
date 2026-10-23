@@ -5,10 +5,11 @@ use std::io::Write;
 use std::path::Path;
 
 use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
-use alchemy_ipc::{ErrorCode, Request, Response};
+use alchemy_ipc::{Request, Response};
 
+use crate::context::Context;
+use crate::daemon::{Daemon, DaemonInfo};
 use crate::error::ClientError;
-use crate::transport::{Connection, with_timeout};
 
 /// Arguments to `alchemy status`.
 #[derive(Debug, Clone, Default, clap::Args)]
@@ -23,114 +24,79 @@ pub struct Args {
 ///
 /// With `--watch` this only returns on an error, such as the daemon
 /// stopping; the caller ends it by dropping the future.
-pub(crate) async fn run<W: Write>(
-    socket: &Path,
-    json: bool,
-    out: &mut W,
+pub(crate) async fn run<D: Daemon, W: Write>(
+    ctx: &mut Context<D, W>,
     args: Args,
 ) -> Result<(), ClientError> {
+    let daemon = ctx.daemon_info().await?.clone();
     if args.watch {
-        watch_status(socket, json, out).await
-    } else {
-        status(socket, json, out).await
+        return watch(ctx, &daemon).await;
     }
+    let engine = engine_status(ctx.request(&Request::Engine).await?)?;
+    print_status(ctx, &daemon, &engine)
 }
 
-async fn status<W: Write>(socket: &Path, json: bool, out: &mut W) -> Result<(), ClientError> {
-    let (daemon, engine) = with_timeout(socket, async {
-        let mut conn = Connection::connect(socket).await?;
-        let daemon = version(&mut conn).await?;
-        let engine = engine_status(conn.request(&Request::Engine).await?, &daemon)?;
-        Ok((daemon, engine))
-    })
-    .await?;
-    print_status(out, &daemon, socket, &engine, json)
-}
-
-/// Follow the engine status. Only the handshake, up to the first status,
-/// is bounded by a timeout: the stream may be quiet for as long as Docker
-/// is.
-async fn watch_status<W: Write>(socket: &Path, json: bool, out: &mut W) -> Result<(), ClientError> {
-    let (mut conn, daemon, mut engine) = with_timeout(socket, async {
-        let mut conn = Connection::connect(socket).await?;
-        let daemon = version(&mut conn).await?;
-        let first = conn.request(&Request::WatchEngine).await?;
-        let engine = engine_status(first, &daemon)?;
-        Ok((conn, daemon, engine))
-    })
-    .await?;
-    print_status(out, &daemon, socket, &engine, json)?;
-    let mut last_line = engine_line(&engine);
+/// Follow the engine status, printing the engine line again only when it
+/// changes, or every update with `--json`.
+async fn watch<D: Daemon, W: Write>(
+    ctx: &mut Context<D, W>,
+    daemon: &DaemonInfo,
+) -> Result<(), ClientError> {
+    let mut stream = ctx.stream(&Request::WatchEngine).await?;
+    let mut last_line = None;
     loop {
-        let Some(resp) = conn.recv().await? else {
+        let Some(resp) = stream.next().await? else {
             return Err(ClientError::Disconnected);
         };
-        engine = engine_status(resp, &daemon)?;
-        if json {
-            writeln!(out, "{}", status_json(&daemon, socket, &engine))?;
-        } else {
-            let line = engine_line(&engine);
-            if line == last_line {
-                continue;
-            }
-            writeln!(out, "{line}")?;
-            last_line = line;
+        let engine = engine_status(resp)?;
+        let line = engine_line(&engine);
+        if last_line.is_none() {
+            print_status(ctx, daemon, &engine)?;
+        } else if ctx.json() {
+            let json = status_json(daemon, ctx.socket(), &engine);
+            ctx.out().line(json)?;
+        } else if last_line.as_ref() != Some(&line) {
+            ctx.out().line(&line)?;
         }
-        out.flush()?;
+        last_line = Some(line);
     }
 }
 
-async fn version(conn: &mut Connection) -> Result<Daemon, ClientError> {
-    match conn.request(&Request::Version).await? {
-        Response::Version { daemon, protocol } => Ok(Daemon {
-            version: daemon,
-            protocol,
-        }),
-        other => Err(ClientError::from_response(other)),
-    }
-}
-
-/// Unwrap an engine status, treating `BadRequest` as a daemon that
-/// predates the engine requests.
-fn engine_status(resp: Response, daemon: &Daemon) -> Result<EngineStatus, ClientError> {
+fn engine_status(resp: Response) -> Result<EngineStatus, ClientError> {
     match resp {
         Response::Engine(engine) => Ok(engine),
-        Response::Error {
-            code: ErrorCode::BadRequest,
-            ..
-        } => Err(ClientError::DaemonTooOld {
-            daemon: daemon.version.clone(),
-        }),
         other => Err(ClientError::from_response(other)),
     }
 }
 
-fn print_status<W: Write>(
-    out: &mut W,
-    daemon: &Daemon,
-    socket: &Path,
+fn print_status<D: Daemon, W: Write>(
+    ctx: &mut Context<D, W>,
+    daemon: &DaemonInfo,
     engine: &EngineStatus,
-    json: bool,
 ) -> Result<(), ClientError> {
-    if json {
-        writeln!(out, "{}", status_json(daemon, socket, engine))?;
-    } else {
-        writeln!(out, "{}", daemon_line(daemon, socket))?;
-        writeln!(out, "{}", engine_line(engine))?;
+    for line in status_lines(daemon, ctx.socket(), engine, ctx.json()) {
+        ctx.out().line(line)?;
     }
-    out.flush()?;
     Ok(())
 }
 
-/// What the daemon said about itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Daemon {
-    pub(crate) version: String,
-    pub(crate) protocol: u32,
+/// What `alchemy status` prints: the daemon and engine lines, or one JSON
+/// object.
+pub(crate) fn status_lines(
+    daemon: &DaemonInfo,
+    socket: &Path,
+    engine: &EngineStatus,
+    json: bool,
+) -> Vec<String> {
+    if json {
+        vec![status_json(daemon, socket, engine)]
+    } else {
+        vec![daemon_line(daemon, socket), engine_line(engine)]
+    }
 }
 
 /// The first line of `alchemy status`.
-pub(crate) fn daemon_line(daemon: &Daemon, socket: &Path) -> String {
+pub(crate) fn daemon_line(daemon: &DaemonInfo, socket: &Path) -> String {
     format!(
         "alchemyd {} (protocol {}) at {}",
         daemon.version,
@@ -166,7 +132,7 @@ pub(crate) fn engine_line(engine: &EngineStatus) -> String {
 }
 
 /// The `--json` object: the daemon, its socket, and the engine status.
-pub(crate) fn status_json(daemon: &Daemon, socket: &Path, engine: &EngineStatus) -> String {
+pub(crate) fn status_json(daemon: &DaemonInfo, socket: &Path, engine: &EngineStatus) -> String {
     serde_json::json!({
         "daemon": daemon.version,
         "protocol": daemon.protocol,
@@ -309,7 +275,7 @@ mod tests {
 
     #[test]
     fn daemon_line_names_version_protocol_and_socket() {
-        let daemon = Daemon {
+        let daemon = DaemonInfo {
             version: "1.2.3".into(),
             protocol: 1,
         };
@@ -321,7 +287,7 @@ mod tests {
 
     #[test]
     fn status_json_nests_the_engine() {
-        let daemon = Daemon {
+        let daemon = DaemonInfo {
             version: "1.2.3".into(),
             protocol: 1,
         };

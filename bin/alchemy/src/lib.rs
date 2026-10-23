@@ -4,13 +4,20 @@
 //! holds no state of its own.
 
 pub mod commands;
+mod context;
+mod daemon;
 mod error;
+mod output;
 mod transport;
 
 use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+
+use crate::context::Context;
+use crate::daemon::IpcDaemon;
+use crate::output::Output;
 
 pub use error::ClientError;
 pub use transport::exchange_at;
@@ -46,7 +53,8 @@ pub enum Command {
 /// stopping; the caller ends it by dropping the future.
 pub async fn run<W: Write>(cli: Cli, out: &mut W) -> Result<(), ClientError> {
     let socket = cli.socket.unwrap_or_else(alchemy_ipc::default_socket_path);
+    let mut ctx = Context::new(IpcDaemon::new(socket), Output::new(out, cli.json));
     match cli.command {
-        Command::Status(args) => commands::status::run(&socket, cli.json, out, args).await,
+        Command::Status(args) => commands::status::run(&mut ctx, args).await,
     }
 }
