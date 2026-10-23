@@ -3,6 +3,8 @@
 use alchemy_ipc::{IpcError, Response};
 use thiserror::Error;
 
+/// The CLI was invoked or configured wrongly. Clap exits with it too.
+const EXIT_USAGE: u8 = 2;
 /// `sysexits.h` `EX_UNAVAILABLE`.
 const EX_UNAVAILABLE: u8 = 69;
 /// `sysexits.h` `EX_IOERR`.
@@ -46,6 +48,26 @@ pub enum ClientError {
         /// `alchemy`.
         command: &'static str,
     },
+    /// The daemon target names a remote daemon. Those need
+    /// authentication, which arrives in M13, so none is contacted.
+    #[error(
+        "cannot use a {scheme}:// daemon from {origin}: remote daemons need authentication, which arrives in M13 (https://github.com/hostingaccessories/alchemy/issues/16)\nhint: forward the remote socket over SSH and pass the local end with --socket"
+    )]
+    RemoteDaemon {
+        /// Where the target came from: a flag or an environment variable.
+        origin: &'static str,
+        /// The URL scheme, lowercased. The rest of the URL is not kept,
+        /// since it may carry credentials.
+        scheme: String,
+    },
+    /// The daemon target is malformed.
+    #[error("invalid {origin}: {reason}")]
+    InvalidTarget {
+        /// Where the target came from: a flag or an environment variable.
+        origin: &'static str,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
     /// Writing the command's output failed.
     #[error("cannot write output: {0}")]
     Output(#[from] std::io::Error),
@@ -69,6 +91,7 @@ impl ClientError {
             | Self::Unexpected(_)
             | Self::DaemonTooOld { .. } => EX_PROTOCOL,
             Self::Output(_) => EX_IOERR,
+            Self::RemoteDaemon { .. } | Self::InvalidTarget { .. } => EXIT_USAGE,
             Self::Daemon(_) => 1,
         }
     }

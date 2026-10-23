@@ -8,6 +8,7 @@ mod context;
 mod daemon;
 mod error;
 mod output;
+mod target;
 mod transport;
 
 use std::io::Write;
@@ -19,8 +20,10 @@ use crate::commands::status;
 use crate::context::Context;
 use crate::daemon::IpcDaemon;
 use crate::output::Output;
+use crate::target::{Sources, Target};
 
 pub use error::ClientError;
+pub use target::DAEMON_ENV;
 pub use transport::exchange_at;
 
 /// Manage Docker Compose stacks through alchemyd.
@@ -31,8 +34,25 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Path of the alchemyd IPC socket.
-    #[arg(long, global = true, env = alchemy_ipc::SOCKET_ENV)]
+    /// URL of alchemyd, overriding [`DAEMON_ENV`]. Only `unix://` is
+    /// supported until remote daemons have authentication.
+    #[arg(
+        long,
+        global = true,
+        value_name = "URL",
+        conflicts_with = "socket",
+        help = "URL of alchemyd; only unix:///path/to/alchemyd.sock for now [env: ALCHEMY_DAEMON]"
+    )]
+    pub daemon: Option<String>,
+
+    /// Path of the alchemyd IPC socket, overriding `ALCHEMY_SOCKET`.
+    /// Short for `--daemon unix://PATH`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Path of the alchemyd IPC socket, short for --daemon unix://PATH [env: ALCHEMY_SOCKET]"
+    )]
     pub socket: Option<PathBuf>,
 
     /// The command to run.
@@ -53,7 +73,7 @@ pub enum Command {
 /// `status --watch` only returns on an error, such as the daemon
 /// stopping; the caller ends it by dropping the future.
 pub async fn run<W: Write>(cli: Cli, out: &mut W) -> Result<(), ClientError> {
-    let socket = cli.socket.unwrap_or_else(alchemy_ipc::default_socket_path);
+    let Target::Unix(socket) = target::resolve(Sources::from_env(cli.daemon, cli.socket))?;
     let context =
         |command| Context::new(IpcDaemon::new(socket), Output::new(out, cli.json), command);
     match cli.command {

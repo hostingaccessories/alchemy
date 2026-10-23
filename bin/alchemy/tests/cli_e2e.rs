@@ -11,10 +11,11 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::time::Duration;
 
 use alchemy::commands::status;
-use alchemy::{Cli, ClientError, Command};
+use alchemy::{Cli, ClientError, Command, DAEMON_ENV};
 use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
 use alchemy_ipc::{
     DEFAULT_MAX_FRAME, ErrorCode, FrameDecoder, PROTOCOL_VERSION, Request, Response, read_frame,
@@ -22,6 +23,7 @@ use alchemy_ipc::{
 };
 use alchemyd::engine::EngineSource;
 use alchemyd::{Config, Deps, State};
+use clap::Parser;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -92,6 +94,7 @@ impl Daemon {
 fn cli(socket: &Path, json: bool, watch: bool) -> Cli {
     Cli {
         json,
+        daemon: None,
         socket: Some(socket.to_owned()),
         command: Command::Status(status::Args { watch }),
     }
@@ -357,4 +360,77 @@ async fn missing_daemon_is_unavailable() {
         assert!(matches!(err, ClientError::DaemonUnreachable(_)), "{err:?}");
         assert_eq!(err.exit_code(), 69);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_unix_daemon_url_reaches_the_same_socket_as_socket() {
+    let daemon = Daemon::start(ready_desktop()).await;
+    let url = format!("unix://{}", daemon.socket.display());
+    let cli = Cli::try_parse_from(["alchemy", "--daemon", &url, "status", "--json"]).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&run(cli).await.unwrap()).unwrap();
+    assert_eq!(json["socket"], daemon.socket.to_str().unwrap());
+    daemon.stop().await;
+}
+
+#[test]
+fn daemon_and_socket_flags_together_are_a_usage_error() {
+    let err = Cli::try_parse_from([
+        "alchemy",
+        "--daemon",
+        "unix:///a.sock",
+        "--socket",
+        "/b.sock",
+        "status",
+    ])
+    .unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// Runs the real `alchemy` binary with `args` and `env`, and without the
+/// caller's own daemon variables.
+async fn alchemy_bin(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_alchemy"));
+    cmd.args(args)
+        .env_remove(DAEMON_ENV)
+        .env_remove(alchemy_ipc::SOCKET_ENV)
+        .envs(env.iter().copied());
+    tokio::task::spawn_blocking(move || cmd.output())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_remote_daemon_is_refused_until_auth_lands() {
+    let flag = alchemy_bin(&["--daemon", "https://x", "status"], &[]).await;
+    let env = alchemy_bin(&["status"], &[(DAEMON_ENV, "https://x")]).await;
+    for (out, origin) in [(flag, "--daemon"), (env, DAEMON_ENV)] {
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.status.code(), Some(2), "{stderr}");
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "");
+        assert!(
+            stderr.starts_with(&format!(
+                "alchemy: cannot use a https:// daemon from {origin}: remote daemons need authentication, which arrives in M13"
+            )),
+            "{stderr}"
+        );
+        assert!(stderr.contains("issues/16"), "{stderr}");
+        assert!(stderr.contains("\nhint: "), "{stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_socket_flag_beats_the_daemon_env() {
+    let daemon = Daemon::start(ready_desktop()).await;
+    let socket = daemon.socket.to_str().unwrap().to_owned();
+    let out = alchemy_bin(
+        &["--socket", &socket, "status"],
+        &[(DAEMON_ENV, "https://x")],
+    )
+    .await;
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{stdout}");
+    assert_eq!(stdout.lines().next().unwrap(), daemon_line(&daemon.socket));
+    daemon.stop().await;
 }
