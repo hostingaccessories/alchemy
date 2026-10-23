@@ -25,7 +25,7 @@ fn alchemy(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_alchemy"))
         .args(args)
         .env(DAEMON_ENV, "https://unreachable.invalid")
-        .env_remove(alchemy_ipc::SOCKET_ENV)
+        .env_remove(alchemy_api::SOCKET_ENV)
         .output()
         .unwrap()
 }

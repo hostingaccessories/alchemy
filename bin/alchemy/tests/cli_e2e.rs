@@ -18,11 +18,10 @@ use alchemy::commands::{safety_probe, status};
 use alchemy::prompt::FakePrompt;
 use alchemy::safety::Safety;
 use alchemy::{Cli, ClientError, Color, Command, DAEMON_ENV};
-use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
-use alchemy_ipc::{
-    DEFAULT_MAX_FRAME, ErrorCode, FrameDecoder, PROTOCOL_VERSION, Request, Response, read_frame,
-    write_message,
+use alchemy_api::{
+    API_VERSION, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, VersionResponse,
 };
+use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
 use alchemyd::engine::EngineSource;
 use alchemyd::{Config, Deps, State};
 use clap::{CommandFactory, Parser};
@@ -177,28 +176,10 @@ fn ready_desktop() -> EngineStatus {
 
 fn daemon_line(socket: &Path) -> String {
     format!(
-        "alchemyd {} (protocol {PROTOCOL_VERSION}) at {}",
+        "alchemyd {} (protocol {API_VERSION}) at {}",
         env!("CARGO_PKG_VERSION"),
         socket.display()
     )
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn ping_round_trips_through_a_real_daemon() {
-    let daemon = Daemon::start(EngineStatus::new(EngineState::Starting)).await;
-    assert_eq!(
-        alchemy::exchange_at(&daemon.socket, &Request::Ping)
-            .await
-            .unwrap(),
-        Response::Pong
-    );
-    assert_eq!(
-        alchemy::exchange_at(&daemon.socket, &Request::Engine)
-            .await
-            .unwrap(),
-        Response::Engine(EngineStatus::new(EngineState::Starting))
-    );
-    daemon.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -231,7 +212,7 @@ async fn status_json_adds_the_engine() {
     assert_eq!(out.lines().count(), 1, "{out}");
     let json: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(json["daemon"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(json["protocol"], PROTOCOL_VERSION);
+    assert_eq!(json["protocol"], API_VERSION);
     assert_eq!(json["socket"], daemon.socket.to_str().unwrap());
     assert_eq!(
         json["engine"],
@@ -305,7 +286,7 @@ async fn version_reports_alchemy_and_the_daemon() {
     assert_eq!(
         run(cli).await.unwrap(),
         format!(
-            "alchemy {version} (protocol {PROTOCOL_VERSION})\n{}\n",
+            "alchemy {version} (protocol {API_VERSION})\n{}\n",
             daemon_line(&daemon.socket)
         )
     );
@@ -317,52 +298,46 @@ async fn version_reports_alchemy_and_the_daemon() {
         serde_json::from_str::<serde_json::Value>(&out).unwrap(),
         serde_json::json!({
             "cli": version,
-            "cli_protocol": PROTOCOL_VERSION,
+            "cli_protocol": API_VERSION,
             "daemon": version,
-            "protocol": PROTOCOL_VERSION,
+            "protocol": API_VERSION,
             "socket": socket,
         })
     );
     daemon.stop().await;
 }
 
-/// Answers like an alchemyd from before the engine requests existed: it
-/// knows `ping` and `version`, and rejects anything else as a bad request.
+/// Answers like an alchemyd from before the engine routes existed: it
+/// knows `/api/health` and `/api/version`, and answers anything else with
+/// a `not_found` error.
 fn old_daemon(socket: &Path) -> JoinHandle<()> {
+    let app = axum::Router::new()
+        .route(
+            "/api/health",
+            axum::routing::get(|| async {
+                axum::Json(HealthResponse {
+                    status: HealthStatus::Ok,
+                })
+            }),
+        )
+        .route(
+            "/api/version",
+            axum::routing::get(|| async {
+                axum::Json(VersionResponse {
+                    version: "0.0.1".into(),
+                    api: 1,
+                })
+            }),
+        )
+        .fallback(|| async {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(ErrorResponse::new(ErrorCode::NotFound, "not found")),
+            )
+        });
     let listener = tokio::net::UnixListener::bind(socket).unwrap();
     tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            tokio::spawn(async move {
-                let mut decoder = FrameDecoder::new();
-                while let Ok(Some(frame)) = read_frame(&mut stream, &mut decoder).await {
-                    let req: serde_json::Value = serde_json::from_slice(&frame).unwrap();
-                    let (resp, keep_open) = match req["type"].as_str() {
-                        Some("ping") => (Response::Pong, true),
-                        Some("version") => (
-                            Response::Version {
-                                daemon: "0.0.1".into(),
-                                protocol: 1,
-                            },
-                            true,
-                        ),
-                        _ => (
-                            Response::Error {
-                                code: ErrorCode::BadRequest,
-                                message: "unsupported or malformed request".into(),
-                            },
-                            false,
-                        ),
-                    };
-                    write_message(&mut stream, &resp, DEFAULT_MAX_FRAME)
-                        .await
-                        .unwrap();
-                    if !keep_open {
-                        return;
-                    }
-                }
-            });
-        }
+        axum::serve(listener, app).await.unwrap();
     })
 }
 
@@ -600,7 +575,7 @@ async fn alchemy_bin(args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_alchemy"));
     cmd.args(args)
         .env_remove(DAEMON_ENV)
-        .env_remove(alchemy_ipc::SOCKET_ENV)
+        .env_remove(alchemy_api::SOCKET_ENV)
         .envs(env.iter().copied());
     tokio::task::spawn_blocking(move || cmd.output())
         .await

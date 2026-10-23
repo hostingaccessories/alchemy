@@ -1,7 +1,7 @@
 //! The `alchemy` CLI.
 //!
-//! Each subcommand maps to IPC requests against `alchemyd`. The CLI
-//! holds no state of its own.
+//! Each subcommand maps to HTTP requests against `alchemyd`'s API on its
+//! Unix socket. The CLI holds no state of its own.
 
 pub mod commands;
 mod context;
@@ -10,8 +10,8 @@ mod error;
 mod output;
 pub mod prompt;
 pub mod safety;
+mod sse;
 mod target;
-mod transport;
 
 use std::ffi::OsStr;
 use std::io::Write;
@@ -21,15 +21,14 @@ use clap::{Parser, Subcommand};
 
 use crate::commands::{completions, generate_man, status, version};
 use crate::context::Context;
-use crate::daemon::IpcDaemon;
+use crate::daemon::HttpDaemon;
 use crate::output::Output;
 use crate::prompt::{Prompt, TtyPrompt};
 use crate::target::{Sources, Target};
 
-pub use error::{ClientError, Exit};
+pub use error::{ClientError, Exit, ProtocolError};
 pub use output::Color;
 pub use target::DAEMON_ENV;
-pub use transport::exchange_at;
 
 /// Manage Alchemy from the command line. clap shows the package
 /// description instead of this, so keep the two in step.
@@ -123,7 +122,7 @@ pub async fn run_with<W: Write, P: Prompt>(
     let context = |out, command| -> Result<_, ClientError> {
         let Target::Unix(socket) = target::resolve(Sources::from_env(daemon, socket))?;
         Ok(Context::new(
-            IpcDaemon::new(socket),
+            HttpDaemon::new(socket),
             Output::new(out, json, color),
             command,
         ))

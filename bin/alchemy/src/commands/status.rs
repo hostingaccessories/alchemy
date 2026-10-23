@@ -4,8 +4,8 @@
 use std::io::Write;
 use std::path::Path;
 
+use alchemy_api::ApiEvent;
 use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
-use alchemy_ipc::{Request, Response};
 
 use crate::context::Context;
 use crate::daemon::{Daemon, DaemonInfo};
@@ -35,7 +35,7 @@ pub(crate) async fn run<D: Daemon, W: Write>(
     if args.watch {
         return watch(ctx, &daemon).await;
     }
-    let engine = engine_status(ctx.request(&Request::Engine).await?)?;
+    let engine = ctx.get::<EngineStatus>("/api/engine").await?;
     print_status(ctx, &daemon, &engine)
 }
 
@@ -45,13 +45,13 @@ async fn watch<D: Daemon, W: Write>(
     ctx: &mut Context<D, W>,
     daemon: &DaemonInfo,
 ) -> Result<(), ClientError> {
-    let mut stream = ctx.stream(&Request::WatchEngine).await?;
+    let mut events = ctx.events().await?;
     let mut last_line = None;
     loop {
-        let Some(resp) = stream.next().await? else {
+        let Some(event) = events.next().await? else {
             return Err(ClientError::Disconnected);
         };
-        let engine = engine_status(resp)?;
+        let ApiEvent::Engine(engine) = event;
         let line = engine_line(&engine);
         if last_line.is_none() {
             print_status(ctx, daemon, &engine)?;
@@ -62,13 +62,6 @@ async fn watch<D: Daemon, W: Write>(
             ctx.out().line(&line)?;
         }
         last_line = Some(line);
-    }
-}
-
-fn engine_status(resp: Response) -> Result<EngineStatus, ClientError> {
-    match resp {
-        Response::Engine(engine) => Ok(engine),
-        other => Err(ClientError::from_response(other)),
     }
 }
 
@@ -103,7 +96,7 @@ pub(crate) fn daemon_line(daemon: &DaemonInfo, socket: &Path) -> String {
     format!(
         "alchemyd {} (protocol {}) at {}",
         daemon.version,
-        daemon.protocol,
+        daemon.api,
         socket.display()
     )
 }
@@ -138,7 +131,7 @@ pub(crate) fn engine_line(engine: &EngineStatus) -> String {
 pub(crate) fn status_json(daemon: &DaemonInfo, socket: &Path, engine: &EngineStatus) -> String {
     serde_json::json!({
         "daemon": daemon.version,
-        "protocol": daemon.protocol,
+        "protocol": daemon.api,
         "socket": socket,
         "engine": engine,
     })
@@ -188,10 +181,10 @@ fn ready_line(engine: &EngineStatus) -> String {
     clippy::indexing_slicing
 )]
 mod tests {
-    use alchemy_ipc::ErrorCode;
-
     use super::*;
-    use crate::daemon::fake::{FAKE_SOCKET, FakeDaemon};
+    use crate::daemon::Method;
+    use crate::daemon::fake::{FAKE_SOCKET, FakeDaemon, sse};
+    use crate::sse::SseEvent;
 
     fn status(
         state: EngineState,
@@ -283,7 +276,7 @@ mod tests {
     fn daemon_line_names_version_protocol_and_socket() {
         let daemon = DaemonInfo {
             version: "1.2.3".into(),
-            protocol: 1,
+            api: 1,
         };
         assert_eq!(
             daemon_line(&daemon, Path::new("/run/alchemyd.sock")),
@@ -295,7 +288,7 @@ mod tests {
     fn status_json_nests_the_engine() {
         let daemon = DaemonInfo {
             version: "1.2.3".into(),
-            protocol: 1,
+            api: 1,
         };
         let engine = EngineStatus::new(EngineState::Starting);
         let json: serde_json::Value = serde_json::from_str(&status_json(
@@ -327,14 +320,21 @@ mod tests {
         )
     }
 
-    fn engine(state: EngineState) -> Response {
-        Response::Engine(EngineStatus::new(state))
+    fn engine(state: EngineState) -> Result<SseEvent, ClientError> {
+        engine_event(&EngineStatus::new(state))
     }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn engine_event(engine: &EngineStatus) -> Result<SseEvent, ClientError> {
+        Ok(sse("engine", &serde_json::to_string(engine).unwrap()))
+    }
+
+    const ENGINE: &str = "/api/engine";
 
     struct Run {
         result: Result<(), ClientError>,
         out: String,
-        requests: Vec<Request>,
+        requests: Vec<String>,
     }
 
     async fn run_with(fake: FakeDaemon, json: bool, watch: bool) -> Run {
@@ -357,18 +357,18 @@ mod tests {
     async fn status_prints_the_daemon_and_the_engine() {
         let fake = FakeDaemon::new()
             .version("1.2.3", 1)
-            .reply(Request::Engine, Response::Engine(ready()));
+            .ok(Method::GET, ENGINE, &ready());
         let run = run_with(fake, false, false).await;
         run.result.unwrap();
         assert_eq!(run.out, format!("{DAEMON_LINE}\n{READY_LINE}\n"));
-        assert_eq!(run.requests, [Request::Version, Request::Engine]);
+        assert_eq!(run.requests, ["GET /api/version", "GET /api/engine"]);
     }
 
     #[tokio::test]
     async fn status_json_prints_one_object() {
         let fake = FakeDaemon::new()
             .version("1.2.3", 1)
-            .reply(Request::Engine, Response::Engine(ready()));
+            .ok(Method::GET, ENGINE, &ready());
         let run = run_with(fake, true, false).await;
         run.result.unwrap();
         assert_eq!(
@@ -386,15 +386,13 @@ mod tests {
     async fn watch_prints_the_engine_line_only_when_it_changes() {
         let mut api_only = EngineStatus::new(EngineState::Starting);
         api_only.api_version = Some("1.47".into());
-        let fake = FakeDaemon::new().version("1.2.3", 1).stream(
-            Request::WatchEngine,
-            [
-                Ok(engine(EngineState::NotRunning)),
-                Ok(engine(EngineState::Starting)),
-                Ok(Response::Engine(api_only)),
-                Ok(Response::Engine(ready())),
-            ],
-        );
+        let fake = FakeDaemon::new().version("1.2.3", 1).events([
+            engine(EngineState::NotRunning),
+            engine(EngineState::Starting),
+            Ok(sse("some_future_topic", "{}")),
+            engine_event(&api_only),
+            engine_event(&ready()),
+        ]);
         let run = run_with(fake, false, true).await;
         assert!(
             matches!(run.result, Err(ClientError::Disconnected)),
@@ -410,19 +408,16 @@ mod tests {
                 READY_LINE
             ]
         );
-        assert_eq!(run.requests, [Request::Version, Request::WatchEngine]);
+        assert_eq!(run.requests, ["GET /api/version", "GET /api/events"]);
     }
 
     #[tokio::test]
     async fn watch_json_prints_every_update() {
-        let fake = FakeDaemon::new().version("1.2.3", 1).stream(
-            Request::WatchEngine,
-            [
-                Ok(engine(EngineState::Starting)),
-                Ok(engine(EngineState::Starting)),
-                Ok(Response::Engine(ready())),
-            ],
-        );
+        let fake = FakeDaemon::new().version("1.2.3", 1).events([
+            engine(EngineState::Starting),
+            engine(EngineState::Starting),
+            engine_event(&ready()),
+        ]);
         let run = run_with(fake, true, true).await;
         assert!(matches!(run.result, Err(ClientError::Disconnected)));
         let states: Vec<_> = json_lines(&run.out)
@@ -438,49 +433,61 @@ mod tests {
 
     #[tokio::test]
     async fn failures_are_reported_as_errors() {
-        let bad_request = || Response::Error {
-            code: ErrorCode::BadRequest,
-            message: "unsupported or malformed request".into(),
-        };
-        let internal = || Response::Error {
-            code: ErrorCode::Internal,
-            message: "engine monitor stopped".into(),
-        };
         let unreachable = || ClientError::DaemonUnreachable(format!("{FAKE_SOCKET}: refused"));
         let version = || FakeDaemon::new().version("0.0.1", 1);
+        let too_old = "alchemyd 0.0.1 is too old for `status`";
         let cases: Vec<(FakeDaemon, bool, u8, &str)> = vec![
             (
-                version().reply(Request::Engine, bad_request()),
+                version().error(Method::GET, ENGINE, 404, "not_found", "not found"),
                 false,
                 76,
-                "alchemyd 0.0.1 is too old for `status`",
+                too_old,
             ),
             (
-                version().stream(Request::WatchEngine, [Ok(bad_request())]),
+                version()
+                    .refuse_events(404, br#"{"error":"not found","code":"not_found"}"#.to_vec()),
                 true,
                 76,
-                "alchemyd 0.0.1 is too old for `status`",
+                too_old,
             ),
             (
-                version().reply(Request::Engine, internal()),
+                version().error(
+                    Method::GET,
+                    ENGINE,
+                    500,
+                    "internal",
+                    "engine monitor stopped",
+                ),
                 false,
                 1,
                 "alchemyd: engine monitor stopped",
             ),
             (
-                version().reply(Request::Engine, Response::Pong),
+                version().reply(Method::GET, ENGINE, 200, b"pong".to_vec()),
                 false,
                 76,
-                "unexpected response from alchemyd: Pong",
+                "cannot talk to alchemyd: decode: ",
             ),
             (
-                FakeDaemon::new().fail(Request::Version, unreachable()),
+                version().events([Ok(sse("engine", "pong"))]),
+                true,
+                76,
+                "cannot talk to alchemyd: decode: ",
+            ),
+            (
+                version().fail_events(unreachable()),
+                true,
+                69,
+                "cannot reach alchemyd: /run/alchemyd.sock: refused",
+            ),
+            (
+                FakeDaemon::new().fail(Method::GET, "/api/version", unreachable()),
                 false,
                 69,
                 "cannot reach alchemyd: /run/alchemyd.sock: refused",
             ),
             (
-                FakeDaemon::new().fail(Request::Version, unreachable()),
+                FakeDaemon::new().fail(Method::GET, "/api/version", unreachable()),
                 true,
                 69,
                 "cannot reach alchemyd: /run/alchemyd.sock: refused",

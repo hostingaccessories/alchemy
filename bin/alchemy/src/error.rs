@@ -5,8 +5,9 @@
 //! `--json` it is one `{"error":{"kind","message","hint"}}` document.
 //! Both go to stderr and carry no ANSI codes.
 
-use alchemy_ipc::{IpcError, Response};
 use thiserror::Error;
+
+use crate::sse::{MAX_EVENT, SseError};
 
 /// The process exit statuses `alchemy` uses. Each is a contract that
 /// scripts branch on.
@@ -66,17 +67,19 @@ pub enum ClientError {
     /// it stopped.
     #[error("alchemyd closed the connection")]
     Disconnected,
-    /// The exchange failed below the message layer.
+    /// The exchange failed below the API: the connection broke, or the
+    /// daemon did not answer with the HTTP and JSON the route promises.
     #[error("cannot talk to alchemyd: {0}")]
-    Ipc(#[from] IpcError),
+    Protocol(#[from] ProtocolError),
     /// The daemon answered with an error.
     #[error("alchemyd: {0}")]
     Daemon(String),
-    /// The daemon answered with a response this command did not expect.
+    /// The daemon answered with an HTTP status that is neither a success
+    /// nor an error.
     #[error("unexpected response from alchemyd: {0}")]
     Unexpected(String),
-    /// The daemon predates a request this command needs and answered it
-    /// as a bad request.
+    /// The daemon predates a route this command needs: it answered with
+    /// `not_found` or `method_not_allowed`.
     #[error("alchemyd {daemon} is too old for `{command}`")]
     DaemonTooOld {
         /// The daemon's reported version.
@@ -137,21 +140,51 @@ pub enum ClientError {
     Runtime(#[source] std::io::Error),
 }
 
-impl ClientError {
-    /// Convert an unexpected or error response into a [`ClientError`].
-    pub fn from_response(resp: Response) -> Self {
-        match resp {
-            Response::Error { message, .. } => Self::Daemon(message),
-            other => Self::Unexpected(format!("{other:?}")),
+/// Why an exchange with alchemyd failed below the API.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ProtocolError {
+    /// The connection failed. Only the [`std::io::ErrorKind`] is kept.
+    #[error("io: {kind}")]
+    Io {
+        /// The OS-level error category.
+        kind: std::io::ErrorKind,
+    },
+    /// The daemon's answer was not HTTP this client understands.
+    #[error("http: {0}")]
+    Http(String),
+    /// A body was not the JSON its route promises.
+    #[error("decode: {0}")]
+    Decode(#[source] serde_json::Error),
+    /// An event on `/api/events` grew past the size the client accepts.
+    #[error("event stream: an event is longer than {limit} bytes")]
+    EventTooLong {
+        /// The most bytes one event may take.
+        limit: usize,
+    },
+}
+
+impl From<SseError> for ProtocolError {
+    fn from(err: SseError) -> Self {
+        match err {
+            SseError::TooLong => Self::EventTooLong { limit: MAX_EVENT },
         }
     }
+}
 
+impl From<SseError> for ClientError {
+    fn from(err: SseError) -> Self {
+        Self::Protocol(err.into())
+    }
+}
+
+impl ClientError {
     /// The exit status for this error.
     pub fn exit(&self) -> Exit {
         match self {
             Self::DaemonUnreachable(_) | Self::Disconnected => Exit::Unavailable,
             Self::ConnectionClosed
-            | Self::Ipc(_)
+            | Self::Protocol(_)
             | Self::Unexpected(_)
             | Self::DaemonTooOld { .. } => Exit::Protocol,
             Self::Output(_) => Exit::Io,
@@ -176,7 +209,7 @@ impl ClientError {
             Self::DaemonUnreachable(_) => "daemon_unreachable",
             Self::ConnectionClosed => "connection_closed",
             Self::Disconnected => "disconnected",
-            Self::Ipc(_) => "protocol",
+            Self::Protocol(_) => "protocol",
             Self::Daemon(_) => "daemon",
             Self::Unexpected(_) => "unexpected_response",
             Self::DaemonTooOld { .. } => "daemon_too_old",
@@ -198,11 +231,10 @@ impl ClientError {
                 "start alchemyd, or point --socket at the socket it listens on"
             }
             Self::ConnectionClosed => "alchemyd may have crashed; check its logs",
-            Self::Disconnected
-            | Self::Ipc(IpcError::Io { .. } | IpcError::UnexpectedEof { .. }) => {
+            Self::Disconnected | Self::Protocol(ProtocolError::Io { .. }) => {
                 "check that alchemyd is still running with `alchemy status`"
             }
-            Self::Ipc(_) | Self::Unexpected(_) => {
+            Self::Protocol(_) | Self::Unexpected(_) => {
                 "alchemy and alchemyd may be different versions; upgrade both to the same release"
             }
             Self::DaemonTooOld { .. } => {
@@ -381,20 +413,36 @@ mod tests {
                 Some(running),
             ),
             (
-                ClientError::Ipc(IpcError::Decode(decode)),
+                ClientError::Protocol(ProtocolError::Decode(decode)),
                 76,
                 "protocol",
                 "cannot talk to alchemyd: decode: expected value at line 1 column 1".into(),
                 Some(versions),
             ),
             (
-                ClientError::Ipc(IpcError::Io {
+                ClientError::Protocol(ProtocolError::Io {
                     kind: std::io::ErrorKind::ConnectionReset,
                 }),
                 76,
                 "protocol",
                 "cannot talk to alchemyd: io: connection reset".into(),
                 Some(running),
+            ),
+            (
+                ClientError::Protocol(ProtocolError::Http("invalid HTTP version parsed".into())),
+                76,
+                "protocol",
+                "cannot talk to alchemyd: http: invalid HTTP version parsed".into(),
+                Some(versions),
+            ),
+            (
+                ClientError::from(SseError::TooLong),
+                76,
+                "protocol",
+                format!(
+                    "cannot talk to alchemyd: event stream: an event is longer than {MAX_EVENT} bytes"
+                ),
+                Some(versions),
             ),
             (
                 ClientError::Daemon("engine monitor stopped: \"x\"".into()),
@@ -404,10 +452,10 @@ mod tests {
                 None,
             ),
             (
-                ClientError::Unexpected("Pong".into()),
+                ClientError::Unexpected("302 Found".into()),
                 76,
                 "unexpected_response",
-                "unexpected response from alchemyd: Pong".into(),
+                "unexpected response from alchemyd: 302 Found".into(),
                 Some(versions),
             ),
             (
@@ -521,23 +569,6 @@ mod tests {
         for (err, quiet) in cases {
             assert_eq!(err.is_quiet(), quiet, "{err:?}");
         }
-    }
-
-    #[test]
-    fn from_response_keeps_the_daemon_message() {
-        let err = ClientError::from_response(Response::Error {
-            code: alchemy_ipc::ErrorCode::Internal,
-            message: "boom".into(),
-        });
-        assert!(
-            matches!(&err, ClientError::Daemon(m) if m == "boom"),
-            "{err:?}"
-        );
-        let err = ClientError::from_response(Response::Pong);
-        assert!(
-            matches!(&err, ClientError::Unexpected(m) if m == "Pong"),
-            "{err:?}"
-        );
     }
 
     #[test]
