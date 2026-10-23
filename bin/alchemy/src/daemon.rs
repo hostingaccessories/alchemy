@@ -1,56 +1,76 @@
 //! The CLI's view of alchemyd: a [`Daemon`] client that commands talk to
 //! instead of the socket, so their logic can be tested against a fake.
+//!
+//! The trait works at the HTTP level: a status and a body, or raw
+//! server-sent events. [`crate::context::Context`] decodes them into API
+//! types and errors.
 
 #[cfg(test)]
 pub(crate) mod fake;
-mod ipc;
+mod http;
 
 use std::path::Path;
 
-use alchemy_ipc::{Request, Response};
+pub(crate) use hyper::Method;
 
 use crate::error::ClientError;
+use crate::sse::SseEvent;
 
-pub(crate) use ipc::IpcDaemon;
+pub(crate) use http::HttpDaemon;
 
 /// A client of alchemyd.
 ///
-/// Implementations return the daemon's [`Response`] as sent, including
-/// [`Response::Error`]; [`crate::context::Context`] turns those into
-/// [`ClientError`]s. They bound each request by a timeout so a wedged
-/// daemon cannot hang the CLI.
+/// Implementations return the daemon's answer as sent, error statuses
+/// included; only a failure to exchange it at all is an `Err`. They bound
+/// each exchange by a timeout so a wedged daemon cannot hang the CLI.
 pub(crate) trait Daemon {
-    /// The responses that follow a streaming request.
-    type Stream: ResponseStream;
+    /// The events that follow a [`Daemon::events`] request.
+    type Events: EventStream;
 
     /// Where this client reaches the daemon.
     fn socket(&self) -> &Path;
 
-    /// Send `req` and wait for its one response.
-    async fn request(&mut self, req: &Request) -> Result<Response, ClientError>;
+    /// Send `method` to `path`, such as `/api/engine`, with no body, and
+    /// return the status and the whole body.
+    async fn request(&mut self, method: Method, path: &str) -> Result<Reply, ClientError>;
 
-    /// Send `req`, which the daemon answers with a stream of responses.
-    ///
-    /// The stream takes over the client's connection; a later
-    /// [`Daemon::request`] opens a new one.
-    async fn stream(&mut self, req: &Request) -> Result<Self::Stream, ClientError>;
+    /// `GET` the server-sent event stream at `path`. A status other than
+    /// success comes back as [`Opened::Refused`] with its body.
+    async fn events(&mut self, path: &str) -> Result<Opened<Self::Events>, ClientError>;
 }
 
-/// The responses to a streaming request, in the order the daemon sent
-/// them.
-pub(crate) trait ResponseStream {
-    /// The next response, or `None` once the daemon ends the stream.
+/// The events on an open stream, in the order the daemon sent them.
+pub(crate) trait EventStream {
+    /// The next event, or `None` once the daemon ends the stream.
     ///
-    /// Only the first response is bounded by a timeout: a stream may be
-    /// quiet for as long as whatever it follows is.
-    async fn next(&mut self) -> Result<Option<Response>, ClientError>;
+    /// Only the first event is bounded by a timeout: a stream may be quiet
+    /// for as long as whatever it follows is.
+    async fn next(&mut self) -> Result<Option<SseEvent>, ClientError>;
 }
 
-/// What the daemon said about itself in the `Version` handshake.
+/// A complete HTTP answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Reply {
+    /// The HTTP status code.
+    pub(crate) status: u16,
+    /// The body, usually JSON.
+    pub(crate) body: Vec<u8>,
+}
+
+/// The outcome of opening an event stream.
+#[derive(Debug)]
+pub(crate) enum Opened<S> {
+    /// The daemon accepted and is streaming.
+    Stream(S),
+    /// The daemon answered with a status other than success.
+    Refused(Reply),
+}
+
+/// What the daemon said about itself on `GET /api/version`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DaemonInfo {
     /// The daemon's release version.
     pub(crate) version: String,
-    /// The daemon's IPC protocol version.
-    pub(crate) protocol: u32,
+    /// The daemon's API version.
+    pub(crate) api: u32,
 }

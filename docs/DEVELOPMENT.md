@@ -35,8 +35,8 @@ and the daemon serves no UI until it exists.
 
 | Command                          | What it does                                                         |
 | -------------------------------- | -------------------------------------------------------------------- |
-| `cargo run -p alchemyd`          | Daemon on `127.0.0.1:7240` plus the IPC socket                       |
-| `cargo run -p alchemy -- status` | CLI; talks to the daemon over IPC                                    |
+| `cargo run -p alchemyd`          | Daemon on `127.0.0.1:7240` plus the API on a Unix socket             |
+| `cargo run -p alchemy -- status` | CLI; talks to the daemon's API over its Unix socket                  |
 | `pnpm dev`                       | Web UI dev server on `localhost:5173`, proxying `/api` to the daemon |
 | `pnpm gui`                       | Tauri desktop shell in dev mode (starts the web dev server)          |
 | `pnpm docs`                      | Documentation site dev server                                        |
@@ -66,6 +66,21 @@ when alchemyd can't be reached, 76 when alchemy and alchemyd are different
 versions, and so on through [the table in §8](#errors-and-exit-codes).
 `alchemy version` shows the versions and protocols of the CLI and the
 daemon; `alchemy --version` shows the CLI's alone, without contacting it.
+
+### Calling the API
+
+The socket and the TCP port serve the same `/api`; only TCP serves the web
+UI. `alchemy status` prints the socket path. Any host name works on the
+socket.
+
+```sh
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/version
+curl http://127.0.0.1:7240/api/version
+curl -N --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/events
+```
+
+`/api/events` is a server-sent event stream; `-N` prints each event as it
+arrives.
 
 ### Shell completions
 
@@ -177,7 +192,8 @@ scripts/release-smoke.sh
 This builds the web UI and release binaries, runs `alchemyd` on a temporary
 socket and port `17240` (override with `SMOKE_PORT`), and checks:
 
-- `/api/health` and `/api/engine` respond;
+- `/api/health` and `/api/engine` respond on the port, and `/api/health`
+  on the socket, where `/` is a JSON 404;
 - `/api/events` streams an `engine` event to the Tauri origin;
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
@@ -310,7 +326,9 @@ each pattern. Then run [the gate](#4-the-gate).
 
 ## 8. Adding a CLI command
 
-A command is a module, a `Command` variant, and one dispatch arm. Usage
+A command is a module, a `Command` variant, and one dispatch arm, plus a
+route in `alchemy-api` and `alchemyd` if it needs data the daemon doesn't
+serve yet ([Talking to alchemyd](#talking-to-alchemyd)). Usage
 errors, `--json` errors, exit codes, `--daemon` and `--socket`, the version
 handshake, ctrl-c, help, completions, and man pages already apply to every
 command; nothing else needs wiring. The examples add `alchemy app list`;
@@ -347,10 +365,8 @@ pub(crate) async fn run<D: Daemon, W: Write>(
     ctx: &mut Context<D, W>,
     args: Args,
 ) -> Result<(), ClientError> {
-    let apps = match ctx.request(&Request::Apps { all: args.all }).await? {
-        Response::Apps(apps) => apps,
-        other => return Err(ClientError::from_response(other)),
-    };
+    let path = if args.all { "/api/apps?all=true" } else { "/api/apps" };
+    let apps = ctx.get::<Vec<App>>(path).await?;
     for line in app_lines(&apps, ctx.json()) {
         ctx.out().line(line)?;
     }
@@ -390,29 +406,35 @@ its `Args` instead and doesn't call `context`, so it still works when
 ### Talking to alchemyd
 
 Commands reach the daemon only through `Context`, never the socket. The
-`Daemon` trait (`src/daemon.rs`) has the real `IpcDaemon` and, for tests,
-`FakeDaemon`.
+CLI speaks the same `/api` routes as the web UI, over HTTP on the Unix
+socket. The `Daemon` trait (`src/daemon.rs`) works at the HTTP level, a
+status and a body or raw server-sent events, and has the real
+`HttpDaemon` (`src/daemon/http.rs`) and, for tests, `FakeDaemon`.
 
-- `ctx.daemon_info()` is the daemon's version and protocol, from a
-  handshake that the first request performs once.
-- `ctx.request(&req)` returns one response. Turn one of any other variant
-  into an error with `ClientError::from_response`, as above.
-- `ctx.stream(&req)` returns a `Subscription`. Its `next()` gives
-  `Ok(None)` when the daemon ends the stream; a command that follows
-  changes returns `ClientError::Disconnected` then, as `status --watch`
-  does.
+- `ctx.daemon_info()` is the daemon's version and API version, from a
+  `GET /api/version` handshake that the first request performs once.
+- `ctx.get::<T>(path)` sends `GET path` and decodes the JSON body as `T`,
+  an `alchemy-api` type.
+- `ctx.events()` follows `GET /api/events` and returns a `Subscription`.
+  Its `next()` gives the next `ApiEvent`, skipping event names this build
+  doesn't know, and `Ok(None)` when the daemon ends the stream; a command
+  that follows changes returns `ClientError::Disconnected` then, as
+  `status --watch` does. The SSE parser is `src/sse.rs`.
 
-`Context` turns error responses into errors: `BadRequest` means the daemon
-predates the request and becomes "alchemyd 0.1.0 is too old for
-`app list`" (exit 76); anything else becomes `alchemyd: <message>` (exit 1).
-Each request times out after 10 seconds; a stream only until its first
-response.
+`Context` turns error statuses into errors: a 404 `not_found` or 405
+`method_not_allowed` means the daemon predates the route and becomes
+"alchemyd 0.1.0 is too old for `app list`" (exit 76); any other
+`ErrorResponse` becomes `alchemyd: <error>` (exit 1); a body that doesn't
+decode is a `protocol` error (exit 76). Each request times out after 10
+seconds; a stream only until its first event.
 
-A new request is a contract change in `crates/alchemy-ipc`: add the
-`Request` and `Response` variants with a wire-shape test in
-`tests/wire_stability.rs`, and answer it in `dispatch` in
-`bin/alchemyd/src/ipc.rs`. Adding one needs no `PROTOCOL_VERSION` bump,
-because an older daemon answers it with `BadRequest`.
+A new route is a contract change in `crates/alchemy-api`: add its types
+with a wire-shape test in `tests/wire_stability.rs`, mirror them in
+`app/alchemy-web/src/lib/api.ts`, and add its handler to `api()` in
+`bin/alchemyd/src/http.rs`, before the 405 fallback. The socket and the TCP
+port share that router, so the CLI and the web UI see the route at once.
+Adding one needs no `API_VERSION` bump, because an older daemon answers it
+with `not_found`.
 
 ### Output
 
@@ -423,8 +445,8 @@ and a command never writes either itself. Never `println!`.
 Render text and JSON in one pure function that takes `ctx.json()`, such as
 `status_lines` in `src/commands/status.rs`, and table-test it. With
 `--json`, print one document on one line, or one per line for a stream.
-JSON output is a contract like the IPC and HTTP APIs: add fields, never
-rename or remove one. A type serialized into it, such as `EngineStatus` in
+JSON output is a contract like the HTTP API: add fields, never rename or
+remove one. A type serialized into it, such as `EngineStatus` in
 `status --json`, brings its wire shape into that contract. A command whose
 output has no JSON form, like `completions`, ignores `--json` rather than
 rejecting it.
@@ -510,7 +532,7 @@ pub(crate) async fn run<D: Daemon, W: Write, P: Prompt>(
 Its arm in `run_with` passes `prompt`. The first such command must delete
 the `expect(unused_variables)` on `run_with`, which stands in until one
 exists. alchemyd has no plan request yet: the first destructive command
-adds one to `alchemy-ipc`, along with its JSON shape. The hidden
+adds one to `alchemy-api`, along with its JSON shape. The hidden
 `safety-probe` command in `src/commands/safety_probe.rs` shows the flow,
 and its JSON isn't a contract.
 
@@ -533,20 +555,22 @@ goes behind the `test-command` feature, as `safety-probe` does.
 ### Tests
 
 Unit-test `run` in the command's module against `FakeDaemon`, a script of
-requests and replies, with `Context::buffered`:
+requests, by method and path, and replies, with `Context::buffered`:
 
 ```rust
 let fake = FakeDaemon::new()
     .version("1.2.3", 1)
-    .reply(Request::Apps { all: false }, Response::Apps(vec![web()]));
+    .ok(Method::GET, "/api/apps", &vec![web()]);
 let mut ctx = Context::buffered(fake, false, NAME);
 run(&mut ctx, Args::default()).await.unwrap();
 assert_eq!(ctx.written(), "web  running\n");
-assert_eq!(ctx.daemon().requests(), [Request::Version, Request::Apps { all: false }]);
+assert_eq!(ctx.daemon().requests(), ["GET /api/version", "GET /api/apps"]);
 ```
 
-`.fail(req, err)` fails a request as the transport would, and
-`.stream(req, items)` scripts a stream. A request out of order panics.
+`.error(method, path, status, code, message)` answers with an
+`ErrorResponse`, `.fail(method, path, err)` fails a request as the
+transport would, and `.events(items)` scripts `/api/events` with raw
+events built by `fake::sse(name, data)`. A request out of order panics.
 Cover the text and JSON forms and each error. For a command that changes
 things, pass a `FakePrompt::tty([answers])` or `FakePrompt::no_tty()` and
 assert on `requests()` that a refusal sends nothing and a dry run sends no

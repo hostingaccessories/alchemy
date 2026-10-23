@@ -2,14 +2,14 @@
 //! tests can drive the safety flags before a real one exists.
 //!
 //! Built only with the `test-command` feature and hidden from help. Its
-//! "change" is a harmless `Ping`. A real command asks alchemyd for its
+//! "change" is a harmless `GET /api/health`. A real command asks alchemyd for its
 //! plan; alchemyd has no plan request yet, so the probe's one-step plan
 //! is built from the daemon's handshake instead.
 
 use std::io::Write;
 use std::path::Path;
 
-use alchemy_ipc::{Request, Response};
+use alchemy_api::HealthResponse;
 
 use crate::context::Context;
 use crate::daemon::{Daemon, DaemonInfo};
@@ -46,13 +46,9 @@ pub(crate) async fn run<D: Daemon, W: Write, P: Prompt>(
         }
         Mode::Execute => {
             let daemon = ctx.daemon_info().await?.clone();
-            match ctx.request(&Request::Ping).await? {
-                Response::Pong => {
-                    let line = done_line(&step(&daemon, ctx.socket()), ctx.json());
-                    ctx.out().line(line)
-                }
-                other => Err(ClientError::from_response(other)),
-            }
+            ctx.get::<HealthResponse>("/api/health").await?;
+            let line = done_line(&step(&daemon, ctx.socket()), ctx.json());
+            ctx.out().line(line)
         }
     }
 }
@@ -88,6 +84,7 @@ pub(crate) fn done_line(step: &str, json: bool) -> String {
 )]
 mod tests {
     use super::*;
+    use crate::daemon::Method;
     use crate::daemon::fake::FakeDaemon;
     use crate::prompt::FakePrompt;
 
@@ -120,42 +117,48 @@ mod tests {
     #[tokio::test]
     async fn only_a_confirmed_run_changes_anything() {
         let version = || FakeDaemon::new().version("1.2.3", 1);
-        let pinged = || version().reply(Request::Ping, Response::Pong);
+        let pinged = || {
+            version().ok(
+                Method::GET,
+                "/api/health",
+                &serde_json::json!({ "status": "ok" }),
+            )
+        };
         let cases = [
             (
                 pinged(),
                 FakePrompt::tty([true]),
                 safety(false, false),
                 Ok(format!("did {STEP}\n")),
-                vec![Request::Version, Request::Ping],
+                vec!["GET /api/version", "GET /api/health"],
             ),
             (
                 FakeDaemon::new(),
                 FakePrompt::tty([false]),
                 safety(false, false),
                 Err(3),
-                vec![],
+                Vec::<&str>::new(),
             ),
             (
                 FakeDaemon::new(),
                 FakePrompt::no_tty(),
                 safety(false, false),
                 Err(3),
-                vec![],
+                Vec::<&str>::new(),
             ),
             (
                 pinged(),
                 FakePrompt::no_tty(),
                 safety(false, true),
                 Ok(format!("did {STEP}\n")),
-                vec![Request::Version, Request::Ping],
+                vec!["GET /api/version", "GET /api/health"],
             ),
             (
                 version(),
                 FakePrompt::no_tty(),
                 safety(true, false),
                 Ok(format!("would {STEP}\n")),
-                vec![Request::Version],
+                vec!["GET /api/version"],
             ),
         ];
         for (fake, mut prompt, args, want, requests) in cases {

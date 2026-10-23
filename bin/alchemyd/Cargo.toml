@@ -1,6 +1,6 @@
 [package]
 name                   = "alchemyd"
-description            = "Alchemy daemon: owns Compose stacks and serves the HTTP API, web UI, and local IPC socket."
+description            = "Alchemy daemon: owns Compose stacks and serves the HTTP API and web UI, and the API on a per-user Unix socket."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -17,15 +17,13 @@ name = "alchemyd"
 path = "src/lib.rs"
 
 [dependencies]
-alchemy-api        = { workspace = true }
+alchemy-api        = { workspace = true, features = ["socket"] }
 alchemy-core       = { workspace = true }
-alchemy-ipc        = { workspace = true, features = ["transport"] }
 anyhow             = { workspace = true }
 axum               = { workspace = true }
 bollard            = { workspace = true }
 clap               = { workspace = true }
 futures-util       = { workspace = true }
-interprocess       = { workspace = true }
 rust-embed         = { workspace = true }
 thiserror          = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync", "io-util", "process", "time"] }

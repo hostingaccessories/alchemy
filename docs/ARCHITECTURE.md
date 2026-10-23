@@ -22,9 +22,10 @@ Everything below follows from the line at the top of this page.
    the real implementation lives at the edge. Don't create traits ahead of
    need: add one when the first real side effect arrives.
 3. **OS decisions are pure helpers.** Keep the decision separate from the
-   effect so it can be tested without the OS. For example,
-   `alchemy_ipc::runtime_dir_from(xdg, temp, uid)` decides the path;
-   `default_socket_path()` reads the environment and calls it.
+   effect so it can be tested without the OS. For example, in
+   `alchemy_api`'s socket module, the private
+   `runtime_dir_from(xdg, temp, uid)` decides the path; `runtime_dir()`
+   reads the environment and calls it.
 4. **Binaries are thin.** `alchemyd` and `alchemy` are a library plus a small
    `main.rs`. `main` parses arguments, sets up logging and the runtime, and
    calls into the library. Interesting logic belongs in a crate with tests.
@@ -34,44 +35,43 @@ Everything below follows from the line at the top of this page.
 
 ## 2. Crates and dependency direction
 
-| Crate            | Path                  | Role                                                                          |
-| ---------------- | --------------------- | ----------------------------------------------------------------------------- |
-| `alchemy-core`   | `crates/alchemy-core` | Pure domain model (stacks, the Docker engine, and their invariants)           |
-| `alchemy-ipc`    | `crates/alchemy-ipc`  | IPC protocol, framing, codec; socket transport behind the `transport` feature |
-| `alchemy-api`    | `crates/alchemy-api`  | HTTP API types shared by the daemon and its web clients                       |
-| `alchemyd`       | `bin/alchemyd`        | Daemon: HTTP API, embedded web UI, IPC socket                                 |
-| `alchemy`        | `bin/alchemy`         | CLI, an IPC client                                                            |
-| `alchemy-helper` | `bin/alchemy-helper`  | Privileged one-shot                                                           |
-| `alchemy-gui`    | `app/alchemy-gui`     | Tauri desktop shell around the web UI                                         |
-| `alchemy-web`    | `app/alchemy-web`     | React web UI, served by the daemon and bundled into the shell                 |
+| Crate            | Path                  | Role                                                                |
+| ---------------- | --------------------- | ------------------------------------------------------------------- |
+| `alchemy-core`   | `crates/alchemy-core` | Pure domain model (stacks, the Docker engine, and their invariants) |
+| `alchemy-api`    | `crates/alchemy-api`  | HTTP API types; the socket path behind the `socket` feature         |
+| `alchemyd`       | `bin/alchemyd`        | Daemon: HTTP API on TCP and a Unix socket, embedded web UI          |
+| `alchemy`        | `bin/alchemy`         | CLI, an HTTP client over the Unix socket                            |
+| `alchemy-helper` | `bin/alchemy-helper`  | Privileged one-shot                                                 |
+| `alchemy-gui`    | `app/alchemy-gui`     | Tauri desktop shell around the web UI                               |
+| `alchemy-web`    | `app/alchemy-web`     | React web UI, served by the daemon and bundled into the shell       |
 
 Internal dependencies flow strictly downhill, with no cycles:
 
 ```
-alchemy-core ◄── alchemy-ipc ◄── alchemyd, alchemy, alchemy-helper
-alchemy-core ◄── alchemy-api ◄── alchemyd
+alchemy-core ◄── alchemy-api ◄── alchemyd, alchemy
 ```
 
 - `alchemy-core` depends on no other `alchemy-*` crate.
+- `alchemy-helper` depends on no internal crate.
 - Libraries never depend on binaries.
-- Clients depend on a protocol crate, not on daemon internals. `alchemy`
+- Clients depend on `alchemy-api`, not on daemon internals. `alchemy`
   may use `alchemyd` as a dev-dependency for end-to-end tests only.
 
-## 3. Two front doors, two contracts
+## 3. One contract, two listeners
 
-The daemon serves the same state through two interfaces:
+The daemon serves one HTTP API, `/api` (`alchemy-api`), on two listeners:
 
-- **IPC socket** (`alchemy-ipc`): used by the CLI and the helper. Per-user,
-  `0o600`, in the user's runtime directory.
-- **HTTP `/api`** (`alchemy-api`): used by the web UI and the desktop shell.
-  Loopback only until it has authentication.
+- **Unix socket**: used by the CLI. Per-user, `0o600`, in the user's
+  runtime directory. It serves only `/api`.
+- **TCP**: used by the web UI and the desktop shell. It also serves the
+  web UI itself. Loopback only until it has authentication.
 
-Both are stable contracts:
+The API is a stable contract:
 
-- Change them additively: add fields and variants; never rename or remove
-  one silently.
-- Bump `PROTOCOL_VERSION` on any breaking IPC change.
-- Wire-shape tests (`crates/alchemy-ipc/tests/wire_stability.rs`) pin the
+- Change it additively: add routes, fields, and variants; never rename or
+  remove one silently.
+- Bump `API_VERSION` on any breaking change.
+- Wire-shape tests (`crates/alchemy-api/tests/wire_stability.rs`) pin the
   bytes. If one fails, treat it as an accidental contract change, not as a
   test to update.
 - `app/alchemy-web/src/lib/api.ts` mirrors `alchemy-api` by hand. Change
@@ -98,8 +98,8 @@ Both are stable contracts:
   can branch on. `anyhow` only in binaries, never in a library's dependency
   graph.
 - **Async only at the edge.** Pure crates and modules never depend on
-  `tokio`. `alchemy-ipc` keeps its codec sync and gates async transport
-  behind a feature.
+  `tokio`. `alchemy-api` is pure by default and gates its socket path
+  helpers behind the `socket` feature.
 - **TLS is rustls.** OpenSSL and native-tls are banned in `deny.toml`.
 - **`alchemy-helper` is the security boundary.** It is the only privileged
   surface: never setuid, never long-running, strictly typed arguments, never

@@ -1,5 +1,5 @@
-//! `alchemy version`: the versions of alchemy and alchemyd, and the IPC
-//! protocol each speaks.
+//! `alchemy version`: the versions of alchemy and alchemyd, and the API
+//! version each speaks.
 //!
 //! `alchemy --version` prints the CLI's version without contacting the
 //! daemon; this asks the daemon too, to show when the two differ.
@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use alchemy_ipc::PROTOCOL_VERSION;
+use alchemy_api::API_VERSION;
 
 use super::status::daemon_line;
 use crate::context::Context;
@@ -26,7 +26,7 @@ pub struct Args {}
 pub(crate) struct CliInfo {
     /// The CLI's release version.
     pub(crate) version: &'static str,
-    /// The IPC protocol version the CLI speaks.
+    /// The API version the CLI speaks, shown as its protocol.
     pub(crate) protocol: u32,
 }
 
@@ -34,7 +34,7 @@ impl CliInfo {
     /// This build of alchemy.
     pub(crate) const CURRENT: Self = Self {
         version: env!("CARGO_PKG_VERSION"),
-        protocol: PROTOCOL_VERSION,
+        protocol: API_VERSION,
     };
 }
 
@@ -63,7 +63,7 @@ pub(crate) fn version_lines(
             "cli": cli.version,
             "cli_protocol": cli.protocol,
             "daemon": daemon.version,
-            "protocol": daemon.protocol,
+            "protocol": daemon.api,
             "socket": socket,
         });
         vec![doc.to_string()]
@@ -83,9 +83,8 @@ pub(crate) fn version_lines(
     clippy::indexing_slicing
 )]
 mod tests {
-    use alchemy_ipc::Request;
-
     use super::*;
+    use crate::daemon::Method;
     use crate::daemon::fake::{FAKE_SOCKET, FakeDaemon};
 
     const CLI: CliInfo = CliInfo {
@@ -93,10 +92,10 @@ mod tests {
         protocol: 1,
     };
 
-    fn daemon(version: &str, protocol: u32) -> DaemonInfo {
+    fn daemon(version: &str, api: u32) -> DaemonInfo {
         DaemonInfo {
             version: version.into(),
-            protocol,
+            api,
         }
     }
 
@@ -127,7 +126,7 @@ mod tests {
                     "cli": "1.2.3",
                     "cli_protocol": 1,
                     "daemon": daemon.version,
-                    "protocol": daemon.protocol,
+                    "protocol": daemon.api,
                     "socket": "/run/alchemyd.sock",
                 }),
                 "{daemon:?}"
@@ -138,7 +137,7 @@ mod tests {
     #[test]
     fn current_is_this_build() {
         assert_eq!(CliInfo::CURRENT.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(CliInfo::CURRENT.protocol, PROTOCOL_VERSION);
+        assert_eq!(CliInfo::CURRENT.protocol, API_VERSION);
     }
 
     #[tokio::test]
@@ -154,14 +153,15 @@ mod tests {
                 json,
             );
             assert_eq!(ctx.written(), format!("{}\n", want.join("\n")), "{json}");
-            assert_eq!(ctx.daemon().requests(), [Request::Version], "{json}");
+            assert_eq!(ctx.daemon().requests(), ["GET /api/version"], "{json}");
         }
     }
 
     #[tokio::test]
     async fn an_unreachable_daemon_prints_nothing() {
         let fake = FakeDaemon::new().fail(
-            Request::Version,
+            Method::GET,
+            "/api/version",
             ClientError::DaemonUnreachable(format!("{FAKE_SOCKET}: refused")),
         );
         let mut ctx = Context::buffered(fake, false, NAME);

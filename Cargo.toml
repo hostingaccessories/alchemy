@@ -2,7 +2,6 @@
 resolver = "3"
 members  = [
   "crates/alchemy-core",
-  "crates/alchemy-ipc",
   "crates/alchemy-api",
   "bin/alchemy",
   "bin/alchemyd",
@@ -20,7 +19,6 @@ publish      = false
 
 [workspace.dependencies]
 alchemy-core = { path = "crates/alchemy-core" }
-alchemy-ipc  = { path = "crates/alchemy-ipc" }
 alchemy-api  = { path = "crates/alchemy-api" }
 alchemyd     = { path = "bin/alchemyd" }
 
@@ -31,7 +29,9 @@ clap               = { version = "4.6", default-features = false, features = ["s
 clap_complete      = { version = "4.6", default-features = false }
 clap_mangen        = { version = "0.3", default-features = false, features = ["env"] }
 futures-util       = { version = "0.3", default-features = false, features = ["alloc"] }
-interprocess       = { version = "2", features = ["tokio"] }
+http-body-util     = { version = "0.1.5", default-features = false }
+hyper              = { version = "1.12", default-features = false }
+hyper-util         = { version = "0.1.21", default-features = false }
 rust-embed         = { version = "8", features = ["mime-guess"] }
 rustix             = { version = "1", default-features = false, features = ["std", "process"] }
 serde              = { version = "1", features = ["derive"] }

@@ -9,7 +9,7 @@ beforeEach(() => {
   vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal(
     "fetch",
-    vi.fn(async () => new Response(JSON.stringify({ version: "9.9.9" }), { status: 200 })),
+    vi.fn(async () => new Response(JSON.stringify({ version: "9.9.9", api: 1 }), { status: 200 })),
   );
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});

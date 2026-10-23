@@ -8,6 +8,8 @@ export interface HealthResponse {
 /** Mirrors `alchemy_api::VersionResponse`. */
 export interface VersionResponse {
   version: string;
+  /** Mirrors `alchemy_api::API_VERSION`, bumped only on a breaking change. */
+  api: number;
 }
 
 /** Mirrors `alchemy_api::EngineState`. */
@@ -60,10 +62,18 @@ export interface SubscribeOptions {
   onError?: () => void;
 }
 
+/**
+ * Mirrors `alchemy_api::ErrorCode`. A newer daemon may send a code not listed
+ * here; the Rust client reads those as `unknown`.
+ */
+export type ErrorCode = "not_found" | "method_not_allowed" | "bad_request" | "internal" | "unknown";
+
 /** Mirrors `alchemy_api::ErrorResponse`, the body of every `/api` error. */
 export interface ErrorResponse {
   /** Human-readable detail, safe to show to the user. */
   error: string;
+  /** Machine-readable failure category. */
+  code: ErrorCode;
 }
 
 /** An HTTP method {@link request} sends. */

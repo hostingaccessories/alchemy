@@ -1,6 +1,6 @@
 //! Filesystem hardening for daemon-owned paths.
 //!
-//! The IPC socket's only access control is filesystem permissions, so the
+//! The API socket's only access control is filesystem permissions, so the
 //! runtime directory is forced to `0o700` and the socket to `0o600`. If
 //! another user owns a pre-existing directory the `chmod` fails and the
 //! daemon refuses to start rather than trust it.

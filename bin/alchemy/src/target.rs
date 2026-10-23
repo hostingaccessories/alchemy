@@ -25,7 +25,7 @@ pub(crate) enum Target {
 }
 
 /// Everything target resolution chooses between. Empty environment
-/// values count as unset, as they do for `alchemy_ipc::default_socket_path`.
+/// values count as unset, as they do for `alchemy_api::default_socket_path`.
 #[derive(Debug, Default)]
 pub(crate) struct Sources {
     pub(crate) daemon_flag: Option<String>,
@@ -42,8 +42,8 @@ impl Sources {
             daemon_flag,
             socket_flag,
             daemon_env: std::env::var_os(DAEMON_ENV),
-            socket_env: std::env::var_os(alchemy_ipc::SOCKET_ENV),
-            default_socket: alchemy_ipc::runtime_dir().join(alchemy_ipc::SOCKET_FILE),
+            socket_env: std::env::var_os(alchemy_api::SOCKET_ENV),
+            default_socket: alchemy_api::runtime_dir().join(alchemy_api::SOCKET_FILE),
         }
     }
 }
