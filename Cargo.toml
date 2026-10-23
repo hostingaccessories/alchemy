@@ -42,6 +42,12 @@ tower-http         = { version = "0.7", default-features = false, features = ["c
 tracing            = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "ansi", "env-filter"] }
 
+tauri                        = { version = "2.12", features = [] }
+tauri-build                  = { version = "2.7", features = [] }
+tauri-plugin-opener          = "2.7"
+tauri-plugin-single-instance = "2.5"
+tauri-plugin-window-state    = "2.5"
+
 [workspace.lints.rust]
 unsafe_code  = "forbid"
 missing_docs = "warn"

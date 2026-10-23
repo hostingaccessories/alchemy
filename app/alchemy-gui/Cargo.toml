@@ -13,12 +13,13 @@ name = "alchemy-gui"
 path = "src/main.rs"
 
 [build-dependencies]
-tauri-build = { version = "2.7", features = [] }
+tauri-build = { workspace = true }
 
 [dependencies]
-tauri                        = { version = "2.12", features = [] }
-tauri-plugin-opener          = "2.7"
-tauri-plugin-single-instance = "2.5"
+tauri                        = { workspace = true }
+tauri-plugin-opener          = { workspace = true }
+tauri-plugin-single-instance = { workspace = true }
+tauri-plugin-window-state    = { workspace = true }
 
 [lints]
 workspace = true
