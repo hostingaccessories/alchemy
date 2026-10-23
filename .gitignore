@@ -1,0 +1,17 @@
+# Claude Code
+/.claude/worktrees/
+/.claude/settings.local.json
+CLAUDE.local.md
+
+# Env/Direnv
+.envrc
+.env
+.env.*
+!.env.example
+
+# OS junk
+.DS_Store
+
+# sqlite
+*.db
+*.db-*
