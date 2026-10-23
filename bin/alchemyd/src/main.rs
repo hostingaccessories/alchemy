@@ -1,6 +1,7 @@
 //! `alchemyd` entry point: parse arguments, install logging, run the daemon
 //! until SIGINT or SIGTERM.
 
+use std::io::IsTerminal as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -24,6 +25,8 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_env_filter(
             EnvFilter::try_from_env("ALCHEMY_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
         )

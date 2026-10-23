@@ -5,6 +5,9 @@ all-features = true
 [advisories]
 version = 2
 yanked  = "deny"
+# Tauri's Linux stack (gtk-rs, zbus) pulls unmaintained transitive crates we
+# cannot replace; only fail on unmaintained crates we depend on directly.
+unmaintained = "workspace"
 ignore  = []
 
 [licenses]
