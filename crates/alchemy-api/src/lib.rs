@@ -1,7 +1,8 @@
 //! HTTP API types shared by `alchemyd` and its web and desktop clients.
 //!
 //! Every route lives under [`API_PREFIX`]. Like the IPC protocol, these
-//! shapes only grow additively; the JSON is pinned by the tests below.
+//! shapes only grow additively; the JSON is pinned in
+//! `tests/wire_stability.rs`. Bump [`API_VERSION`] on any breaking change.
 //!
 //! `GET /api/engine` returns an [`EngineStatus`], re-exported from
 //! `alchemy-core` so the wire type and the domain type cannot drift.
@@ -12,6 +13,12 @@ use serde::{Deserialize, Serialize, Serializer};
 
 /// Path prefix for every API route.
 pub const API_PREFIX: &str = "/api";
+
+/// The current API version, sent as [`VersionResponse::api`].
+///
+/// Bumped only on a breaking change to a route or a wire shape. Additive
+/// changes keep it as is.
+pub const API_VERSION: u32 = 1;
 
 /// `GET /api/health`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +41,8 @@ pub enum HealthStatus {
 pub struct VersionResponse {
     /// The daemon's release version.
     pub version: String,
+    /// The daemon's [`API_VERSION`].
+    pub api: u32,
 }
 
 /// Body of every non-2xx API response.
@@ -41,6 +50,42 @@ pub struct VersionResponse {
 pub struct ErrorResponse {
     /// Human-readable detail, safe to show to the user.
     pub error: String,
+    /// Machine-readable failure category. Decodes as
+    /// [`ErrorCode::Unknown`] when absent.
+    #[serde(default)]
+    pub code: ErrorCode,
+}
+
+impl ErrorResponse {
+    /// An error response with `code` and a human-readable `error`.
+    pub fn new(code: ErrorCode, error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            code,
+        }
+    }
+}
+
+/// Machine-readable failure category carried by [`ErrorResponse::code`].
+///
+/// Clients branch on this rather than on the HTTP status or the message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ErrorCode {
+    /// No route matches the request path.
+    NotFound,
+    /// The route exists but does not accept the request method.
+    MethodNotAllowed,
+    /// The request was malformed.
+    BadRequest,
+    /// The daemon failed while handling a valid request.
+    Internal,
+    /// A code this build does not know, sent by a newer daemon, or no code
+    /// at all.
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 /// One message on the `GET /api/events` server-sent event stream.
@@ -95,97 +140,6 @@ impl Serialize for EventData<'_> {
 )]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wire_shapes() {
-        let health = HealthResponse {
-            status: HealthStatus::Ok,
-        };
-        assert_eq!(
-            serde_json::to_string(&health).unwrap(),
-            r#"{"status":"ok"}"#
-        );
-
-        let version = VersionResponse {
-            version: "0.1.0".into(),
-        };
-        assert_eq!(
-            serde_json::to_string(&version).unwrap(),
-            r#"{"version":"0.1.0"}"#
-        );
-
-        let error = ErrorResponse {
-            error: "not found".into(),
-        };
-        assert_eq!(
-            serde_json::to_string(&error).unwrap(),
-            r#"{"error":"not found"}"#
-        );
-    }
-
-    #[test]
-    fn engine_status_wire_shape() {
-        let mut status = EngineStatus::new(EngineState::Ready);
-        status.flavor = Some(EngineFlavor::DockerDesktop);
-        status.engine_version = Some("29.8.1".into());
-        status.api_version = Some("1.52".into());
-        status.compose_version = Some("2.40.0".into());
-        status.desktop_version = Some("4.93.0".into());
-        status.endpoint = Some("unix:///var/run/docker.sock".into());
-        assert_eq!(
-            serde_json::to_string(&status).unwrap(),
-            concat!(
-                r#"{"state":"ready","flavor":"docker_desktop","engine_version":"29.8.1","#,
-                r#""api_version":"1.52","compose_version":"2.40.0","desktop_version":"4.93.0","#,
-                r#""endpoint":"unix:///var/run/docker.sock"}"#,
-            )
-        );
-
-        assert_eq!(
-            serde_json::to_string(&EngineStatus::new(EngineState::NotRunning)).unwrap(),
-            concat!(
-                r#"{"state":"not_running","flavor":null,"engine_version":null,"#,
-                r#""api_version":null,"compose_version":null,"desktop_version":null,"#,
-                r#""endpoint":null}"#,
-            )
-        );
-
-        let state_names = [
-            (EngineState::NotInstalled, r#""not_installed""#),
-            (EngineState::NotRunning, r#""not_running""#),
-            (EngineState::Starting, r#""starting""#),
-            (EngineState::Ready, r#""ready""#),
-            (EngineState::Unsupported, r#""unsupported""#),
-        ];
-        for (state, want) in state_names {
-            assert_eq!(serde_json::to_string(&state).unwrap(), want);
-        }
-
-        let flavors = [
-            (EngineFlavor::DockerDesktop, r#""docker_desktop""#),
-            (EngineFlavor::DockerEngine, r#""docker_engine""#),
-            (EngineFlavor::Other, r#""other""#),
-        ];
-        for (flavor, want) in flavors {
-            assert_eq!(serde_json::to_string(&flavor).unwrap(), want);
-        }
-    }
-
-    #[test]
-    fn api_event_wire_shape() {
-        let event = ApiEvent::Engine(EngineStatus::new(EngineState::Starting));
-        assert_eq!(event.name(), "engine");
-        let json = serde_json::to_string(&event).unwrap();
-        assert_eq!(
-            json,
-            concat!(
-                r#"{"event":"engine","data":{"state":"starting","flavor":null,"#,
-                r#""engine_version":null,"api_version":null,"compose_version":null,"#,
-                r#""desktop_version":null,"endpoint":null}}"#,
-            )
-        );
-        assert_eq!(serde_json::from_str::<ApiEvent>(&json).unwrap(), event);
-    }
 
     #[test]
     fn api_event_data_is_the_payload() {

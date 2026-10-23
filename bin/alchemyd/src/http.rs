@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alchemy_api::{
-    ApiEvent, EngineStatus, ErrorResponse, HealthResponse, HealthStatus, VersionResponse,
+    ApiEvent, EngineStatus, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, VersionResponse,
 };
 use axum::extract::{self, FromRef};
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -66,6 +66,7 @@ pub fn router_with_topics(
         .route("/version", get(version))
         .route("/engine", get(engine))
         .route("/events", get(events))
+        .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found)
         .with_state(Api {
             state,
@@ -95,6 +96,7 @@ async fn health() -> Json<HealthResponse> {
 async fn version() -> Json<VersionResponse> {
     Json(VersionResponse {
         version: alchemy_core::VERSION.to_owned(),
+        api: alchemy_api::API_VERSION,
     })
 }
 
@@ -118,13 +120,19 @@ fn sse_event(event: &ApiEvent) -> Result<Event, axum::Error> {
 }
 
 async fn api_not_found() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "not found".to_owned(),
-        }),
+    api_error(StatusCode::NOT_FOUND, ErrorCode::NotFound, "not found")
+}
+
+async fn api_method_not_allowed() -> Response {
+    api_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        ErrorCode::MethodNotAllowed,
+        "method not allowed",
     )
-        .into_response()
+}
+
+fn api_error(status: StatusCode, code: ErrorCode, error: &str) -> Response {
+    (status, Json(ErrorResponse::new(code, error))).into_response()
 }
 
 #[cfg(test)]
@@ -219,6 +227,7 @@ mod tests {
         let (status, body) = get_json("/api/version").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["version"], alchemy_core::VERSION);
+        assert_eq!(body["api"], alchemy_api::API_VERSION);
     }
 
     #[tokio::test]
@@ -333,7 +342,33 @@ mod tests {
     async fn unknown_api_route_is_json_404() {
         let (status, body) = get_json("/api/nope").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body, serde_json::json!({ "error": "not found" }));
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "not found", "code": "not_found" })
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_method_on_api_route_is_json_405() {
+        for uri in ["/api/health", "/api/version", "/api/engine", "/api/events"] {
+            let (app, _stop) = test_router(State::new());
+            let resp = app
+                .oneshot(Request::post(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{uri}");
+            assert_eq!(
+                resp.headers().get(header::ALLOW).unwrap(),
+                "GET,HEAD",
+                "{uri}"
+            );
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({ "error": "method not allowed", "code": "method_not_allowed" }),
+                "{uri}"
+            );
+        }
     }
 
     #[tokio::test]

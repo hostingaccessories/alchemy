@@ -72,7 +72,8 @@ describe("request", () => {
   const failures: [string, () => Promise<Response>, number, string][] = [
     [
       "an ErrorResponse",
-      async () => new Response(JSON.stringify({ error: "not found" }), { status: 404 }),
+      async () =>
+        new Response(JSON.stringify({ error: "not found", code: "not_found" }), { status: 404 }),
       404,
       "not found",
     ],

@@ -27,7 +27,7 @@ beforeEach(() => {
       if (!daemonUp) {
         throw new TypeError("connection refused");
       }
-      return new Response(JSON.stringify({ version: "9.9.9" }), { status: 200 });
+      return new Response(JSON.stringify({ version: "9.9.9", api: 1 }), { status: 200 });
     }),
   );
 });
