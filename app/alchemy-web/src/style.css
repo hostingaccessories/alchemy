@@ -1,1 +1,68 @@
 @import "tailwindcss";
+
+/*
+ * Theme. Style with these tokens (`bg-surface`, `text-muted`, `border-border`,
+ * `text-accent`, ...). Tailwind's own palette is switched off; the values
+ * below come from its stone, amber, emerald, and rose scales.
+ *
+ * The theme follows the OS unless `<html data-theme="light|dark">` overrides
+ * it: `public/theme.js` sets the attribute before first paint, and `useTheme`
+ * in `lib/theme.ts` changes it from the Settings page.
+ */
+@custom-variant dark {
+  &:where([data-theme="dark"], [data-theme="dark"] *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: dark) {
+    &:where(:root:not([data-theme="light"]), :root:not([data-theme="light"]) *) {
+      @slot;
+    }
+  }
+}
+
+@theme {
+  /* Drop Tailwind's palette so only the tokens below generate colour utilities. */
+  --color-*: initial;
+
+  /* Page background. */
+  --color-surface: oklch(97% 0.001 106.424);
+  /* Cards, panels, dialogs. */
+  --color-surface-raised: oklch(100% 0 0);
+  /* Hover and selected rows, inline code, wells. */
+  --color-surface-muted: oklch(92.3% 0.003 48.717);
+  --color-border: oklch(86.9% 0.005 56.366);
+  --color-text: oklch(21.6% 0.006 56.043);
+  /* Secondary text. */
+  --color-muted: oklch(44.4% 0.011 73.639);
+  --color-accent: oklch(55.5% 0.163 48.998);
+  /* Text and icons on an `accent` background. */
+  --color-accent-contrast: oklch(100% 0 0);
+  --color-ok: oklch(50.8% 0.118 165.612);
+  --color-warn: oklch(55.5% 0.163 48.998);
+  --color-error: oklch(51.4% 0.222 16.935);
+}
+
+:root {
+  color-scheme: light;
+
+  @variant dark {
+    color-scheme: dark;
+    --color-surface: oklch(14.7% 0.004 49.25);
+    --color-surface-raised: oklch(21.6% 0.006 56.043);
+    --color-surface-muted: oklch(26.8% 0.007 34.298);
+    --color-border: oklch(26.8% 0.007 34.298);
+    --color-text: oklch(97% 0.001 106.424);
+    --color-muted: oklch(70.9% 0.01 56.259);
+    --color-accent: oklch(82.8% 0.189 84.429);
+    --color-accent-contrast: oklch(14.7% 0.004 49.25);
+    --color-ok: oklch(76.5% 0.177 163.223);
+    --color-warn: oklch(82.8% 0.189 84.429);
+    --color-error: oklch(71.2% 0.194 13.428);
+  }
+}
+
+@layer base {
+  body {
+    @apply bg-surface text-text;
+  }
+}

@@ -1,27 +1,8 @@
-import { act, cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { App } from "./App.tsx";
-import type { EngineStatus } from "./lib/api.ts";
-
-/** Minimal EventSource stand-in; jsdom does not implement one. */
-class FakeEventSource extends EventTarget {
-  static instances: FakeEventSource[] = [];
-  readonly url: string;
-  closed = false;
-  readyState = 0;
-
-  constructor(url: string | URL) {
-    super();
-    this.url = String(url);
-    FakeEventSource.instances.push(this);
-  }
-
-  close(): void {
-    this.closed = true;
-    this.readyState = 2;
-  }
-}
+import type { EngineStatus } from "../lib/api.ts";
+import { FakeEventSource, renderAt } from "../test/render.tsx";
 
 const ready: EngineStatus = {
   state: "ready",
@@ -46,15 +27,13 @@ const unknown: EngineStatus = {
 /** Whether the stubbed `GET /api/version` answers. */
 let daemonUp = true;
 
-function source(): FakeEventSource {
-  const last = FakeEventSource.instances.at(-1);
-  if (!last) throw new Error("no EventSource opened");
-  return last;
-}
+const source = () => FakeEventSource.last();
 
-function sendEngine(status: EngineStatus) {
-  act(() => {
-    source().dispatchEvent(new MessageEvent("engine", { data: JSON.stringify(status) }));
+/** Send an `engine` event and wait for Query's batched notification to render. */
+async function sendEngine(status: EngineStatus) {
+  await act(async () => {
+    source().emit("engine", JSON.stringify(status));
+    await new Promise((resolve) => setTimeout(resolve, 0));
   });
 }
 
@@ -64,8 +43,12 @@ function dispatch(type: "open" | "error") {
   });
 }
 
+function renderMachines() {
+  return renderAt("/machines");
+}
+
 async function renderOnline() {
-  render(<App />);
+  await renderMachines();
   await screen.findByText("alchemyd 9.9.9");
 }
 
@@ -79,9 +62,12 @@ beforeEach(() => {
   vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal(
     "fetch",
-    vi.fn(async () => {
+    vi.fn(async (url: string) => {
       if (!daemonUp) {
         throw new TypeError("connection refused");
+      }
+      if (url === "/api/engine") {
+        return new Promise<Response>(() => {});
       }
       return new Response(JSON.stringify({ version: "9.9.9" }), { status: 200 });
     }),
@@ -93,17 +79,18 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("App", () => {
+describe("Machines", () => {
   it("shows the daemon version when alchemyd answers", async () => {
-    render(<App />);
+    await renderMachines();
     expect(await screen.findByText("alchemyd 9.9.9")).toBeTruthy();
   });
 
   it("reports the daemon as unreachable when the request fails", async () => {
     daemonUp = false;
-    render(<App />);
+    await renderMachines();
     expect(await screen.findByText("alchemyd is not reachable")).toBeTruthy();
     expect(screen.queryByRole("status", { name: "Docker" })).toBeNull();
+    expect(screen.getByText("Docker status appears once alchemyd is reachable.")).toBeTruthy();
   });
 
   it("checks Docker until the first engine event arrives", async () => {
@@ -169,7 +156,7 @@ describe("App", () => {
 
   it.each(states)("shows Docker %s", async (_name, status, texts) => {
     await renderOnline();
-    sendEngine(status);
+    await sendEngine(status);
     for (const text of texts) {
       expect(within(docker()).getByText(text)).toBeTruthy();
     }
@@ -177,32 +164,32 @@ describe("App", () => {
 
   it("shows Starting with a labelled spinner", async () => {
     await renderOnline();
-    sendEngine({ ...unknown, state: "starting" });
+    await sendEngine({ ...unknown, state: "starting" });
     expect(within(docker()).getByRole("img", { name: "In progress" })).toBeTruthy();
   });
 
   it("follows engine changes live", async () => {
     await renderOnline();
-    sendEngine(ready);
+    await sendEngine(ready);
     expect(within(docker()).getByText("Docker is ready")).toBeTruthy();
 
-    sendEngine({ ...unknown, flavor: "docker_desktop" });
+    await sendEngine({ ...unknown, flavor: "docker_desktop" });
     expect(
       within(docker()).getByText("Docker Desktop isn't running. Open it to continue."),
     ).toBeTruthy();
     expect(within(docker()).queryByText("Docker is ready")).toBeNull();
 
-    sendEngine({ ...unknown, state: "starting", flavor: "docker_desktop" });
+    await sendEngine({ ...unknown, state: "starting", flavor: "docker_desktop" });
     expect(within(docker()).getByText("Docker Desktop is starting…")).toBeTruthy();
 
-    sendEngine(ready);
+    await sendEngine(ready);
     expect(within(docker()).getByText("Docker is ready")).toBeTruthy();
     expect(FakeEventSource.instances).toHaveLength(1);
   });
 
   it("falls back to offline when the stream drops and the daemon is gone, then recovers", async () => {
     await renderOnline();
-    sendEngine(ready);
+    await sendEngine(ready);
 
     daemonUp = false;
     dispatch("error");
@@ -212,26 +199,26 @@ describe("App", () => {
     daemonUp = true;
     dispatch("open");
     expect(await screen.findByText("alchemyd 9.9.9")).toBeTruthy();
-    expect(within(docker()).getByText("Checking Docker…")).toBeTruthy();
-    sendEngine({ ...unknown, flavor: "docker_desktop" });
+    await sendEngine({ ...unknown, flavor: "docker_desktop" });
     expect(
       within(docker()).getByText("Docker Desktop isn't running. Open it to continue."),
     ).toBeTruthy();
   });
 
-  it("stays online while the stream reconnects to a reachable daemon", async () => {
+  it("keeps the last engine status while the stream reconnects to a reachable daemon", async () => {
     await renderOnline();
-    sendEngine(ready);
+    await sendEngine(ready);
     dispatch("error");
-    expect(within(docker()).getByText("Checking Docker…")).toBeTruthy();
     await act(async () => {});
     expect(screen.getByText("alchemyd 9.9.9")).toBeTruthy();
-    sendEngine(ready);
     expect(within(docker()).getByText("Docker is ready")).toBeTruthy();
+    dispatch("open");
+    await sendEngine({ ...unknown, state: "starting" });
+    expect(within(docker()).getByText("Docker is starting…")).toBeTruthy();
   });
 
   it("closes the stream on unmount", async () => {
-    const { unmount } = render(<App />);
+    const { unmount } = await renderMachines();
     await screen.findByText("alchemyd 9.9.9");
     const opened = source();
     expect(opened.closed).toBe(false);

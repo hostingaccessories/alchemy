@@ -122,16 +122,11 @@ async fn events_stream_reaches_the_tauri_origin_and_ends_on_shutdown() {
         "{head}"
     );
 
-    let first = raw.until("\n\n").await;
-    assert!(first.contains("event: engine\n"), "{first}");
-    if !first.contains(r#""state":"ready""#) {
-        let next = raw.until(r#""state":"ready""#).await;
-        assert!(next.contains("event: engine\n"), "{next}");
-    }
+    raw.until("event: engine\ndata: {\"state\":\"ready\"").await;
 
     state.set_engine(EngineStatus::new(EngineState::NotRunning));
-    let change = raw.until(r#""state":"not_running""#).await;
-    assert!(change.contains("event: engine\n"), "{change}");
+    raw.until("event: engine\ndata: {\"state\":\"not_running\"")
+        .await;
 
     stop.send(()).unwrap();
     tokio::time::timeout(TIMEOUT, daemon)

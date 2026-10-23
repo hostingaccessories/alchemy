@@ -154,3 +154,113 @@ macOS.
 | `docs/`    | Project docs; `docs/site` is the documentation website   |
 | `scripts/` | Development scripts                                      |
 | `.github/` | CI workflows and shared actions                          |
+
+## 7. Adding a feature page
+
+A feature page is a route, the API types it reads, and the shared
+components. The layout, header, daemon-unreachable banner, error boundary,
+live updates, and theme already apply to every route; nothing else needs
+wiring. The examples add a Volumes page; `src/` means `app/alchemy-web/src/`.
+
+### Route
+
+Create `src/routes/volumes.tsx`:
+
+```tsx
+export const volumesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/volumes",
+  component: VolumesPage,
+});
+
+function VolumesPage() {
+  return <PageHeader title="Volumes" />;
+}
+```
+
+Add `volumesRoute` to `routeTree` in `src/router.ts`. A top-level page also
+gets an entry in `NAV` in `src/components/Layout.tsx`, with its path added to
+`NAV`'s `to` type, and its label added to the sidebar test in
+`src/router.test.tsx`, which pins the sidebar's words. `PageHeader` puts the
+title, and any actions passed as children, in the layout's header. A nested
+route sets `getParentRoute` to its parent, which renders `<Outlet />`.
+
+### API type
+
+The daemon owns the data; the page only reads it.
+
+1. Add the type to `crates/alchemy-api/src/lib.rs` with a wire-shape test,
+   and its handler under `/api` in `bin/alchemyd/src/http.rs` with a test.
+2. Mirror the type by hand in `src/lib/api.ts`.
+3. Read it with `useQuery`, nothing else:
+
+```tsx
+const volumes = useQuery({
+  queryKey: ["volumes"],
+  queryFn: ({ signal }) => request<Volume[]>("GET", "/volumes", { signal }),
+});
+```
+
+Mutations call `request("POST" | "PUT" | "DELETE", path, { body })`. A failed
+request rejects with an `ApiError`, whose `message` is safe to show.
+
+### Live updates
+
+When the daemon pushes changes, add a topic instead of polling:
+
+1. `crates/alchemy-api`: an `ApiEvent` variant, its arms in `ApiEvent::name`
+   and `EventData`'s `Serialize` impl, and a wire-shape test.
+2. `bin/alchemyd/src/events.rs`: one entry in `topics()`, such as
+   `Topic::watch(State::watch_volumes, ApiEvent::Volumes)`.
+3. `src/lib/api.ts`: the variant in `ApiEvent` and its name in `EVENT_NAMES`.
+4. `src/lib/queries.ts`: one `liveQueries` entry, with the REST read above as
+   its `queryFn` and `staleTime: Infinity`.
+
+`rustc` and `tsc` flag a missing match arm or a missing step 3 or 4, but
+nothing flags a missing `topics()` entry.
+
+The page reads `useQuery(liveQueries.volumes)`. Each event replaces the
+query's data, and every reconnect resends it. While the daemon is
+unreachable the query keeps its last value; gate on `useDaemonConnection()`
+if stale data would mislead, as Machines does.
+
+### Components and styling
+
+Show every state with the shared components in `src/components/`:
+
+```tsx
+if (volumes.isPending) return <Loading label="Loading volumes…" />;
+if (volumes.isError) {
+  return (
+    <ErrorState
+      error={volumes.error}
+      title="Couldn't load your volumes"
+      onRetry={() => void volumes.refetch()}
+    />
+  );
+}
+if (volumes.data.length === 0) return <EmptyState icon={HardDrive} title="No volumes yet" />;
+```
+
+Use `Notice` for status, `Button`, `ConfirmDialog` before anything
+destructive, `ExternalLink` for every link outside Alchemy, and `Advanced`
+for technical detail. `pnpm dev` shows them all at `/dev/components`; add a
+new shared component there too. A page that throws is replaced by an error
+state inside the layout, with no wiring.
+
+Style with theme tokens only: `surface`, `surface-raised`, `surface-muted`,
+`border`, `text`, `muted`, `accent`, `accent-contrast`, `ok`, `warn`, and
+`error`, as in `text-muted`, `border-border`, or `bg-error/10`. Tailwind's
+palette is off, and `src/palette.test.ts` fails on classes like
+`text-stone-400`. The layout already sets the page background and text
+colour; a card is `rounded-lg border border-border bg-surface-raised`. If no
+token fits, add one to both blocks in `src/style.css`.
+
+### Tests
+
+`src/routes/volumes.test.tsx` stubs `fetch` and `EventSource` with
+`vi.stubGlobal`, then renders the whole app with `renderAt("/volumes")` from
+`src/test/render.tsx`. To push a live event, call
+`FakeEventSource.last().emit("volumes", JSON.stringify(data))` inside `act`
+and wait for the update with `findBy*`. `src/routes/machines.test.tsx` shows
+each pattern. Then run [the gate](#4-the-gate).

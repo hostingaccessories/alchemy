@@ -5,6 +5,7 @@
 //! embedded web UI build with an `index.html` fallback for client-side
 //! routing.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use alchemy_api::{
@@ -16,11 +17,12 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use futures_util::{Stream, stream};
+use futures_util::{Stream, StreamExt as _};
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 
 use crate::State;
+use crate::events::{self, Topic};
 
 /// Origins the Tauri shell serves its bundled UI from (macOS and Linux
 /// respectively). The browser UI is same-origin and needs no CORS.
@@ -33,6 +35,7 @@ pub const KEEP_ALIVE: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone)]
 struct Api {
     state: State,
+    topics: Arc<[Topic]>,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -48,13 +51,27 @@ impl FromRef<Api> for State {
 /// dropped), so open `/api/events` connections do not hold up graceful
 /// shutdown.
 pub fn router(state: State, shutdown: watch::Receiver<bool>) -> Router {
+    router_with_topics(state, events::topics(), shutdown)
+}
+
+/// [`router`], with `/api/events` publishing `topics` instead of the
+/// daemon's own [`events::topics`].
+pub fn router_with_topics(
+    state: State,
+    topics: Vec<Topic>,
+    shutdown: watch::Receiver<bool>,
+) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/engine", get(engine))
         .route("/events", get(events))
         .fallback(api_not_found)
-        .with_state(Api { state, shutdown });
+        .with_state(Api {
+            state,
+            topics: topics.into(),
+            shutdown,
+        });
 
     Router::new()
         .nest(alchemy_api::API_PREFIX, api)
@@ -91,30 +108,13 @@ async fn events(
     Sse::new(event_stream(api)).keep_alive(KeepAlive::new().interval(KEEP_ALIVE))
 }
 
-/// The current engine status, then one event per change, until shutdown.
+/// Every topic's current value, then one event per change, until shutdown.
 fn event_stream(api: Api) -> impl Stream<Item = Result<Event, axum::Error>> {
-    let engine = api.state.watch_engine();
-    stream::unfold(
-        (engine, api.shutdown, true),
-        |(mut engine, mut shutdown, first)| async move {
-            if !first {
-                tokio::select! {
-                    biased;
-                    _ = shutdown.wait_for(|stop| *stop) => return None,
-                    changed = engine.changed() => changed.ok()?,
-                }
-            }
-            let event = ApiEvent::Engine(engine.borrow_and_update().clone());
-            Some((sse_event(&event), (engine, shutdown, false)))
-        },
-    )
+    events::stream(&api.state, &api.topics, api.shutdown).map(|event| sse_event(&event))
 }
 
 fn sse_event(event: &ApiEvent) -> Result<Event, axum::Error> {
-    let frame = Event::default().event(event.name());
-    match event {
-        ApiEvent::Engine(status) => frame.json_data(status),
-    }
+    Event::default().event(event.name()).json_data(event.data())
 }
 
 async fn api_not_found() -> Response {
@@ -139,12 +139,14 @@ mod tests {
     use alchemy_api::EngineState;
     use axum::body::{Body, BodyDataStream, to_bytes};
     use axum::http::Request;
-    use futures_util::StreamExt as _;
     use tower::ServiceExt as _;
 
+    /// The daemon's router with only the engine topic on `/api/events`, so
+    /// these tests read engine frames alone as other topics are added.
     fn test_router(state: State) -> (Router, watch::Sender<bool>) {
         let (tx, rx) = watch::channel(false);
-        (router(state, rx), tx)
+        let engine = Topic::watch(State::watch_engine, ApiEvent::Engine);
+        (router_with_topics(state, vec![engine], rx), tx)
     }
 
     async fn get_json(uri: &str) -> (StatusCode, serde_json::Value) {
@@ -251,6 +253,37 @@ mod tests {
 
         state.set_engine(EngineStatus::new(EngineState::NotRunning));
         assert_eq!(frames.next_engine().await.state, EngineState::NotRunning);
+
+        stop.send_replace(true);
+        assert_eq!(frames.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn events_merge_every_topic() {
+        let topic = |rx: watch::Receiver<EngineState>| {
+            Topic::watch(
+                move |_| rx.clone(),
+                |s| ApiEvent::Engine(EngineStatus::new(s)),
+            )
+        };
+        let (a, a_rx) = watch::channel(EngineState::Starting);
+        let (b, b_rx) = watch::channel(EngineState::Ready);
+        let (stop, stop_rx) = watch::channel(false);
+        let app = router_with_topics(State::new(), vec![topic(a_rx), topic(b_rx)], stop_rx);
+        let mut frames = Frames::new(open_events(app, None).await);
+
+        let mut initial = [
+            frames.next_engine().await.state,
+            frames.next_engine().await.state,
+        ];
+        initial.sort_by_key(|s| format!("{s:?}"));
+        assert_eq!(initial, [EngineState::Ready, EngineState::Starting]);
+
+        a.send_replace(EngineState::NotRunning);
+        assert_eq!(frames.next_engine().await.state, EngineState::NotRunning);
+
+        b.send_replace(EngineState::Unsupported);
+        assert_eq!(frames.next_engine().await.state, EngineState::Unsupported);
 
         stop.send_replace(true);
         assert_eq!(frames.next().await, None);

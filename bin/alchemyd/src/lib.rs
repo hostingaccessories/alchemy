@@ -13,6 +13,7 @@
 
 pub mod compose;
 pub mod engine;
+pub mod events;
 pub mod http;
 pub mod ipc;
 mod secure_fs;

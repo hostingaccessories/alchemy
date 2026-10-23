@@ -40,8 +40,14 @@ export type ApiEvent = { event: "engine"; data: EngineStatus };
 /** Every SSE event name the daemon sends. */
 export type ApiEventName = ApiEvent["event"];
 
+/** The payload of the event named `K`. */
+export type ApiEventData<K extends ApiEventName> = Extract<ApiEvent, { event: K }>["data"];
+
+/** One key per event name, so adding an {@link ApiEvent} variant fails to compile until listed. */
+const EVENT_NAMES: { [K in ApiEventName]: K } = { engine: "engine" };
+
 /** The event names {@link subscribe} listens for. Others are ignored. */
-export const API_EVENT_NAMES: readonly ApiEventName[] = ["engine"];
+export const API_EVENT_NAMES: readonly ApiEventName[] = Object.values(EVENT_NAMES);
 
 /** Optional callbacks for {@link subscribe}. */
 export interface SubscribeOptions {
@@ -54,12 +60,96 @@ export interface SubscribeOptions {
   onError?: () => void;
 }
 
-async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(`${apiBase()}/api${path}`, { signal });
-  if (!res.ok) {
-    throw new Error(`GET /api${path} failed: ${res.status}`);
+/** Mirrors `alchemy_api::ErrorResponse`, the body of every `/api` error. */
+export interface ErrorResponse {
+  /** Human-readable detail, safe to show to the user. */
+  error: string;
+}
+
+/** An HTTP method {@link request} sends. */
+export type Method = "GET" | "POST" | "PUT" | "DELETE";
+
+/** `ApiError.status` when no response arrived at all. */
+export const NO_RESPONSE = 0;
+
+/**
+ * Why an `/api` request failed. `message` is always safe to show the user:
+ * the daemon's {@link ErrorResponse} text when it sent one, or a generic line
+ * otherwise. `status` is the HTTP status, or {@link NO_RESPONSE} when the
+ * daemon could not be reached.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
   }
-  return (await res.json()) as T;
+}
+
+/** Options for {@link request}. */
+export interface RequestOptions {
+  /** Sent as JSON. */
+  body?: unknown;
+  signal?: AbortSignal;
+}
+
+function isAbort(err: unknown): boolean {
+  return err instanceof DOMException && err.name === "AbortError";
+}
+
+/** The daemon's {@link ErrorResponse} text, or a generic line for any other body. */
+async function errorMessage(res: Response): Promise<string> {
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    body = null;
+  }
+  const error = (body as Partial<ErrorResponse> | null)?.error;
+  return typeof error === "string" && error !== ""
+    ? error
+    : `alchemyd answered with HTTP ${res.status}`;
+}
+
+/**
+ * Send one request to `/api{path}` and return the JSON response, or
+ * `undefined` for `204 No Content`. `body`, when given, is sent as JSON.
+ * Rejects with an {@link ApiError} for every failure except an abort, which
+ * rejects with the `AbortError` unchanged.
+ */
+export async function request<T>(
+  method: Method,
+  path: string,
+  { body, signal }: RequestOptions = {},
+): Promise<T> {
+  const init: RequestInit = { method, signal };
+  if (body !== undefined) {
+    init.headers = { "content-type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${apiBase()}/api${path}`, init);
+  } catch (err) {
+    if (isAbort(err)) throw err;
+    throw new ApiError(NO_RESPONSE, "alchemyd is not reachable");
+  }
+
+  if (!res.ok) {
+    throw new ApiError(res.status, await errorMessage(res));
+  }
+  if (res.status === 204) {
+    return undefined as T;
+  }
+  try {
+    return (await res.json()) as T;
+  } catch (err) {
+    if (isAbort(err)) throw err;
+    throw new ApiError(res.status, "alchemyd sent a response Alchemy can't read");
+  }
 }
 
 /**
@@ -121,8 +211,8 @@ export function subscribe(
 }
 
 export const api = {
-  health: (signal?: AbortSignal) => getJson<HealthResponse>("/health", signal),
-  version: (signal?: AbortSignal) => getJson<VersionResponse>("/version", signal),
-  engine: (signal?: AbortSignal) => getJson<EngineStatus>("/engine", signal),
+  health: (signal?: AbortSignal) => request<HealthResponse>("GET", "/health", { signal }),
+  version: (signal?: AbortSignal) => request<VersionResponse>("GET", "/version", { signal }),
+  engine: (signal?: AbortSignal) => request<EngineStatus>("GET", "/engine", { signal }),
   subscribe,
 };

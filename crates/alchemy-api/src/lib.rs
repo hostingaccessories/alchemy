@@ -8,7 +8,7 @@
 //! `GET /api/events` streams [`ApiEvent`]s.
 
 pub use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 /// Path prefix for every API route.
 pub const API_PREFIX: &str = "/api";
@@ -65,6 +65,23 @@ impl ApiEvent {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Engine(_) => "engine",
+        }
+    }
+
+    /// The payload alone, which serializes as the SSE `data:` field.
+    pub fn data(&self) -> EventData<'_> {
+        EventData(self)
+    }
+}
+
+/// An [`ApiEvent`]'s payload without its name, from [`ApiEvent::data`].
+#[derive(Debug, Clone, Copy)]
+pub struct EventData<'a>(&'a ApiEvent);
+
+impl Serialize for EventData<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            ApiEvent::Engine(status) => status.serialize(serializer),
         }
     }
 }
@@ -168,5 +185,15 @@ mod tests {
             )
         );
         assert_eq!(serde_json::from_str::<ApiEvent>(&json).unwrap(), event);
+    }
+
+    #[test]
+    fn api_event_data_is_the_payload() {
+        let status = EngineStatus::new(EngineState::Ready);
+        let event = ApiEvent::Engine(status.clone());
+        assert_eq!(
+            serde_json::to_string(&event.data()).unwrap(),
+            serde_json::to_string(&status).unwrap()
+        );
     }
 }
