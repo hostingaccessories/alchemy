@@ -1,5 +1,6 @@
 //! Engine edge wiring: the real `HostProbe`, `DockerCli`, and `DockerApi`
-//! implementations against a fake engine socket and a fake `docker` binary.
+//! implementations against a fake engine socket and a fake `docker` binary,
+//! and the `EngineMonitor` against a scripted host and engine.
 
 #![allow(
     clippy::unwrap_used,
@@ -8,21 +9,26 @@
     clippy::indexing_slicing
 )]
 
+use std::future::{Future, ready};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alchemy_core::engine::{
-    ContainerAction, ContainerState, EngineFlavor, EngineState, EngineStatus, Health,
+    ContainerAction, ContainerEvent, ContainerState, ContainerStatus, Containers, EngineFlavor,
+    EngineState, EngineStatus, Health, reconnect_delay,
 };
 use alchemyd::engine::{
-    ApiError, BollardApi, CliError, DockerApi, DockerCli, Endpoint, HostProbe, ProcessDockerCli,
+    ApiError, BollardApi, CliError, Connector, DockerApi, DockerCli, Endpoint, EngineMonitor,
+    EngineSource, EngineVersion, HostEnv, HostProbe, Os, POLL_INTERVAL, ProcessDockerCli,
     SocketConnect, SystemProbe,
 };
-use futures_util::StreamExt as _;
+use alchemyd::{Deps, State};
+use futures_util::{Stream, StreamExt as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixListener;
+use tokio::sync::{mpsc, watch};
 
 const VERSION_JSON: &str = r#"{"Platform":{"Name":"Docker Desktop 4.34.2 (167172)"},"Version":"27.3.1","ApiVersion":"1.47","MinAPIVersion":"1.24","Os":"linux","Arch":"arm64"}"#;
 
@@ -377,4 +383,430 @@ async fn real_engine_smoke() {
         containers.len()
     );
     assert_eq!(socket, alchemy_core::engine::SocketProbe::Responding);
+}
+
+/// What the scripted host and engine look like right now. Tests change it
+/// while an [`EngineMonitor`] runs against it.
+#[derive(Debug, Default)]
+struct Host {
+    existing: Vec<PathBuf>,
+    executable: Vec<PathBuf>,
+    connect: Option<SocketConnect>,
+    ping_ok: bool,
+    containers: Vec<ContainerStatus>,
+    streams: Vec<mpsc::UnboundedSender<Result<ContainerEvent, ApiError>>>,
+    calls: Vec<&'static str>,
+}
+
+type SharedHost = Arc<Mutex<Host>>;
+
+const SOCKET: &str = "/run/fake/docker.sock";
+const DOCKER: &str = "/usr/bin/docker";
+
+#[derive(Clone)]
+struct ScriptedProbe(SharedHost);
+
+impl HostProbe for ScriptedProbe {
+    fn exists(&self, path: &Path) -> bool {
+        self.0.lock().unwrap().existing.iter().any(|p| p == path)
+    }
+
+    fn is_executable(&self, path: &Path) -> bool {
+        self.0.lock().unwrap().executable.iter().any(|p| p == path)
+    }
+
+    fn connect(&self, _socket: &Path) -> impl Future<Output = SocketConnect> + Send {
+        ready(
+            self.0
+                .lock()
+                .unwrap()
+                .connect
+                .unwrap_or(SocketConnect::Missing),
+        )
+    }
+}
+
+struct ScriptedCli;
+
+impl DockerCli for ScriptedCli {
+    fn context_host(&self) -> impl Future<Output = Result<String, CliError>> + Send {
+        ready(Err(CliError::Failed {
+            code: Some(1),
+            stderr: "no context".into(),
+        }))
+    }
+
+    fn compose_version(&self) -> impl Future<Output = Result<String, CliError>> + Send {
+        ready(Ok("2.29.7".into()))
+    }
+}
+
+struct ScriptedApi(SharedHost);
+
+impl ScriptedApi {
+    fn call(&self, name: &'static str) -> std::sync::MutexGuard<'_, Host> {
+        let mut host = self.0.lock().unwrap();
+        host.calls.push(name);
+        host
+    }
+}
+
+impl DockerApi for ScriptedApi {
+    fn ping(&self) -> impl Future<Output = Result<(), ApiError>> + Send {
+        let ok = self.call("ping").ping_ok;
+        ready(if ok { Ok(()) } else { Err(ApiError::Timeout) })
+    }
+
+    fn version(&self) -> impl Future<Output = Result<EngineVersion, ApiError>> + Send {
+        drop(self.call("version"));
+        ready(Ok(EngineVersion {
+            version: Some("27.3.1".into()),
+            api_version: Some("1.47".into()),
+            platform: Some("Docker Engine - Community".into()),
+        }))
+    }
+
+    fn list_containers(
+        &self,
+    ) -> impl Future<Output = Result<Vec<ContainerStatus>, ApiError>> + Send {
+        ready(Ok(self.call("list").containers.clone()))
+    }
+
+    fn events(
+        &self,
+    ) -> impl Stream<Item = Result<ContainerEvent, ApiError>> + Send + Unpin + 'static {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.call("events").streams.push(tx);
+        futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        })
+        .boxed()
+    }
+}
+
+#[derive(Clone)]
+struct ScriptedConnector(SharedHost);
+
+impl Connector for ScriptedConnector {
+    type Cli = ScriptedCli;
+    type Api = ScriptedApi;
+
+    fn cli(&self, _binary: PathBuf) -> ScriptedCli {
+        ScriptedCli
+    }
+
+    fn api(&self, endpoint: &Endpoint) -> Result<ScriptedApi, ApiError> {
+        let exists = self
+            .0
+            .lock()
+            .unwrap()
+            .existing
+            .iter()
+            .any(|p| p == endpoint.socket());
+        if exists {
+            Ok(ScriptedApi(Arc::clone(&self.0)))
+        } else {
+            Err(ApiError::SocketNotFound(endpoint.socket().to_owned()))
+        }
+    }
+}
+
+type ScriptedMonitor = EngineMonitor<ScriptedProbe, ScriptedConnector>;
+
+/// A monitor over a scripted Linux host with `docker` installed and
+/// `DOCKER_HOST` set to `docker_host`.
+fn scripted_monitor(docker_host: &str) -> (SharedHost, ScriptedMonitor) {
+    let host = Arc::new(Mutex::new(Host {
+        executable: vec![PathBuf::from(DOCKER)],
+        ..Host::default()
+    }));
+    let env = HostEnv {
+        docker_host: Some(docker_host.to_owned()),
+        home: Some(PathBuf::from("/home/me")),
+        path: Some("/usr/bin".into()),
+        ..HostEnv::default()
+    };
+    let monitor = EngineMonitor::new(
+        env,
+        Os::Linux,
+        ScriptedProbe(Arc::clone(&host)),
+        ScriptedConnector(Arc::clone(&host)),
+    );
+    (host, monitor)
+}
+
+/// A host whose engine at [`SOCKET`] is up and answering.
+fn ready_host(host: &SharedHost) {
+    let mut h = host.lock().unwrap();
+    h.existing.push(PathBuf::from(SOCKET));
+    h.connect = Some(SocketConnect::Connected);
+    h.ping_ok = true;
+}
+
+struct Running {
+    state: State,
+    stop: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Running {
+    async fn stop(self) {
+        self.stop.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), self.task)
+            .await
+            .expect("monitor did not stop")
+            .unwrap();
+    }
+}
+
+fn spawn_monitor(monitor: impl EngineSource) -> Running {
+    let state = State::new();
+    let (stop, stop_rx) = watch::channel(false);
+    let task = tokio::spawn(monitor.run(state.clone(), stop_rx));
+    Running { state, stop, task }
+}
+
+/// Wait for the engine status to satisfy `pred`. Under paused time the
+/// timeout is virtual, so it only fires if the monitor stops making
+/// progress.
+async fn engine_until(state: &State, pred: impl FnMut(&EngineStatus) -> bool) -> EngineStatus {
+    let mut rx = state.watch_engine();
+    tokio::time::timeout(Duration::from_secs(120), rx.wait_for(pred))
+        .await
+        .expect("engine status never matched")
+        .unwrap()
+        .clone()
+}
+
+async fn containers_until(state: &State, pred: impl FnMut(&Containers) -> bool) -> Containers {
+    let mut rx = state.watch_containers();
+    tokio::time::timeout(Duration::from_secs(120), rx.wait_for(pred))
+        .await
+        .expect("containers never matched")
+        .unwrap()
+        .clone()
+}
+
+fn states(containers: &Containers) -> Vec<(String, ContainerState)> {
+    containers.iter().map(|c| (c.id.clone(), c.state)).collect()
+}
+
+fn has_state(containers: &Containers, id: &str, state: ContainerState) -> bool {
+    containers.get(id).is_some_and(|c| c.state == state)
+}
+
+fn send(host: &SharedHost, event: ContainerEvent) {
+    let host = host.lock().unwrap();
+    host.streams.last().unwrap().send(Ok(event)).unwrap();
+}
+
+fn subscriptions(host: &SharedHost) -> usize {
+    let host = host.lock().unwrap();
+    host.calls.iter().filter(|c| **c == "events").count()
+}
+
+fn unix(path: &str) -> String {
+    format!("unix://{path}")
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitor_moves_from_not_running_through_starting_to_ready() {
+    let (host, monitor) = scripted_monitor(&unix(SOCKET));
+    {
+        let mut h = host.lock().unwrap();
+        h.existing.push(PathBuf::from(SOCKET));
+        h.connect = Some(SocketConnect::Refused);
+        h.containers = vec![ContainerStatus::new("abc", "web", ContainerState::Running)];
+    }
+    let run = spawn_monitor(monitor);
+
+    let status = engine_until(&run.state, |s| s.endpoint.is_some()).await;
+    let mut want = EngineStatus::new(EngineState::NotRunning);
+    want.endpoint = Some(unix(SOCKET));
+    assert_eq!(status, want);
+
+    host.lock().unwrap().connect = Some(SocketConnect::Connected);
+    let status = engine_until(&run.state, |s| s.state != EngineState::NotRunning).await;
+    assert_eq!(status.state, EngineState::Starting);
+    assert!(run.state.containers().is_empty());
+
+    host.lock().unwrap().ping_ok = true;
+    let status = engine_until(&run.state, |s| s.state == EngineState::Ready).await;
+    assert_eq!(status.endpoint, Some(unix(SOCKET)));
+    assert_eq!(status.engine_version.as_deref(), Some("27.3.1"));
+    assert_eq!(status.api_version.as_deref(), Some("1.47"));
+    assert_eq!(status.compose_version.as_deref(), Some("2.29.7"));
+    assert_eq!(status.flavor, Some(EngineFlavor::DockerEngine));
+
+    let containers = containers_until(&run.state, |c| !c.is_empty()).await;
+    assert_eq!(
+        states(&containers),
+        [("abc".to_owned(), ContainerState::Running)]
+    );
+    let calls = host.lock().unwrap().calls.clone();
+    let tail = calls.get(calls.len() - 2..).unwrap();
+    assert_eq!(
+        tail,
+        ["events", "list"],
+        "subscribe before listing: {calls:?}"
+    );
+
+    send(&host, ContainerEvent::new("abc", ContainerAction::Stop));
+    let containers =
+        containers_until(&run.state, |c| has_state(c, "abc", ContainerState::Exited)).await;
+    assert_eq!(containers.len(), 1);
+
+    run.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitor_reconnects_and_resyncs_when_the_stream_drops() {
+    let (host, monitor) = scripted_monitor(&unix(SOCKET));
+    ready_host(&host);
+    host.lock().unwrap().containers =
+        vec![ContainerStatus::new("abc", "web", ContainerState::Running)];
+    let run = spawn_monitor(monitor);
+    containers_until(&run.state, |c| !c.is_empty()).await;
+    let mut engine_rx = run.state.watch_engine();
+    assert_eq!(engine_rx.borrow_and_update().state, EngineState::Ready);
+
+    {
+        let mut h = host.lock().unwrap();
+        h.containers = vec![ContainerStatus::new("def", "db", ContainerState::Running)];
+        h.streams.clear();
+    }
+    let dropped = tokio::time::Instant::now();
+    let containers = containers_until(&run.state, |c| c.get("def").is_some()).await;
+    assert_eq!(
+        states(&containers),
+        [("def".to_owned(), ContainerState::Running)],
+        "the listing replaces containers missed while disconnected"
+    );
+    assert_eq!(dropped.elapsed(), reconnect_delay(0));
+    assert_eq!(subscriptions(&host), 2);
+    assert!(
+        !engine_rx.has_changed().unwrap(),
+        "reconnecting to the same engine does not republish its status"
+    );
+
+    send(&host, ContainerEvent::new("def", ContainerAction::Pause));
+    containers_until(&run.state, |c| has_state(c, "def", ContainerState::Paused)).await;
+
+    {
+        let mut h = host.lock().unwrap();
+        h.connect = Some(SocketConnect::Refused);
+        h.streams.clear();
+    }
+    let status = engine_until(&run.state, |s| s.state != EngineState::Ready).await;
+    assert_eq!(status.state, EngineState::NotRunning);
+    assert!(run.state.containers().is_empty());
+
+    run.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitor_backs_off_while_streams_keep_failing() {
+    let (host, monitor) = scripted_monitor(&unix(SOCKET));
+    ready_host(&host);
+    let run = spawn_monitor(monitor);
+    engine_until(&run.state, |s| s.state == EngineState::Ready).await;
+
+    let mut gaps = Vec::new();
+    let mut last = tokio::time::Instant::now();
+    for want in 2..=5 {
+        while subscriptions(&host) < want {
+            for tx in host.lock().unwrap().streams.drain(..) {
+                let _ = tx.send(Err(ApiError::Timeout));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let now = tokio::time::Instant::now();
+        gaps.push((now - last).as_secs());
+        last = now;
+    }
+    assert_eq!(gaps, [1, 2, 4, 8]);
+
+    run.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitor_reports_an_unsupported_endpoint_without_probing_it() {
+    let tcp = "tcp://nas:2375";
+    let (host, monitor) = scripted_monitor(tcp);
+    let run = spawn_monitor(monitor);
+    let status = engine_until(&run.state, |s| s.endpoint.is_some()).await;
+    let mut want = EngineStatus::new(EngineState::Unsupported);
+    want.endpoint = Some(tcp.to_owned());
+    assert_eq!(status, want);
+    tokio::time::sleep(POLL_INTERVAL * 3).await;
+    let calls = host.lock().unwrap().calls.clone();
+    assert_eq!(calls, Vec::<&str>::new(), "never probes a socket");
+    run.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitor_reports_not_installed_without_cli_or_desktop() {
+    let (host, monitor) = scripted_monitor(&unix(SOCKET));
+    host.lock().unwrap().executable.clear();
+    let run = spawn_monitor(monitor);
+    let status = engine_until(&run.state, |s| s.endpoint.is_some()).await;
+    assert_eq!(status.state, EngineState::NotInstalled);
+
+    host.lock().unwrap().executable.push(PathBuf::from(DOCKER));
+    let status = engine_until(&run.state, |s| s.state != EngineState::NotInstalled).await;
+    assert_eq!(status.state, EngineState::NotRunning);
+    run.stop().await;
+}
+
+/// Publishes a fixed status, the way front-door tests can fake the engine.
+struct FixedEngine(EngineStatus);
+
+impl EngineSource for FixedEngine {
+    async fn run(self, state: State, mut shutdown: watch::Receiver<bool>) {
+        state.set_engine(self.0);
+        let _ = shutdown.wait_for(|stop| *stop).await;
+    }
+}
+
+async fn run_daemon_until(deps: Deps<impl EngineSource>, pred: impl FnMut(&EngineStatus) -> bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = alchemyd::Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        socket: dir.path().join("alchemyd.sock"),
+    };
+    let state = deps.state.clone();
+    let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let daemon = tokio::spawn(alchemyd::run_with(config.clone(), deps, async {
+        let _ = stop_rx.await;
+    }));
+    engine_until(&state, pred).await;
+    assert!(config.socket.exists());
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), daemon)
+        .await
+        .expect("daemon did not shut down")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn run_with_runs_the_engine_monitor_until_shutdown() {
+    let (host, monitor) = scripted_monitor(&unix(SOCKET));
+    ready_host(&host);
+    run_daemon_until(Deps::new(monitor), |s| s.state == EngineState::Ready).await;
+}
+
+#[tokio::test]
+async fn run_with_accepts_any_engine_source() {
+    let engine = FixedEngine(EngineStatus::new(EngineState::Starting));
+    run_daemon_until(Deps::new(engine), |s| s.state == EngineState::Starting).await;
+}
+
+#[tokio::test]
+async fn run_with_starts_without_docker() {
+    let (_host, monitor) = scripted_monitor(&unix(SOCKET));
+    run_daemon_until(Deps::new(monitor), |s| {
+        s.state == EngineState::NotRunning && s.endpoint.is_some()
+    })
+    .await;
 }
