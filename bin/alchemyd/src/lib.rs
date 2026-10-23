@@ -113,8 +113,8 @@ pub async fn run_with(
         deps.state.clone(),
         shutdown_rx.clone(),
     ));
+    let router = http::router(deps.state, shutdown_rx.clone());
     let mut http_shutdown = shutdown_rx;
-    let router = http::router(deps.state);
     let http_task = tokio::spawn(async move {
         axum::serve(http_listener, router)
             .with_graceful_shutdown(async move {
