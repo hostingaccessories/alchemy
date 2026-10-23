@@ -48,9 +48,52 @@ Daemon settings, as flags or environment variables:
 | `--listen` | `ALCHEMY_LISTEN` | `127.0.0.1:7240`                                                   |
 | `--socket` | `ALCHEMY_SOCKET` | `$XDG_RUNTIME_DIR/alchemy/alchemyd.sock`, else a per-user temp dir |
 |            | `ALCHEMY_LOG`    | `info` (any `tracing` filter, e.g. `alchemyd=debug`)               |
+| `--daemon` | `ALCHEMY_DAEMON` | CLI only: the daemon as a URL; only `unix:///path` for now         |
 
-The CLI honours `--socket` and `ALCHEMY_SOCKET` the same way, and takes
-`--json` for machine-readable output.
+The CLI honours `--socket` and `ALCHEMY_SOCKET` the same way.
+`--daemon unix:///path/to/alchemyd.sock` is the same as
+`--socket /path/to/alchemyd.sock`; passing both is a usage error. Precedence
+is `--daemon` or `--socket`, then `ALCHEMY_DAEMON`, then `ALCHEMY_SOCKET`,
+then the default. Other schemes, such as `https://`, are refused with exit 2
+and nothing is contacted: remote daemons need authentication, which arrives
+in M13 ([#16](https://github.com/hostingaccessories/alchemy/issues/16)).
+
+Every command prints its results on stdout and everything else on stderr.
+With `--json`, results are one JSON document, or one per line for a stream,
+and errors are one `{"error":{"kind","message","hint"}}` line on stderr. The
+exit code says what kind of failure it was: 2 for a bad command line, 69
+when alchemyd can't be reached, 76 when alchemy and alchemyd are different
+versions, and so on through [the table in §8](#errors-and-exit-codes).
+`alchemy version` shows the versions and protocols of the CLI and the
+daemon; `alchemy --version` shows the CLI's alone, without contacting it.
+
+### Shell completions
+
+`alchemy completions <bash|zsh|fish>` writes a completion script to stdout.
+It never contacts the daemon.
+
+```sh
+alchemy completions bash > ~/.local/share/bash-completion/completions/alchemy
+alchemy completions zsh > ~/.zfunc/_alchemy   # with ~/.zfunc on $fpath
+alchemy completions fish > ~/.config/fish/completions/alchemy.fish
+```
+
+### Remote daemon over SSH
+
+Until then, reach a daemon on another machine by forwarding its socket over
+SSH, as the user that runs alchemyd there, and pointing `--socket` at the
+local end. `alchemy status` on the server prints the remote path.
+
+```sh
+ssh -N -o StreamLocalBindUnlink=yes \
+  -L "$HOME/.alchemyd-server.sock:/run/user/1000/alchemy/alchemyd.sock" \
+  user@server &
+alchemy --socket "$HOME/.alchemyd-server.sock" status
+```
+
+The local socket is created `0600`, but anyone who can open it controls the
+remote daemon, so keep it in a directory only you can write to.
+`StreamLocalBindUnlink` replaces a socket left behind by an earlier session.
 
 ### Docker engine
 
@@ -264,3 +307,261 @@ token fits, add one to both blocks in `src/style.css`.
 `FakeEventSource.last().emit("volumes", JSON.stringify(data))` inside `act`
 and wait for the update with `findBy*`. `src/routes/machines.test.tsx` shows
 each pattern. Then run [the gate](#4-the-gate).
+
+## 8. Adding a CLI command
+
+A command is a module, a `Command` variant, and one dispatch arm. Usage
+errors, `--json` errors, exit codes, `--daemon` and `--socket`, the version
+handshake, ctrl-c, help, completions, and man pages already apply to every
+command; nothing else needs wiring. The examples add `alchemy app list`;
+paths are relative to `bin/alchemy/`.
+
+### Naming
+
+Commands are a noun, then a verb, parallel to the web UI's sidebar:
+`alchemy status` (Home), `alchemy app <verb>`, `alchemy machine <verb>`,
+`alchemy settings <verb>`. Nouns are singular and use the UI's words: app
+and machine, never stack, container, or node. Tools that aren't about what
+Alchemy manages, such as `completions` and `version`, are single words at
+the top level. A noun arrives with its first real verb; don't add an empty
+group to fill in later.
+
+### Module
+
+Create `src/commands/app/list.rs`:
+
+```rust
+/// The command as typed after `alchemy`, for errors.
+pub(crate) const NAME: &str = "app list";
+
+/// Arguments to `alchemy app list`.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct Args {
+    /// Show stopped apps too.
+    #[arg(long)]
+    pub all: bool,
+}
+
+/// Run `alchemy app list`.
+pub(crate) async fn run<D: Daemon, W: Write>(
+    ctx: &mut Context<D, W>,
+    args: Args,
+) -> Result<(), ClientError> {
+    let apps = match ctx.request(&Request::Apps { all: args.all }).await? {
+        Response::Apps(apps) => apps,
+        other => return Err(ClientError::from_response(other)),
+    };
+    for line in app_lines(&apps, ctx.json()) {
+        ctx.out().line(line)?;
+    }
+    Ok(())
+}
+```
+
+A command with no flags yet still takes an empty `pub struct Args {}`, so
+flags can be added later without touching the wiring.
+
+Then register it:
+
+1. `pub mod list;` in its parent. A top-level command goes in
+   `src/commands/mod.rs`. A noun is `src/commands/app.rs`, holding
+   `pub struct Args` with a `#[command(subcommand)]` field and a `Verb`
+   enum with one variant per verb, such as `List(list::Args)`.
+2. A variant on `Command` in `src/lib.rs`, such as
+   `App(commands::app::Args)`. Its doc comment is the help text.
+3. One arm in `run_with`, which builds the `Context` for that command only,
+   with the module added to the `use crate::commands::{..}` list above it.
+   `src/commands/version.rs` is a small top-level example:
+
+```rust
+Command::Version(args) => version::run(&mut context(out, version::NAME)?, args).await,
+Command::App(args) => match args.command {
+    app::Verb::List(args) => {
+        let mut context = context(out, app::list::NAME)?;
+        app::list::run(&mut context, args).await
+    }
+},
+```
+
+A command that never needs the daemon, like `completions`, takes `out` and
+its `Args` instead and doesn't call `context`, so it still works when
+`ALCHEMY_DAEMON` is invalid.
+
+### Talking to alchemyd
+
+Commands reach the daemon only through `Context`, never the socket. The
+`Daemon` trait (`src/daemon.rs`) has the real `IpcDaemon` and, for tests,
+`FakeDaemon`.
+
+- `ctx.daemon_info()` is the daemon's version and protocol, from a
+  handshake that the first request performs once.
+- `ctx.request(&req)` returns one response. Turn one of any other variant
+  into an error with `ClientError::from_response`, as above.
+- `ctx.stream(&req)` returns a `Subscription`. Its `next()` gives
+  `Ok(None)` when the daemon ends the stream; a command that follows
+  changes returns `ClientError::Disconnected` then, as `status --watch`
+  does.
+
+`Context` turns error responses into errors: `BadRequest` means the daemon
+predates the request and becomes "alchemyd 0.1.0 is too old for
+`app list`" (exit 76); anything else becomes `alchemyd: <message>` (exit 1).
+Each request times out after 10 seconds; a stream only until its first
+response.
+
+A new request is a contract change in `crates/alchemy-ipc`: add the
+`Request` and `Response` variants with a wire-shape test in
+`tests/wire_stability.rs`, and answer it in `dispatch` in
+`bin/alchemyd/src/ipc.rs`. Adding one needs no `PROTOCOL_VERSION` bump,
+because an older daemon answers it with `BadRequest`.
+
+### Output
+
+Results go to stdout through `ctx.out().line(..)`, which flushes each line
+so `| head` and followers see it at once. Prompts and errors go to stderr,
+and a command never writes either itself. Never `println!`.
+
+Render text and JSON in one pure function that takes `ctx.json()`, such as
+`status_lines` in `src/commands/status.rs`, and table-test it. With
+`--json`, print one document on one line, or one per line for a stream.
+JSON output is a contract like the IPC and HTTP APIs: add fields, never
+rename or remove one. A type serialized into it, such as `EngineStatus` in
+`status --json`, brings its wire shape into that contract. A command whose
+output has no JSON form, like `completions`, ignores `--json` rather than
+rejecting it.
+
+`ctx.out().color()` says whether ANSI styling is allowed: only on a
+terminal, without `NO_COLOR`, and never with `--json`. No command styles
+output yet, so it carries `expect(dead_code)`; delete that with the first
+one that does.
+
+### Errors and exit codes
+
+A command returns `Err(ClientError)` and never prints it: `main` reports
+it on stderr as text,
+
+```console
+alchemy: cannot reach alchemyd: /run/user/1000/alchemy/alchemyd.sock: No such file or directory (os error 2)
+hint: start alchemyd, or point --socket at the socket it listens on
+```
+
+or, with `--json`, as one line:
+
+```text
+{"error":{"hint":"start alchemyd, or point --socket at the socket it listens on","kind":"daemon_unreachable","message":"cannot reach alchemyd: …"}}
+```
+
+The message says what failed, then why, in lower case without a final full
+stop or the `alchemy: ` prefix. The hint is the next step, kept out of the
+message. `kind` is a contract.
+
+| Exit | When                                                    | `kind`                                                                   |
+| ---- | ------------------------------------------------------- | ------------------------------------------------------------------------ |
+| 0    | It did what was asked                                   |                                                                          |
+| 1    | It failed, for example alchemyd refused it              | `daemon`, `runtime`                                                      |
+| 2    | The command line or daemon target is invalid            | `usage`, `remote_daemon`, `invalid_target`                               |
+| 3    | Confirmation was declined, or needed without a terminal | `declined`, `confirmation_required`                                      |
+| 69   | alchemyd is unreachable or went away                    | `daemon_unreachable`, `disconnected`                                     |
+| 74   | Writing the output failed                               | `output`                                                                 |
+| 76   | alchemy and alchemyd don't speak the same protocol      | `daemon_too_old`, `protocol`, `unexpected_response`, `connection_closed` |
+| 130  | Interrupted with ctrl-c                                 | `interrupted`                                                            |
+
+Ctrl-c and a closed stdout (`| head`) only set the exit code. Most commands
+need no new error. Add a `ClientError` variant only when a script would
+branch on it; `exit`, `kind`, and `hint` match every variant, so it won't
+compile until it has all three. Add its row to
+`every_variant_has_an_exit_code_text_and_json` in `src/error.rs`.
+
+### Commands that change things
+
+A command that changes or removes something flattens the shared safety
+flags into its `Args`; one that changes nothing doesn't, so `--yes` on it is
+a usage error.
+
+```rust
+/// The shared safety flags.
+#[command(flatten)]
+pub safety: Safety,
+```
+
+- `--dry-run` shows alchemyd's plan and changes nothing. The daemon computes
+  the plan; the CLI only renders it.
+- `--force` overrides a safety check in the daemon. It never skips the
+  question.
+- `--yes` skips the question. Without a terminal and without `--yes`, the
+  command refuses with exit 3 rather than waiting.
+- None of them deletes data. A command that can takes its own explicit flag
+  for that.
+
+Its `run` also takes the prompt, and confirms before anything else:
+
+```rust
+pub(crate) async fn run<D: Daemon, W: Write, P: Prompt>(
+    ctx: &mut Context<D, W>,
+    prompt: &mut P,
+    args: Args,
+) -> Result<(), ClientError> {
+    match safety::confirm(prompt, &args.safety, NAME, "Remove the app web?").await? {
+        Mode::DryRun => { /* ask alchemyd for its plan and print it */ }
+        Mode::Execute => { /* send the request, passing args.safety.force */ }
+    }
+}
+```
+
+Its arm in `run_with` passes `prompt`. The first such command must delete
+the `expect(unused_variables)` on `run_with`, which stands in until one
+exists. alchemyd has no plan request yet: the first destructive command
+adds one to `alchemy-ipc`, along with its JSON shape. The hidden
+`safety-probe` command in `src/commands/safety_probe.rs` shows the flow,
+and its JSON isn't a contract.
+
+### Help, completions, and man pages
+
+The variant's doc comment is the command's help, its man page, and its
+description in completions; its first paragraph is the one-line summary.
+Doc comments on `Args` fields are each flag's help. Where the rustdoc and
+the help must differ, set `help = "..."`, as `--daemon` does. The new
+command appears in `alchemy --help`, `alchemy completions`, and
+`generate-man`'s pages with no further wiring, but the tests pin the set of
+man pages: add `alchemy-app-list.1` (and `alchemy-app.1` for a new noun) to
+`one_page_per_visible_command` in `src/commands/generate_man.rs` and to
+`generated_man_pages_render` in `tests/completions_and_man.rs`.
+
+To hide a command, put `#[command(hide = true)]` on its variant; it still
+runs. A hidden flag is `#[arg(hide = true)]`. A command only for tests also
+goes behind the `test-command` feature, as `safety-probe` does.
+
+### Tests
+
+Unit-test `run` in the command's module against `FakeDaemon`, a script of
+requests and replies, with `Context::buffered`:
+
+```rust
+let fake = FakeDaemon::new()
+    .version("1.2.3", 1)
+    .reply(Request::Apps { all: false }, Response::Apps(vec![web()]));
+let mut ctx = Context::buffered(fake, false, NAME);
+run(&mut ctx, Args::default()).await.unwrap();
+assert_eq!(ctx.written(), "web  running\n");
+assert_eq!(ctx.daemon().requests(), [Request::Version, Request::Apps { all: false }]);
+```
+
+`.fail(req, err)` fails a request as the transport would, and
+`.stream(req, items)` scripts a stream. A request out of order panics.
+Cover the text and JSON forms and each error. For a command that changes
+things, pass a `FakePrompt::tty([answers])` or `FakePrompt::no_tty()` and
+assert on `requests()` that a refusal sends nothing and a dry run sends no
+change. `src/commands/status.rs` and `src/commands/safety_probe.rs` show
+each pattern.
+
+Then wire it end to end in `tests/cli_e2e.rs`, which runs a real alchemyd
+on a temporary socket with `Daemon::start`. Build the command line with
+`Cli::try_parse_from` and call `alchemy::run`, or `alchemy::run_with` with
+a `FakePrompt`. `alchemy_bin` runs the real binary to check stdout, stderr,
+and the exit code.
+
+Finally, run [the gate](#4-the-gate). It builds `alchemy` with the
+`test-command` feature, so it never lints what users get. Check that too:
+
+```sh
+cargo clippy -p alchemy --lib --bins --locked -- -D warnings
+```

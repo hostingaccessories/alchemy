@@ -1,37 +1,47 @@
 //! `alchemy` entry point.
 
+use std::ffi::OsString;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
+use alchemy::{Cli, ClientError, Color};
 use clap::Parser;
 
-/// Shell convention for a process ended by `SIGINT`: 128 + 2.
-const EXIT_INTERRUPTED: u8 = 130;
-
 fn main() -> ExitCode {
-    let cli = alchemy::Cli::parse();
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(e) if !e.use_stderr() => {
+            let _ = e.print();
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => return fail(&ClientError::from_clap(&e), alchemy::wants_json(&args)),
+    };
+    let json = cli.json;
+    let color = Color::detect(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    );
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("alchemy: failed to start async runtime: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return fail(&ClientError::Runtime(e), json),
     };
     let mut stdout = std::io::stdout();
     let outcome = runtime.block_on(async {
         tokio::select! {
-            result = alchemy::run(cli, &mut stdout) => Some(result),
-            Ok(()) = tokio::signal::ctrl_c() => None,
+            result = alchemy::run(cli, &mut stdout, color) => result,
+            Ok(()) = tokio::signal::ctrl_c() => Err(ClientError::Interrupted),
         }
     });
     match outcome {
-        Some(Ok(())) => ExitCode::SUCCESS,
-        Some(Err(e)) => {
-            eprintln!("alchemy: {e}");
-            ExitCode::from(e.exit_code())
-        }
-        None => ExitCode::from(EXIT_INTERRUPTED),
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&e, json),
     }
+}
+
+fn fail(err: &ClientError, json: bool) -> ExitCode {
+    ExitCode::from(alchemy::report(err, json, &mut std::io::stderr().lock()))
 }
