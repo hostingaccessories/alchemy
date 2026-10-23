@@ -1,30 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { type ApiEvent, type EngineStatus, RESUBSCRIBE_DELAY_MS, api, subscribe } from "./api.ts";
-
-/** Minimal EventSource stand-in; jsdom does not implement one. */
-class FakeEventSource extends EventTarget {
-  static instances: FakeEventSource[] = [];
-  readonly url: string;
-  closed = false;
-  readyState = 0;
-
-  constructor(url: string | URL) {
-    super();
-    this.url = String(url);
-    FakeEventSource.instances.push(this);
-  }
-
-  /** Deliver one SSE frame, as the browser would. */
-  emit(event: string, data: string): void {
-    this.dispatchEvent(new MessageEvent(event, { data }));
-  }
-
-  close(): void {
-    this.closed = true;
-    this.readyState = 2;
-  }
-}
+import { FakeEventSource } from "../test/event-source.ts";
+import {
+  type ApiEvent,
+  ApiError,
+  type EngineStatus,
+  NO_RESPONSE,
+  RESUBSCRIBE_DELAY_MS,
+  api,
+  request,
+  subscribe,
+} from "./api.ts";
 
 const ready: EngineStatus = {
   state: "ready",
@@ -36,11 +22,7 @@ const ready: EngineStatus = {
   endpoint: "unix:///var/run/docker.sock",
 };
 
-function lastSource(): FakeEventSource {
-  const source = FakeEventSource.instances.at(-1);
-  if (!source) throw new Error("no EventSource opened");
-  return source;
-}
+const lastSource = () => FakeEventSource.last();
 
 beforeEach(() => {
   FakeEventSource.instances = [];
@@ -51,17 +33,90 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("api.engine", () => {
-  it("fetches the engine status", async () => {
+async function rejection(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise;
+  } catch (err) {
+    return err;
+  }
+  throw new Error("expected a rejection");
+}
+
+describe("request", () => {
+  it("GETs JSON from /api", async () => {
     const fetch = vi.fn(async () => new Response(JSON.stringify(ready)));
     vi.stubGlobal("fetch", fetch);
     await expect(api.engine()).resolves.toEqual(ready);
-    expect(fetch).toHaveBeenCalledWith("/api/engine", { signal: undefined });
+    expect(fetch).toHaveBeenCalledWith("/api/engine", { method: "GET", signal: undefined });
   });
 
-  it("rejects on an error status", async () => {
-    vi.stubGlobal("fetch", async () => new Response("{}", { status: 500 }));
-    await expect(api.engine()).rejects.toThrow("GET /api/engine failed: 500");
+  it.each(["POST", "PUT", "DELETE"] as const)("sends %s with a JSON body", async (method) => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ ok: true })));
+    vi.stubGlobal("fetch", fetch);
+    await expect(request(method, "/things/1", { body: { name: "web" } })).resolves.toEqual({
+      ok: true,
+    });
+    expect(fetch).toHaveBeenCalledWith("/api/things/1", {
+      method,
+      signal: undefined,
+      headers: { "content-type": "application/json" },
+      body: '{"name":"web"}',
+    });
+  });
+
+  it("resolves to undefined for 204 No Content", async () => {
+    vi.stubGlobal("fetch", async () => new Response(null, { status: 204 }));
+    await expect(request("DELETE", "/things/1")).resolves.toBeUndefined();
+  });
+
+  const failures: [string, () => Promise<Response>, number, string][] = [
+    [
+      "an ErrorResponse",
+      async () => new Response(JSON.stringify({ error: "not found" }), { status: 404 }),
+      404,
+      "not found",
+    ],
+    [
+      "a body that is not an ErrorResponse",
+      async () => new Response("<h1>Bad Gateway</h1>", { status: 502 }),
+      502,
+      "alchemyd answered with HTTP 502",
+    ],
+    [
+      "an empty error field",
+      async () => new Response(JSON.stringify({ error: "" }), { status: 500 }),
+      500,
+      "alchemyd answered with HTTP 500",
+    ],
+    [
+      "a success body that is not JSON",
+      async () => new Response("not json", { status: 200 }),
+      200,
+      "alchemyd sent a response Alchemy can't read",
+    ],
+    [
+      "no response",
+      async () => {
+        throw new TypeError("Failed to fetch");
+      },
+      NO_RESPONSE,
+      "alchemyd is not reachable",
+    ],
+  ];
+
+  it.each(failures)("rejects with an ApiError for %s", async (_name, respond, status, message) => {
+    vi.stubGlobal("fetch", respond);
+    const err = await rejection(request("GET", "/engine"));
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).toMatchObject({ status, message });
+  });
+
+  it("passes an abort through unchanged", async () => {
+    const abort = new DOMException("aborted", "AbortError");
+    vi.stubGlobal("fetch", async () => {
+      throw abort;
+    });
+    expect(await rejection(request("GET", "/engine"))).toBe(abort);
   });
 });
 

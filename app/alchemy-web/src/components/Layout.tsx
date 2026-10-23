@@ -2,7 +2,7 @@ import { Link, Outlet } from "@tanstack/react-router";
 import { Boxes, FlaskConical, type LucideIcon, Server, Settings } from "lucide-react";
 import { useState } from "react";
 
-import { useLive } from "../lib/live.tsx";
+import { useDaemonConnection } from "../lib/live.tsx";
 import { DaemonStatus } from "./DaemonStatus.tsx";
 import { HeaderSlotContext } from "./PageHeader.tsx";
 
@@ -20,7 +20,7 @@ const NAV: { to: "/apps" | "/machines" | "/settings"; label: string; icon: Lucid
  */
 export function Layout() {
   const [slot, setSlot] = useState<HTMLElement | null>(null);
-  const { daemon } = useLive();
+  const daemon = useDaemonConnection();
 
   return (
     <div className="flex h-screen bg-stone-950 text-stone-100">

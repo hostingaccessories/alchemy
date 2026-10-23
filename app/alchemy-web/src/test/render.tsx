@@ -6,24 +6,7 @@ import { vi } from "vite-plus/test";
 import { App } from "../App.tsx";
 import { createAppRouter } from "../router.ts";
 
-/** Minimal EventSource stand-in; jsdom does not implement one. */
-export class FakeEventSource extends EventTarget {
-  static instances: FakeEventSource[] = [];
-  readonly url: string;
-  closed = false;
-  readyState = 0;
-
-  constructor(url: string | URL) {
-    super();
-    this.url = String(url);
-    FakeEventSource.instances.push(this);
-  }
-
-  close(): void {
-    this.closed = true;
-    this.readyState = 2;
-  }
-}
+export { FakeEventSource } from "./event-source.ts";
 
 /**
  * Render the whole app at `path` with in-memory history, and wait for the
