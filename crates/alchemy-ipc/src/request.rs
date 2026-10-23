@@ -14,4 +14,13 @@ pub enum Request {
     /// Ask for the daemon's version. Answered with
     /// [`crate::Response::Version`].
     Version,
+    /// Ask for the Docker engine's status. Answered with
+    /// [`crate::Response::Engine`].
+    Engine,
+    /// Subscribe to the Docker engine's status. Answered with a
+    /// [`crate::Response::Engine`] for the current status, then another on
+    /// every change, until the client disconnects or the daemon exits.
+    ///
+    /// The daemon reads nothing else from the connection after this.
+    WatchEngine,
 }

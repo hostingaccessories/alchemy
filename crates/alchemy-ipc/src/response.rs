@@ -1,5 +1,6 @@
 //! Daemon to client responses.
 
+use alchemy_core::engine::EngineStatus;
 use serde::{Deserialize, Serialize};
 
 /// A response sent from `alchemyd` to a local client.
@@ -16,6 +17,10 @@ pub enum Response {
         /// The daemon's [`crate::PROTOCOL_VERSION`].
         protocol: u32,
     },
+    /// Reply to [`crate::Request::Engine`], and each frame of the stream
+    /// that answers [`crate::Request::WatchEngine`]. The status's fields
+    /// sit beside `type` in the same object.
+    Engine(EngineStatus),
     /// The request failed.
     Error {
         /// Machine-readable failure category.
