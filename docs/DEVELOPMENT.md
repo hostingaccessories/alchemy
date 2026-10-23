@@ -179,7 +179,9 @@ function VolumesPage() {
 ```
 
 Add `volumesRoute` to `routeTree` in `src/router.ts`. A top-level page also
-gets an entry in `NAV` in `src/components/Layout.tsx`. `PageHeader` puts the
+gets an entry in `NAV` in `src/components/Layout.tsx`, with its path added to
+`NAV`'s `to` type, and its label added to the sidebar test in
+`src/router.test.tsx`, which pins the sidebar's words. `PageHeader` puts the
 title, and any actions passed as children, in the layout's header. A nested
 route sets `getParentRoute` to its parent, which renders `<Outlet />`.
 
@@ -213,6 +215,9 @@ When the daemon pushes changes, add a topic instead of polling:
 3. `src/lib/api.ts`: the variant in `ApiEvent` and its name in `EVENT_NAMES`.
 4. `src/lib/queries.ts`: one `liveQueries` entry, with the REST read above as
    its `queryFn` and `staleTime: Infinity`.
+
+`rustc` and `tsc` flag a missing match arm or a missing step 3 or 4, but
+nothing flags a missing `topics()` entry.
 
 The page reads `useQuery(liveQueries.volumes)`. Each event replaces the
 query's data, and every reconnect resends it. While the daemon is
