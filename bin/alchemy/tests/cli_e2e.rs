@@ -434,3 +434,68 @@ async fn the_socket_flag_beats_the_daemon_env() {
     assert_eq!(stdout.lines().next().unwrap(), daemon_line(&daemon.socket));
     daemon.stop().await;
 }
+
+fn text(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn results_go_to_stdout_and_nothing_to_stderr() {
+    let daemon = Daemon::start(ready_desktop()).await;
+    let socket = daemon.socket.to_str().unwrap().to_owned();
+    for args in [vec!["--socket", &socket, "status"], vec!["--help"]] {
+        let out = alchemy_bin(&args, &[("NO_COLOR", "1")]).await;
+        let stdout = text(out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        assert_eq!(text(out.stderr), "", "{args:?}");
+        assert_ne!(stdout, "", "{args:?}");
+        assert!(!stdout.contains('\x1b'), "{stdout}");
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn failures_are_reported_on_stderr_as_text_or_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("nope.sock");
+    let missing = missing.to_str().unwrap();
+    let cases: [(&[&str], i32, &str, &str); 2] = [
+        (
+            &["--socket", missing, "status"],
+            69,
+            "daemon_unreachable",
+            "start alchemyd, or point --socket at the socket it listens on",
+        ),
+        (
+            &["status", "--nope"],
+            2,
+            "usage",
+            "see `alchemy status --help`",
+        ),
+    ];
+    for (args, code, kind, hint) in cases {
+        let out = alchemy_bin(args, &[]).await;
+        assert_eq!(out.status.code(), Some(code), "{args:?}");
+        assert_eq!(text(out.stdout), "", "{args:?}");
+        let stderr = text(out.stderr);
+        let lines: Vec<_> = stderr.lines().collect();
+        assert_eq!(lines.len(), 2, "{stderr}");
+        assert!(lines[0].starts_with("alchemy: "), "{stderr}");
+        assert_eq!(lines[1], format!("hint: {hint}"), "{stderr}");
+
+        let json_args: Vec<_> = ["--json"].iter().chain(args).copied().collect();
+        let out = alchemy_bin(&json_args, &[]).await;
+        assert_eq!(out.status.code(), Some(code), "{args:?}");
+        assert_eq!(text(out.stdout), "", "{args:?}");
+        let stderr = text(out.stderr);
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        let json: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+        assert_eq!(json["error"]["kind"], kind, "{stderr}");
+        assert_eq!(json["error"]["hint"], hint, "{stderr}");
+        assert_eq!(
+            format!("alchemy: {}", json["error"]["message"].as_str().unwrap()),
+            lines[0],
+            "{stderr}"
+        );
+    }
+}
