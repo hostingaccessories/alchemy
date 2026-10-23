@@ -102,6 +102,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_serves_ui_or_reports_it_unbuilt() {
+        let resp = router()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                resp.status(),
+                StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE
+            ),
+            "{}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
     async fn cors_allows_tauri_origin_only() {
         for (origin, allowed) in [
             ("tauri://localhost", true),
