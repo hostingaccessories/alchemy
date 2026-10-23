@@ -89,6 +89,9 @@ index="$(curl -fsS "${base}/")" || fail "GET / failed (web UI not embedded?)"
 [[ "$index" == *'id="root"'* ]] || fail "GET / did not return the web UI"
 deep="$(curl -fsS "${base}/machines")" || fail "GET /machines failed (no index.html fallback?)"
 [[ "$deep" == *'id="root"'* ]] || fail "GET /machines did not return the web UI"
+theme_type="$(curl -fsS -o /dev/null -w '%{content_type}' "${base}/theme.js")" \
+  || fail "GET /theme.js failed (pre-paint theme script not embedded?)"
+[[ "$theme_type" == *javascript* ]] || fail "GET /theme.js served as ${theme_type}"
 
 log "Checking alchemy status"
 cli_version="$("${bin}/alchemy" --version | awk '{print $2}')"
