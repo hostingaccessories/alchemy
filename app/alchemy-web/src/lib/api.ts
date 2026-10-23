@@ -63,9 +63,20 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
 }
 
 /**
+ * How long {@link subscribe} waits before reopening a stream the browser has
+ * stopped retrying, which it does when a reconnect gets an error response
+ * (a dev proxy with the daemon down) instead of a refused connection.
+ */
+export const RESUBSCRIBE_DELAY_MS = 2000;
+
+/** `EventSource.CLOSED`: the browser will not reconnect on its own. */
+const EVENT_SOURCE_CLOSED = 2;
+
+/**
  * Open `GET /api/events` and call `onEvent` for every event. The first
  * `engine` event carries the current status, so no separate fetch is needed.
- * Frames whose data is not valid JSON are skipped.
+ * Frames whose data is not valid JSON are skipped. If the browser gives up
+ * reconnecting, the stream is reopened after {@link RESUBSCRIBE_DELAY_MS}.
  *
  * Returns a function that closes the stream.
  */
@@ -73,25 +84,40 @@ export function subscribe(
   onEvent: (event: ApiEvent) => void,
   options: SubscribeOptions = {},
 ): () => void {
-  const source = new EventSource(`${apiBase()}/api/events`);
-  for (const name of API_EVENT_NAMES) {
-    source.addEventListener(name, (message: MessageEvent<string>) => {
-      let data: unknown;
-      try {
-        data = JSON.parse(message.data);
-      } catch {
-        return;
+  let closed = false;
+  let retry: ReturnType<typeof setTimeout> | undefined;
+  let source: EventSource;
+
+  const open = () => {
+    retry = undefined;
+    const current = new EventSource(`${apiBase()}/api/events`);
+    source = current;
+    for (const name of API_EVENT_NAMES) {
+      current.addEventListener(name, (message: MessageEvent<string>) => {
+        let data: unknown;
+        try {
+          data = JSON.parse(message.data);
+        } catch {
+          return;
+        }
+        onEvent({ event: name, data } as ApiEvent);
+      });
+    }
+    current.addEventListener("open", () => options.onOpen?.());
+    current.addEventListener("error", () => {
+      options.onError?.();
+      if (!closed && retry === undefined && current.readyState === EVENT_SOURCE_CLOSED) {
+        retry = setTimeout(open, RESUBSCRIBE_DELAY_MS);
       }
-      onEvent({ event: name, data } as ApiEvent);
     });
-  }
-  if (options.onOpen) {
-    source.addEventListener("open", options.onOpen);
-  }
-  if (options.onError) {
-    source.addEventListener("error", options.onError);
-  }
-  return () => source.close();
+  };
+
+  open();
+  return () => {
+    closed = true;
+    clearTimeout(retry);
+    source.close();
+  };
 }
 
 export const api = {

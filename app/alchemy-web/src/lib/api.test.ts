@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { type ApiEvent, type EngineStatus, api, subscribe } from "./api.ts";
+import { type ApiEvent, type EngineStatus, RESUBSCRIBE_DELAY_MS, api, subscribe } from "./api.ts";
 
 /** Minimal EventSource stand-in; jsdom does not implement one. */
 class FakeEventSource extends EventTarget {
   static instances: FakeEventSource[] = [];
   readonly url: string;
   closed = false;
+  readyState = 0;
 
   constructor(url: string | URL) {
     super();
@@ -21,6 +22,7 @@ class FakeEventSource extends EventTarget {
 
   close(): void {
     this.closed = true;
+    this.readyState = 2;
   }
 }
 
@@ -106,5 +108,53 @@ describe("subscribe", () => {
     expect(source.closed).toBe(false);
     unsubscribe();
     expect(source.closed).toBe(true);
+  });
+
+  it("reopens the stream when the browser stops retrying", () => {
+    vi.useFakeTimers();
+    try {
+      const onEvent = vi.fn();
+      const unsubscribe = subscribe(onEvent);
+      const first = lastSource();
+      first.readyState = 2;
+      first.dispatchEvent(new Event("error"));
+      vi.advanceTimersByTime(RESUBSCRIBE_DELAY_MS);
+      expect(FakeEventSource.instances).toHaveLength(2);
+
+      const second = lastSource();
+      second.emit("engine", JSON.stringify(ready));
+      expect(onEvent).toHaveBeenCalledWith({ event: "engine", data: ready });
+      unsubscribe();
+      expect(second.closed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves reconnecting to the browser while it is retrying", () => {
+    vi.useFakeTimers();
+    try {
+      subscribe(() => {});
+      lastSource().dispatchEvent(new Event("error"));
+      vi.advanceTimersByTime(RESUBSCRIBE_DELAY_MS);
+      expect(FakeEventSource.instances).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not reopen after unsubscribing", () => {
+    vi.useFakeTimers();
+    try {
+      const unsubscribe = subscribe(() => {});
+      const source = lastSource();
+      source.readyState = 2;
+      source.dispatchEvent(new Event("error"));
+      unsubscribe();
+      vi.advanceTimersByTime(RESUBSCRIBE_DELAY_MS);
+      expect(FakeEventSource.instances).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
