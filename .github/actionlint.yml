@@ -1,0 +1,8 @@
+paths:
+  .github/workflows/**/*.yml:
+    ignore:
+      # actionlint 1.7.12 fails on the new `$/` self-repository syntax, while
+      # zizmor warns about the `./` form. Security wins.
+      #
+      # See also: rhysd/actionlint#711
+      - 'specifying action "\$/.github/actions/install-tauri-deps"'
