@@ -1,27 +1,8 @@
-import { act, cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { App } from "./App.tsx";
-import type { EngineStatus } from "./lib/api.ts";
-
-/** Minimal EventSource stand-in; jsdom does not implement one. */
-class FakeEventSource extends EventTarget {
-  static instances: FakeEventSource[] = [];
-  readonly url: string;
-  closed = false;
-  readyState = 0;
-
-  constructor(url: string | URL) {
-    super();
-    this.url = String(url);
-    FakeEventSource.instances.push(this);
-  }
-
-  close(): void {
-    this.closed = true;
-    this.readyState = 2;
-  }
-}
+import type { EngineStatus } from "../lib/api.ts";
+import { FakeEventSource, renderAt } from "../test/render.tsx";
 
 const ready: EngineStatus = {
   state: "ready",
@@ -64,8 +45,12 @@ function dispatch(type: "open" | "error") {
   });
 }
 
+function renderMachines() {
+  return renderAt("/machines");
+}
+
 async function renderOnline() {
-  render(<App />);
+  await renderMachines();
   await screen.findByText("alchemyd 9.9.9");
 }
 
@@ -93,17 +78,18 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("App", () => {
+describe("Machines", () => {
   it("shows the daemon version when alchemyd answers", async () => {
-    render(<App />);
+    await renderMachines();
     expect(await screen.findByText("alchemyd 9.9.9")).toBeTruthy();
   });
 
   it("reports the daemon as unreachable when the request fails", async () => {
     daemonUp = false;
-    render(<App />);
+    await renderMachines();
     expect(await screen.findByText("alchemyd is not reachable")).toBeTruthy();
     expect(screen.queryByRole("status", { name: "Docker" })).toBeNull();
+    expect(screen.getByText("Docker status appears once alchemyd is reachable.")).toBeTruthy();
   });
 
   it("checks Docker until the first engine event arrives", async () => {
@@ -231,7 +217,7 @@ describe("App", () => {
   });
 
   it("closes the stream on unmount", async () => {
-    const { unmount } = render(<App />);
+    const { unmount } = await renderMachines();
     await screen.findByText("alchemyd 9.9.9");
     const opened = source();
     expect(opened.closed).toBe(false);
