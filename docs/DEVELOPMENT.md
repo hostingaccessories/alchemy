@@ -77,7 +77,8 @@ scripts/release-smoke.sh
 This builds the web UI and release binaries, runs `alchemyd` on a temporary
 socket and port `17240` (override with `SMOKE_PORT`), and checks:
 
-- `/api/health` responds;
+- `/api/health` and `/api/engine` respond;
+- `/api/events` streams an `engine` event to the Tauri origin;
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
 - `alchemy-helper` refuses to run without root;
