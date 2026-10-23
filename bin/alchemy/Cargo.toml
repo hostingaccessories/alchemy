@@ -23,7 +23,7 @@ clap         = { workspace = true }
 interprocess = { workspace = true }
 serde_json   = { workspace = true }
 thiserror    = { workspace = true }
-tokio        = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "signal"] }
+tokio        = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "signal", "sync"] }
 
 [dev-dependencies]
 alchemyd = { workspace = true }

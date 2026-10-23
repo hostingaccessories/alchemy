@@ -8,6 +8,7 @@ mod context;
 mod daemon;
 mod error;
 mod output;
+pub mod prompt;
 pub mod safety;
 mod target;
 mod transport;

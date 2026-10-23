@@ -118,7 +118,7 @@ pub enum ClientError {
     },
     /// The command needs confirmation, but there is no TTY to ask on and
     /// `--yes` was not given.
-    #[error("`{command}` needs confirmation, but stdin isn't a terminal")]
+    #[error("`{command}` needs confirmation, but there is no terminal to ask on")]
     ConfirmationRequired {
         /// The command, as typed after `alchemy`.
         command: &'static str,
@@ -453,7 +453,7 @@ mod tests {
                 },
                 3,
                 "confirmation_required",
-                "`app down` needs confirmation, but stdin isn't a terminal".into(),
+                "`app down` needs confirmation, but there is no terminal to ask on".into(),
                 Some("pass --yes to go ahead without a prompt"),
             ),
             (
