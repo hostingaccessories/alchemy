@@ -64,6 +64,8 @@ and errors are one `{"error":{"kind","message","hint"}}` line on stderr. The
 exit code says what kind of failure it was: 2 for a bad command line, 69
 when alchemyd can't be reached, 76 when alchemy and alchemyd are different
 versions, and so on through [the table in §8](#errors-and-exit-codes).
+`alchemy version` shows the versions and protocols of the CLI and the
+daemon; `alchemy --version` shows the CLI's alone, without contacting it.
 
 ### Shell completions
 
@@ -320,9 +322,9 @@ Commands are a noun, then a verb, parallel to the web UI's sidebar:
 `alchemy status` (Home), `alchemy app <verb>`, `alchemy machine <verb>`,
 `alchemy settings <verb>`. Nouns are singular and use the UI's words: app
 and machine, never stack, container, or node. Tools that aren't about what
-Alchemy manages, such as `completions`, are single words at the top level.
-A noun arrives with its first real verb; don't add an empty group to fill
-in later.
+Alchemy manages, such as `completions` and `version`, are single words at
+the top level. A noun arrives with its first real verb; don't add an empty
+group to fill in later.
 
 ### Module
 
@@ -356,6 +358,9 @@ pub(crate) async fn run<D: Daemon, W: Write>(
 }
 ```
 
+A command with no flags yet still takes an empty `pub struct Args {}`, so
+flags can be added later without touching the wiring.
+
 Then register it:
 
 1. `pub mod list;` in its parent. A top-level command goes in
@@ -364,11 +369,17 @@ Then register it:
    enum with one variant per verb, such as `List(list::Args)`.
 2. A variant on `Command` in `src/lib.rs`, such as
    `App(commands::app::Args)`. Its doc comment is the help text.
-3. One arm in `run_with`, which builds the `Context` for that command only:
+3. One arm in `run_with`, which builds the `Context` for that command only,
+   with the module added to the `use crate::commands::{..}` list above it.
+   `src/commands/version.rs` is a small top-level example:
 
 ```rust
+Command::Version(args) => version::run(&mut context(out, version::NAME)?, args).await,
 Command::App(args) => match args.command {
-    app::Verb::List(args) => app::list::run(&mut context(out, app::list::NAME)?, args).await,
+    app::Verb::List(args) => {
+        let mut context = context(out, app::list::NAME)?;
+        app::list::run(&mut context, args).await
+    }
 },
 ```
 
@@ -384,8 +395,8 @@ Commands reach the daemon only through `Context`, never the socket. The
 
 - `ctx.daemon_info()` is the daemon's version and protocol, from a
   handshake that the first request performs once.
-- `ctx.request(&req)` returns one response. Answer one of the wrong variant
-  with `ClientError::from_response`, as above.
+- `ctx.request(&req)` returns one response. Turn one of any other variant
+  into an error with `ClientError::from_response`, as above.
 - `ctx.stream(&req)` returns a `Subscription`. Its `next()` gives
   `Ok(None)` when the daemon ends the stream; a command that follows
   changes returns `ClientError::Disconnected` then, as `status --watch`
@@ -435,7 +446,7 @@ hint: start alchemyd, or point --socket at the socket it listens on
 
 or, with `--json`, as one line:
 
-```json
+```text
 {"error":{"hint":"start alchemyd, or point --socket at the socket it listens on","kind":"daemon_unreachable","message":"cannot reach alchemyd: …"}}
 ```
 
@@ -510,7 +521,10 @@ description in completions; its first paragraph is the one-line summary.
 Doc comments on `Args` fields are each flag's help. Where the rustdoc and
 the help must differ, set `help = "..."`, as `--daemon` does. The new
 command appears in `alchemy --help`, `alchemy completions`, and
-`generate-man`'s pages with no further wiring.
+`generate-man`'s pages with no further wiring, but the tests pin the set of
+man pages: add `alchemy-app-list.1` (and `alchemy-app.1` for a new noun) to
+`one_page_per_visible_command` in `src/commands/generate_man.rs` and to
+`generated_man_pages_render` in `tests/completions_and_man.rs`.
 
 To hide a command, put `#[command(hide = true)]` on its variant; it still
 runs. A hidden flag is `#[arg(hide = true)]`. A command only for tests also
