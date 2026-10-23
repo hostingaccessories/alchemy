@@ -1,41 +1,9 @@
-import { CircleAlert, CircleCheck, CircleX, LoaderCircle, type LucideIcon } from "lucide-react";
-import type { ReactNode } from "react";
-
 import type { EngineStatus } from "../lib/api.ts";
+import { Code } from "./Code.tsx";
+import { Notice } from "./Notice.tsx";
 
 /** Where Docker's own install guide lives; shown when Docker is missing. */
 const GET_DOCKER_URL = "https://docs.docker.com/get-started/get-docker/";
-
-type Tone = "ok" | "warn" | "error" | "busy";
-
-const TONES: Record<Tone, { icon: LucideIcon; className: string }> = {
-  ok: { icon: CircleCheck, className: "text-emerald-400" },
-  warn: { icon: CircleAlert, className: "text-amber-400" },
-  error: { icon: CircleX, className: "text-rose-400" },
-  busy: { icon: LoaderCircle, className: "text-stone-400" },
-};
-
-/** One problem-first line, with optional detail underneath. */
-function Notice({ tone, title, children }: { tone: Tone; title: string; children?: ReactNode }) {
-  const { icon: Icon, className } = TONES[tone];
-  return (
-    <div className="flex flex-col gap-1">
-      <p className={`flex items-center gap-2 ${className}`}>
-        {tone === "busy" ? (
-          <Icon className="size-4 animate-spin" role="img" aria-label="In progress" />
-        ) : (
-          <Icon className="size-4" aria-hidden />
-        )}
-        {title}
-      </p>
-      {children && <div className="text-sm text-stone-400">{children}</div>}
-    </div>
-  );
-}
-
-function Code({ children }: { children: ReactNode }) {
-  return <code className="rounded bg-stone-800 px-1 py-0.5 text-stone-200">{children}</code>;
-}
 
 /**
  * Docker's state as the daemon last reported it. `null` means no report
@@ -52,7 +20,7 @@ export function EngineStatusView({ status }: { status: EngineStatus | null }) {
           <p>Alchemy runs your apps with Docker. Install Docker Desktop, then open it.</p>
           <p>
             <a
-              className="text-amber-400 underline"
+              className="text-accent underline"
               href={GET_DOCKER_URL}
               target="_blank"
               rel="noreferrer"

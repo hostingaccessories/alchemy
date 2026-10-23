@@ -11,6 +11,8 @@
     "test": "vp test"
   },
   "dependencies": {
+    "@radix-ui/react-alert-dialog": "catalog:",
+    "@radix-ui/react-collapsible": "catalog:",
     "@tanstack/react-query": "catalog:",
     "@tanstack/react-router": "catalog:",
     "lucide-react": "^1.61.0",
@@ -20,6 +22,7 @@
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
     "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "catalog:",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.2",
