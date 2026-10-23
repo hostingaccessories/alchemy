@@ -11,16 +11,19 @@ use axum::routing::get;
 use axum::{Json, Router};
 use tower_http::cors::CorsLayer;
 
+use crate::State;
+
 /// Origins the Tauri shell serves its bundled UI from (macOS and Linux
 /// respectively). The browser UI is same-origin and needs no CORS.
 const TAURI_ORIGINS: [&str; 2] = ["tauri://localhost", "http://tauri.localhost"];
 
 /// Build the full router: API, CORS for the desktop shell, and the web UI.
-pub fn router() -> Router {
+pub fn router(state: State) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
-        .fallback(api_not_found);
+        .fallback(api_not_found)
+        .with_state(state);
 
     Router::new()
         .nest(alchemy_api::API_PREFIX, api)
@@ -71,7 +74,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     async fn get_json(uri: &str) -> (StatusCode, serde_json::Value) {
-        let resp = router()
+        let resp = router(State::new())
             .oneshot(Request::get(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -103,7 +106,7 @@ mod tests {
 
     #[tokio::test]
     async fn root_serves_ui_or_reports_it_unbuilt() {
-        let resp = router()
+        let resp = router(State::new())
             .oneshot(Request::get("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -124,7 +127,7 @@ mod tests {
             ("http://tauri.localhost", true),
             ("https://evil.example", false),
         ] {
-            let resp = router()
+            let resp = router(State::new())
                 .oneshot(
                     Request::get("/api/health")
                         .header(header::ORIGIN, origin)

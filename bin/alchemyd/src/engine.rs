@@ -12,10 +12,15 @@
 //!
 //! `bollard` types are mapped to [`alchemy_core::engine`] types inside
 //! [`BollardApi`] and nowhere else.
+//!
+//! [`EngineMonitor`] ties them together: it runs for the daemon's lifetime
+//! and keeps the engine status and containers in [`State`](crate::State)
+//! current.
 
 mod api;
 mod cli;
 mod discovery;
+mod monitor;
 mod probe;
 
 pub use api::{ApiError, BollardApi, DockerApi, EngineVersion};
@@ -24,6 +29,7 @@ pub use discovery::{
     Candidate, Endpoint, EndpointError, EndpointSource, HostEnv, Os, desktop_install_paths,
     docker_binary_candidates, endpoint_candidates, select_endpoint,
 };
+pub use monitor::{Connector, EngineMonitor, EngineSource, POLL_INTERVAL, SystemConnector};
 pub use probe::{
     HostProbe, SocketConnect, SystemProbe, desktop_installed, discover_endpoint,
     find_docker_binary, probe_socket,

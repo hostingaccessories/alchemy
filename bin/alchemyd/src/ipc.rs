@@ -12,7 +12,7 @@ use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName};
 use tokio::sync::watch;
 
-use crate::secure_fs;
+use crate::{State, secure_fs};
 
 /// Bind the IPC socket at `path`.
 ///
@@ -66,15 +66,16 @@ fn remove_stale_socket(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Accept connections until `shutdown` flips to `true`.
-pub async fn serve(listener: Listener, mut shutdown: watch::Receiver<bool>) {
+/// Accept connections until `shutdown` flips to `true`, answering each
+/// from `state`.
+pub async fn serve(listener: Listener, state: State, mut shutdown: watch::Receiver<bool>) {
     loop {
         tokio::select! {
             biased;
             _ = shutdown.wait_for(|stop| *stop) => break,
             accepted = listener.accept() => match accepted {
                 Ok(stream) => {
-                    tokio::spawn(handle_client(stream));
+                    tokio::spawn(handle_client(stream, state.clone()));
                 }
                 Err(e) => tracing::debug!(error = %e, "ipc accept failed"),
             },
@@ -82,12 +83,12 @@ pub async fn serve(listener: Listener, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
-async fn handle_client(stream: Stream) {
+async fn handle_client(stream: Stream, state: State) {
     let (mut reader, mut writer) = stream.split();
     let mut decoder = FrameDecoder::new();
     loop {
         let (resp, keep_open) = match read_message::<_, Request>(&mut reader, &mut decoder).await {
-            Ok(Some(req)) => (dispatch(&req), true),
+            Ok(Some(req)) => (dispatch(&state, &req), true),
             Ok(None) => return,
             Err(IpcError::Decode(e)) => (
                 Response::Error {
@@ -112,7 +113,7 @@ async fn handle_client(stream: Stream) {
 }
 
 /// Answer a single request.
-pub fn dispatch(req: &Request) -> Response {
+pub fn dispatch(_state: &State, req: &Request) -> Response {
     match req {
         Request::Ping => Response::Pong,
         Request::Version => Response::Version {
@@ -138,9 +139,10 @@ mod tests {
 
     #[test]
     fn dispatch_answers_ping_and_version() {
-        assert_eq!(dispatch(&Request::Ping), Response::Pong);
+        let state = State::new();
+        assert_eq!(dispatch(&state, &Request::Ping), Response::Pong);
         assert_eq!(
-            dispatch(&Request::Version),
+            dispatch(&state, &Request::Version),
             Response::Version {
                 daemon: alchemy_core::VERSION.to_owned(),
                 protocol: PROTOCOL_VERSION,

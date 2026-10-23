@@ -19,7 +19,11 @@ async fn status_round_trips_through_a_real_daemon() {
     let socket = tmp.path().join("alchemyd.sock");
     let listener = alchemyd::ipc::bind(&socket).unwrap();
     let (stop, stop_rx) = watch::channel(false);
-    let server = tokio::spawn(alchemyd::ipc::serve(listener, stop_rx));
+    let server = tokio::spawn(alchemyd::ipc::serve(
+        listener,
+        alchemyd::State::new(),
+        stop_rx,
+    ));
 
     assert_eq!(
         alchemy::exchange_at(&socket, &Request::Ping).await.unwrap(),
