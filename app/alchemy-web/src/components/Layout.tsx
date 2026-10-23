@@ -2,9 +2,11 @@ import { Link, Outlet } from "@tanstack/react-router";
 import { Boxes, FlaskConical, type LucideIcon, Server, Settings } from "lucide-react";
 import { useState } from "react";
 
+import type { ApiError } from "../lib/api.ts";
 import { useDaemonConnection } from "../lib/live.tsx";
 import { useWindowTheme } from "../lib/theme.ts";
 import { DaemonStatus } from "./DaemonStatus.tsx";
+import { Notice } from "./Notice.tsx";
 import { HeaderSlotContext } from "./PageHeader.tsx";
 
 /** Sidebar entries, in the personas' words. */
@@ -17,7 +19,8 @@ const NAV: { to: "/apps" | "/machines" | "/settings"; label: string; icon: Lucid
 /**
  * The app frame: sidebar, header, and the current route in the outlet. Pages
  * fill the header's slot with {@link PageHeader}; the daemon's connection
- * state sits beside it. Fits the desktop shell's 800px minimum width.
+ * state sits beside it, and a banner spans the page while the daemon is
+ * unreachable. Fits the desktop shell's 800px minimum width.
  */
 export function Layout() {
   const [slot, setSlot] = useState<HTMLElement | null>(null);
@@ -55,12 +58,31 @@ export function Layout() {
             <DaemonStatus state={daemon} />
           </div>
         </header>
+        {daemon.kind === "offline" && <DaemonUnreachable error={daemon.error} />}
         <main className="min-h-0 flex-1 overflow-y-auto px-6 py-6">
           <HeaderSlotContext value={slot}>
             <Outlet />
           </HeaderSlotContext>
         </main>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Shown while `alchemyd` doesn't answer, in the browser and the shell alike.
+ * It clears itself once the event stream reconnects.
+ */
+function DaemonUnreachable({ error }: { error: ApiError }) {
+  return (
+    <div role="alert" className="shrink-0 border-b border-border bg-error/10 px-6 py-3">
+      <Notice
+        tone="error"
+        title="Alchemy can't reach alchemyd"
+        detail={<p className="text-sm text-muted">{error.message}</p>}
+      >
+        <p>Check that alchemyd is running on this machine. Alchemy reconnects on its own.</p>
+      </Notice>
     </div>
   );
 }
