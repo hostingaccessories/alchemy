@@ -338,7 +338,7 @@ async fn an_old_daemon_is_reported_as_too_old() {
     for watch in [false, true] {
         let err = run(cli(&socket, false, watch)).await.unwrap_err();
         assert!(
-            matches!(&err, ClientError::DaemonTooOld { daemon } if daemon == "0.0.1"),
+            matches!(&err, ClientError::DaemonTooOld { daemon, command: "status" } if daemon == "0.0.1"),
             "{err:?}"
         );
         assert!(err.to_string().contains("too old"), "{err}");

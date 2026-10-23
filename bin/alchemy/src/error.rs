@@ -36,12 +36,15 @@ pub enum ClientError {
     /// The daemon predates a request this command needs and answered it
     /// as a bad request.
     #[error(
-        "alchemyd {daemon} is too old to report Docker status; upgrade it to match alchemy {cli} and restart it",
+        "alchemyd {daemon} is too old for `{command}`; upgrade it to match alchemy {cli} and restart it",
         cli = env!("CARGO_PKG_VERSION")
     )]
     DaemonTooOld {
         /// The daemon's reported version.
         daemon: String,
+        /// The command that needed the newer daemon, as typed after
+        /// `alchemy`.
+        command: &'static str,
     },
     /// Writing the command's output failed.
     #[error("cannot write output: {0}")]

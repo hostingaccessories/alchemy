@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::commands::status;
 use crate::context::Context;
 use crate::daemon::IpcDaemon;
 use crate::output::Output;
@@ -53,8 +54,9 @@ pub enum Command {
 /// stopping; the caller ends it by dropping the future.
 pub async fn run<W: Write>(cli: Cli, out: &mut W) -> Result<(), ClientError> {
     let socket = cli.socket.unwrap_or_else(alchemy_ipc::default_socket_path);
-    let mut ctx = Context::new(IpcDaemon::new(socket), Output::new(out, cli.json));
+    let context =
+        |command| Context::new(IpcDaemon::new(socket), Output::new(out, cli.json), command);
     match cli.command {
-        Command::Status(args) => commands::status::run(&mut ctx, args).await,
+        Command::Status(args) => status::run(&mut context(status::NAME), args).await,
     }
 }

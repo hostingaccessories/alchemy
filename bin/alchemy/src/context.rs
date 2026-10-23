@@ -19,15 +19,18 @@ use crate::output::Output;
 pub(crate) struct Context<D, W> {
     daemon: D,
     out: Output<W>,
+    command: &'static str,
     info: Option<DaemonInfo>,
 }
 
 impl<D: Daemon, W: Write> Context<D, W> {
-    /// A context for one invocation.
-    pub(crate) fn new(daemon: D, out: Output<W>) -> Self {
+    /// A context for one invocation of `command`, named as typed after
+    /// `alchemy` (`status`, `app up`) for errors.
+    pub(crate) fn new(daemon: D, out: Output<W>, command: &'static str) -> Self {
         Self {
             daemon,
             out,
+            command,
             info: None,
         }
     }
@@ -62,7 +65,7 @@ impl<D: Daemon, W: Write> Context<D, W> {
     pub(crate) async fn request(&mut self, req: &Request) -> Result<Response, ClientError> {
         let daemon = self.daemon_info().await?.version.clone();
         let resp = self.daemon.request(req).await?;
-        accept(resp, &daemon)
+        accept(resp, &daemon, self.command)
     }
 
     /// Send a streaming `req` and return its responses. Error responses
@@ -73,7 +76,11 @@ impl<D: Daemon, W: Write> Context<D, W> {
     ) -> Result<Subscription<D::Stream>, ClientError> {
         let daemon = self.daemon_info().await?.version.clone();
         let inner = self.daemon.stream(req).await?;
-        Ok(Subscription { inner, daemon })
+        Ok(Subscription {
+            inner,
+            daemon,
+            command: self.command,
+        })
     }
 }
 
@@ -81,13 +88,14 @@ impl<D: Daemon, W: Write> Context<D, W> {
 pub(crate) struct Subscription<S> {
     inner: S,
     daemon: String,
+    command: &'static str,
 }
 
 impl<S: ResponseStream> Subscription<S> {
     /// The next response, or `None` once the daemon ends the stream.
     pub(crate) async fn next(&mut self) -> Result<Option<Response>, ClientError> {
         match self.inner.next().await? {
-            Some(resp) => accept(resp, &self.daemon).map(Some),
+            Some(resp) => accept(resp, &self.daemon, self.command).map(Some),
             None => Ok(None),
         }
     }
@@ -106,13 +114,14 @@ async fn handshake<D: Daemon>(daemon: &mut D) -> Result<DaemonInfo, ClientError>
 /// Turn an error response into a [`ClientError`]. alchemyd answers a
 /// request it does not know with `BadRequest`, so that means the daemon
 /// predates it.
-fn accept(resp: Response, daemon: &str) -> Result<Response, ClientError> {
+fn accept(resp: Response, daemon: &str, command: &'static str) -> Result<Response, ClientError> {
     match resp {
         Response::Error {
             code: ErrorCode::BadRequest,
             ..
         } => Err(ClientError::DaemonTooOld {
             daemon: daemon.to_owned(),
+            command,
         }),
         Response::Error { .. } => Err(ClientError::from_response(resp)),
         resp => Ok(resp),

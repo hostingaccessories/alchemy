@@ -11,6 +11,9 @@ use crate::context::Context;
 use crate::daemon::{Daemon, DaemonInfo};
 use crate::error::ClientError;
 
+/// The command's name, for errors.
+pub(crate) const NAME: &str = "status";
+
 /// Arguments to `alchemy status`.
 #[derive(Debug, Clone, Default, clap::Args)]
 pub struct Args {
