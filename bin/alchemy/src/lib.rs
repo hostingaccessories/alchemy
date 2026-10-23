@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::status;
+use crate::commands::{completions, generate_man, status};
 use crate::context::Context;
 use crate::daemon::IpcDaemon;
 use crate::output::Output;
@@ -72,6 +72,13 @@ pub enum Command {
     /// whether Docker is ready.
     Status(commands::status::Args),
 
+    /// Write a shell completion script to stdout.
+    Completions(commands::completions::Args),
+
+    /// Write man pages for packaging.
+    #[command(hide = true)]
+    GenerateMan(commands::generate_man::Args),
+
     /// A stand-in destructive command for the e2e tests.
     #[cfg(feature = "test-command")]
     #[command(hide = true)]
@@ -102,20 +109,28 @@ pub async fn run_with<W: Write, P: Prompt>(
     color: Color,
     prompt: &mut P,
 ) -> Result<(), ClientError> {
-    let Target::Unix(socket) = target::resolve(Sources::from_env(cli.daemon, cli.socket))?;
-    let context = |command| {
-        Context::new(
+    let Cli {
+        json,
+        daemon,
+        socket,
+        command,
+    } = cli;
+    let context = |out, command| -> Result<_, ClientError> {
+        let Target::Unix(socket) = target::resolve(Sources::from_env(daemon, socket))?;
+        Ok(Context::new(
             IpcDaemon::new(socket),
-            Output::new(out, cli.json, color),
+            Output::new(out, json, color),
             command,
-        )
+        ))
     };
-    match cli.command {
-        Command::Status(args) => status::run(&mut context(status::NAME), args).await,
+    match command {
+        Command::Status(args) => status::run(&mut context(out, status::NAME)?, args).await,
+        Command::Completions(args) => completions::run(out, &args),
+        Command::GenerateMan(args) => generate_man::run(&args),
         #[cfg(feature = "test-command")]
         Command::SafetyProbe(args) => {
-            commands::safety_probe::run(&mut context(commands::safety_probe::NAME), prompt, args)
-                .await
+            let mut context = context(out, commands::safety_probe::NAME)?;
+            commands::safety_probe::run(&mut context, prompt, args).await
         }
     }
 }
