@@ -141,9 +141,12 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt as _;
 
+    /// The daemon's router with only the engine topic on `/api/events`, so
+    /// these tests read engine frames alone as other topics are added.
     fn test_router(state: State) -> (Router, watch::Sender<bool>) {
         let (tx, rx) = watch::channel(false);
-        (router(state, rx), tx)
+        let engine = Topic::watch(State::watch_engine, ApiEvent::Engine);
+        (router_with_topics(state, vec![engine], rx), tx)
     }
 
     async fn get_json(uri: &str) -> (StatusCode, serde_json::Value) {
