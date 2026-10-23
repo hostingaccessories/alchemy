@@ -1,0 +1,15 @@
+{
+  "name": "alchemy-gui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Alchemy desktop shell (Tauri). Bundles alchemy-web; holds no business logic.",
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "bundle": "tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4"
+  }
+}

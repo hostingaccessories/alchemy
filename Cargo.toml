@@ -7,7 +7,7 @@ members  = [
   "bin/alchemy",
   "bin/alchemyd",
   "bin/alchemy-helper",
-  # "app/alchemy-gui",
+  "app/alchemy-gui",
 ]
 
 [workspace.package]
