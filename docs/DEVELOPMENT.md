@@ -48,9 +48,33 @@ Daemon settings, as flags or environment variables:
 | `--listen` | `ALCHEMY_LISTEN` | `127.0.0.1:7240`                                                   |
 | `--socket` | `ALCHEMY_SOCKET` | `$XDG_RUNTIME_DIR/alchemy/alchemyd.sock`, else a per-user temp dir |
 |            | `ALCHEMY_LOG`    | `info` (any `tracing` filter, e.g. `alchemyd=debug`)               |
+| `--daemon` | `ALCHEMY_DAEMON` | CLI only: the daemon as a URL; only `unix:///path` for now         |
 
 The CLI honours `--socket` and `ALCHEMY_SOCKET` the same way, and takes
-`--json` for machine-readable output.
+`--json` for machine-readable output. `--daemon unix:///path/to/alchemyd.sock`
+is the same as `--socket /path/to/alchemyd.sock`; passing both is a usage
+error. Precedence is `--daemon` or `--socket`, then `ALCHEMY_DAEMON`, then
+`ALCHEMY_SOCKET`, then the default. Other schemes, such as `https://`, are
+refused with exit 2 and nothing is contacted: remote daemons need
+authentication, which arrives in M13
+([#16](https://github.com/hostingaccessories/alchemy/issues/16)).
+
+### Remote daemon over SSH
+
+Until then, reach a daemon on another machine by forwarding its socket over
+SSH, as the user that runs alchemyd there, and pointing `--socket` at the
+local end. `alchemy status` on the server prints the remote path.
+
+```sh
+ssh -N -o StreamLocalBindUnlink=yes \
+  -L "$HOME/.alchemyd-server.sock:/run/user/1000/alchemy/alchemyd.sock" \
+  user@server &
+alchemy --socket "$HOME/.alchemyd-server.sock" status
+```
+
+The local socket is created `0600`, but anyone who can open it controls the
+remote daemon, so keep it in a directory only you can write to.
+`StreamLocalBindUnlink` replaces a socket left behind by an earlier session.
 
 ### Docker engine
 
