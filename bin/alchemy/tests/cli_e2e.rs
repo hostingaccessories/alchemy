@@ -13,6 +13,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use alchemy::commands::status;
 use alchemy::{Cli, ClientError, Command};
 use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
 use alchemy_ipc::{
@@ -92,7 +93,7 @@ fn cli(socket: &Path, json: bool, watch: bool) -> Cli {
     Cli {
         json,
         socket: Some(socket.to_owned()),
-        command: Command::Status { watch },
+        command: Command::Status(status::Args { watch }),
     }
 }
 
