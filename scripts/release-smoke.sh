@@ -34,6 +34,7 @@ tmp="$(mktemp -d)"
 socket="${tmp}/alchemyd.sock"
 daemon_pid=""
 events_pid=""
+watch_pid=""
 
 cleanup() {
   if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
@@ -41,6 +42,9 @@ cleanup() {
   fi
   if [[ -n "$events_pid" ]] && kill -0 "$events_pid" 2>/dev/null; then
     kill -KILL "$events_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$watch_pid" ]] && kill -0 "$watch_pid" 2>/dev/null; then
+    kill -KILL "$watch_pid" 2>/dev/null || true
   fi
   rm -rf "$tmp"
 }
@@ -111,6 +115,20 @@ status="$("${bin}/alchemy" --socket "$socket" --json status)"
 [[ "$status" == *"\"daemon\":\"${cli_version}\""* ]] \
   || fail "status did not report daemon ${cli_version}: ${status}"
 
+log "Following alchemy status --watch"
+"${bin}/alchemy" --socket "$socket" status --watch \
+  >"${tmp}/watch.txt" 2>"${tmp}/watch.err" &
+watch_pid=$!
+for _ in $(seq 1 50); do
+  [[ "$(wc -l <"${tmp}/watch.txt")" -ge 2 ]] && break
+  sleep 0.2
+done
+[[ "$(wc -l <"${tmp}/watch.txt")" -ge 2 ]] \
+  || fail "status --watch printed no engine line: $(cat "${tmp}/watch.txt" "${tmp}/watch.err")"
+[[ "$(head -n 1 "${tmp}/watch.txt")" == "alchemyd ${cli_version} (protocol "*") at ${socket}" ]] \
+  || fail "status --watch did not report daemon ${cli_version}: $(head -n 1 "${tmp}/watch.txt")"
+kill -0 "$watch_pid" 2>/dev/null || fail "status --watch exited early: $(cat "${tmp}/watch.err")"
+
 log "Checking alchemy-helper refuses non-root"
 if [[ "$(id -u)" -ne 0 ]]; then
   set +e
@@ -135,5 +153,15 @@ set +e
 wait "$events_pid"
 set -e
 events_pid=""
+
+log "Checking alchemy status --watch ends when alchemyd stops"
+set +e
+wait "$watch_pid"
+code=$?
+set -e
+watch_pid=""
+[[ "$code" -eq 69 ]] || fail "status --watch exited ${code}, expected 69: $(cat "${tmp}/watch.err")"
+grep -q 'alchemyd closed the connection' "${tmp}/watch.err" \
+  || fail "status --watch did not report the disconnect: $(cat "${tmp}/watch.err")"
 
 log "Release smoke test passed"
