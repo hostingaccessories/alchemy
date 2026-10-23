@@ -21,6 +21,7 @@ dependencies = [
 name = "alchemy"
 version = "0.1.0"
 dependencies = [
+ "alchemy",
  "alchemy-core",
  "alchemy-ipc",
  "alchemyd",

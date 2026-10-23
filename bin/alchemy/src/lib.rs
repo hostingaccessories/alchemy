@@ -23,6 +23,7 @@ use crate::commands::status;
 use crate::context::Context;
 use crate::daemon::IpcDaemon;
 use crate::output::Output;
+use crate::prompt::{Prompt, TtyPrompt};
 use crate::target::{Sources, Target};
 
 pub use error::{ClientError, Exit};
@@ -70,14 +71,37 @@ pub enum Command {
     /// Show whether alchemyd is reachable, which version it runs, and
     /// whether Docker is ready.
     Status(commands::status::Args),
+
+    /// A stand-in destructive command for the e2e tests.
+    #[cfg(feature = "test-command")]
+    #[command(hide = true)]
+    SafetyProbe(commands::safety_probe::Args),
 }
 
 /// Run `cli`, writing its results to `out`, styled only when `color`
-/// allows it. The caller reports a returned error with [`report`].
+/// allows it, and asking for any confirmation on the terminal. The
+/// caller reports a returned error with [`report`].
 ///
 /// `status --watch` only returns on an error, such as the daemon
 /// stopping; the caller ends it by dropping the future.
 pub async fn run<W: Write>(cli: Cli, out: &mut W, color: Color) -> Result<(), ClientError> {
+    run_with(cli, out, color, &mut TtyPrompt).await
+}
+
+/// [`run`], asking for confirmation on `prompt` instead of the terminal.
+#[cfg_attr(
+    not(feature = "test-command"),
+    expect(
+        unused_variables,
+        reason = "no destructive command exists outside tests until M4"
+    )
+)]
+pub async fn run_with<W: Write, P: Prompt>(
+    cli: Cli,
+    out: &mut W,
+    color: Color,
+    prompt: &mut P,
+) -> Result<(), ClientError> {
     let Target::Unix(socket) = target::resolve(Sources::from_env(cli.daemon, cli.socket))?;
     let context = |command| {
         Context::new(
@@ -88,6 +112,11 @@ pub async fn run<W: Write>(cli: Cli, out: &mut W, color: Color) -> Result<(), Cl
     };
     match cli.command {
         Command::Status(args) => status::run(&mut context(status::NAME), args).await,
+        #[cfg(feature = "test-command")]
+        Command::SafetyProbe(args) => {
+            commands::safety_probe::run(&mut context(commands::safety_probe::NAME), prompt, args)
+                .await
+        }
     }
 }
 

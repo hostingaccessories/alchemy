@@ -69,7 +69,7 @@ pub(crate) fn is_yes(answer: &str) -> bool {
 
 /// A scripted [`Prompt`]: answers from a list, in order, and records
 /// each question.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-command"))]
 #[derive(Debug, Clone, Default)]
 pub struct FakePrompt {
     interactive: bool,
@@ -77,7 +77,7 @@ pub struct FakePrompt {
     asked: Vec<String>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-command"))]
 impl FakePrompt {
     /// A terminal that answers with `answers`, then with no once they run
     /// out.
@@ -100,7 +100,7 @@ impl FakePrompt {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-command"))]
 impl Prompt for FakePrompt {
     fn is_interactive(&self) -> bool {
         self.interactive

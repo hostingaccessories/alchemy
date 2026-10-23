@@ -16,6 +16,11 @@ path = "src/main.rs"
 name = "alchemy"
 path = "src/lib.rs"
 
+[features]
+# The hidden `safety-probe` command and `FakePrompt`, for this crate's own
+# tests. Release builds never enable it.
+test-command = []
+
 [dependencies]
 alchemy-core = { workspace = true }
 alchemy-ipc  = { workspace = true, features = ["transport"] }
@@ -26,6 +31,9 @@ thiserror    = { workspace = true }
 tokio        = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "signal", "sync"] }
 
 [dev-dependencies]
+# Itself, to turn on `test-command` for the e2e tests: they build the
+# library as an ordinary dependency, which `cfg(test)` doesn't reach.
+alchemy  = { path = ".", features = ["test-command"] }
 alchemyd = { workspace = true }
 tempfile = { workspace = true }
 tokio    = { workspace = true, features = ["rt-multi-thread", "sync"] }

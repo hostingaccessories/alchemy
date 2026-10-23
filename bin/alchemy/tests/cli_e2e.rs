@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::Duration;
 
-use alchemy::commands::status;
+use alchemy::commands::{safety_probe, status};
+use alchemy::prompt::FakePrompt;
+use alchemy::safety::Safety;
 use alchemy::{Cli, ClientError, Color, Command, DAEMON_ENV};
 use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
 use alchemy_ipc::{
@@ -23,7 +25,7 @@ use alchemy_ipc::{
 };
 use alchemyd::engine::EngineSource;
 use alchemyd::{Config, Deps, State};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -348,6 +350,180 @@ async fn an_old_daemon_is_reported_as_too_old() {
         assert_eq!(err.exit_code(), 76);
     }
     server.abort();
+}
+
+fn probe(socket: &Path, json: bool, safety: Safety) -> Cli {
+    Cli {
+        json,
+        daemon: None,
+        socket: Some(socket.to_owned()),
+        command: Command::SafetyProbe(safety_probe::Args { safety }),
+    }
+}
+
+async fn run_prompted(cli: Cli, prompt: &mut FakePrompt) -> Result<String, ClientError> {
+    let mut out = Vec::new();
+    alchemy::run_with(cli, &mut out, Color::Off, prompt).await?;
+    Ok(String::from_utf8(out).unwrap())
+}
+
+fn yes() -> Safety {
+    Safety {
+        yes: true,
+        ..Safety::default()
+    }
+}
+
+fn dry_run() -> Safety {
+    Safety {
+        dry_run: true,
+        ..Safety::default()
+    }
+}
+
+fn probe_step(socket: &Path) -> String {
+    format!(
+        "ping alchemyd {} at {}",
+        env!("CARGO_PKG_VERSION"),
+        socket.display()
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_destructive_command_asks_on_a_terminal() {
+    let daemon = Daemon::start(EngineStatus::new(EngineState::Ready)).await;
+    let step = probe_step(&daemon.socket);
+
+    let mut prompt = FakePrompt::tty([true]);
+    let out = run_prompted(probe(&daemon.socket, false, Safety::default()), &mut prompt)
+        .await
+        .unwrap();
+    assert_eq!(out, format!("did {step}\n"));
+    assert_eq!(prompt.asked(), [safety_probe::QUESTION]);
+
+    let mut prompt = FakePrompt::tty([false]);
+    let err = run_prompted(probe(&daemon.socket, false, Safety::default()), &mut prompt)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ClientError::Declined {
+                command: "safety-probe"
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(err.exit_code(), 3);
+    assert_eq!(prompt.asked(), [safety_probe::QUESTION]);
+
+    let force = Safety {
+        force: true,
+        ..Safety::default()
+    };
+    let mut prompt = FakePrompt::tty([false]);
+    let err = run_prompted(probe(&daemon.socket, false, force), &mut prompt)
+        .await
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 3, "--force must not skip the question");
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn yes_skips_the_question_without_a_terminal() {
+    let daemon = Daemon::start(EngineStatus::new(EngineState::Ready)).await;
+    let mut prompt = FakePrompt::no_tty();
+    let out = run_prompted(probe(&daemon.socket, false, yes()), &mut prompt)
+        .await
+        .unwrap();
+    assert_eq!(out, format!("did {}\n", probe_step(&daemon.socket)));
+    assert_eq!(prompt.asked(), [] as [&str; 0]);
+
+    let mut prompt = FakePrompt::tty([false]);
+    let out = run_prompted(probe(&daemon.socket, true, yes()), &mut prompt)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(json["done"][0], probe_step(&daemon.socket));
+    assert_eq!(prompt.asked(), [] as [&str; 0]);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn without_a_terminal_or_yes_it_refuses_before_reaching_the_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("nope.sock");
+    for json in [false, true] {
+        let mut prompt = FakePrompt::no_tty();
+        let err = run_prompted(probe(&socket, json, Safety::default()), &mut prompt)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClientError::ConfirmationRequired {
+                    command: "safety-probe"
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_text().contains("hint: pass --yes"), "{err}");
+        assert_eq!(prompt.asked(), [] as [&str; 0]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dry_run_prints_the_plan_and_asks_nothing() {
+    let daemon = Daemon::start(EngineStatus::new(EngineState::Ready)).await;
+    let step = probe_step(&daemon.socket);
+    for prompt in [FakePrompt::no_tty(), FakePrompt::tty([true])] {
+        let mut prompt = prompt;
+        let out = run_prompted(probe(&daemon.socket, false, dry_run()), &mut prompt)
+            .await
+            .unwrap();
+        assert_eq!(out, format!("would {step}\n"));
+        assert_eq!(prompt.asked(), [] as [&str; 0]);
+    }
+
+    let mut prompt = FakePrompt::no_tty();
+    let out = run_prompted(probe(&daemon.socket, true, dry_run()), &mut prompt)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&out).unwrap(),
+        serde_json::json!({ "dry_run": true, "plan": [step] })
+    );
+    daemon.stop().await;
+}
+
+#[test]
+fn safety_flags_belong_to_destructive_commands_only() {
+    let cli =
+        Cli::try_parse_from(["alchemy", "safety-probe", "--dry-run", "--force", "-y"]).unwrap();
+    let Command::SafetyProbe(args) = cli.command else {
+        panic!("{:?}", cli.command);
+    };
+    assert_eq!(
+        args.safety,
+        Safety {
+            dry_run: true,
+            force: true,
+            yes: true
+        }
+    );
+
+    for flag in ["--dry-run", "--force", "--yes"] {
+        let err = Cli::try_parse_from(["alchemy", "status", flag]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "{flag}"
+        );
+    }
+
+    let help = Cli::command().render_long_help().to_string();
+    assert!(!help.contains("safety-probe"), "{help}");
 }
 
 #[tokio::test]
