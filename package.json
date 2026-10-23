@@ -1,0 +1,25 @@
+{
+  "name": "alchemy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "ready": "vp check && vp run -r test && vp run -r build",
+    "dev": "vp run alchemy-web#dev",
+    "gui": "vp run alchemy-gui#dev",
+    "docs": "vp run site#dev"
+  },
+  "devDependencies": {
+    "vite-plus": "catalog:"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "12.15.0",
+      "onFail": "download"
+    }
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}

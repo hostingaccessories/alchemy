@@ -4,15 +4,15 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - '.github/workflows/**'
-      - '.github/actions/**'
-      - '.github/dependabot.yml'
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - ".github/dependabot.yml"
   push:
     branches: [main]
     paths:
-      - '.github/workflows/**'
-      - '.github/actions/**'
-      - '.github/dependabot.yml'
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - ".github/dependabot.yml"
 
 permissions:
   contents: read
