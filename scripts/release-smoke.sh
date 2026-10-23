@@ -73,6 +73,18 @@ log "Checking /api/engine"
 engine="$(curl -fsS "${base}/api/engine")"
 [[ "$engine" == *'"state":'* ]] || fail "unexpected engine response: ${engine}"
 
+log "Checking /api/health on the socket"
+sock_health="$(curl -fsS --unix-socket "$socket" http://localhost/api/health)" \
+  || fail "GET /api/health on ${socket} failed"
+[[ "$sock_health" == *'"ok"'* ]] || fail "unexpected socket health response: ${sock_health}"
+
+log "Checking / on the socket is a JSON 404"
+sock_root_code="$(curl -sS -o "${tmp}/sock-root.json" -w '%{http_code}' \
+  --unix-socket "$socket" http://localhost/)" || fail "GET / on ${socket} failed"
+[[ "$sock_root_code" == 404 ]] || fail "GET / on the socket returned ${sock_root_code}, expected 404"
+grep -q '"code":"not_found"' "${tmp}/sock-root.json" \
+  || fail "GET / on the socket was not a JSON 404: $(cat "${tmp}/sock-root.json")"
+
 log "Opening /api/events"
 curl -fsSN -H 'Origin: tauri://localhost' "${base}/api/events" \
   >"${tmp}/events.txt" 2>/dev/null &
