@@ -1,6 +1,8 @@
 //! The CLI's view of alchemyd: a [`Daemon`] client that commands talk to
 //! instead of the socket, so their logic can be tested against a fake.
 
+#[cfg(test)]
+pub(crate) mod fake;
 mod ipc;
 
 use std::path::Path;

@@ -188,7 +188,10 @@ fn ready_line(engine: &EngineStatus) -> String {
     clippy::indexing_slicing
 )]
 mod tests {
+    use alchemy_ipc::ErrorCode;
+
     use super::*;
+    use crate::daemon::fake::{FAKE_SOCKET, FakeDaemon};
 
     fn status(
         state: EngineState,
@@ -310,5 +313,185 @@ mod tests {
                 "engine": serde_json::to_value(&engine).unwrap(),
             })
         );
+    }
+
+    const DAEMON_LINE: &str = "alchemyd 1.2.3 (protocol 1) at /run/alchemyd.sock";
+    const READY_LINE: &str = "Docker ready: Desktop 4.34.2, Engine 27.3.1, Compose v2.29.7";
+
+    fn ready() -> EngineStatus {
+        status(
+            EngineState::Ready,
+            Some(EngineFlavor::DockerDesktop),
+            [Some("4.34.2"), Some("27.3.1"), Some("2.29.7")],
+            Some("unix:///var/run/docker.sock"),
+        )
+    }
+
+    fn engine(state: EngineState) -> Response {
+        Response::Engine(EngineStatus::new(state))
+    }
+
+    struct Run {
+        result: Result<(), ClientError>,
+        out: String,
+        requests: Vec<Request>,
+    }
+
+    async fn run_with(fake: FakeDaemon, json: bool, watch: bool) -> Run {
+        let mut ctx = Context::buffered(fake, json, NAME);
+        let result = run(&mut ctx, Args { watch }).await;
+        Run {
+            result,
+            out: ctx.written(),
+            requests: ctx.daemon().requests().to_vec(),
+        }
+    }
+
+    fn json_lines(out: &str) -> Vec<serde_json::Value> {
+        out.lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn status_prints_the_daemon_and_the_engine() {
+        let fake = FakeDaemon::new()
+            .version("1.2.3", 1)
+            .reply(Request::Engine, Response::Engine(ready()));
+        let run = run_with(fake, false, false).await;
+        run.result.unwrap();
+        assert_eq!(run.out, format!("{DAEMON_LINE}\n{READY_LINE}\n"));
+        assert_eq!(run.requests, [Request::Version, Request::Engine]);
+    }
+
+    #[tokio::test]
+    async fn status_json_prints_one_object() {
+        let fake = FakeDaemon::new()
+            .version("1.2.3", 1)
+            .reply(Request::Engine, Response::Engine(ready()));
+        let run = run_with(fake, true, false).await;
+        run.result.unwrap();
+        assert_eq!(
+            json_lines(&run.out),
+            [serde_json::json!({
+                "daemon": "1.2.3",
+                "protocol": 1,
+                "socket": FAKE_SOCKET,
+                "engine": serde_json::to_value(ready()).unwrap(),
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_prints_the_engine_line_only_when_it_changes() {
+        let mut api_only = EngineStatus::new(EngineState::Starting);
+        api_only.api_version = Some("1.47".into());
+        let fake = FakeDaemon::new().version("1.2.3", 1).stream(
+            Request::WatchEngine,
+            [
+                Ok(engine(EngineState::NotRunning)),
+                Ok(engine(EngineState::Starting)),
+                Ok(Response::Engine(api_only)),
+                Ok(Response::Engine(ready())),
+            ],
+        );
+        let run = run_with(fake, false, true).await;
+        assert!(
+            matches!(run.result, Err(ClientError::Disconnected)),
+            "{:?}",
+            run.result
+        );
+        assert_eq!(
+            run.out.lines().collect::<Vec<_>>(),
+            [
+                DAEMON_LINE,
+                "Docker isn't running",
+                "Docker is starting…",
+                READY_LINE
+            ]
+        );
+        assert_eq!(run.requests, [Request::Version, Request::WatchEngine]);
+    }
+
+    #[tokio::test]
+    async fn watch_json_prints_every_update() {
+        let fake = FakeDaemon::new().version("1.2.3", 1).stream(
+            Request::WatchEngine,
+            [
+                Ok(engine(EngineState::Starting)),
+                Ok(engine(EngineState::Starting)),
+                Ok(Response::Engine(ready())),
+            ],
+        );
+        let run = run_with(fake, true, true).await;
+        assert!(matches!(run.result, Err(ClientError::Disconnected)));
+        let states: Vec<_> = json_lines(&run.out)
+            .iter()
+            .map(|json| {
+                assert_eq!(json["daemon"], "1.2.3");
+                assert_eq!(json["socket"], FAKE_SOCKET);
+                json["engine"]["state"].clone()
+            })
+            .collect();
+        assert_eq!(states, ["starting", "starting", "ready"]);
+    }
+
+    #[tokio::test]
+    async fn failures_are_reported_as_errors() {
+        let bad_request = || Response::Error {
+            code: ErrorCode::BadRequest,
+            message: "unsupported or malformed request".into(),
+        };
+        let internal = || Response::Error {
+            code: ErrorCode::Internal,
+            message: "engine monitor stopped".into(),
+        };
+        let unreachable = || ClientError::DaemonUnreachable(format!("{FAKE_SOCKET}: refused"));
+        let version = || FakeDaemon::new().version("0.0.1", 1);
+        let cases: Vec<(FakeDaemon, bool, u8, &str)> = vec![
+            (
+                version().reply(Request::Engine, bad_request()),
+                false,
+                76,
+                "alchemyd 0.0.1 is too old for `status`",
+            ),
+            (
+                version().stream(Request::WatchEngine, [Ok(bad_request())]),
+                true,
+                76,
+                "alchemyd 0.0.1 is too old for `status`",
+            ),
+            (
+                version().reply(Request::Engine, internal()),
+                false,
+                1,
+                "alchemyd: engine monitor stopped",
+            ),
+            (
+                version().reply(Request::Engine, Response::Pong),
+                false,
+                76,
+                "unexpected response from alchemyd: Pong",
+            ),
+            (
+                FakeDaemon::new().fail(Request::Version, unreachable()),
+                false,
+                69,
+                "cannot reach alchemyd: /run/alchemyd.sock: refused",
+            ),
+            (
+                FakeDaemon::new().fail(Request::Version, unreachable()),
+                true,
+                69,
+                "cannot reach alchemyd: /run/alchemyd.sock: refused",
+            ),
+        ];
+        for (fake, watch, code, message) in cases {
+            let run = run_with(fake, false, watch).await;
+            let err = run.result.unwrap_err();
+            assert!(err.to_string().starts_with(message), "{err}");
+            assert_eq!(err.exit_code(), code, "{err}");
+            assert_eq!(run.out, "", "{err}");
+        }
     }
 }

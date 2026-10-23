@@ -33,3 +33,11 @@ impl<W: Write> Output<W> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+impl<W> Output<W> {
+    /// The sink, to inspect what was written.
+    pub(crate) fn get_ref(&self) -> &W {
+        &self.out
+    }
+}

@@ -127,3 +127,116 @@ fn accept(resp: Response, daemon: &str, command: &'static str) -> Result<Respons
         resp => Ok(resp),
     }
 }
+
+#[cfg(test)]
+impl<D: Daemon> Context<D, Vec<u8>> {
+    /// A context for `command` that writes to a buffer.
+    pub(crate) fn buffered(daemon: D, json: bool, command: &'static str) -> Self {
+        Self::new(daemon, Output::new(Vec::new(), json), command)
+    }
+
+    /// Everything written to the output so far.
+    pub(crate) fn written(&self) -> String {
+        String::from_utf8_lossy(self.out.get_ref()).into_owned()
+    }
+
+    /// The daemon client, to inspect what was sent.
+    pub(crate) fn daemon(&self) -> &D {
+        &self.daemon
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+    use crate::daemon::fake::FakeDaemon;
+
+    #[tokio::test]
+    async fn handshakes_once_per_invocation() {
+        let fake = FakeDaemon::new()
+            .version("1.2.3", 1)
+            .reply(Request::Ping, Response::Pong)
+            .stream(Request::WatchEngine, [])
+            .reply(Request::Ping, Response::Pong);
+        let mut ctx = Context::buffered(fake, false, "test");
+        assert_eq!(ctx.request(&Request::Ping).await.unwrap(), Response::Pong);
+        let mut stream = ctx.stream(&Request::WatchEngine).await.unwrap();
+        assert!(stream.next().await.unwrap().is_none());
+        assert_eq!(ctx.request(&Request::Ping).await.unwrap(), Response::Pong);
+        assert_eq!(
+            ctx.daemon_info().await.unwrap(),
+            &DaemonInfo {
+                version: "1.2.3".into(),
+                protocol: 1,
+            }
+        );
+        assert_eq!(
+            ctx.daemon().requests(),
+            [
+                Request::Version,
+                Request::Ping,
+                Request::WatchEngine,
+                Request::Ping
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn error_responses_become_errors() {
+        let internal = Response::Error {
+            code: ErrorCode::Internal,
+            message: "boom".into(),
+        };
+        let bad = Response::Error {
+            code: ErrorCode::BadRequest,
+            message: "unsupported or malformed request".into(),
+        };
+        let fake = FakeDaemon::new()
+            .version("0.0.1", 1)
+            .reply(Request::Ping, internal.clone())
+            .reply(Request::Engine, bad.clone())
+            .stream(Request::WatchEngine, [Ok(internal), Ok(bad)]);
+        let mut ctx = Context::buffered(fake, false, "app up");
+
+        let err = ctx.request(&Request::Ping).await.unwrap_err();
+        assert!(
+            matches!(&err, ClientError::Daemon(m) if m == "boom"),
+            "{err:?}"
+        );
+
+        let err = ctx.request(&Request::Engine).await.unwrap_err();
+        assert!(
+            matches!(&err, ClientError::DaemonTooOld { daemon, command: "app up" } if daemon == "0.0.1"),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("alchemyd 0.0.1 is too old for `app up`; upgrade it"),
+            "{err}"
+        );
+
+        let mut stream = ctx.stream(&Request::WatchEngine).await.unwrap();
+        let err = stream.next().await.unwrap_err();
+        assert!(matches!(err, ClientError::Daemon(_)), "{err:?}");
+        let err = stream.next().await.unwrap_err();
+        assert!(matches!(err, ClientError::DaemonTooOld { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_handshake_sends_nothing_else() {
+        let fake = FakeDaemon::new().fail(
+            Request::Version,
+            ClientError::DaemonUnreachable("/run/alchemyd.sock: refused".into()),
+        );
+        let mut ctx = Context::buffered(fake, false, "test");
+        let err = ctx.request(&Request::Engine).await.unwrap_err();
+        assert!(matches!(err, ClientError::DaemonUnreachable(_)), "{err:?}");
+        assert_eq!(ctx.daemon().requests(), [Request::Version]);
+    }
+}
