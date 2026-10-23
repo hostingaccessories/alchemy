@@ -1,0 +1,10 @@
+{
+  // Static assets Worker for https://alchemy.computer. Deployed on release.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "alchemy-site",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "404-page",
+  },
+}

@@ -1,0 +1,23 @@
+{
+  "name": "site",
+  "version": "0.1.0",
+  "private": true,
+  "description": "alchemy.computer marketing and documentation site.",
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "deploy": "astro build && wrangler deploy"
+  },
+  "dependencies": {
+    "astro": "^7.4.2"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "tailwindcss": "^4.3.3",
+    "typescript": "catalog:",
+    "vite-plus": "catalog:",
+    "wrangler": "^4.152.0"
+  }
+}
