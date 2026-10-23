@@ -46,3 +46,16 @@ export async function openExternal(url: string): Promise<void> {
   }
   window.open(parsed.href, "_blank", "noopener,noreferrer");
 }
+
+/**
+ * Set the desktop window's native title bar to `theme`, or back to the OS
+ * theme with `null`. Does nothing in a browser. The Tauri code loads only
+ * in the shell, so the browser bundle doesn't carry it.
+ */
+export async function setWindowTheme(theme: "light" | "dark" | null): Promise<void> {
+  if (!isTauri()) {
+    return;
+  }
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  await getCurrentWindow().setTheme(theme);
+}

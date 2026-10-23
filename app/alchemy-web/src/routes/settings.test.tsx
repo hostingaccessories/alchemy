@@ -7,6 +7,10 @@ import { FakeEventSource, renderAt } from "../test/render.tsx";
 
 const root = document.documentElement;
 
+const setTheme = vi.hoisted(() => vi.fn(async (_theme: "light" | "dark" | null) => {}));
+
+vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ setTheme }) }));
+
 beforeEach(() => {
   vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal(
@@ -20,6 +24,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
   localStorage.clear();
   delete root.dataset.theme;
+  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  setTheme.mockClear();
 });
 
 function checked() {
@@ -69,5 +75,24 @@ describe("theme setting", () => {
   it("treats a missing matchMedia as light", async () => {
     await renderAt("/settings");
     expect(screen.getByText(/which is light right now/)).toBeTruthy();
+  });
+
+  it("leaves the window alone in a browser", async () => {
+    await renderAt("/settings");
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    expect(setTheme).not.toHaveBeenCalled();
+  });
+
+  it("matches the desktop window's title bar to the choice", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    localStorage.setItem(THEME_STORAGE_KEY, "light");
+    await renderAt("/settings");
+    await vi.waitFor(() => expect(setTheme).toHaveBeenLastCalledWith("light"));
+
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    await vi.waitFor(() => expect(setTheme).toHaveBeenLastCalledWith("dark"));
+
+    fireEvent.click(screen.getByRole("radio", { name: "System" }));
+    await vi.waitFor(() => expect(setTheme).toHaveBeenLastCalledWith(null));
   });
 });

@@ -3,6 +3,7 @@ import { Boxes, FlaskConical, type LucideIcon, Server, Settings } from "lucide-r
 import { useState } from "react";
 
 import { useDaemonConnection } from "../lib/live.tsx";
+import { useWindowTheme } from "../lib/theme.ts";
 import { DaemonStatus } from "./DaemonStatus.tsx";
 import { HeaderSlotContext } from "./PageHeader.tsx";
 
@@ -21,6 +22,7 @@ const NAV: { to: "/apps" | "/machines" | "/settings"; label: string; icon: Lucid
 export function Layout() {
   const [slot, setSlot] = useState<HTMLElement | null>(null);
   const daemon = useDaemonConnection();
+  useWindowTheme();
 
   return (
     <div className="flex h-screen bg-surface text-text">

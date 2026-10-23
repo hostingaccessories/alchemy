@@ -1,12 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { apiBase, externalUrl, isTauri, openExternal } from "./platform.ts";
+import { apiBase, externalUrl, isTauri, openExternal, setWindowTheme } from "./platform.ts";
 
 const tauri = vi.hoisted(() => ({
   openUrl: vi.fn(async (_url: string) => {}),
+  setTheme: vi.fn(async (_theme: "light" | "dark" | null) => {}),
 }));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: tauri.openUrl }));
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({ setTheme: tauri.setTheme }),
+}));
 
 function enterShell() {
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
@@ -78,4 +82,17 @@ describe("openExternal", () => {
       expect(tauri.openUrl).not.toHaveBeenCalled();
     },
   );
+});
+
+describe("setWindowTheme", () => {
+  it("does nothing in a browser", async () => {
+    await setWindowTheme("dark");
+    expect(tauri.setTheme).not.toHaveBeenCalled();
+  });
+
+  it.each(["light", "dark", null] as const)("sets the shell window to %j", async (theme) => {
+    enterShell();
+    await setWindowTheme(theme);
+    expect(tauri.setTheme).toHaveBeenCalledWith(theme);
+  });
 });

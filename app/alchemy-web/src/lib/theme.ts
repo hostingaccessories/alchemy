@@ -1,4 +1,6 @@
-import { useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
+
+import { setWindowTheme } from "./platform.ts";
 
 /**
  * The `localStorage` key holding the theme preference. The pre-paint script
@@ -153,4 +155,18 @@ export function useTheme(): {
     theme: resolveTheme(preference, systemDark),
     setPreference: store.set,
   };
+}
+
+/**
+ * Keep the desktop shell's native title bar on the preferred theme, so a
+ * Light or Dark override doesn't leave it following the OS. Mount once, in
+ * the layout. A failure only leaves the title bar on the OS theme.
+ */
+export function useWindowTheme(): void {
+  const { preference } = useTheme();
+  useEffect(() => {
+    setWindowTheme(preference === "system" ? null : preference).catch((error: unknown) => {
+      console.warn("Couldn't set the window theme", error);
+    });
+  }, [preference]);
 }
