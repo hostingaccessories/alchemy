@@ -10,6 +10,7 @@
 //!
 //! It talks to the Docker engine through [`engine`].
 
+pub mod compose;
 pub mod engine;
 pub mod http;
 pub mod ipc;
