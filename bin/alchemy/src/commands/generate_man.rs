@@ -96,7 +96,12 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            ["alchemy-completions.1", "alchemy-status.1", "alchemy.1"]
+            [
+                "alchemy-completions.1",
+                "alchemy-status.1",
+                "alchemy-version.1",
+                "alchemy.1"
+            ]
         );
     }
 

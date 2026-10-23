@@ -83,6 +83,22 @@ mod tests {
     }
 
     #[test]
+    fn every_shell_completes_version_as_a_command() {
+        let cases = [
+            (Shell::Bash, "alchemy,version)"),
+            (
+                Shell::Zsh,
+                "'version:Show the versions of alchemy and alchemyd",
+            ),
+            (Shell::Fish, "-a \"version\""),
+        ];
+        for (shell, command) in cases {
+            let script = String::from_utf8(script(shell)).unwrap();
+            assert!(script.contains(command), "{shell:?} lacks {command}");
+        }
+    }
+
+    #[test]
     fn run_writes_the_script() {
         let mut out = Vec::new();
         run(&mut out, &Args { shell: Shell::Bash }).unwrap();

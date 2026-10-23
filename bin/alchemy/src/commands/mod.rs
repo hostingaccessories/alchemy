@@ -8,6 +8,7 @@ pub mod generate_man;
 #[cfg(feature = "test-command")]
 pub mod safety_probe;
 pub mod status;
+pub mod version;
 
 use clap::CommandFactory;
 

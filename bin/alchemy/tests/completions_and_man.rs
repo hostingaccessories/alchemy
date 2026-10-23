@@ -83,7 +83,12 @@ fn generated_man_pages_render() {
     names.sort();
     assert_eq!(
         names,
-        ["alchemy-completions.1", "alchemy-status.1", "alchemy.1"]
+        [
+            "alchemy-completions.1",
+            "alchemy-status.1",
+            "alchemy-version.1",
+            "alchemy.1"
+        ]
     );
 
     for name in &names {
@@ -101,6 +106,7 @@ fn generated_man_pages_render() {
     let (_, top) = render(&out.join("alchemy.1")).unwrap();
     assert!(top.contains("alchemy-status(1)"), "{top}");
     assert!(top.contains("alchemy-completions(1)"), "{top}");
+    assert!(top.contains("alchemy-version(1)"), "{top}");
 }
 
 /// Render `page` with the first renderer installed: `man -l` where it

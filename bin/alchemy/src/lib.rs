@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{completions, generate_man, status};
+use crate::commands::{completions, generate_man, status, version};
 use crate::context::Context;
 use crate::daemon::IpcDaemon;
 use crate::output::Output;
@@ -71,6 +71,10 @@ pub enum Command {
     /// Show whether alchemyd is reachable, which version it runs, and
     /// whether Docker is ready.
     Status(commands::status::Args),
+
+    /// Show the versions of alchemy and alchemyd, and the protocol each
+    /// speaks.
+    Version(commands::version::Args),
 
     /// Write a shell completion script to stdout.
     Completions(commands::completions::Args),
@@ -125,6 +129,7 @@ pub async fn run_with<W: Write, P: Prompt>(
     };
     match command {
         Command::Status(args) => status::run(&mut context(out, status::NAME)?, args).await,
+        Command::Version(args) => version::run(&mut context(out, version::NAME)?, args).await,
         Command::Completions(args) => completions::run(out, &args),
         Command::GenerateMan(args) => generate_man::run(&args),
         #[cfg(feature = "test-command")]

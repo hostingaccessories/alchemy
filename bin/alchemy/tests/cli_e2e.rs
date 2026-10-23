@@ -295,6 +295,37 @@ async fn status_watch_json_prints_one_object_per_change() {
     daemon.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn version_reports_alchemy_and_the_daemon() {
+    let daemon = Daemon::start(EngineStatus::new(EngineState::Starting)).await;
+    let socket = daemon.socket.to_str().unwrap();
+    let version = env!("CARGO_PKG_VERSION");
+
+    let cli = Cli::try_parse_from(["alchemy", "--socket", socket, "version"]).unwrap();
+    assert_eq!(
+        run(cli).await.unwrap(),
+        format!(
+            "alchemy {version} (protocol {PROTOCOL_VERSION})\n{}\n",
+            daemon_line(&daemon.socket)
+        )
+    );
+
+    let cli = Cli::try_parse_from(["alchemy", "--socket", socket, "version", "--json"]).unwrap();
+    let out = run(cli).await.unwrap();
+    assert_eq!(out.lines().count(), 1, "{out}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&out).unwrap(),
+        serde_json::json!({
+            "cli": version,
+            "cli_protocol": PROTOCOL_VERSION,
+            "daemon": version,
+            "protocol": PROTOCOL_VERSION,
+            "socket": socket,
+        })
+    );
+    daemon.stop().await;
+}
+
 /// Answers like an alchemyd from before the engine requests existed: it
 /// knows `ping` and `version`, and rejects anything else as a bad request.
 fn old_daemon(socket: &Path) -> JoinHandle<()> {
