@@ -50,13 +50,13 @@ pub struct Cli {
     )]
     pub daemon: Option<String>,
 
-    /// Path of the alchemyd IPC socket, overriding `ALCHEMY_SOCKET`.
+    /// Path of the alchemyd socket, overriding `ALCHEMY_SOCKET`.
     /// Short for `--daemon unix://PATH`.
     #[arg(
         long,
         global = true,
         value_name = "PATH",
-        help = "Path of the alchemyd IPC socket, short for --daemon unix://PATH [env: ALCHEMY_SOCKET]"
+        help = "Path of the alchemyd socket, short for --daemon unix://PATH [env: ALCHEMY_SOCKET]"
     )]
     pub socket: Option<PathBuf>,
 
