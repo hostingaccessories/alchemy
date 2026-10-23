@@ -8,6 +8,7 @@ import { ConfirmDialog } from "../components/ConfirmDialog.tsx";
 import { CopyButton } from "../components/CopyButton.tsx";
 import { EmptyState } from "../components/EmptyState.tsx";
 import { ErrorState } from "../components/ErrorState.tsx";
+import { ExternalLink } from "../components/ExternalLink.tsx";
 import { Loading } from "../components/Loading.tsx";
 import { Notice } from "../components/Notice.tsx";
 import { PageHeader } from "../components/PageHeader.tsx";
@@ -108,6 +109,15 @@ export function ComponentGallery() {
             Compose file: <Code>~/Alchemy/apps/nextcloud/compose.yaml</Code>
           </p>
         </Advanced>
+      </Section>
+
+      <Section title="ExternalLink">
+        <p className="text-sm text-muted">
+          Opens in the default browser:{" "}
+          <ExternalLink href="https://docs.docker.com/get-started/get-docker/">
+            docs.docker.com/get-started/get-docker
+          </ExternalLink>
+        </p>
       </Section>
 
       <Section title="ConfirmDialog">

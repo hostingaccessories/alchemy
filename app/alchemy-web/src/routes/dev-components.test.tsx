@@ -34,6 +34,7 @@ describe("component gallery", () => {
       "Buttons",
       "ProgressSteps",
       "Advanced",
+      "ExternalLink",
       "ConfirmDialog",
       "EmptyState",
       "Loading",

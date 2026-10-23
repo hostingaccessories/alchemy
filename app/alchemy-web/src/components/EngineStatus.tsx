@@ -1,5 +1,6 @@
 import type { EngineStatus } from "../lib/api.ts";
 import { Code } from "./Code.tsx";
+import { ExternalLink } from "./ExternalLink.tsx";
 import { Notice } from "./Notice.tsx";
 
 /** Where Docker's own install guide lives; shown when Docker is missing. */
@@ -19,14 +20,9 @@ export function EngineStatusView({ status }: { status: EngineStatus | null }) {
         <Notice tone="error" title="Docker isn't installed">
           <p>Alchemy runs your apps with Docker. Install Docker Desktop, then open it.</p>
           <p>
-            <a
-              className="text-accent underline"
-              href={GET_DOCKER_URL}
-              target="_blank"
-              rel="noreferrer"
-            >
+            <ExternalLink href={GET_DOCKER_URL}>
               docs.docker.com/get-started/get-docker
-            </a>
+            </ExternalLink>
           </p>
         </Notice>
       );
