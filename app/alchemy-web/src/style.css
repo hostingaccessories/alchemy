@@ -6,7 +6,8 @@
  * amber, emerald, and rose scales.
  *
  * The theme follows the OS unless `<html data-theme="light|dark">` overrides
- * it. The Settings page sets it (#39).
+ * it: `public/theme.js` sets the attribute before first paint, and `useTheme`
+ * in `lib/theme.ts` changes it from the Settings page.
  */
 @custom-variant dark {
   &:where([data-theme="dark"], [data-theme="dark"] *) {
