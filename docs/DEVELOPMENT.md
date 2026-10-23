@@ -67,6 +67,21 @@ versions, and so on through [the table in §8](#errors-and-exit-codes).
 `alchemy version` shows the versions and protocols of the CLI and the
 daemon; `alchemy --version` shows the CLI's alone, without contacting it.
 
+### Calling the API
+
+The socket and the TCP port serve the same `/api`; only TCP serves the web
+UI. `alchemy status` prints the socket path. Any host name works on the
+socket.
+
+```sh
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/version
+curl http://127.0.0.1:7240/api/version
+curl -N --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/events
+```
+
+`/api/events` is a server-sent event stream; `-N` prints each event as it
+arrives.
+
 ### Shell completions
 
 `alchemy completions <bash|zsh|fish>` writes a completion script to stdout.
@@ -177,7 +192,8 @@ scripts/release-smoke.sh
 This builds the web UI and release binaries, runs `alchemyd` on a temporary
 socket and port `17240` (override with `SMOKE_PORT`), and checks:
 
-- `/api/health` and `/api/engine` respond;
+- `/api/health` and `/api/engine` respond on the port, and `/api/health`
+  on the socket, where `/` is a JSON 404;
 - `/api/events` streams an `engine` event to the Tauri origin;
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
@@ -310,7 +326,9 @@ each pattern. Then run [the gate](#4-the-gate).
 
 ## 8. Adding a CLI command
 
-A command is a module, a `Command` variant, and one dispatch arm. Usage
+A command is a module, a `Command` variant, and one dispatch arm, plus a
+route in `alchemy-api` and `alchemyd` if it needs data the daemon doesn't
+serve yet ([Talking to alchemyd](#talking-to-alchemyd)). Usage
 errors, `--json` errors, exit codes, `--daemon` and `--socket`, the version
 handshake, ctrl-c, help, completions, and man pages already apply to every
 command; nothing else needs wiring. The examples add `alchemy app list`;
@@ -412,9 +430,11 @@ seconds; a stream only until its first event.
 
 A new route is a contract change in `crates/alchemy-api`: add its types
 with a wire-shape test in `tests/wire_stability.rs`, mirror them in
-`app/alchemy-web/src/lib/api.ts`, and serve the route in
-`bin/alchemyd/src/http.rs`. Adding one needs no `API_VERSION` bump,
-because an older daemon answers it with `not_found`.
+`app/alchemy-web/src/lib/api.ts`, and add its handler to `api()` in
+`bin/alchemyd/src/http.rs`, before the 405 fallback. The socket and the TCP
+port share that router, so the CLI and the web UI see the route at once.
+Adding one needs no `API_VERSION` bump, because an older daemon answers it
+with `not_found`.
 
 ### Output
 
