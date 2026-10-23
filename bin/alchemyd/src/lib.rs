@@ -7,7 +7,10 @@
 //!   and the Tauri shell, and
 //! - a local IPC socket ([`ipc`]), used by the `alchemy` CLI and
 //!   `alchemy-helper`.
+//!
+//! It talks to the Docker engine through [`engine`].
 
+pub mod engine;
 pub mod http;
 pub mod ipc;
 mod secure_fs;
