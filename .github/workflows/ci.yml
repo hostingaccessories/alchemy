@@ -3,8 +3,10 @@ name: CI
 on:
   pull_request:
     branches: [main]
-  push:
-    branches: [main]
+
+  # Intentionally skipping main
+  # push:
+  #   branches: [main]
 
 permissions:
   contents: read
