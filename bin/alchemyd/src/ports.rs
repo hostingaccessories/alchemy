@@ -299,6 +299,7 @@ mod tests {
             services: Vec::new(),
             problems: Vec::new(),
             stop_reason: StopReason::default(),
+            addresses: Vec::new(),
         }
     }
 

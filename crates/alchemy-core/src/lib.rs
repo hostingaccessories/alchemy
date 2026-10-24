@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod network;
 pub mod operation;
 pub mod ports;
+pub mod route;
 pub mod stack;
 
 pub use stack::{StackName, StackNameError};

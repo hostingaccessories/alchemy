@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Release build smoke test: build the web UI and release binaries, run
 # alchemyd on a throwaway socket, port, and state directory, and check the
-# daemon, embedded UI, CLI, and helper end to end.
+# daemon, embedded UI, CLI, helper, and web address proxy end to end.
 #
 # Usage: scripts/release-smoke.sh
 #   SMOKE_PORT  HTTP port for the test daemon (default 17240)
@@ -177,8 +177,8 @@ done
 history="$(curl -fsS --unix-socket "$socket" 'http://localhost/api/metrics/history?range=1h')" \
   || fail "GET /api/metrics/history on ${socket} failed"
 [[ "$history" == *'"points":[{"t":'* ]] || fail "no stored metrics point: ${history}"
-"${bin}/alchemy" --socket "$socket" machine stats | grep -q '^Memory ' \
-  || fail "alchemy machine stats did not show memory"
+stats="$("${bin}/alchemy" --socket "$socket" machine stats)" || fail "alchemy machine stats failed"
+grep -q '^Memory ' <<<"$stats" || fail "alchemy machine stats did not show memory: ${stats}"
 
 log "Checking operations on the socket"
 operations="$(curl -fsS --unix-socket "$socket" http://localhost/api/operations)" \
@@ -204,6 +204,63 @@ done
 [[ "$apps" == *"\"path\":\"${apps_dir}\""* ]] || fail "app list does not search ${apps_dir}: ${apps}"
 [[ "$apps" == *'"apps":[]'* ]] || fail "an empty app home listed apps: ${apps}"
 [[ "$apps" == *'"reason":"invalid_name"'* ]] || fail "Not_An_App was not reported as skipped: ${apps}"
+
+log "Checking the web address proxy"
+engine_state=""
+for _ in $(seq 1 50); do
+  engine_state="$(curl -fsS --unix-socket "$socket" http://localhost/api/engine | jq -r .state)" \
+    || fail "GET /api/engine on ${socket} failed"
+  [[ "$engine_state" == ready ]] && break
+  sleep 0.2
+done
+if [[ "$engine_state" != ready ]]; then
+  log "Docker is ${engine_state}; skipping the proxy, which routes nothing without it"
+else
+  mkdir -p "${apps_dir}/smokeweb"
+  printf 'services:\n  web:\n    image: busybox:1.37.0\n    ports:\n      - "127.0.0.1::80"\n' \
+    >"${apps_dir}/smokeweb/compose.yaml"
+  proxy_port=""
+  for _ in $(seq 1 100); do
+    network="$(curl -fsS --unix-socket "$socket" http://localhost/api/network)" \
+      || fail "GET /api/network on ${socket} failed"
+    proxy_port="$(jq -r '.proxy.ports[] | select(.app == "smokeweb" and .state == "listening") | .port' <<<"$network")"
+    [[ -n "$proxy_port" ]] && break
+    sleep 0.2
+  done
+  [[ -n "$proxy_port" ]] || fail "the proxy is not listening for smokeweb: $(jq -c .proxy <<<"$network")"
+  ((proxy_port >= 8100 && proxy_port <= 8999)) || fail "smokeweb's proxy port ${proxy_port} is outside 8100-8999"
+  [[ "$proxy_port" != "$port" ]] || fail "the proxy took the API's port"
+  stopped_code="$(curl -sS -o "${tmp}/stopped.html" -w '%{http_code}' "http://127.0.0.1:${proxy_port}/api/health")" \
+    || fail "GET on the proxy port ${proxy_port} failed"
+  [[ "$stopped_code" == 503 ]] || fail "a stopped app's proxy port answered ${stopped_code}, expected 503"
+  grep -qF "This app isn't running." "${tmp}/stopped.html" \
+    || fail "the proxy port ${proxy_port} did not explain the app is stopped: $(cat "${tmp}/stopped.html")"
+  # A program bound to 127.0.0.1:80 shadows alchemyd's 0.0.0.0:80 there,
+  # so ask on the LAN address the app's own URL names when it has one.
+  smoke_url="$(curl -fsS --unix-socket "$socket" http://localhost/api/apps \
+    | jq -r '.apps[] | select(.name == "smokeweb") | .addresses[]? | select(.kind == "port") | .url')"
+  lan_host="${smoke_url#http://}"
+  lan_host="${lan_host%%:*}"
+  [[ -n "$lan_host" ]] || fail "smokeweb has no port address"
+  host_state="$(jq -r .proxy.host.state <<<"$network")"
+  if [[ "$host_state" == listening ]]; then
+    for name in nope.localhost localhost "127.0.0.1:${port}"; do
+      unknown_code="$(curl -sS -o "${tmp}/unknown.html" -w '%{http_code}' \
+        -H "Host: ${name}" -H "$bearer" "http://${lan_host}:80/api/health")" \
+        || fail "GET /api/health with Host ${name} on ${lan_host}:80 failed"
+      if grep -q '"ok"' "${tmp}/unknown.html"; then
+        fail "Host ${name} on ${lan_host}:80 reached the API"
+      fi
+      if ! grep -qF 'Alchemy has no app at this address.' "${tmp}/unknown.html"; then
+        log "Something else answers ${lan_host}:80, such as a firewall redirect: $(head -c 200 "${tmp}/unknown.html"); skipping the unknown Host check"
+        break
+      fi
+      [[ "$unknown_code" == 404 ]] || fail "Host ${name} on ${lan_host}:80 returned ${unknown_code}, expected 404"
+    done
+  else
+    log "Port 80 is ${host_state} ($(jq -r '.proxy.host.message // "no reason given"' <<<"$network")); skipping the unknown Host check"
+  fi
+fi
 
 log "Checking embedded web UI"
 index="$(curl -fsS "${base}/")" || fail "GET / failed (web UI not embedded?)"

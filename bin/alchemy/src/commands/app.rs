@@ -13,7 +13,9 @@ pub mod logs;
 pub mod show;
 pub mod stats;
 
-use alchemy_api::apps::{AppService, ContainerState, StackStatus, StopReason};
+use alchemy_api::apps::{
+    AddressState, AppAddress, AppService, ContainerState, StackStatus, StopReason,
+};
 use alchemy_core::StackName;
 
 /// Arguments to `alchemy app`.
@@ -207,6 +209,22 @@ fn reason_words(reason: StopReason) -> String {
     chars.next().map_or_else(String::new, |first| {
         first.to_lowercase().chain(chars).collect()
     })
+}
+
+/// Whether an address answers, in words, with why not when it doesn't,
+/// such as `not running: Service web isn't running.`
+pub(crate) fn address_status(address: &AppAddress) -> String {
+    let word = match address.state {
+        AddressState::Ready => "ready",
+        AddressState::Pending => "starting",
+        AddressState::NotRunning => "not running",
+        AddressState::Unavailable => "unavailable",
+        _ => "unknown",
+    };
+    match address.message.as_deref() {
+        Some(message) if address.state != AddressState::Ready => format!("{word}: {message}"),
+        _ => word.to_owned(),
+    }
 }
 
 /// Whether any of `service`'s containers is running.

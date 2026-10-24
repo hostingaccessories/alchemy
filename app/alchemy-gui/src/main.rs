@@ -2,14 +2,16 @@
 //!
 //! A thin Tauri wrapper around the bundled `alchemy-web` UI. All state
 //! lives in `alchemyd`; the UI talks to it over HTTP. This crate only
-//! adds native affordances (single instance, opening `https:` links in the
-//! default browser, remembering the window's size and position, and later a
-//! tray and daemon lifecycle management), and hands the UI the token that
-//! signs it in to alchemyd's TCP listener ([`daemon_token`]).
+//! adds native affordances (single instance, opening links and apps' web
+//! addresses in the default browser, remembering the window's size and
+//! position, and later a tray and daemon lifecycle management), and hands
+//! the UI the token that signs it in to alchemyd's TCP listener
+//! ([`daemon_token`]).
 //!
-//! Links open only through the UI's `openExternal`, which the capability
-//! scopes to `https:`. The opener plugin's own click handler is off, so no
-//! second path opens URLs behind it.
+//! URLs open only through the UI's `openExternal` (`https:`) and
+//! `openAddress` (an app's `http:` address from alchemyd), and the
+//! capability scopes the opener to those two schemes. The opener plugin's
+//! own click handler is off, so no second path opens URLs behind it.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 

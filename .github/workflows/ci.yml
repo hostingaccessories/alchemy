@@ -97,6 +97,14 @@ jobs:
           HOME_NET_SKIP_BUILD: "1"
         run: scripts/home-network.sh
 
+      # Reuses the smoke test's release build; grants port 80 with setcap.
+      - name: Web-address test
+        if: runner.os == 'Linux'
+        env:
+          WEB_ADDR_SKIP_BUILD: "1"
+          WEB_ADDR_SETCAP: "1"
+        run: scripts/web-address.sh
+
   cargo-deny:
     name: Cargo deny
     runs-on: ubuntu-24.04

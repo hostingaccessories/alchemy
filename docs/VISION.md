@@ -48,8 +48,10 @@ A Docker Compose management platform that:
    Dockerfiles.
 3. **Gives every app a web address automatically**, through a managed
    reverse proxy.
-4. **Handles ports.** Web apps need no published ports. Ports that must be
-   published are chosen and conflict-checked by Alchemy.
+4. **Handles ports.** On a native Linux engine, web apps need no published
+   ports. Docker Desktop only lets the host reach published ports, so there
+   an app's web port must be published. Ports that must be published are
+   chosen and conflict-checked by Alchemy.
 5. **Explains problems in plain language.** When an app doesn't open,
    Alchemy finds the first broken link (container, network, proxy, name,
    certificate, firewall) and says what to do about it.

@@ -9,11 +9,11 @@ use alchemy_core::ports::Listener;
 use futures_util::future::BoxFuture;
 use sysinfo::Networks;
 
-use super::{HostNetwork, NetworkError, Route, lan_subnets_from, unique};
+use super::{HostNetwork, LanAddress, NetworkError, Route, lan_addresses_from, unique};
 
 /// The real [`HostNetwork`].
 ///
-/// LAN subnets come from `sysinfo`. On Linux, routes and sockets are read
+/// LAN addresses and subnets come from `sysinfo`. On Linux, routes and sockets are read
 /// from `/proc/net`, and owners are found by matching socket inodes in
 /// `/proc/<pid>/fd`, which shows only this user's processes unless the
 /// daemon runs as root. On macOS they come from `/usr/sbin/netstat`,
@@ -67,10 +67,24 @@ impl Default for SystemNetwork {
 
 impl HostNetwork for SystemNetwork {
     fn lan_subnets(&self) -> BoxFuture<'_, Result<Vec<Ipv4Net>, NetworkError>> {
+        Box::pin(async {
+            let mut subnets: Vec<Ipv4Net> = self
+                .lan_addresses()
+                .await?
+                .into_iter()
+                .map(|address| address.subnet)
+                .collect();
+            subnets.sort_unstable();
+            subnets.dedup();
+            Ok(subnets)
+        })
+    }
+
+    fn lan_addresses(&self) -> BoxFuture<'_, Result<Vec<LanAddress>, NetworkError>> {
         Box::pin(self.bounded("reading interface addresses", async {
             tokio::task::spawn_blocking(|| {
                 let networks = Networks::new_with_refreshed_list();
-                lan_subnets_from(networks.iter().flat_map(|(name, data)| {
+                lan_addresses_from(networks.iter().flat_map(|(name, data)| {
                     data.ip_networks()
                         .iter()
                         .map(move |ip| (name.as_str(), ip.addr, ip.prefix))

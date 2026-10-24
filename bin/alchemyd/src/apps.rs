@@ -32,7 +32,7 @@ pub use assemble::{ConfigOutcome, Inputs, app_list};
 pub use disk::{AppDisk, FileRead, ReadOutcome, SystemDisk};
 pub use edit::{AppEditor, EditError, content_hash};
 pub use fs::{AppFs, FakeFs, SystemFs};
-pub use monitor::{AppsDeps, DEFAULT_SCAN_INTERVAL, run};
+pub use monitor::{AppsDeps, DEFAULT_SCAN_INTERVAL, load_settings, run};
 
 use alchemy_api::apps::{App, AppList};
 

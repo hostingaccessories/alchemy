@@ -175,6 +175,7 @@ mod tests {
                 .collect(),
             problems: vec![],
             stop_reason: StopReason::default(),
+            addresses: vec![],
         }
     }
 

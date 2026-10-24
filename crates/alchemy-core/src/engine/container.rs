@@ -1,6 +1,7 @@
 //! Containers as seen through the Engine API and its event stream.
 
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 
@@ -107,6 +108,11 @@ pub struct ContainerStatus {
     /// Empty while it is not running, and left off the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PublishedPort>,
+    /// Its IPv4 address on each network it has joined, by network name,
+    /// from the engine's container listing. Empty while it is not running,
+    /// and left off the wire when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub networks: BTreeMap<String, Ipv4Addr>,
     /// The history `stop_reason` is decided from. Not on the wire.
     #[serde(skip)]
     trail: Trail,
@@ -126,6 +132,7 @@ impl ContainerStatus {
             health: None,
             stop_reason: stop_reason(state, &Trail::default(), None),
             ports: Vec::new(),
+            networks: BTreeMap::new(),
             trail: Trail::default(),
         }
     }
@@ -176,6 +183,11 @@ pub enum ContainerAction {
     Rename,
     /// A healthcheck reported a new result.
     Health(Health),
+    /// The container joined a network. Docker reports this as a network
+    /// event, not a container one.
+    NetworkConnect,
+    /// The container left a network, also a network event.
+    NetworkDisconnect,
 }
 
 impl ContainerAction {
@@ -185,7 +197,13 @@ impl ContainerAction {
             Self::Start | Self::Restart | Self::Unpause => Some(ContainerState::Running),
             Self::Pause => Some(ContainerState::Paused),
             Self::Stop | Self::Die => Some(ContainerState::Exited),
-            Self::Kill | Self::Oom | Self::Destroy | Self::Rename | Self::Health(_) => None,
+            Self::Kill
+            | Self::Oom
+            | Self::Destroy
+            | Self::Rename
+            | Self::Health(_)
+            | Self::NetworkConnect
+            | Self::NetworkDisconnect => None,
         }
     }
 }
@@ -216,6 +234,19 @@ pub fn parse_action(action: &str) -> Option<ContainerAction> {
         "unpause" => Some(ContainerAction::Unpause),
         "destroy" => Some(ContainerAction::Destroy),
         "rename" => Some(ContainerAction::Rename),
+        _ => None,
+    }
+}
+
+/// Parse a network event's `Action` string into what it did to the
+/// container in its `container` attribute.
+///
+/// Only `connect` and `disconnect` concern a container; `create`,
+/// `destroy`, and the rest are `None`.
+pub fn parse_network_action(action: &str) -> Option<ContainerAction> {
+    match action.trim() {
+        "connect" => Some(ContainerAction::NetworkConnect),
+        "disconnect" => Some(ContainerAction::NetworkDisconnect),
         _ => None,
     }
 }
@@ -317,18 +348,24 @@ impl Containers {
         changed
     }
 
-    /// Take the ports of each container in `listed` whose state still
-    /// matches the one known. Returns whether any changed.
+    /// Take the ports and network addresses of each container in
+    /// `listed` whose state still matches the one known. Returns whether
+    /// any changed.
     ///
-    /// Events carry no ports, so a container started after the last full
-    /// listing learns them from a later one. Nothing else is taken from
-    /// it, and a container whose state has moved on since is left alone,
-    /// so a listing that raced an event cannot undo it.
-    pub fn update_ports(&mut self, listed: impl IntoIterator<Item = ContainerStatus>) -> bool {
+    /// Events carry neither, so a container started or connected to a
+    /// network after the last full listing learns them from a later one.
+    /// Nothing else is taken from it, and a container whose state has
+    /// moved on since is left alone, so a listing that raced an event
+    /// cannot undo it.
+    pub fn update_listed(&mut self, listed: impl IntoIterator<Item = ContainerStatus>) -> bool {
         listed.into_iter().fold(false, |changed, fresh| {
             match self.by_id.get_mut(&fresh.id) {
-                Some(known) if known.state == fresh.state && known.ports != fresh.ports => {
+                Some(known)
+                    if known.state == fresh.state
+                        && (known.ports != fresh.ports || known.networks != fresh.networks) =>
+                {
                     known.ports = fresh.ports;
+                    known.networks = fresh.networks;
                     true
                 }
                 _ => changed,
@@ -482,6 +519,7 @@ fn transition(status: &mut ContainerStatus, action: ContainerAction) {
         status.state = state;
         if !matches!(state, ContainerState::Running | ContainerState::Paused) {
             status.ports.clear();
+            status.networks.clear();
         }
     }
 }
@@ -803,12 +841,12 @@ mod tests {
     }
 
     #[test]
-    fn update_ports_takes_only_ports_of_containers_in_the_same_state() {
+    fn update_listed_takes_only_ports_of_containers_in_the_same_state() {
         let mut containers = Containers::new();
         containers.replace_all([running("a"), running("b"), running("c")]);
         containers.apply(&ContainerEvent::new("b", ContainerAction::Die));
 
-        let changed = containers.update_ports([
+        let changed = containers.update_listed([
             publishing("a", ContainerState::Running, "8080"),
             publishing("b", ContainerState::Running, "9090"),
             publishing("x", ContainerState::Running, "7070"),
@@ -823,7 +861,88 @@ mod tests {
         assert_eq!(ports("b"), Some(vec![]), "stopped since the listing");
         assert_eq!(ports("c"), Some(vec![]), "not listed");
         assert_eq!(ports("x"), None, "unknown containers are not added");
-        assert!(!containers.update_ports([publishing("a", ContainerState::Running, "8080")]));
+        assert!(!containers.update_listed([publishing("a", ContainerState::Running, "8080")]));
+    }
+
+    fn joined(id: &str, state: ContainerState, ip: &str) -> ContainerStatus {
+        let mut status = ContainerStatus::new(id, id, state);
+        status
+            .networks
+            .insert("alchemy".to_owned(), ip.parse().unwrap());
+        status
+    }
+
+    #[test]
+    fn update_listed_takes_network_addresses() {
+        let mut containers = Containers::new();
+        containers.replace_all([running("a"), running("b")]);
+        containers.apply(&ContainerEvent::new("b", ContainerAction::Stop));
+        assert!(containers.update_listed([
+            joined("a", ContainerState::Running, "172.30.0.2"),
+            joined("b", ContainerState::Running, "172.30.0.3"),
+        ]));
+        let ip = |containers: &Containers, id: &str| {
+            containers.get(id).unwrap().networks.get("alchemy").copied()
+        };
+        assert_eq!(ip(&containers, "a"), Some("172.30.0.2".parse().unwrap()));
+        assert_eq!(ip(&containers, "b"), None, "stopped since the listing");
+        assert!(!containers.update_listed([joined("a", ContainerState::Running, "172.30.0.2")]));
+        assert!(containers.update_listed([running("a")]), "disconnected");
+        assert_eq!(ip(&containers, "a"), None);
+    }
+
+    #[test]
+    fn network_events_change_nothing_a_client_sees() {
+        let mut containers = Containers::new();
+        containers.replace_all([joined("a", ContainerState::Running, "172.30.0.2")]);
+        for action in [
+            ContainerAction::NetworkConnect,
+            ContainerAction::NetworkDisconnect,
+        ] {
+            assert!(
+                !containers.apply(&ContainerEvent::new("a", action)),
+                "{action:?}"
+            );
+            assert!(
+                !containers.apply(&ContainerEvent::new("x", action)),
+                "{action:?}"
+            );
+        }
+        assert_eq!(containers.len(), 1, "unknown containers are not added");
+        assert_eq!(containers.get("a").unwrap().state, ContainerState::Running);
+    }
+
+    #[test]
+    fn parse_network_action_recognises_connects() {
+        let cases = [
+            ("connect", Some(ContainerAction::NetworkConnect)),
+            (" disconnect ", Some(ContainerAction::NetworkDisconnect)),
+            ("create", None),
+            ("destroy", None),
+            ("remove", None),
+            ("start", None),
+            ("", None),
+        ];
+        for (action, want) in cases {
+            assert_eq!(parse_network_action(action), want, "{action:?}");
+        }
+    }
+
+    #[test]
+    fn networks_are_on_the_wire_only_when_joined() {
+        let status = joined("abc", ContainerState::Running, "172.30.0.2");
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json["networks"],
+            serde_json::json!({"alchemy": "172.30.0.2"})
+        );
+        assert_eq!(
+            serde_json::from_value::<ContainerStatus>(json).unwrap(),
+            status
+        );
+        let bare = ContainerStatus::new("abc", "web-1", ContainerState::Running);
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json.get("networks").is_none(), "{json}");
     }
 
     #[test]
@@ -837,13 +956,15 @@ mod tests {
         ];
         for (action, kept) in cases {
             let mut containers = Containers::new();
-            containers.replace_all([publishing("a", ContainerState::Running, "8080")]);
+            let mut status = publishing("a", ContainerState::Running, "8080");
+            status
+                .networks
+                .insert("alchemy".to_owned(), "172.30.0.2".parse().unwrap());
+            containers.replace_all([status]);
             containers.apply(&ContainerEvent::new("a", action));
-            assert_eq!(
-                containers.get("a").unwrap().ports.is_empty(),
-                !kept,
-                "{action:?}"
-            );
+            let after = containers.get("a").unwrap();
+            assert_eq!(after.ports.is_empty(), !kept, "{action:?}");
+            assert_eq!(after.networks.is_empty(), !kept, "{action:?}");
         }
     }
 

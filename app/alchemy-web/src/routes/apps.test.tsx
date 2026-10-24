@@ -1,4 +1,5 @@
 import { act, cleanup, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import type { App, AppList, MetricsResponse } from "../lib/api.ts";
@@ -298,6 +299,93 @@ describe("App", () => {
     ).toBeTruthy();
     expect(within(problems).getByText(overlap)).toBeTruthy();
     expect(within(problems).getByText("A port this app publishes is already taken")).toBeTruthy();
+  });
+
+  it("opens the app at its best ready address and lists every address", async () => {
+    const open = vi.fn();
+    vi.stubGlobal("open", open);
+    const address = (
+      kind: "host" | "port",
+      url: string,
+      state: "ready" | "pending" | "not_running" | "unavailable",
+      message: string | null,
+    ) => ({ kind, url, state, service: "web", port: 80, message });
+    apps = {
+      ...full,
+      apps: [
+        {
+          ...blog,
+          addresses: [
+            address(
+              "host",
+              "http://blog.localhost/",
+              "unavailable",
+              "Alchemy doesn't have permission to listen on port 80.",
+            ),
+            address("port", "http://192.168.1.20:8100/", "ready", null),
+          ],
+        },
+      ],
+    };
+    await renderAt("/apps/blog");
+    const header = screen.getByRole("banner");
+    const button = await within(header).findByRole("link", { name: "Open blog" });
+    expect(button.getAttribute("href")).toBe("http://192.168.1.20:8100/");
+    await userEvent.setup().click(button);
+    expect(open).toHaveBeenCalledWith("http://192.168.1.20:8100/", "_blank", "noopener,noreferrer");
+
+    const details = screen.getByRole("heading", { name: "Where it lives" }).parentElement!;
+    expect(within(details).getByText("Addresses")).toBeTruthy();
+    const links = within(details).getAllByRole("link");
+    expect(links.map((link) => link.getAttribute("href"))).toEqual([
+      "http://blog.localhost/",
+      "http://192.168.1.20:8100/",
+    ]);
+    expect(
+      within(details).getByText("Alchemy doesn't have permission to listen on port 80."),
+    ).toBeTruthy();
+  });
+
+  it("offers no Open button until an address answers", async () => {
+    apps = {
+      ...full,
+      apps: [
+        {
+          ...blog,
+          addresses: [
+            {
+              kind: "host",
+              url: "http://blog.localhost/",
+              state: "not_running",
+              service: "web",
+              port: 80,
+              message: "Service web isn't running.",
+            },
+          ],
+        },
+      ],
+    };
+    await renderAt("/apps/blog");
+    expect(await screen.findByText("Service web isn't running.")).toBeTruthy();
+    expect(within(screen.getByRole("banner")).queryByRole("link")).toBeNull();
+    expect(screen.getByText("Address")).toBeTruthy();
+  });
+
+  it("says what to add when the app has no web address", async () => {
+    const unpublished =
+      "Publish port 80 of service web to reach this app. This Docker engine only lets the host reach published ports.";
+    apps = {
+      ...full,
+      apps: [{ ...blog, problems: [{ kind: "route", message: unpublished }] }],
+    };
+    await renderAt("/apps/blog");
+    const problems = await screen.findByRole("region", { name: "Problems" });
+    expect(
+      within(problems).getByText("Something is wrong with this app's web address"),
+    ).toBeTruthy();
+    expect(within(problems).getByText(unpublished)).toBeTruthy();
+    expect(screen.getByText("None. The problem above says why.")).toBeTruthy();
+    expect(within(screen.getByRole("banner")).queryByRole("link")).toBeNull();
   });
 
   it("says when there's no such app", async () => {

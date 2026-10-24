@@ -1006,7 +1006,7 @@ async fn apps_are_found_in_the_folder_the_settings_name() {
 
     let out = run_args(&daemon.socket, &["app", "list"]).await.unwrap();
     assert!(
-        out.starts_with("NAME  STATUS   SERVICES  FOLDER\nblog  unknown  -"),
+        out.starts_with("NAME  STATUS   SERVICES  ADDRESS  FOLDER\nblog  unknown  -         -"),
         "{out}"
     );
     let out = run_args(&daemon.socket, &["app", "show", "blog", "--json"])

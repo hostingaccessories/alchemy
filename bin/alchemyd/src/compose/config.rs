@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use alchemy_core::network::Ipv4Net;
 use alchemy_core::ports::{PortRange, Protocol, PublishedPort};
+use alchemy_core::route::{ExposedPort, XAlchemy, XAlchemyBlock};
 use futures_util::future::BoxFuture;
 use rustix::process::Signal;
 use serde::Deserialize;
@@ -38,6 +39,10 @@ pub struct ComposeConfig {
     /// The networks its services use, by key. Compose leaves out the ones
     /// no service uses.
     pub networks: Vec<NetworkConfig>,
+    /// The top-level `x-alchemy` block, or `None` when there is none. A
+    /// block of the wrong shape is kept as unreadable, for planning to
+    /// report.
+    pub x_alchemy: Option<XAlchemyBlock>,
 }
 
 /// One service of a [`ComposeConfig`].
@@ -53,6 +58,15 @@ pub struct ServiceConfig {
     /// The keys of the [`ComposeConfig::networks`] it joins, sorted. Empty
     /// for a service with a `network_mode`.
     pub networks: Vec<String>,
+    /// The container ports it `expose`s without publishing, in the order
+    /// Compose lists them.
+    pub expose: Vec<ExposedPort>,
+    /// Its own `x-alchemy` block, as for [`ComposeConfig::x_alchemy`].
+    ///
+    /// Compose 5.5 leaves service extensions out of `config --format
+    /// json` (its YAML keeps them), so this is `None` in practice; only
+    /// the top-level block reaches Alchemy today.
+    pub x_alchemy: Option<XAlchemyBlock>,
 }
 
 /// One network of a [`ComposeConfig`].
@@ -77,6 +91,8 @@ struct RawConfig {
     services: BTreeMap<String, RawService>,
     #[serde(default)]
     networks: BTreeMap<String, Lenient<Option<RawNetwork>>>,
+    #[serde(default, rename = "x-alchemy")]
+    x_alchemy: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -87,6 +103,10 @@ struct RawService {
     ports: Option<Lenient<Vec<Lenient<RawPort>>>>,
     #[serde(default)]
     networks: Option<Lenient<RawServiceNetworks>>,
+    #[serde(default)]
+    expose: Option<Lenient<Vec<Lenient<RawPorts>>>>,
+    #[serde(default, rename = "x-alchemy")]
+    x_alchemy: Option<serde_json::Value>,
 }
 
 /// A value Alchemy reads if it can and skips if it can't, so a shape it
@@ -178,6 +198,27 @@ impl RawPorts {
     fn is_empty(&self) -> bool {
         matches!(self, Self::Text(text) if text.trim().is_empty())
     }
+
+    /// An `expose` entry: `80`, `"80"`, `"8000-8010"`, or `"53/udp"`.
+    fn exposed(&self) -> Option<ExposedPort> {
+        match self {
+            Self::Number(_) => Some(ExposedPort {
+                ports: self.range()?,
+                protocol: Protocol::Tcp,
+            }),
+            Self::Text(text) => text.parse().ok(),
+        }
+    }
+}
+
+/// An `x-alchemy` value as [`XAlchemyBlock`]: read, or unreadable with
+/// the reason. `null` counts as no block.
+fn x_alchemy_block(value: Option<serde_json::Value>) -> Option<XAlchemyBlock> {
+    let value = value.filter(|value| !value.is_null())?;
+    Some(match serde_json::from_value::<XAlchemy>(value) {
+        Ok(block) => XAlchemyBlock::Read(block),
+        Err(error) => XAlchemyBlock::Unreadable(error.to_string()),
+    })
 }
 
 impl RawPort {
@@ -254,8 +295,10 @@ impl RawNetwork {
 impl ComposeConfig {
     /// Parse the output of `docker compose config --format json`.
     ///
-    /// A port, network, or `ipam` entry in a shape Alchemy can't read is
-    /// left out rather than failing the whole configuration.
+    /// A port, `expose`, network, or `ipam` entry in a shape Alchemy
+    /// can't read is left out rather than failing the whole
+    /// configuration. An `x-alchemy` block of the wrong shape is kept as
+    /// [`XAlchemyBlock::Unreadable`], so the user hears about it.
     pub fn parse(json: &[u8]) -> Result<Self, serde_json::Error> {
         let raw: RawConfig = serde_json::from_slice(json)?;
         Ok(Self {
@@ -278,6 +321,14 @@ impl ComposeConfig {
                         .and_then(Lenient::ok)
                         .map(RawServiceNetworks::keys)
                         .unwrap_or_default(),
+                    expose: service
+                        .expose
+                        .and_then(Lenient::ok)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|port| port.ok()?.exposed())
+                        .collect(),
+                    x_alchemy: x_alchemy_block(service.x_alchemy),
                 })
                 .collect(),
             networks: raw
@@ -285,6 +336,7 @@ impl ComposeConfig {
                 .into_iter()
                 .map(|(key, network)| network.ok().flatten().unwrap_or_default().config(key))
                 .collect(),
+            x_alchemy: x_alchemy_block(raw.x_alchemy),
         })
     }
 
@@ -877,6 +929,105 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn parses_exposed_ports() {
+        let config = ComposeConfig::parse(PORTS_AND_NETWORKS.as_bytes()).unwrap();
+        assert_eq!(
+            service(&config, "plain").expose,
+            [ExposedPort {
+                protocol: Protocol::Tcp,
+                ports: PortRange::single(6379).unwrap(),
+            }]
+        );
+        assert_eq!(service(&config, "web").expose, []);
+    }
+
+    #[test]
+    fn reads_each_expose_entry_leniently() {
+        let exposed = |protocol, ports: &str| ExposedPort {
+            protocol,
+            ports: ports.parse().unwrap(),
+        };
+        let cases: [(&str, Option<ExposedPort>); 11] = [
+            (r#""80""#, Some(exposed(Protocol::Tcp, "80"))),
+            ("80", Some(exposed(Protocol::Tcp, "80"))),
+            (
+                r#"" 8000-8010 ""#,
+                Some(exposed(Protocol::Tcp, "8000-8010")),
+            ),
+            (r#""53/udp""#, Some(exposed(Protocol::Udp, "53"))),
+            (r#""53/UDP""#, Some(exposed(Protocol::Udp, "53"))),
+            (r#""9000/tcp""#, Some(exposed(Protocol::Tcp, "9000"))),
+            (r#""9000/sctp""#, None),
+            (r#""0""#, None),
+            ("70000", None),
+            (r#""web""#, None),
+            (r#"{"target":80}"#, None),
+        ];
+        for (raw, want) in cases {
+            let json = format!(r#"{{"name":"a","services":{{"web":{{"expose":[{raw}]}}}}}}"#);
+            let config = ComposeConfig::parse(json.as_bytes()).unwrap();
+            assert_eq!(
+                config.services[0].expose,
+                want.into_iter().collect::<Vec<_>>(),
+                "{raw}"
+            );
+        }
+        let odd = ComposeConfig::parse(br#"{"name":"a","services":{"web":{"expose":"80"}}}"#);
+        assert_eq!(odd.unwrap().services[0].expose, []);
+    }
+
+    /// Extensions pass through as written. Compose 5.5 prints the
+    /// top-level block and drops per-service ones from its JSON, but a
+    /// version that keeps them is read the same way.
+    #[test]
+    fn keeps_x_alchemy_blocks_as_written() {
+        let json = br#"{
+            "name": "blog",
+            "x-alchemy": {"service": "web", "port": 8080, "hostname": "blog"},
+            "x-other": {"ignored": true},
+            "services": {
+                "web": {"image": "nginx", "x-alchemy": {"port": "80"}},
+                "db": {"image": "postgres", "x-alchemy": null},
+                "odd": {"image": "redis", "x-alchemy": ["not", "a", "map"]},
+                "bad": {"image": "redis", "x-alchemy": {"port": "http"}},
+                "plain": {"image": "redis"}
+            }
+        }"#;
+        let config = ComposeConfig::parse(json).unwrap();
+        assert_eq!(
+            config.x_alchemy,
+            Some(XAlchemyBlock::Read(XAlchemy {
+                service: Some("web".into()),
+                port: Some(8080),
+                hostname: Some("blog".into()),
+            }))
+        );
+        assert_eq!(
+            service(&config, "web").x_alchemy,
+            Some(XAlchemyBlock::Read(XAlchemy {
+                port: Some(80),
+                ..XAlchemy::default()
+            }))
+        );
+        assert_eq!(service(&config, "db").x_alchemy, None);
+        for name in ["odd", "bad"] {
+            assert!(
+                matches!(
+                    &service(&config, name).x_alchemy,
+                    Some(XAlchemyBlock::Unreadable(reason)) if !reason.is_empty()
+                ),
+                "{name}: {:?}",
+                service(&config, name).x_alchemy
+            );
+        }
+        assert_eq!(service(&config, "plain").x_alchemy, None);
+        assert_eq!(
+            ComposeConfig::parse(br#"{"name":"a"}"#).unwrap().x_alchemy,
+            None
+        );
     }
 
     #[test]

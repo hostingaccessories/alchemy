@@ -69,6 +69,24 @@ export function externalUrl(url: string): URL | null {
 }
 
 /**
+ * `url` parsed, if Alchemy may open it as one of an app's web addresses;
+ * otherwise `null`. Apps are served over plain HTTP, so `http:` passes as
+ * well as `https:`. Nothing else does, and neither does a URL that carries
+ * a user name or password.
+ */
+export function addressUrl(url: string): URL | null {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    return parsed.username === "" && parsed.password === "" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Open an `https:` URL in the user's default browser. The desktop shell
  * hands it to the opener plugin, since its webview opens no windows; a
  * browser opens a new tab with no `window.opener` and no referrer. Rejects
@@ -79,6 +97,23 @@ export async function openExternal(url: string): Promise<void> {
   if (!parsed) {
     throw new Error("Only https: links open outside Alchemy");
   }
+  await openParsed(parsed);
+}
+
+/**
+ * Open one of an app's web addresses the way {@link openExternal} opens a
+ * link, accepting `http:` too (see {@link addressUrl}). Rejects any other
+ * URL without opening anything.
+ */
+export async function openAddress(url: string): Promise<void> {
+  const parsed = addressUrl(url);
+  if (!parsed) {
+    throw new Error("Only http: and https: addresses open outside Alchemy");
+  }
+  await openParsed(parsed);
+}
+
+async function openParsed(parsed: URL): Promise<void> {
   if (isTauri()) {
     const { openUrl } = await import("@tauri-apps/plugin-opener");
     await openUrl(parsed.href);

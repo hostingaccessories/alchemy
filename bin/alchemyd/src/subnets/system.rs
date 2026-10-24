@@ -69,6 +69,20 @@ where
             Ok(api.create_network(spec).await?)
         })
     }
+
+    fn connect<'a>(
+        &'a self,
+        endpoint: &'a str,
+        network: &'a str,
+        container: &'a str,
+    ) -> BoxFuture<'a, Result<(), SubnetsError>> {
+        Box::pin(async move {
+            let api = self.connector.api(&Endpoint::parse(endpoint)?)?;
+            Ok(api
+                .connect_network(network.to_owned(), container.to_owned())
+                .await?)
+        })
+    }
 }
 
 /// [`DaemonConfig`] for this host: `/etc/docker/daemon.json` on Linux.

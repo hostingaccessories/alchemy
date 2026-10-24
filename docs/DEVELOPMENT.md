@@ -668,6 +668,99 @@ Warning: Docker's address pool 192.168.0.0/16 overlaps your local network 192.16
   Networks that already exist keep their subnets until they are removed and created again.
 ```
 
+### Web addresses
+
+The daemon runs a reverse proxy in its own process, on listeners of its
+own, never the API's. Each app it can route gets two addresses:
+
+- its own port, reserved in the [port registry](#ports) as `proxy:<app>`
+  from `8100`-`8999` and kept for good, served on every IPv4 address, so
+  `http://<LAN IP>:<port>` works from a phone;
+- `http://<app>.localhost`, routed by `Host` on port 80. The app name
+  becomes a DNS label: lowercased, `_` and other invalid characters turned
+  into `-`, and trimmed. Chrome, Firefox, and curl resolve `*.localhost`
+  to loopback themselves. The proxy listens on IPv4 only, so a client that
+  tries `::1` first falls back to `127.0.0.1`.
+
+Without an `x-alchemy` block, an app is routed when its services have
+exactly one TCP container port between them, counting `expose` and the
+container side of `ports`. A `web` service publishing `8080:80` next to a
+`db` with no ports is routed to port 80 of `web`. Next to a `redis` that
+exposes `6379` it is ambiguous. Anything else is a `route` app problem
+that says what to add, usually this block, at the top level of
+`compose.yaml`:
+
+```yaml
+x-alchemy:
+  service: web # required when the app has more than one service
+  port: 8080 # the container port; optional when web has only one
+  hostname: wiki # optional: wiki.localhost instead of <app>.localhost
+services:
+  web:
+    image: ghcr.io/example/wiki
+```
+
+Compose ignores `x-` keys, so the file still works by hand. Put the block
+at the top level: `docker compose config --format json`, which the daemon
+reads, drops `x-` keys inside a service, so a block there never arrives.
+`hostname` is one label, not `wiki.localhost`. Two apps that want the
+same hostname both lose it, and both get a problem.
+
+How the proxy reaches the container depends on the engine (`reachability`
+in `/api/network`):
+
+- **Docker Engine on Linux** (`container_ip`): the proxy connects to the
+  container's address on the [`alchemy` network](#networks). The daemon
+  attaches every routed container to it, the same as `docker network
+  connect alchemy <container>`, and again whenever the container is
+  recreated. Compose files are never edited, and the app needs no
+  published ports.
+- **Docker Desktop** on macOS or Linux, rootless Docker, and engines
+  Alchemy doesn't recognize (`published_only`): the host can't reach
+  container addresses, so the proxy connects to the port the container
+  publishes, on loopback. The routed port must be published in the
+  compose file, as `8080:80` or `127.0.0.1::80` for any free port.
+  Without it the app gets the problem "Publish port 80 of service web to
+  reach this app."
+
+macOS lets any user listen on port 80. Linux doesn't: when the bind is
+refused, `<app>.localhost` addresses are `unavailable`, `alchemy status`
+prints a warning with the fix, and each app's own port keeps working. To
+grant the capability (again after every rebuild, since it is stored on the
+file):
+
+```sh
+sudo setcap cap_net_bind_service=+ep "$(command -v alchemyd)"
+```
+
+A port 80 that another program holds is tried again every 10 seconds;
+`alchemy machine ports` names the holder. A firewall redirect of port 80,
+which some local development tools install with `pf` on macOS, takes the
+traffic even while alchemyd reports it is listening.
+
+The proxy answers 404 for a `Host` or port with no app, 503 when the app
+isn't running, and 502 when it can't connect, each with a short page that
+names Alchemy. It never routes to the daemon's own addresses, so the API
+and web UI are only on the daemon's port. It sets `X-Forwarded-For`,
+`X-Forwarded-Host`, and `X-Forwarded-Proto` and drops the client's,
+strips `alchemy_session_*` cookies both ways, streams bodies with no size
+limit, and passes WebSockets through. While the daemon is down the
+addresses stop answering; apps keep running and their own published ports
+keep working.
+
+`alchemy app list` shows each app's best address, and `alchemy app show
+NAME` lists them all with why one doesn't answer. In the API they are
+`addresses` on each app (`kind` `host` or `port`, `url`, and `state`
+`ready`, `pending`, `not_running`, or `unavailable` with a `message`), and
+`proxy` in `GET /api/network` reports the port 80 listener and each app
+port. The route planning is in `alchemy_core::route`, the proxy in
+`bin/alchemyd/src/proxy.rs`, and the wiring in
+`bin/alchemyd/src/routing.rs`.
+
+```sh
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/network | jq .proxy
+```
+
 ### Web UI in debug vs release
 
 The daemon serves `app/alchemy-web/dist`. Debug builds read it from disk, so
@@ -743,6 +836,13 @@ checks:
 - `alchemy settings set app-home` points the daemon at an empty temporary
   folder, and `alchemy app list` then lists no apps and reports a folder
   with an invalid name as skipped, all without Docker;
+- when Docker is ready, an app that publishes `127.0.0.1::80` and is never
+  started gets a proxy port from `8100`-`8999` that answers 503, and, when
+  the daemon holds port 80, an unknown `Host` there (even the API's own,
+  with the token) gets the proxy's 404 and never the API. It asks on the
+  LAN address, since a program on `127.0.0.1:80` would answer first, and
+  skips the `Host` check when something else answers port 80. It needs
+  `jq`;
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
 - `alchemy-helper` refuses to run without root;
@@ -806,6 +906,56 @@ apt-get update && apt-get install -y docker.io iproute2 jq
 (dockerd >/var/log/dockerd.log 2>&1 &) && sleep 5
 CI=true scripts/home-network.sh
 ```
+
+### Web-address test
+
+```sh
+WEB_ADDR_CONFIRM=1 scripts/web-address.sh
+```
+
+This proves [web addresses](#web-addresses) on a real Docker Engine, on
+Linux. It writes an app, `webaddr`, whose only service is `busybox` httpd
+with no `ports` or `expose`, routed by a top-level `x-alchemy` block to
+port 80, and serving a CGI script that echoes a random value written into
+it, the container's hostname, and the request it got. It starts
+`alchemyd` with a fresh state directory and app home, brings the app up
+with `alchemy app up`, and checks that:
+
+- the engine is `container_ip`, the app has no problems, and its port
+  address is `ready` on a port from `8100`-`8999` reserved as
+  `proxy:webaddr`, where the proxy is listening;
+- the container publishes nothing and is on the `alchemy` network;
+- `http://127.0.0.1:<port>/` and the advertised `http://<LAN IP>:<port>/`
+  answer with the random value and the container's hostname, from the
+  `alchemy` network's gateway, so through the container's address on it.
+  `Host` is kept, `X-Forwarded-For` is `127.0.0.1` rather than the
+  client's, and the `alchemy_session_*` cookie is gone;
+- on port 80, `Host: webaddr.localhost` reaches the app the same way, and
+  `nope.localhost`, `localhost`, and the API's own host get the proxy's
+  404, never the API;
+- once the app is stopped, its port answers 503.
+
+When port 80 is refused, it checks the warning, the `setcap` fix, and the
+`unavailable` address instead. With `WEB_ADDR_SETCAP=1` it then grants the
+capability with `sudo setcap`, restarts the daemon on the same state
+directory, checks the app kept its port, and runs the port 80 checks too;
+the capability is removed again on exit. Without it, the port 80 checks
+are skipped.
+
+It needs `jq`, `curl`, a user that can reach Docker, and `sudo` for
+`WEB_ADDR_SETCAP=1` (unless run as root). It pulls `busybox:1.37.0`. It
+runs a Compose project named `webaddr`, which it removes on exit, and lets
+the daemon create the `alchemy` network, so it refuses to run unless
+`CI=true` or `WEB_ADDR_CONFIRM=1`. Set `WEB_ADDR_SKIP_BUILD=1` to reuse
+`target/release`. CI runs it on Linux after the home-network test, reusing
+the smoke test's build, with `WEB_ADDR_SETCAP=1`. macOS and Docker Desktop
+are covered by the routing integration tests in
+`bin/alchemyd/tests/routing.rs`.
+
+It can run in the same privileged container as the home-network test, but
+inside Docker Desktop's VM the engine reports a `linuxkit` kernel, so
+alchemyd takes it for Docker Desktop (`published_only`) and the test stops
+at the first check. Use a Linux machine or VM.
 
 ## 6. Layout
 

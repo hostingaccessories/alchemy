@@ -4,7 +4,7 @@ use std::io::Write;
 
 use alchemy_api::apps::{App, Health, ImageSource};
 
-use super::{app_status, columns, path_segment, service_status};
+use super::{address_status, app_status, columns, path_segment, service_status};
 use crate::context::Context;
 use crate::daemon::Daemon;
 use crate::error::ClientError;
@@ -33,7 +33,8 @@ pub(crate) async fn run<D: Daemon, W: Write>(
 }
 
 /// What `alchemy app show` prints: the app's status and where it lives,
-/// its services, and its problems. With `json`, the [`App`] as one line.
+/// its web addresses, its services, and its problems. With `json`, the
+/// [`App`] as one line.
 pub(crate) fn show_lines(app: &App, json: bool) -> Vec<String> {
     if json {
         return vec![serde_json::json!(app).to_string()];
@@ -57,6 +58,15 @@ pub(crate) fn show_lines(app: &App, json: bool) -> Vec<String> {
         ],
         vec!["Images:".into(), images.into()],
     ]));
+    if !app.addresses.is_empty() {
+        lines.push("Addresses:".into());
+        let rows: Vec<Vec<String>> = app
+            .addresses
+            .iter()
+            .map(|address| vec![address.url.clone(), address_status(address)])
+            .collect();
+        lines.extend(columns(&rows).into_iter().map(|row| format!("  {row}")));
+    }
     if !app.services.is_empty() {
         lines.push("Services:".into());
         let rows: Vec<Vec<String>> = app
@@ -116,6 +126,8 @@ mod tests {
                 "Compose file:  compose.yaml",
                 "Project:       blog",
                 "Images:        downloaded",
+                "Addresses:",
+                "  http://192.168.1.20:8100/  not running: Service web isn't running.",
                 "Services:",
                 "  db   running  blog-db-1 (healthy)",
                 "  web  stopped  blog-web-1",
@@ -124,9 +136,46 @@ mod tests {
     }
 
     #[test]
+    fn shows_addresses_and_why_they_do_not_answer() {
+        use alchemy_api::apps::{AddressKind, AddressState, AppAddress};
+        let mut app = blog();
+        let address = |kind, url: &str, state, message: Option<&str>| AppAddress {
+            kind,
+            url: url.into(),
+            state,
+            service: "web".into(),
+            port: 80,
+            message: message.map(Into::into),
+        };
+        app.addresses = vec![
+            address(
+                AddressKind::Port,
+                "http://192.168.1.20:8100/",
+                AddressState::Ready,
+                None,
+            ),
+            address(
+                AddressKind::Host,
+                "http://blog.localhost/",
+                AddressState::Unavailable,
+                Some("Alchemy doesn't have permission to listen on port 80."),
+            ),
+        ];
+        assert_eq!(
+            show_lines(&app, false)[5..8],
+            [
+                "Addresses:",
+                "  http://192.168.1.20:8100/  ready",
+                "  http://blog.localhost/     unavailable: Alchemy doesn't have permission to listen on port 80.",
+            ]
+        );
+    }
+
+    #[test]
     fn says_why_services_are_not_running() {
         use alchemy_api::apps::StopReason;
         let mut app = blog();
+        app.addresses.clear();
         let crashed = StopReason::Crashed {
             exit_code: Some(137),
             oom: true,
@@ -149,6 +198,7 @@ mod tests {
         app.project = None;
         app.images = None;
         app.services = vec![];
+        app.addresses = vec![];
         app.problems = vec![AppProblem {
             kind: AppProblemKind::ComposeUnavailable,
             message: "Alchemy couldn't run Docker Compose".into(),

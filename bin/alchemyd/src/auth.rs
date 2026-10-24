@@ -113,11 +113,15 @@ pub fn cookies<'a>(headers: &'a HeaderMap, name: &'a str) -> impl Iterator<Item 
         })
 }
 
+/// What every session cookie's name starts with. The proxy strips
+/// cookies with this prefix before forwarding a request to an app.
+pub const SESSION_COOKIE_PREFIX: &str = "alchemy_session_";
+
 /// The session cookie's name for a daemon on `port`. Browsers send a
 /// cookie to every port on its host, so two daemons on one machine each
 /// need their own.
 pub fn cookie_name(port: u16) -> String {
-    format!("alchemy_session_{port}")
+    format!("{SESSION_COOKIE_PREFIX}{port}")
 }
 
 /// The `Set-Cookie` value for session `id`.

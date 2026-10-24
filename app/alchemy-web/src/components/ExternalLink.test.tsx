@@ -2,7 +2,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { ExternalLink } from "./ExternalLink.tsx";
+import { AddressLink, ExternalLink } from "./ExternalLink.tsx";
 
 const openUrl = vi.hoisted(() => vi.fn(async (_url: string) => {}));
 
@@ -52,5 +52,35 @@ describe("ExternalLink", () => {
       expect(openUrl).toHaveBeenCalledWith("https://docs.docker.com/get-started/"),
     );
     expect(open).not.toHaveBeenCalled();
+  });
+});
+
+describe("AddressLink", () => {
+  function renderAddress(href: string) {
+    render(<AddressLink href={href}>Open blog</AddressLink>);
+    return screen.getByRole("link", { name: "Open blog" });
+  }
+
+  it("opens an app's http: address in a new tab", async () => {
+    const link = renderAddress("http://blog.localhost/");
+    expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+    await userEvent.setup().click(link);
+    expect(open).toHaveBeenCalledWith("http://blog.localhost/", "_blank", "noopener,noreferrer");
+  });
+
+  it("opens the default browser from the desktop shell", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    await userEvent.setup().click(renderAddress("http://192.168.1.20:8100/"));
+    await vi.waitFor(() => expect(openUrl).toHaveBeenCalledWith("http://192.168.1.20:8100/"));
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("opens nothing for another scheme", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await userEvent.setup().click(renderAddress("file:///etc/passwd"));
+    await vi.waitFor(() => expect(error).toHaveBeenCalled());
+    expect(open).not.toHaveBeenCalled();
+    expect(openUrl).not.toHaveBeenCalled();
+    error.mockRestore();
   });
 });

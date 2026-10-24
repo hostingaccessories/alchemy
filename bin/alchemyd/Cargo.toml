@@ -26,6 +26,9 @@ bollard            = { workspace = true }
 clap               = { workspace = true }
 futures-util       = { workspace = true }
 getrandom          = { workspace = true }
+http-body-util     = { workspace = true }
+hyper              = { workspace = true, features = ["server", "client", "http1"] }
+hyper-util         = { workspace = true, features = ["tokio"] }
 rust-embed         = { workspace = true }
 rusqlite           = { workspace = true }
 rustix             = { workspace = true, features = ["fs"] }

@@ -157,6 +157,30 @@ pub async fn run(
     Monitor::new(deps, state, store).run(shutdown).await;
 }
 
+/// Load the app settings from `store` into `state`, with
+/// [`AppsDeps::default_home`] standing in for an unset home, and return
+/// the folders they name.
+///
+/// [`run`] does this at start, but only once its task is scheduled. The
+/// daemon calls it before serving, so no request sees the settings
+/// before they load.
+pub async fn load_settings(
+    deps: &AppsDeps,
+    state: &State,
+    store: &SharedStore,
+) -> Option<StackDirs> {
+    let stored = match store.setting::<StoredDirs>(SETTINGS_KEY).await {
+        Ok(stored) => stored.unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(error = %error, "app folder settings unreadable; using the defaults");
+            StoredDirs::default()
+        }
+    };
+    let (dirs, settings) = effective(&stored, deps.default_home.as_deref());
+    state.set_app_settings(settings);
+    dirs
+}
+
 struct Monitor {
     deps: AppsDeps,
     state: State,
@@ -192,6 +216,7 @@ impl Monitor {
         let mut containers = self.state.watch_containers();
         let mut engine = self.state.watch_engine();
         let mut network = self.state.watch_network();
+        let mut routing = self.state.watch_routing();
         let mut rescans = self.state.watch_app_rescans();
         self.generation = *rescans.borrow_and_update();
         let mut tick = tokio::time::interval(self.deps.scan_interval);
@@ -217,6 +242,7 @@ impl Monitor {
                 }
                 Ok(()) = containers.changed() => {}
                 Ok(()) = network.changed() => {}
+                Ok(()) = routing.changed() => {}
             }
             if reload {
                 self.load_settings().await;
@@ -235,16 +261,7 @@ impl Monitor {
     }
 
     async fn load_settings(&mut self) {
-        let stored = match self.store.setting::<StoredDirs>(SETTINGS_KEY).await {
-            Ok(stored) => stored.unwrap_or_default(),
-            Err(error) => {
-                tracing::warn!(error = %error, "app folder settings unreadable; using the defaults");
-                StoredDirs::default()
-            }
-        };
-        let (dirs, settings) = effective(&stored, self.deps.default_home.as_deref());
-        self.state.set_app_settings(settings);
-        self.dirs = dirs;
+        self.dirs = load_settings(&self.deps, &self.state, &self.store).await;
     }
 
     /// List every folder and work out the stacks. With `reread`, every
@@ -411,6 +428,7 @@ impl Monitor {
     fn publish(&self) {
         let containers = self.state.containers();
         let network = self.state.network();
+        let routing = self.state.routing();
         let list = app_list(&Inputs {
             discovery: &self.discovery,
             home: self.dirs.as_ref().map(StackDirs::home),
@@ -418,6 +436,7 @@ impl Monitor {
             containers: &containers,
             engine_ready: self.state.engine().state == EngineState::Ready,
             network: &network,
+            routing: &routing.apps,
         });
         self.state.set_app_configs(self.outcomes.clone());
         self.state.set_apps(list);
@@ -716,6 +735,20 @@ mod tests {
         h.state.set_engine(EngineStatus::new(EngineState::Ready));
         let apps = until(&h.state, "blog read", resolved).await;
         assert_eq!(apps.apps[0].problems, []);
+    }
+
+    #[tokio::test]
+    async fn loading_the_settings_publishes_them_without_the_task() {
+        let state = State::new();
+        let store: SharedStore = Arc::new(MemoryStore::new());
+        let deps = AppsDeps::new(
+            Arc::new(FakeFs::new()),
+            Arc::new(FakeComposeConfig::new()),
+            Some(HOME.into()),
+        );
+        let dirs = load_settings(&deps, &state, &store).await.unwrap();
+        assert_eq!(dirs.home(), Path::new(HOME));
+        assert_eq!(state.app_settings().home.as_deref(), Some(HOME));
     }
 
     #[tokio::test]

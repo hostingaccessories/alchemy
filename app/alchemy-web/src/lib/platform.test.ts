@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { apiBase, externalUrl, isTauri, openExternal, setWindowTheme } from "./platform.ts";
+import {
+  addressUrl,
+  apiBase,
+  externalUrl,
+  isTauri,
+  openAddress,
+  openExternal,
+  setWindowTheme,
+} from "./platform.ts";
 
 const tauri = vi.hoisted(() => ({
   openUrl: vi.fn(async (_url: string) => {}),
@@ -78,6 +86,50 @@ describe("openExternal", () => {
       await expect(openExternal(url)).rejects.toThrow("Only https: links open outside Alchemy");
       enterShell();
       await expect(openExternal(url)).rejects.toThrow("Only https: links open outside Alchemy");
+      expect(open).not.toHaveBeenCalled();
+      expect(tauri.openUrl).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe("addressUrl", () => {
+  it.each([
+    ["http://blog.localhost/", "http://blog.localhost/"],
+    ["http://192.168.1.20:8100/", "http://192.168.1.20:8100/"],
+    ["https://wiki.localhost/", "https://wiki.localhost/"],
+    ["HTTP://Blog.localhost", "http://blog.localhost/"],
+    ["http://me:secret@blog.localhost/", null],
+    ["http://me@blog.localhost/", null],
+    ["javascript:alert(1)", null],
+    ["file:///etc/passwd", null],
+    ["tauri://localhost/", null],
+    ["/apps", null],
+    ["", null],
+  ])("%j -> %j", (url, expected) => {
+    expect(addressUrl(url)?.href ?? null).toBe(expected);
+  });
+});
+
+describe("openAddress", () => {
+  it("opens an http: address in a new tab in a browser", async () => {
+    await openAddress("http://blog.localhost/");
+    expect(open).toHaveBeenCalledWith("http://blog.localhost/", "_blank", "noopener,noreferrer");
+    expect(tauri.openUrl).not.toHaveBeenCalled();
+  });
+
+  it("hands the address to the opener plugin in the shell", async () => {
+    enterShell();
+    await openAddress("http://192.168.1.20:8100/");
+    expect(tauri.openUrl).toHaveBeenCalledWith("http://192.168.1.20:8100/");
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it.each(["javascript:alert(1)", "file:///etc/passwd", "http://me:pw@blog.localhost/"])(
+    "rejects %j and opens nothing",
+    async (url) => {
+      await expect(openAddress(url)).rejects.toThrow("Only http: and https: addresses");
+      enterShell();
+      await expect(openAddress(url)).rejects.toThrow("Only http: and https: addresses");
       expect(open).not.toHaveBeenCalled();
       expect(tauri.openUrl).not.toHaveBeenCalled();
     },

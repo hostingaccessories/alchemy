@@ -6,11 +6,12 @@ use alchemy_core::network::Ipv4Net;
 use alchemy_core::ports::Listener;
 use futures_util::future::BoxFuture;
 
-use super::{HostNetwork, NetworkError, Route};
+use super::{HostNetwork, LanAddress, NetworkError, Route};
 
 #[derive(Debug, Default)]
 struct Inner {
     lan_subnets: Vec<Ipv4Net>,
+    lan_addresses: Vec<LanAddress>,
     routes: Vec<Route>,
     listeners: Vec<Listener>,
     failing: bool,
@@ -18,7 +19,8 @@ struct Inner {
 
 /// [`HostNetwork`] that answers with what it was given.
 ///
-/// It starts with no subnets, routes, or listeners. Clones share their
+/// It starts with no subnets, addresses, routes, or listeners. Subnets
+/// and addresses are set apart, so a test sets what it reads. Clones share their
 /// answers, so a test can change them while the daemon holds a clone.
 #[derive(Debug, Clone, Default)]
 pub struct FakeNetwork {
@@ -34,6 +36,11 @@ impl FakeNetwork {
     /// Answer `lan_subnets` from now on.
     pub fn set_lan_subnets(&self, lan_subnets: Vec<Ipv4Net>) {
         self.lock().lan_subnets = lan_subnets;
+    }
+
+    /// Answer `lan_addresses` from now on.
+    pub fn set_lan_addresses(&self, lan_addresses: Vec<LanAddress>) {
+        self.lock().lan_addresses = lan_addresses;
     }
 
     /// Answer `routes` from now on.
@@ -71,6 +78,11 @@ impl HostNetwork for FakeNetwork {
         Box::pin(async move { answer })
     }
 
+    fn lan_addresses(&self) -> BoxFuture<'_, Result<Vec<LanAddress>, NetworkError>> {
+        let answer = self.answer(|inner| inner.lan_addresses.clone());
+        Box::pin(async move { answer })
+    }
+
     fn routes(&self) -> BoxFuture<'_, Result<Vec<Route>, NetworkError>> {
         let answer = self.answer(|inner| inner.routes.clone());
         Box::pin(async move { answer })
@@ -100,6 +112,7 @@ mod tests {
         let fake = FakeNetwork::new();
         let shared: SharedNetwork = Arc::new(fake.clone());
         assert_eq!(shared.lan_subnets().await.unwrap(), []);
+        assert_eq!(shared.lan_addresses().await.unwrap(), []);
         assert_eq!(shared.routes().await.unwrap(), []);
         assert_eq!(shared.listeners().await.unwrap(), []);
 
@@ -116,15 +129,23 @@ mod tests {
             process: Some("nginx".into()),
             pid: Some(42),
         };
+        let address = LanAddress {
+            interface: "en0".into(),
+            addr: "10.0.1.50".parse().unwrap(),
+            subnet: lan,
+        };
         fake.set_lan_subnets(vec![lan]);
+        fake.set_lan_addresses(vec![address.clone()]);
         fake.set_routes(vec![route.clone()]);
         fake.set_listeners(vec![listener.clone()]);
         assert_eq!(shared.lan_subnets().await.unwrap(), [lan]);
+        assert_eq!(shared.lan_addresses().await.unwrap(), [address]);
         assert_eq!(shared.routes().await.unwrap(), [route]);
         assert_eq!(shared.listeners().await.unwrap(), [listener]);
 
         fake.set_failing(true);
         assert!(shared.lan_subnets().await.is_err());
+        assert!(shared.lan_addresses().await.is_err());
         assert!(shared.routes().await.is_err());
         assert!(shared.listeners().await.is_err());
     }

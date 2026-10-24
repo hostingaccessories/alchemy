@@ -11,7 +11,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use alchemy_core::ports::{Listener, Protocol};
-use alchemyd::network::{HostNetwork, SharedNetwork, SystemNetwork};
+use alchemyd::network::{HostNetwork, SharedNetwork, SystemNetwork, preferred_lan_address};
 
 fn held_by_us(listeners: &[Listener], protocol: Protocol, port: u16) -> Option<&Listener> {
     listeners.iter().find(|l| {
@@ -60,4 +60,21 @@ async fn reads_routes_and_lan_subnets() {
         routes.iter().all(|route| !route.interface.is_empty()),
         "{routes:#?}"
     );
+}
+
+#[tokio::test]
+async fn lan_addresses_are_on_the_lan_subnets() {
+    let network = SystemNetwork::new();
+    let addresses = network.lan_addresses().await.unwrap();
+    let mut subnets: Vec<_> = addresses.iter().map(|a| a.subnet).collect();
+    subnets.sort_unstable();
+    subnets.dedup();
+    assert_eq!(subnets, network.lan_subnets().await.unwrap());
+    for address in &addresses {
+        assert!(address.subnet.contains(address.addr), "{address:?}");
+        assert!(!address.addr.is_loopback(), "{address:?}");
+    }
+    let routes = network.routes().await.unwrap();
+    let preferred = preferred_lan_address(&addresses, &routes);
+    assert_eq!(preferred.is_some(), !addresses.is_empty(), "{addresses:?}");
 }

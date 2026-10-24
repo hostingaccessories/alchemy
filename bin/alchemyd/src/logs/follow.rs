@@ -572,6 +572,7 @@ mod tests {
                     .collect(),
                 problems: vec![],
                 stop_reason: StopReason::Unknown,
+                addresses: vec![],
             }],
             ..AppList::default()
         }
