@@ -10,12 +10,16 @@
 
 mod env;
 mod plan;
+mod progress;
 mod project;
 mod runner;
 
 pub use env::{ALLOWED_ENV, ALLOWED_ENV_PREFIXES, FIXED_ENV, child_env, is_allowed};
 pub use plan::{
     ComposeAction, ComposeCommand, ComposePlan, ComposeStep, ImageSource, UnknownAction,
+};
+pub use progress::{
+    BuildProgress, BuildVertex, ProgressEvent, ResourceProgress, ResourceStatus, parse_progress,
 };
 pub use project::{ComposeProject, ComposeProjectError};
 pub use runner::{CliComposeRunner, ComposeError, ComposeRunner};
