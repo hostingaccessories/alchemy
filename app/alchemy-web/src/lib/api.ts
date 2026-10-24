@@ -55,6 +55,8 @@ export interface ContainerStatus {
   image: string | null;
   project: string | null;
   service: string | null;
+  /** The Compose project folder, from its `working_dir` label. */
+  working_dir: string | null;
   state: ContainerState;
   health: Health | null;
   /** Absent from a daemon older than stop reasons; treat as `unknown`. */

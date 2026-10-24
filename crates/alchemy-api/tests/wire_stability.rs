@@ -130,6 +130,7 @@ fn container_status() {
     status.image = Some("nginx:1".into());
     status.project = Some("blog".into());
     status.service = Some("web".into());
+    status.working_dir = Some("/srv/apps/blog".into());
     status.health = Some(Health::Unhealthy);
     status.stop_reason = StopReason::Crashed {
         exit_code: Some(137),
@@ -139,7 +140,8 @@ fn container_status() {
         &status,
         concat!(
             r#"{"id":"abc","name":"blog-web-1","image":"nginx:1","project":"blog","#,
-            r#""service":"web","state":"exited","health":"unhealthy","#,
+            r#""service":"web","working_dir":"/srv/apps/blog","#,
+            r#""state":"exited","health":"unhealthy","#,
             r#""stop_reason":{"kind":"crashed","exit_code":137,"oom":true}}"#,
         ),
     );
