@@ -10,8 +10,11 @@ use alchemy_core::engine::{
     ContainerEvent, ContainerState, ContainerStatus, EngineStatus, Health, flavor_from_platform,
     parse_action,
 };
-use bollard::models::{ContainerSummary, EventMessage, EventMessageTypeEnum, SystemVersion};
-use bollard::query_parameters::{EventsOptions, ListContainersOptions};
+use alchemy_core::metrics::{ContainerSample, DiskIo, Traffic, container_memory};
+use bollard::models::{
+    ContainerStatsResponse, ContainerSummary, EventMessage, EventMessageTypeEnum, SystemVersion,
+};
+use bollard::query_parameters::{EventsOptions, ListContainersOptions, StatsOptions};
 use bollard::{ClientVersion, Docker};
 use futures_util::{Stream, StreamExt as _};
 
@@ -255,6 +258,77 @@ impl DockerApi for BollardApi {
     }
 }
 
+impl BollardApi {
+    /// `GET /containers/{id}/stats?stream=false&one-shot=true`: one reading
+    /// of `container`'s raw counters, without waiting for the engine to
+    /// compute a delta of its own.
+    pub async fn container_stats(
+        &self,
+        container: &ContainerStatus,
+    ) -> Result<ContainerSample, ApiError> {
+        let options = StatsOptions {
+            stream: false,
+            one_shot: true,
+        };
+        let stats = self
+            .docker
+            .stats(&container.id, Some(options))
+            .next()
+            .await
+            .ok_or_else(|| ApiError::Decode("the engine sent no stats".into()))??;
+        Ok(container_sample(container, stats))
+    }
+}
+
+/// The raw counters in `stats`, labelled with `container`'s identity.
+fn container_sample(container: &ContainerStatus, stats: ContainerStatsResponse) -> ContainerSample {
+    let cpu = stats.cpu_stats.unwrap_or_default();
+    let memory = stats.memory_stats.unwrap_or_default();
+    let cache = memory.stats.unwrap_or_default();
+    let net = stats.networks.map(|networks| {
+        networks
+            .values()
+            .fold(Traffic::default(), |total, network| Traffic {
+                rx: total.rx.saturating_add(network.rx_bytes.unwrap_or(0)),
+                tx: total.tx.saturating_add(network.tx_bytes.unwrap_or(0)),
+            })
+    });
+    let block = stats
+        .blkio_stats
+        .and_then(|blkio| blkio.io_service_bytes_recursive)
+        .map(|entries| {
+            entries.iter().fold(DiskIo::default(), |total, entry| {
+                let value = entry.value.unwrap_or(0);
+                match entry.op.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                    Some("read") => DiskIo {
+                        read: total.read.saturating_add(value),
+                        ..total
+                    },
+                    Some("write") => DiskIo {
+                        written: total.written.saturating_add(value),
+                        ..total
+                    },
+                    _ => total,
+                }
+            })
+        });
+    ContainerSample {
+        id: container.id.clone(),
+        name: container.name.clone(),
+        project: container.project.clone(),
+        service: container.service.clone(),
+        cpu_usage: cpu.cpu_usage.and_then(|u| u.total_usage).unwrap_or(0),
+        system_cpu: cpu.system_cpu_usage,
+        memory: container_memory(
+            memory.usage.unwrap_or(0),
+            cache.get("total_inactive_file").copied(),
+            cache.get("inactive_file").copied(),
+        ),
+        net,
+        block,
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -495,5 +569,81 @@ mod tests {
             BollardApi::connect(&endpoint, BollardApi::DEFAULT_TIMEOUT),
             Err(ApiError::SocketNotFound(_))
         ));
+    }
+
+    #[test]
+    fn container_sample_maps_raw_stats() {
+        use bollard::models::{
+            ContainerBlkioStatEntry, ContainerBlkioStats, ContainerCpuStats, ContainerCpuUsage,
+            ContainerMemoryStats, ContainerNetworkStats,
+        };
+        let entry = |op: &str, value| ContainerBlkioStatEntry {
+            op: Some(op.into()),
+            value: Some(value),
+            ..ContainerBlkioStatEntry::default()
+        };
+        let network = |rx, tx| ContainerNetworkStats {
+            rx_bytes: Some(rx),
+            tx_bytes: Some(tx),
+            ..ContainerNetworkStats::default()
+        };
+        let full = ContainerStatsResponse {
+            cpu_stats: Some(ContainerCpuStats {
+                cpu_usage: Some(ContainerCpuUsage {
+                    total_usage: Some(500),
+                    ..ContainerCpuUsage::default()
+                }),
+                system_cpu_usage: Some(10_000),
+                ..ContainerCpuStats::default()
+            }),
+            memory_stats: Some(ContainerMemoryStats {
+                usage: Some(1_000),
+                stats: Some(HashMap::from([("inactive_file".to_owned(), 300)])),
+                ..ContainerMemoryStats::default()
+            }),
+            networks: Some(HashMap::from([
+                ("eth0".to_owned(), network(100, 10)),
+                ("eth1".to_owned(), network(5, 1)),
+            ])),
+            blkio_stats: Some(ContainerBlkioStats {
+                io_service_bytes_recursive: Some(vec![
+                    entry("read", 40),
+                    entry("write", 7),
+                    entry("Read", 2),
+                    entry("discard", 99),
+                ]),
+                ..ContainerBlkioStats::default()
+            }),
+            ..ContainerStatsResponse::default()
+        };
+        let mut container = ContainerStatus::new("abc", "blog-db-1", ContainerState::Running);
+        container.project = Some("blog".into());
+        container.service = Some("db".into());
+
+        let got = container_sample(&container, full);
+        assert_eq!(
+            got,
+            ContainerSample {
+                id: "abc".into(),
+                name: "blog-db-1".into(),
+                project: Some("blog".into()),
+                service: Some("db".into()),
+                cpu_usage: 500,
+                system_cpu: Some(10_000),
+                memory: 700,
+                net: Some(Traffic { rx: 105, tx: 11 }),
+                block: Some(DiskIo {
+                    read: 42,
+                    written: 7
+                }),
+            }
+        );
+
+        let empty = container_sample(&container, ContainerStatsResponse::default());
+        assert_eq!(
+            (empty.cpu_usage, empty.system_cpu, empty.memory),
+            (0, None, 0)
+        );
+        assert_eq!((empty.net, empty.block), (None, None), "host network");
     }
 }

@@ -9,15 +9,16 @@
 //! - a per-user Unix socket ([`socket`]) serving the API alone, used by
 //!   the `alchemy` CLI and `alchemy-helper`.
 //!
-//! It talks to the Docker engine through [`engine`], keeps what it
-//! learns in [`State`], and persists settings and history in a
-//! [`store::Store`].
+//! It talks to the Docker engine through [`engine`], samples resource
+//! usage through [`metrics`], keeps what it learns in [`State`], and
+//! persists settings and history in a [`store::Store`].
 
 pub mod compose;
 pub mod engine;
 pub mod events;
 pub mod guard;
 pub mod http;
+pub mod metrics;
 mod secure_fs;
 pub mod socket;
 mod state;
@@ -35,6 +36,7 @@ use anyhow::Context as _;
 use tokio::sync::watch;
 
 use crate::engine::{EngineMonitor, EngineSource, SystemConnector, SystemProbe};
+use crate::metrics::{Collector, MetricsSource, SystemMetrics};
 use crate::store::{SharedStore, SqliteStore};
 
 /// Default HTTP listen address. Loopback only: the API has no
@@ -53,23 +55,38 @@ pub struct Config {
     pub state_dir: PathBuf,
 }
 
-/// What [`run_with`] runs against: the shared state and the task that
-/// keeps its engine part current.
+/// What [`run_with`] runs against: the shared state, the task that keeps
+/// its engine part current, and where metrics are read.
 #[derive(Debug, Clone)]
-pub struct Deps<E> {
-    /// State shared by the engine task and both front doors. Keep a clone
-    /// to observe or seed it from outside.
+pub struct Deps<E, M = SystemMetrics> {
+    /// State shared by the engine task, the metrics collector, and both
+    /// front doors. Keep a clone to observe or seed it from outside.
     pub state: State,
     /// Keeps the engine status and containers in `state` current.
     pub engine: E,
+    /// Where the metrics collector reads the machine and its containers.
+    pub metrics: M,
 }
 
 impl<E> Deps<E> {
-    /// Fresh state with `engine` keeping it current.
+    /// Fresh state with `engine` keeping it current, and this machine's
+    /// metrics.
     pub fn new(engine: E) -> Self {
         Self {
             state: State::new(),
             engine,
+            metrics: SystemMetrics::new(),
+        }
+    }
+}
+
+impl<E, M> Deps<E, M> {
+    /// The same, reading metrics from `metrics` instead.
+    pub fn with_metrics<N>(self, metrics: N) -> Deps<E, N> {
+        Deps {
+            state: self.state,
+            engine: self.engine,
+            metrics,
         }
     }
 }
@@ -91,12 +108,12 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::
 ///
 /// The state database in `config.state_dir` is opened, created, or
 /// migrated first; a corrupt or too-new one fails startup before either
-/// listener is bound. The engine task runs alongside the listeners. An
-/// engine that is absent or broken never fails startup; it only shows up
-/// in the engine status.
+/// listener is bound. The engine task and the metrics collector run
+/// alongside the listeners. An engine that is absent or broken never fails
+/// startup; it only shows up in the engine status.
 pub async fn run_with(
     config: Config,
-    deps: Deps<impl EngineSource>,
+    deps: Deps<impl EngineSource, impl MetricsSource>,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
     if !config.listen.ip().is_loopback() {
@@ -128,6 +145,9 @@ pub async fn run_with(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let engine_task = tokio::spawn(deps.engine.run(deps.state.clone(), shutdown_rx.clone()));
+    let metrics_task = tokio::spawn(
+        Collector::new(deps.metrics, deps.state.clone(), store.clone()).run(shutdown_rx.clone()),
+    );
     let socket_task = tokio::spawn(
         axum::serve(
             socket_listener,
@@ -149,10 +169,12 @@ pub async fn run_with(
     shutdown_tx.send_replace(true);
 
     let engine_result = engine_task.await;
+    let metrics_result = metrics_task.await;
     let socket_result = socket_task.await;
     let http_result = http_task.await;
     drop(socket_file);
     engine_result.context("engine task failed")?;
+    metrics_result.context("metrics task failed")?;
     socket_result.context("API socket task failed")??;
     http_result.context("HTTP task failed")??;
     Ok(())

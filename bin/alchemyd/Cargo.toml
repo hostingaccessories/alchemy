@@ -29,6 +29,7 @@ rusqlite           = { workspace = true }
 rustix             = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
+sysinfo            = { workspace = true }
 thiserror          = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync", "io-util", "process", "time"] }
 tower-http         = { workspace = true }

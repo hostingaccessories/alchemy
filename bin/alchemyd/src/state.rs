@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use alchemy_api::MetricsResponse;
 use alchemy_core::engine::{Containers, EngineState, EngineStatus};
 use tokio::sync::watch;
 
@@ -22,16 +23,22 @@ pub struct State {
 struct Inner {
     engine: watch::Sender<EngineStatus>,
     containers: watch::Sender<Containers>,
+    metrics: watch::Sender<MetricsResponse>,
 }
 
 impl State {
     /// Fresh state: the engine is reported as not running, with no
-    /// containers, until the engine monitor's first probe says otherwise.
+    /// containers, until the engine monitor's first probe says otherwise,
+    /// and there are no metrics until the collector's first sample.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
                 engine: watch::Sender::new(EngineStatus::new(EngineState::NotRunning)),
                 containers: watch::Sender::new(Containers::new()),
+                metrics: watch::Sender::new(MetricsResponse {
+                    interval: u32::try_from(crate::metrics::INTERVAL.as_secs()).unwrap_or(u32::MAX),
+                    ..MetricsResponse::default()
+                }),
             }),
         }
     }
@@ -78,6 +85,31 @@ impl State {
     /// do; subscribers are only notified if it did.
     pub fn update_containers(&self, update: impl FnOnce(&mut Containers) -> bool) -> bool {
         self.inner.containers.send_if_modified(update)
+    }
+
+    /// The latest metrics sample.
+    pub fn metrics(&self) -> MetricsResponse {
+        self.inner.metrics.borrow().clone()
+    }
+
+    /// Subscribe to new metrics samples.
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_metrics(&self) -> watch::Receiver<MetricsResponse> {
+        self.inner.metrics.subscribe()
+    }
+
+    /// Replace the latest metrics. Returns whether they changed;
+    /// subscribers are only notified if they did.
+    pub fn set_metrics(&self, metrics: MetricsResponse) -> bool {
+        self.inner.metrics.send_if_modified(|current| {
+            if *current == metrics {
+                false
+            } else {
+                *current = metrics;
+                true
+            }
+        })
     }
 }
 
