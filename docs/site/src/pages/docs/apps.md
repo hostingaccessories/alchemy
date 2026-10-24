@@ -12,9 +12,28 @@ Alchemy reads the folder and runs `docker compose` in it, and you can keep
 running `docker compose` in it yourself, with or without Alchemy.
 
 This page assumes `alchemyd` is running on the machine and Docker is
-installed (Docker Desktop, or Docker Engine with the Compose v2 plugin). The
-web UI is at [http://127.0.0.1:7240](http://127.0.0.1:7240), and every
-command below is also in `alchemy --help`.
+installed (Docker Desktop, or Docker Engine with the Compose v2 plugin).
+Every command below is also in `alchemy --help`.
+
+## Opening the web UI
+
+The desktop app opens signed in. In a browser, run this in a terminal on
+the same machine:
+
+```sh
+alchemy open
+```
+
+It opens Alchemy at `http://127.0.0.1:7240` in your default browser,
+signed in. Only you can do this: other people and programs on the machine
+can't use the web UI or its API without signing in. The link works once,
+within a minute, and the browser stays signed in until alchemyd stops. If
+the web UI says **You're signed out of alchemyd**, run `alchemy open`
+again.
+
+If no browser opens, or it can't open the page (some sandboxed browsers,
+such as Ubuntu's Firefox snap, can't), run `alchemy open --print` and
+paste the link it prints into your browser.
 
 ## App folders
 

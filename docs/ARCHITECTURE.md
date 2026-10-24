@@ -35,20 +35,20 @@ Everything below follows from the line at the top of this page.
 
 ## 2. Crates and dependency direction
 
-| Crate            | Path                  | Role                                                                                           |
-| ---------------- | --------------------- | ---------------------------------------------------------------------------------------------- |
-| `alchemy-core`   | `crates/alchemy-core` | Pure domain model (stacks, the Docker engine, operations, logs, metrics, and their invariants) |
-| `alchemy-api`    | `crates/alchemy-api`  | HTTP API types; the socket path behind the `socket` feature                                    |
-| `alchemyd`       | `bin/alchemyd`        | Daemon: HTTP API on TCP and a Unix socket, embedded web UI                                     |
-| `alchemy`        | `bin/alchemy`         | CLI, an HTTP client over the Unix socket                                                       |
-| `alchemy-helper` | `bin/alchemy-helper`  | Privileged one-shot                                                                            |
-| `alchemy-gui`    | `app/alchemy-gui`     | Tauri desktop shell around the web UI                                                          |
-| `alchemy-web`    | `app/alchemy-web`     | React web UI, served by the daemon and bundled into the shell                                  |
+| Crate            | Path                  | Role                                                                                                 |
+| ---------------- | --------------------- | ---------------------------------------------------------------------------------------------------- |
+| `alchemy-core`   | `crates/alchemy-core` | Pure domain model (stacks, the Docker engine, operations, logs, metrics, and their invariants)       |
+| `alchemy-api`    | `crates/alchemy-api`  | HTTP API types; the socket path and the state directory behind the `socket` and `state-dir` features |
+| `alchemyd`       | `bin/alchemyd`        | Daemon: HTTP API on TCP and a Unix socket, embedded web UI                                           |
+| `alchemy`        | `bin/alchemy`         | CLI, an HTTP client over the Unix socket                                                             |
+| `alchemy-helper` | `bin/alchemy-helper`  | Privileged one-shot                                                                                  |
+| `alchemy-gui`    | `app/alchemy-gui`     | Tauri desktop shell around the web UI                                                                |
+| `alchemy-web`    | `app/alchemy-web`     | React web UI, served by the daemon and bundled into the shell                                        |
 
 Internal dependencies flow strictly downhill, with no cycles:
 
 ```
-alchemy-core ◄── alchemy-api ◄── alchemyd, alchemy
+alchemy-core ◄── alchemy-api ◄── alchemyd, alchemy, alchemy-gui
 ```
 
 - `alchemy-core` depends on no other `alchemy-*` crate.
@@ -64,12 +64,15 @@ The daemon serves one HTTP API, `/api` (`alchemy-api`), on two listeners:
 - **Unix socket**: used by the CLI. Per-user, `0o600`, in the user's
   runtime directory. It serves only `/api`.
 - **TCP**: used by the web UI and the desktop shell. It also serves the
-  web UI itself. Loopback only until it has authentication.
+  web UI itself. Loopback only, and token-authenticated (a per-start
+  token or a browser session from `alchemy open`) until full auth in M13.
 
 Every request passes the checks in `bin/alchemyd/src/guard.rs` before any
 route: `Host` and, under `/api`, `Sec-Fetch-Site` on TCP, then `Origin`
-on TCP and a JSON content type on both for mutating requests. Routes nested under `/api` in `http.rs` get them
-for free; never serve a route outside them.
+on TCP and a JSON content type on both for mutating requests. On TCP,
+signing in (`bin/alchemyd/src/auth.rs`) comes after them, for every `/api`
+route but health and version. Routes nested under `/api` in `http.rs` get
+all of this for free; never serve a route outside them.
 
 The API is a stable contract:
 

@@ -41,6 +41,15 @@ and the daemon serves no UI until it exists.
 | `pnpm gui`                       | Tauri desktop shell in dev mode (starts the web dev server)          |
 | `pnpm docs`                      | Documentation site dev server                                        |
 
+The web UI on the TCP port needs signing in. Open it with
+`cargo run -p alchemy -- open`, which opens a one-time sign-in link in
+your browser. For the dev server, run
+`cargo run -p alchemy -- open --url-base http://localhost:5173`: Vite
+passes `/login` and `/api` on to the daemon, keeping the `Host`, so the
+session cookie belongs to `localhost:5173`. `pnpm gui` needs nothing: the
+shell reads the daemon's token itself. See
+[Signing in to the TCP port](#signing-in-to-the-tcp-port).
+
 Daemon settings, as flags or environment variables:
 
 | Flag          | Variable            | Default                                                            |
@@ -54,7 +63,9 @@ Daemon settings, as flags or environment variables:
 The state directory is `$XDG_STATE_HOME/alchemy` (else
 `~/.local/state/alchemy`) on Linux and `~/Library/Application Support/Alchemy`
 on macOS. It holds `alchemy.db`, the daemon's SQLite database of the app
-folder settings, operation and metrics history, and stop intents. The directory is `0700` and the database `0600`. A
+folder settings, operation and metrics history, and stop intents, and
+`tcp-token`, which signs clients in to the TCP port
+([Signing in to the TCP port](#signing-in-to-the-tcp-port)). The directory is `0700` and the database and token `0600`. A
 database that is corrupt, or was written by a newer alchemyd, stops startup
 with a message saying so; move it aside to start fresh. Point
 `--state-dir` at a temporary directory to run a throwaway daemon. The schema
@@ -81,12 +92,15 @@ daemon; `alchemy --version` shows the CLI's alone, without contacting it.
 ### Calling the API
 
 The socket and the TCP port serve the same `/api`; only TCP serves the web
-UI. `alchemy status` prints the socket path. Any host name works on the
-socket.
+UI and `/login`. `alchemy status` prints the socket path. Any host name
+works on the socket. On the port, everything under `/api` but
+`/api/health` and `/api/version` needs the daemon's token or a browser
+session, as below.
 
 ```sh
 curl --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/version
 curl http://127.0.0.1:7240/api/version
+curl -H "Authorization: Bearer $(cat ~/.local/state/alchemy/tcp-token)" http://127.0.0.1:7240/api/apps
 curl -N --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/events
 ```
 
@@ -111,6 +125,63 @@ requests without the header, like `curl`'s, pass. The socket ignores
 ```sh
 curl -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:7240/api/...
 ```
+
+### Signing in to the TCP port
+
+The guard checks keep other web pages off the port, but any process or
+other user on the machine can connect to loopback, and the API can create
+an app, which runs as root through Docker, or read an app's `.env`. So the
+port requires signing in (`bin/alchemyd/src/auth.rs`, the live state in
+`session.rs`), after the guard checks and before any route. The socket
+needs none: its `0600` mode is the access control. Full accounts, for
+other machines, are M13 ([#16](https://github.com/hostingaccessories/alchemy/issues/16)).
+
+- **Token.** Each start, once both listeners are bound and before either
+  serves a request, alchemyd writes 256 random bits from the OS, as hex, to
+  `tcp-token` in the state directory, `0600`, replacing the last one in
+  one rename. Shutdown removes it. Every request under `/api` on the port
+  but `GET /api/health` and `GET /api/version` must send it as
+  `Authorization: Bearer TOKEN`, or a session cookie; anything else is 401
+  `unauthorized` with `WWW-Authenticate: Bearer`. A wrong bearer is
+  refused even beside a good cookie. Comparison is constant-time. A
+  restart signs everything out.
+- **Browser sessions.** `alchemy open` asks the socket for a launch code
+  (`POST /api/session/launch`, which the port refuses with 403) and opens
+  `http://127.0.0.1:7240/login?code=CODE`. `GET /login` uses the code up,
+  whatever happens, and answers `303` to `/` with `Cache-Control:
+  no-store`, `Referrer-Policy: no-referrer`, and
+  `Set-Cookie: alchemy_session_PORT=ID; HttpOnly; SameSite=Strict;
+  Path=/api`. A code works once, within 60 seconds. The cookie holds a
+  random session id, never the token, and the daemon keeps only SHA-256
+  digests of ids and codes (at most 64 sessions and 16 codes). It has no
+  `Secure`, since browsers refuse that over plain `http://127.0.0.1`, and
+  no `Max-Age`. Browsers send a cookie to every port on its host, so the
+  name carries the daemon's port and the path is `/api` only, but any
+  other page served from `127.0.0.1` whose path starts with `/api` gets it
+  too; this is why sessions end with the daemon. `GET /api/session` says
+  how a request got in (`socket`, `token`, or `cookie`).
+- **Why `alchemy open` doesn't pass the link to the browser.** A process's
+  arguments are readable by every user (`ps`, `/proc/PID/cmdline`), so
+  another user could read the code and use it first. `alchemy open`
+  writes a `0600` page with the link, `open.html` in the `0700` runtime
+  directory, and opens that file with `/usr/bin/open` on macOS or the
+  first `xdg-open` in an absolute `PATH` directory on Linux, never through
+  a shell. Browsers confined away from that directory, such as Ubuntu's
+  Firefox snap, can't read the page; use `alchemy open --print`, which
+  prints the link instead, as `alchemy open` also does when it finds no
+  opener. `--json` prints `{"url","opened","expires_in"}`.
+- **The desktop shell** serves the UI from its own origin, so the cookie
+  never reaches it. Its `daemon_token` command (`app/alchemy-gui`, allowed
+  for the main window only) reads `tcp-token` from the same state
+  directory as alchemyd, honouring `ALCHEMY_STATE_DIR`, and the UI sends
+  it as a bearer token (`src/lib/platform.ts`). After a 401 it reads the
+  file again and retries once, since a restarted daemon has a new token.
+  `EventSource` can't send headers, so in the shell event streams are read
+  with `fetch` (`src/lib/stream.ts`) rather than putting a credential in a
+  URL. CORS allows `Authorization` from the shell's origins only.
+- **The web UI** shows "You're signed out of alchemyd" while
+  `GET /api/session` answers 401, and the daemon status keeps using the
+  public version probe.
 
 ### Shell completions
 
@@ -139,6 +210,10 @@ alchemy --socket "$HOME/.alchemyd-server.sock" status
 The local socket is created `0600`, but anyone who can open it controls the
 remote daemon, so keep it in a directory only you can write to.
 `StreamLocalBindUnlink` replaces a socket left behind by an earlier session.
+
+For the remote web UI, forward its port too (`-L 7240:127.0.0.1:7240`)
+and run `alchemy --socket "$HOME/.alchemyd-server.sock" open`: the link
+names the server's loopback address, which the tunnel brings to yours.
 
 ### Docker engine
 
@@ -500,12 +575,18 @@ This builds the web UI and release binaries, runs `alchemyd` on a temporary
 socket, state directory, and port `17240` (override with `SMOKE_PORT`), and
 checks:
 
-- the daemon creates its state database `0600` in a `0700` directory;
-- `/api/health` and `/api/engine` respond on the port, and `/api/health`
-  on the socket, where `/` is a JSON 404;
+- the daemon creates its state database `0600` in a `0700` directory,
+  and its TCP token `0600` beside it;
+- `/api/health` responds on the port without signing in, while
+  `/api/apps` and `/api/engine` are 401 without the token or with a wrong
+  one, and `/api/engine` answers with it;
+- `alchemy open --print` prints a sign-in link whose `/login` sets a
+  private session cookie that `/api/apps` accepts, the link works only
+  once, and the port refuses to issue launch codes;
+- `/api/health` responds on the socket, where `/` is a JSON 404;
 - a rebinding `Host`, a cross-origin form `POST`, and a cross-site `GET`
   are refused with 403;
-- `/api/events` streams an `engine` event to the Tauri origin;
+- `/api/events` streams an `engine` event to the Tauri origin with the token;
 - `/api/metrics` reports the machine, `/api/metrics/history` has a
   stored point, and `alchemy machine stats` prints them;
 - `/api/operations` answers, and an action on an app that doesn't exist
@@ -516,7 +597,8 @@ checks:
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
 - `alchemy-helper` refuses to run without root;
-- the daemon shuts down cleanly on `SIGTERM` and removes its socket;
+- the daemon shuts down cleanly on `SIGTERM` and removes its socket and
+  token;
 - the daemon refuses a corrupt state database before binding its socket.
 
 Set `SMOKE_SKIP_BUILD=1` to reuse an existing build. CI runs it on Linux and
@@ -582,9 +664,10 @@ const volumes = useQuery({
 Mutations call `request("POST" | "PUT" | "DELETE", path, { body })`, which
 sends `Content-Type: application/json` even without a body, as alchemyd
 requires. A failed request rejects with an `ApiError`, whose `message` is
-safe to show. A mutating route needs no wiring of its own for the Host,
-Origin, and content-type checks: nesting it under `/api` in `http.rs` puts
-it behind them (`bin/alchemyd/src/guard.rs`).
+safe to show. A route needs no wiring of its own for the Host, Origin,
+and content-type checks or for signing in: nesting it under `/api` in
+`http.rs` puts it behind them (`bin/alchemyd/src/guard.rs`, `auth.rs`),
+and `request` signs the shell's requests.
 
 ### Live updates
 
