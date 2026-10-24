@@ -43,14 +43,25 @@ and the daemon serves no UI until it exists.
 
 Daemon settings, as flags or environment variables:
 
-| Flag       | Variable         | Default                                                            |
-| ---------- | ---------------- | ------------------------------------------------------------------ |
-| `--listen` | `ALCHEMY_LISTEN` | `127.0.0.1:7240`                                                   |
-| `--socket` | `ALCHEMY_SOCKET` | `$XDG_RUNTIME_DIR/alchemy/alchemyd.sock`, else a per-user temp dir |
-|            | `ALCHEMY_LOG`    | `info` (any `tracing` filter, e.g. `alchemyd=debug`)               |
-| `--daemon` | `ALCHEMY_DAEMON` | CLI only: the daemon as a URL; only `unix:///path` for now         |
+| Flag          | Variable            | Default                                                            |
+| ------------- | ------------------- | ------------------------------------------------------------------ |
+| `--listen`    | `ALCHEMY_LISTEN`    | `127.0.0.1:7240`                                                   |
+| `--socket`    | `ALCHEMY_SOCKET`    | `$XDG_RUNTIME_DIR/alchemy/alchemyd.sock`, else a per-user temp dir |
+| `--state-dir` | `ALCHEMY_STATE_DIR` | The per-user state directory, below                                |
+|               | `ALCHEMY_LOG`       | `info` (any `tracing` filter, e.g. `alchemyd=debug`)               |
+| `--daemon`    | `ALCHEMY_DAEMON`    | CLI only: the daemon as a URL; only `unix:///path` for now         |
 
-The CLI honours `--socket` and `ALCHEMY_SOCKET` the same way.
+The state directory is `$XDG_STATE_HOME/alchemy` (else
+`~/.local/state/alchemy`) on Linux and `~/Library/Application Support/Alchemy`
+on macOS. It holds `alchemy.db`, the daemon's SQLite database of settings
+and history. The directory is `0700` and the database `0600`. A
+database that is corrupt, or was written by a newer alchemyd, stops startup
+with a message saying so; move it aside to start fresh. Point
+`--state-dir` at a temporary directory to run a throwaway daemon. The schema
+lives in `bin/alchemyd/src/store/migrations.rs`, which explains how to add
+a migration.
+
+The CLI honours `--socket` and `ALCHEMY_SOCKET` the same way as the daemon.
 `--daemon unix:///path/to/alchemyd.sock` is the same as
 `--socket /path/to/alchemyd.sock`; passing both is a usage error. Precedence
 is `--daemon` or `--socket`, then `ALCHEMY_DAEMON`, then `ALCHEMY_SOCKET`,
@@ -205,8 +216,10 @@ scripts/release-smoke.sh
 ```
 
 This builds the web UI and release binaries, runs `alchemyd` on a temporary
-socket and port `17240` (override with `SMOKE_PORT`), and checks:
+socket, state directory, and port `17240` (override with `SMOKE_PORT`), and
+checks:
 
+- the daemon creates its state database `0600` in a `0700` directory;
 - `/api/health` and `/api/engine` respond on the port, and `/api/health`
   on the socket, where `/` is a JSON 404;
 - a rebinding `Host` and a cross-origin form `POST` are refused with 403;
@@ -214,7 +227,8 @@ socket and port `17240` (override with `SMOKE_PORT`), and checks:
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
 - `alchemy-helper` refuses to run without root;
-- the daemon shuts down cleanly on `SIGTERM` and removes its socket.
+- the daemon shuts down cleanly on `SIGTERM` and removes its socket;
+- the daemon refuses a corrupt state database before binding its socket.
 
 Set `SMOKE_SKIP_BUILD=1` to reuse an existing build. CI runs it on Linux and
 macOS.
