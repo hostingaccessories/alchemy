@@ -25,8 +25,9 @@ pub use discovery::{
     ListedEntry, Listing, OVERRIDE_FILES, SkipReason, Skipped, WATCHED_FILES, discover,
 };
 pub use files::{
-    CreateRootError, ENV_FILE, FileContentError, MAX_FILE_LEN, MAX_MESSAGE_LEN, NEW_COMPOSE_FILE,
-    STAGING_PREFIX, StackFile, check_content, create_root, scrub, staging_prefix,
+    CreateRootError, ENV_FILE, EntryStat, FileContentError, MAX_FILE_LEN, MAX_MESSAGE_LEN,
+    NEW_COMPOSE_FILE, STAGING_MAX_AGE, STAGING_PREFIX, StackFile, check_content, create_root,
+    is_stale_staging, scrub, staging_prefix,
 };
 pub use status::{ImageSource, ServiceRun, StackStatus, stack_status};
 

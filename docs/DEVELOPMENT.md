@@ -335,6 +335,10 @@ validated with `docker compose --project-directory DIR [-f FILE]
 [--env-file FILE] config`, and only then moved into place with one
 rename. If Compose rejects it, the answer is 422 `invalid` with
 Compose's own message, staging paths removed, and nothing changes.
+A staging folder left by a daemon that stopped mid-write is removed on
+the first scan after the next start, or after the settings add its
+folder, once it is over an hour old, is a real directory (never a
+symlink), and is owned by the daemon's user.
 
 - `POST /api/apps` (`{"name","folder","compose","env"}`) creates
   `FOLDER/NAME` holding `compose.yaml` and, if given, `.env`. `folder` is

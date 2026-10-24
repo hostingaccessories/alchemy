@@ -95,7 +95,8 @@ impl<E> Deps<E> {
     /// metrics.
     ///
     /// The apps task gets the real filesystem but no default home, so it
-    /// searches nothing until the settings name a folder, and a
+    /// searches nothing until the settings name a folder, leaves staging
+    /// folders alone, and gets a
     /// [`FakeComposeConfig`](compose::FakeComposeConfig) that knows no
     /// projects, so `docker compose` never runs. Logs are read from the
     /// engine. Operations run on a

@@ -1762,6 +1762,12 @@ mod tests {
         fn remove_empty_dir(&self, dir: &Path) -> io::Result<()> {
             SystemDisk.remove_empty_dir(dir)
         }
+        fn list_entries(&self, dir: &Path) -> io::Result<Vec<alchemy_core::stack::EntryStat>> {
+            SystemDisk.list_entries(dir)
+        }
+        fn remove_left_staging(&self, dir: &Path) -> io::Result<()> {
+            SystemDisk.remove_left_staging(dir)
+        }
     }
 
     #[tokio::test]
