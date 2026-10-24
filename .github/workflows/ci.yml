@@ -90,6 +90,13 @@ jobs:
       - name: Release smoke test
         run: scripts/release-smoke.sh
 
+      # Reuses the smoke test's release build.
+      - name: Home-network test
+        if: runner.os == 'Linux'
+        env:
+          HOME_NET_SKIP_BUILD: "1"
+        run: scripts/home-network.sh
+
   cargo-deny:
     name: Cargo deny
     runs-on: ubuntu-24.04
