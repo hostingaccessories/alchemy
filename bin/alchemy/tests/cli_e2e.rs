@@ -278,6 +278,46 @@ async fn status_watch_json_prints_one_object_per_change() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn machine_and_app_stats_show_the_daemons_latest_sample() {
+    let daemon = Daemon::start(EngineStatus::new(EngineState::Ready)).await;
+    let mut metrics = daemon.state.watch_metrics();
+    tokio::time::timeout(DEADLINE, metrics.wait_for(|m| m.at.is_some()))
+        .await
+        .unwrap()
+        .unwrap();
+    let socket = daemon.socket.to_str().unwrap();
+    let parse = |args: &[&str]| {
+        let mut argv = vec!["alchemy", "--socket", socket];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).unwrap()
+    };
+
+    let out = run(parse(&["machine", "stats"])).await.unwrap();
+    assert!(out.starts_with("CPU "), "{out}");
+    assert!(out.contains("\nMemory "), "{out}");
+
+    let out = run(parse(&["machine", "stats", "--json"])).await.unwrap();
+    assert_eq!(out.lines().count(), 1, "{out}");
+    let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(json["interval"], 60);
+    assert!(
+        json["machine"]["memory_total"].as_u64().unwrap() > 0,
+        "{out}"
+    );
+
+    let out = run(parse(&["app", "stats", "blog"])).await.unwrap();
+    assert_eq!(out, "blog has no running containers\n");
+    let out = run(parse(&["app", "stats", "blog", "--json"]))
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(json["machine"], serde_json::Value::Null);
+    assert_eq!(json["projects"], serde_json::json!([]));
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn version_reports_alchemy_and_the_daemon() {
     let daemon = Daemon::start(EngineStatus::new(EngineState::Starting)).await;
     let socket = daemon.socket.to_str().unwrap();

@@ -3,11 +3,14 @@
 //! Each module has a clap `Args` struct, a `run` that does the command's
 //! work, and pure functions that render its output.
 
+pub mod app;
 pub mod completions;
 pub mod generate_man;
+pub mod machine;
 #[cfg(feature = "test-command")]
 pub mod safety_probe;
 pub mod status;
+mod usage;
 pub mod version;
 
 use clap::CommandFactory;

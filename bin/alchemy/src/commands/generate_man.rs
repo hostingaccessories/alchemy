@@ -97,7 +97,11 @@ mod tests {
         assert_eq!(
             names,
             [
+                "alchemy-app-stats.1",
+                "alchemy-app.1",
                 "alchemy-completions.1",
+                "alchemy-machine-stats.1",
+                "alchemy-machine.1",
                 "alchemy-status.1",
                 "alchemy-version.1",
                 "alchemy.1"
