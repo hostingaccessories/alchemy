@@ -33,6 +33,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

@@ -7,6 +7,7 @@ pub mod app;
 pub mod completions;
 pub mod generate_man;
 pub mod machine;
+pub mod open;
 #[cfg(feature = "test-command")]
 pub mod safety_probe;
 pub mod settings;

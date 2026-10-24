@@ -115,6 +115,7 @@ mod tests {
                 "alchemy-completions.1",
                 "alchemy-machine-stats.1",
                 "alchemy-machine.1",
+                "alchemy-open.1",
                 "alchemy-settings-set.1",
                 "alchemy-settings-show.1",
                 "alchemy-settings.1",

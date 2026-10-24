@@ -1185,3 +1185,73 @@ async fn app_create_validates_then_creates_and_never_replaces() {
 
     daemon.stop().await;
 }
+
+/// Send one `GET path` with `headers` to `addr` and read the whole
+/// response, lowercasing the head.
+async fn tcp_get(addr: &str, path: &str, headers: &str) -> (String, String) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{headers}Connection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut seen = String::new();
+    tokio::time::timeout(DEADLINE, stream.read_to_string(&mut seen))
+        .await
+        .unwrap()
+        .unwrap();
+    let (head, body) = seen.split_once("\r\n\r\n").unwrap();
+    (head.to_ascii_lowercase(), body.to_owned())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_prints_a_link_that_signs_a_browser_in_once() {
+    let daemon = Daemon::start(ready_desktop()).await;
+
+    let out = run_args(&daemon.socket, &["--json", "open", "--print"])
+        .await
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(doc["opened"], false, "{out}");
+    assert_eq!(doc["expires_in"], 60, "{out}");
+    let url = doc["url"].as_str().unwrap();
+    let (addr, path) = url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split_once('/'))
+        .unwrap();
+    let path = format!("/{path}");
+    assert!(path.starts_with("/login?code="), "{url}");
+
+    let (head, _) = tcp_get(addr, "/api/apps", "").await;
+    assert!(head.starts_with("http/1.1 401"), "{head}");
+
+    let (head, _) = tcp_get(addr, &path, "").await;
+    assert!(head.starts_with("http/1.1 303"), "{head}");
+    let cookie = head
+        .lines()
+        .find_map(|line| line.strip_prefix("set-cookie: "))
+        .and_then(|value| value.split(';').next())
+        .unwrap()
+        .to_owned();
+    let (head, body) = tcp_get(addr, "/api/session", &format!("Cookie: {cookie}\r\n")).await;
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(body, r#"{"auth":"cookie"}"#);
+
+    let (head, _) = tcp_get(addr, &path, "").await;
+    assert!(
+        head.starts_with("http/1.1 401"),
+        "a link worked twice: {head}"
+    );
+
+    let text = run_args(
+        &daemon.socket,
+        &["open", "--print", "--url-base", "http://localhost:5173"],
+    )
+    .await
+    .unwrap();
+    assert!(
+        text.starts_with("http://localhost:5173/login?code="),
+        "{text}"
+    );
+    daemon.stop().await;
+}

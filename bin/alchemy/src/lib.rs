@@ -3,6 +3,7 @@
 //! Each subcommand maps to HTTP requests against `alchemyd`'s API on its
 //! Unix socket. The CLI holds no state of its own.
 
+pub mod browser;
 pub mod commands;
 mod context;
 mod daemon;
@@ -21,7 +22,7 @@ use std::path::PathBuf;
 use alchemy_api::operations::Action;
 use clap::{Parser, Subcommand};
 
-use crate::commands::{app, completions, generate_man, machine, settings, status, version};
+use crate::commands::{app, completions, generate_man, machine, open, settings, status, version};
 use crate::context::Context;
 use crate::daemon::HttpDaemon;
 use crate::editor::TerminalEditor;
@@ -91,6 +92,15 @@ pub enum Command {
     /// speaks.
     Version(commands::version::Args),
 
+    /// Open Alchemy's web UI in your browser, signed in.
+    ///
+    /// alchemyd's web UI only answers a browser that has signed in. This
+    /// asks alchemyd, over its socket, for a link that signs the browser
+    /// in, and opens it. The link works once, within a minute. With
+    /// --print, or when no browser can be opened, it prints the link
+    /// instead, to open by hand or on the other end of an SSH tunnel.
+    Open(commands::open::Args),
+
     /// Write a shell completion script to stdout.
     Completions(commands::completions::Args),
 
@@ -138,6 +148,7 @@ pub async fn run_with<W: Write, P: Prompt>(
     match command {
         Command::Status(args) => status::run(&mut context(out, status::NAME)?, args).await,
         Command::Version(args) => version::run(&mut context(out, version::NAME)?, args).await,
+        Command::Open(args) => open::run_system(&mut context(out, open::NAME)?, args).await,
         Command::App(args) => match args.command {
             app::Verb::List(args) => {
                 app::list::run(&mut context(out, app::list::NAME)?, args).await
