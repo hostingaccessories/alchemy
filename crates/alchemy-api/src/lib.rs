@@ -121,6 +121,9 @@ pub enum ErrorCode {
     AppNotFound,
     /// No operation has the requested id, or it is too old to be kept.
     OperationNotFound,
+    /// The daemon is at a limit, such as on open log streams, and refused
+    /// the request rather than queue it. Try again later.
+    Busy,
     /// The daemon failed while handling a valid request.
     Internal,
     /// A code this build does not know, sent by a newer daemon, or no code

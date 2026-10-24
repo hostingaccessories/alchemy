@@ -491,6 +491,7 @@ export type ErrorCode =
   | "invalid"
   | "app_not_found"
   | "operation_not_found"
+  | "busy"
   | "internal"
   | "unknown";
 

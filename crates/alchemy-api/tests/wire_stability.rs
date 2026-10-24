@@ -81,6 +81,7 @@ fn error_codes() {
         (ErrorCode::Invalid, r#""invalid""#),
         (ErrorCode::AppNotFound, r#""app_not_found""#),
         (ErrorCode::OperationNotFound, r#""operation_not_found""#),
+        (ErrorCode::Busy, r#""busy""#),
         (ErrorCode::Internal, r#""internal""#),
         (ErrorCode::Unknown, r#""unknown""#),
     ];
