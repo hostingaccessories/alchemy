@@ -307,6 +307,29 @@ curl --unix-socket /run/user/1000/alchemy/alchemyd.sock -X PUT \
   http://alchemyd/api/settings/apps
 ```
 
+### Logs
+
+`GET /api/apps/NAME/logs` streams an app's logs as server-sent events,
+read from the Engine API, never a `docker compose logs` process. The
+containers are the app's, as `/api/apps` lists them; `service=web`
+limits them to one service (400 `bad_request` for one the app doesn't
+have). It sends the last `tail` lines (200 by default, at most 5000)
+across the containers in the order Docker timestamped them, as one `log`
+event each, then `done`. With `follow=true` it sends `following` instead
+of `done` and then each new line as it arrives, until the client leaves:
+a container that stops is picked up again, without repeating a line, when
+it starts, and one Compose creates later is followed from its first line.
+A `done` with an `error` means the logs couldn't be read; a stream that
+ends without `done` was cut off. Lines over 8 KiB are cut and end in `…`,
+and bytes that aren't UTF-8 become U+FFFD. `alchemy app logs NAME
+[SERVICE] [-f] [--tail N]` prints `service | line` (NDJSON with
+`--json`), and the app page has a Logs section. The pure line handling
+is in `alchemy_core::logs`, the reading in `bin/alchemyd/src/logs/`.
+
+```sh
+curl -N --unix-socket /run/user/1000/alchemy/alchemyd.sock 'http://alchemyd/api/apps/blog/logs?service=web&follow=true'
+```
+
 ### Web UI in debug vs release
 
 The daemon serves `app/alchemy-web/dist`. Debug builds read it from disk, so
