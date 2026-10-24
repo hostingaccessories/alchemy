@@ -66,6 +66,11 @@ The daemon serves one HTTP API, `/api` (`alchemy-api`), on two listeners:
 - **TCP**: used by the web UI and the desktop shell. It also serves the
   web UI itself. Loopback only until it has authentication.
 
+Every request passes the checks in `bin/alchemyd/src/guard.rs` before any
+route: `Host` on TCP, then `Origin` on TCP and a JSON content type on both
+for mutating requests. Routes nested under `/api` in `http.rs` get them
+for free; never serve a route outside them.
+
 The API is a stable contract:
 
 - Change it additively: add routes, fields, and variants; never rename or

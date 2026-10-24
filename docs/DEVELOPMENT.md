@@ -82,6 +82,21 @@ curl -N --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/e
 `/api/events` is a server-sent event stream; `-N` prints each event as it
 arrives.
 
+The TCP port only answers a `Host` of `localhost`, `tauri.localhost`, a
+loopback address, or the `--listen` address (any address when listening on
+`0.0.0.0` or `::`), with any port, so a DNS-rebinding page can't reach it. A
+daemon bound to a LAN address is reached by that address, not a host name.
+Anything that isn't `GET`, `HEAD`, or `OPTIONS` must send
+`Content-Type: application/json`, body or not, on both the port and the
+socket (415 `unsupported_media_type` otherwise). On the port it is also
+refused when it carries an `Origin` other than its own or the desktop
+shell's (403 `forbidden`). The socket ignores `Host` and `Origin`: no
+browser can open it.
+
+```sh
+curl -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:7240/api/...
+```
+
 ### Shell completions
 
 `alchemy completions <bash|zsh|fish>` writes a completion script to stdout.
@@ -194,6 +209,7 @@ socket and port `17240` (override with `SMOKE_PORT`), and checks:
 
 - `/api/health` and `/api/engine` respond on the port, and `/api/health`
   on the socket, where `/` is a JSON 404;
+- a rebinding `Host` and a cross-origin form `POST` are refused with 403;
 - `/api/events` streams an `engine` event to the Tauri origin;
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
@@ -260,8 +276,12 @@ const volumes = useQuery({
 });
 ```
 
-Mutations call `request("POST" | "PUT" | "DELETE", path, { body })`. A failed
-request rejects with an `ApiError`, whose `message` is safe to show.
+Mutations call `request("POST" | "PUT" | "DELETE", path, { body })`, which
+sends `Content-Type: application/json` even without a body, as alchemyd
+requires. A failed request rejects with an `ApiError`, whose `message` is
+safe to show. A mutating route needs no wiring of its own for the Host,
+Origin, and content-type checks: nesting it under `/api` in `http.rs` puts
+it behind them (`bin/alchemyd/src/guard.rs`).
 
 ### Live updates
 
