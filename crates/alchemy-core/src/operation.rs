@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::StackName;
+use crate::engine::IntentAction;
 
 pub use output::{OutputBuffer, OutputLine};
 pub use track::{Applied, BuildStep, Outcome, Progress, ResourceState, Tracker};
@@ -160,6 +161,20 @@ pub fn step_label(action: Action, command: StepCommand) -> &'static str {
         (_, StepCommand::Stop) => "Stopping the app",
         (_, StepCommand::Restart) => "Restarting the app",
         (_, StepCommand::Down) => "Removing the app's containers",
+    }
+}
+
+/// The intent to record before running `action`, so the containers it
+/// stops are known to have been stopped on purpose. Pull and build leave
+/// containers alone; an update recreates them as `up` does.
+pub fn intent_action(action: Action) -> Option<IntentAction> {
+    match action {
+        Action::Up | Action::Update => Some(IntentAction::Up),
+        Action::Start => Some(IntentAction::Start),
+        Action::Restart => Some(IntentAction::Restart),
+        Action::Stop => Some(IntentAction::Stop),
+        Action::Down => Some(IntentAction::Down),
+        Action::Pull | Action::Build => None,
     }
 }
 
@@ -308,6 +323,23 @@ mod tests {
         ];
         for (action, command, want) in cases {
             assert_eq!(step_label(action, command), want, "{action} {command}");
+        }
+    }
+
+    #[test]
+    fn maps_actions_to_intents() {
+        let cases = [
+            (Action::Up, Some(IntentAction::Up)),
+            (Action::Update, Some(IntentAction::Up)),
+            (Action::Start, Some(IntentAction::Start)),
+            (Action::Restart, Some(IntentAction::Restart)),
+            (Action::Stop, Some(IntentAction::Stop)),
+            (Action::Down, Some(IntentAction::Down)),
+            (Action::Pull, None),
+            (Action::Build, None),
+        ];
+        for (action, want) in cases {
+            assert_eq!(intent_action(action), want, "{action}");
         }
     }
 
