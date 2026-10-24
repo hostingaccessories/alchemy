@@ -1,13 +1,17 @@
 //! Docker Compose lifecycle actions, driven through the `docker` CLI.
 //!
 //! What to run is decided by pure helpers: [`compose_args`] builds the argv
-//! and [`SCRUBBED_ENV`] lists the inherited variables that must not reach
-//! the child. Running it sits behind [`ComposeRunner`], implemented by
-//! [`CliComposeRunner`].
+//! and [`child_env`] the child's whole environment. Running it sits behind
+//! [`ComposeRunner`], implemented by [`CliComposeRunner`].
 //!
 //! This lives in the daemon rather than `alchemy-core` because the argv is
 //! a detail of the `docker` binary, not of the domain.
 
+mod env;
+
+pub use env::{ALLOWED_ENV, ALLOWED_ENV_PREFIXES, FIXED_ENV, child_env, is_allowed};
+
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::future::Future;
@@ -150,24 +154,6 @@ pub fn compose_args(project: &ComposeProject, action: ComposeAction) -> Vec<OsSt
     args
 }
 
-/// Inherited variables removed from the child's environment.
-///
-/// Each one would override what the daemon chose: the engine (it sets
-/// `DOCKER_HOST` itself, so a context or TLS settings must not compete
-/// with it), or the project's files, name, and profiles. The rest of
-/// the environment is kept so `HOME`, `PATH`, and credential helpers work.
-pub const SCRUBBED_ENV: [&str; 9] = [
-    "DOCKER_CONTEXT",
-    "DOCKER_TLS_VERIFY",
-    "DOCKER_CERT_PATH",
-    "COMPOSE_FILE",
-    "COMPOSE_PROJECT_NAME",
-    "COMPOSE_PROJECT_DIRECTORY",
-    "COMPOSE_PROFILES",
-    "COMPOSE_ENV_FILES",
-    "COMPOSE_PATH_SEPARATOR",
-];
-
 const MAX_CAPTURED: usize = 4096;
 
 /// The last [`MAX_CAPTURED`] bytes of `text`, trimmed, on a character
@@ -234,14 +220,15 @@ pub enum ComposeError {
 /// [`ComposeRunner`] that runs `docker compose` as a child process.
 ///
 /// The binary is an absolute path, arguments come from [`compose_args`],
-/// and no shell is involved. `DOCKER_HOST` is set to the endpoint, the
-/// variables in [`SCRUBBED_ENV`] are removed, and stdin is closed. Each
+/// and no shell is involved. The environment is exactly [`child_env`] of
+/// the daemon's, so `DOCKER_HOST` is the endpoint, and stdin is closed. Each
 /// action has a timeout, after which the child is killed; dropping the
 /// future kills it too.
 #[derive(Debug, Clone)]
 pub struct CliComposeRunner {
     binary: PathBuf,
     endpoint: Endpoint,
+    env: BTreeMap<OsString, OsString>,
     timeout: Duration,
 }
 
@@ -259,11 +246,25 @@ impl CliComposeRunner {
         if !binary.is_absolute() {
             return Err(ComposeError::RelativeBinary { binary });
         }
+        let env = child_env(std::env::vars_os(), endpoint.docker_host());
         Ok(Self {
             binary,
             endpoint,
+            env,
             timeout: Self::DEFAULT_TIMEOUT,
         })
+    }
+
+    /// Build the child's environment from `parent` instead of the daemon's
+    /// own, which [`Self::new`] reads.
+    #[must_use]
+    pub fn with_parent_env<K, V>(mut self, parent: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
+        self.env = child_env(parent, self.endpoint.docker_host());
+        self
     }
 
     /// Use `timeout` instead of the default.
@@ -287,14 +288,12 @@ impl CliComposeRunner {
         let mut command = Command::new(&self.binary);
         command
             .args(compose_args(project, action))
-            .env("DOCKER_HOST", self.endpoint.docker_host())
+            .env_clear()
+            .envs(&self.env)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        for name in SCRUBBED_ENV {
-            command.env_remove(name);
-        }
         command
     }
 }
@@ -427,16 +426,6 @@ mod tests {
         let runner = CliComposeRunner::new("/usr/bin/docker", Endpoint::system()).unwrap();
         assert_eq!(runner.binary(), Path::new("/usr/bin/docker"));
         assert_eq!(runner.endpoint(), &Endpoint::system());
-    }
-
-    #[test]
-    fn scrubs_variables_that_override_the_engine_or_project() {
-        for name in ["DOCKER_CONTEXT", "COMPOSE_FILE", "COMPOSE_PROJECT_NAME"] {
-            assert!(SCRUBBED_ENV.contains(&name), "{name}");
-        }
-        for name in ["DOCKER_HOST", "DOCKER_CONFIG", "HOME", "PATH"] {
-            assert!(!SCRUBBED_ENV.contains(&name), "{name}");
-        }
     }
 
     #[test]

@@ -25,6 +25,20 @@ fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
+/// The variables in `env` output, sorted, without the ones `/bin/sh` sets
+/// for itself.
+fn child_env_of(env: &str) -> Vec<&str> {
+    let mut vars: Vec<&str> = env
+        .lines()
+        .filter(|line| {
+            let name = line.split_once('=').map_or(*line, |(name, _)| name);
+            !matches!(name, "PWD" | "OLDPWD" | "SHLVL" | "_")
+        })
+        .collect();
+    vars.sort_unstable();
+    vars
+}
+
 /// One test, so every fixture is written before any child is spawned:
 /// exec'ing a file another thread still holds open for writing fails with
 /// `ETXTBSY` on Linux.
@@ -48,6 +62,12 @@ exit 0"#,
         "echo 'pulling...' >&2\necho 'no such service: web' >&2\nexit 14",
     );
     let slow = write_script(dir.path(), "slow", "exec sleep 10");
+    let env_log = dir.path().join("env.log");
+    let env_dump = write_script(
+        dir.path(),
+        "env-dump",
+        &format!("env > '{}'", env_log.display()),
+    );
 
     let endpoint = Endpoint::unix("/run/user/1000/docker.sock").unwrap();
     let project = ComposeProject::new(
@@ -94,6 +114,36 @@ exit 0"#,
             .await,
         Err(ComposeError::Spawn { .. })
     ));
+
+    CliComposeRunner::new(&env_dump, endpoint.clone())
+        .unwrap()
+        .with_parent_env([
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/home/me"),
+            ("LC_ALL", "C"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("DOCKER_CONFIG", "/home/me/.docker"),
+            ("AWS_SECRET_ACCESS_KEY", "hunter2"),
+            ("COMPOSE_PROJECT_NAME", "other"),
+            ("DOCKER_HOST", "tcp://elsewhere:2375"),
+            ("DOCKER_CONTEXT", "remote"),
+        ])
+        .run(&project, ComposeAction::Up)
+        .await
+        .unwrap();
+    assert_eq!(
+        child_env_of(&std::fs::read_to_string(&env_log).unwrap()),
+        [
+            "COMPOSE_ANSI=never",
+            "DOCKER_CLI_HINTS=false",
+            "DOCKER_CONFIG=/home/me/.docker",
+            "DOCKER_HOST=unix:///run/user/1000/docker.sock",
+            "HOME=/home/me",
+            "LC_ALL=C",
+            "PATH=/usr/bin:/bin",
+            "XDG_RUNTIME_DIR=/run/user/1000",
+        ]
+    );
 
     let started = std::time::Instant::now();
     let timeout = Duration::from_millis(200);
