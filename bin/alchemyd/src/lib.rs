@@ -14,7 +14,8 @@
 //! Compose stacks through [`apps`], samples resource usage through
 //! [`metrics`], reads app logs through [`logs`], runs lifecycle actions
 //! on apps through [`operations`], reads the host's own subnets, routes,
-//! and listeners through [`network`], keeps what it learns in [`State`],
+//! and listeners through [`network`], lists and reserves host ports
+//! through [`ports`], keeps what it learns in [`State`],
 //! and persists settings, history, and stop [`intent`] in a
 //! [`store::Store`].
 
@@ -30,6 +31,7 @@ pub mod logs;
 pub mod metrics;
 pub mod network;
 pub mod operations;
+pub mod ports;
 mod secure_fs;
 pub mod session;
 pub mod socket;
@@ -53,6 +55,7 @@ use crate::logs::{SharedLogSource, SystemLogs};
 use crate::metrics::{Collector, MetricsSource, SystemMetrics};
 use crate::network::{FakeNetwork, SharedNetwork, SystemNetwork};
 use crate::operations::{OperationRunner, Operations, SystemRunner};
+use crate::ports::PortRegistry;
 use crate::session::{Auth, TokenFile};
 use crate::store::{SharedStore, SqliteStore, StateLock};
 
@@ -245,6 +248,7 @@ pub async fn run_with(
         tracing::warn!(%error, "cannot tidy the operation history");
     }
 
+    let ports = PortRegistry::new(deps.state.clone(), store.clone(), deps.network.clone());
     let (socket_listener, socket_file) = socket::bind(&config.socket)
         .with_context(|| format!("binding API socket {}", config.socket.display()))?;
     let http_listener = tokio::net::TcpListener::bind(config.listen)
@@ -275,7 +279,7 @@ pub async fn run_with(
     let socket_task = tokio::spawn(
         axum::serve(
             socket_listener,
-            http::with_editor(
+            with_handlers(
                 http::api_router(
                     deps.state.clone(),
                     store.clone(),
@@ -284,7 +288,8 @@ pub async fn run_with(
                     operations.clone(),
                     auth.clone(),
                 ),
-                deps.editor.clone(),
+                &deps.editor,
+                &ports,
             ),
         )
         .with_graceful_shutdown(stopped(shutdown_rx.clone()))
@@ -293,7 +298,7 @@ pub async fn run_with(
     let http_task = tokio::spawn(
         axum::serve(
             http_listener,
-            http::with_editor(
+            with_handlers(
                 http::router(
                     deps.state,
                     store,
@@ -305,7 +310,8 @@ pub async fn run_with(
                     deps.logs,
                     operations.clone(),
                 ),
-                deps.editor,
+                &deps.editor,
+                &ports,
             ),
         )
         .with_graceful_shutdown(stopped(shutdown_rx))
@@ -329,6 +335,15 @@ pub async fn run_with(
     socket_result.context("API socket task failed")??;
     http_result.context("HTTP task failed")??;
     Ok(())
+}
+
+/// Give `router` the app editor and the port registry its routes use.
+fn with_handlers(
+    router: axum::Router,
+    editor: &Arc<AppEditor>,
+    ports: &PortRegistry,
+) -> axum::Router {
+    http::with_ports(http::with_editor(router, editor.clone()), ports.clone())
 }
 
 fn warn_if_exposed(listen: SocketAddr) {

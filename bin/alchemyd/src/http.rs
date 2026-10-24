@@ -19,9 +19,11 @@
 //!
 //! Creating apps and editing their files needs an [`AppEditor`], which
 //! [`with_editor`] adds to either router; without one those routes answer
-//! 503.
+//! 503. So does `/api/ports` without the [`PortRegistry`] that
+//! [`with_ports`] adds.
 
 mod app_files;
+mod ports;
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -61,6 +63,7 @@ use crate::guard::{self, Refusal, TAURI_ORIGINS};
 use crate::logs::{self, LogQuery, LogsRefusal, SharedLogSource};
 use crate::metrics::Scope;
 use crate::operations::{CancelError, Operations, StartError};
+use crate::ports::PortRegistry;
 use crate::session::Auth;
 use crate::store::SharedStore;
 
@@ -228,6 +231,11 @@ pub fn with_editor(router: Router, editor: Arc<AppEditor>) -> Router {
     router.layer(Extension(editor))
 }
 
+/// Give `router`'s `/api/ports` route `registry` to list ports from.
+pub fn with_ports(router: Router, registry: PortRegistry) -> Router {
+    router.layer(Extension(registry))
+}
+
 /// Wrap `routes` the way the Unix socket serves them: the content-type
 /// check alone, since no browser can reach the socket.
 pub fn socket_checks(routes: Router) -> Router {
@@ -274,6 +282,7 @@ fn api(
                 .layer(app_files::body_limit()),
         )
         .route("/settings/apps", get(app_settings).put(set_app_settings))
+        .route("/ports", get(ports::list))
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found)
         .with_state(Api {
@@ -1124,6 +1133,13 @@ mod tests {
         let (status, body) = get_json("/api/health").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    }
+
+    #[tokio::test]
+    async fn ports_need_a_registry() {
+        let (status, body) = get_json("/api/ports").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "internal");
     }
 
     #[tokio::test]
