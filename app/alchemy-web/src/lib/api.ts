@@ -64,6 +64,12 @@ export interface ContainerStatus {
   stop_reason?: StopReason;
   /** Host ports it publishes while running. Absent when there are none. */
   ports?: PublishedPort[];
+  /**
+   * Its IPv4 address on each network it has joined while running, by
+   * network name, such as `{ alchemy: "10.200.0.3" }`. Absent when there
+   * are none.
+   */
+  networks?: Record<string, string>;
 }
 
 /** Mirrors `alchemy_api::Protocol`. */

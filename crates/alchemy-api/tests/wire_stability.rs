@@ -187,6 +187,27 @@ fn container_status_ports() {
 }
 
 #[test]
+fn container_status_networks() {
+    let mut status = ContainerStatus::new("abc", "blog-web-1", ContainerState::Running);
+    status.stop_reason = StopReason::Running;
+    status
+        .networks
+        .insert("blog_default".into(), "172.18.0.2".parse().unwrap());
+    status
+        .networks
+        .insert("alchemy".into(), "10.200.0.3".parse().unwrap());
+    assert_wire(
+        &status,
+        concat!(
+            r#"{"id":"abc","name":"blog-web-1","image":null,"project":null,"#,
+            r#""service":null,"working_dir":null,"state":"running","health":null,"#,
+            r#""stop_reason":{"kind":"running"},"#,
+            r#""networks":{"alchemy":"10.200.0.3","blog_default":"172.18.0.2"}}"#,
+        ),
+    );
+}
+
+#[test]
 fn port_list() {
     use alchemy_api::ports::{PortClaim, PortHolder, PortList, PortSource};
     use alchemy_api::{Protocol, PublishedPort};
