@@ -10,6 +10,7 @@ use alchemy_api::ApiEvent;
 use alchemy_api::network::{
     ListenerState, MdnsBackend, MdnsReport, MdnsState, NetworkReport, NetworkWarning, ProxyReport,
 };
+use alchemy_api::privileges::PrivilegeAction;
 use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
 
 use crate::context::Context;
@@ -138,7 +139,8 @@ pub(crate) fn mdns_warning_lines(mdns: &MdnsReport) -> Vec<String> {
 }
 
 /// A warning for each proxy port that couldn't be opened: port 80 first,
-/// with its fix, then each app's own port.
+/// with its fix, then each app's own port. When a privilege would open
+/// port 80, the fix is the command that grants it.
 pub(crate) fn proxy_lines(proxy: &ProxyReport) -> Vec<String> {
     let mut lines = Vec::new();
     if proxy.host.state == ListenerState::Unavailable {
@@ -148,7 +150,17 @@ pub(crate) fn proxy_lines(proxy: &ProxyReport) -> Vec<String> {
                 "Alchemy can't use port 80. Your apps still work at their IP:port address."
             )
         ));
-        if let Some(fix) = proxy.host.fix.as_deref() {
+        let grant = proxy
+            .host
+            .privilege
+            .and_then(PrivilegeAction::action)
+            .map(|action| {
+                format!(
+                    "run `alchemy machine privileges grant {}`",
+                    action.cli_name()
+                )
+            });
+        if let Some(fix) = grant.as_deref().or(proxy.host.fix.as_deref()) {
             lines.push(format!("  Fix: {fix}"));
         }
     }
@@ -721,6 +733,23 @@ mod tests {
             ]
         );
         assert_eq!(proxy_lines(&ProxyReport::default()), Vec::<String>::new());
+
+        let cases = [
+            (
+                Some(PrivilegeAction::LowPorts),
+                "  Fix: run `alchemy machine privileges grant low-ports`",
+            ),
+            (
+                Some(PrivilegeAction::Other),
+                "  Fix: Let alchemyd use low ports.",
+            ),
+            (None, "  Fix: Let alchemyd use low ports."),
+        ];
+        for (privilege, want) in cases {
+            let mut proxy = proxy.clone();
+            proxy.host.privilege = privilege;
+            assert_eq!(proxy_lines(&proxy)[1], want, "{privilege:?}");
+        }
     }
 
     #[tokio::test]
