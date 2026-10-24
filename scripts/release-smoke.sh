@@ -86,7 +86,7 @@ log "Checking /api/engine"
 engine="$(curl -fsS "${base}/api/engine")"
 [[ "$engine" == *'"state":'* ]] || fail "unexpected engine response: ${engine}"
 
-log "Checking a rebinding Host and a cross-origin POST are refused"
+log "Checking a rebinding Host, a cross-origin POST, and a cross-site GET are refused"
 rebind_code="$(curl -sS -o "${tmp}/rebind.json" -w '%{http_code}' \
   -H 'Host: evil.example' "${base}/api/health")" || fail "rebinding GET failed"
 [[ "$rebind_code" == 403 ]] || fail "rebinding Host returned ${rebind_code}, expected 403"
@@ -96,6 +96,10 @@ form_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
   -H 'Origin: https://evil.example' -d 'a=b' "${base}/api/health")" \
   || fail "cross-origin POST failed"
 [[ "$form_code" == 403 ]] || fail "cross-origin POST returned ${form_code}, expected 403"
+site_code="$(curl -sS -o /dev/null -w '%{http_code}' \
+  -H 'Sec-Fetch-Site: cross-site' "${base}/api/health")" \
+  || fail "cross-site GET failed"
+[[ "$site_code" == 403 ]] || fail "cross-site GET returned ${site_code}, expected 403"
 
 log "Checking /api/health on the socket"
 sock_health="$(curl -fsS --unix-socket "$socket" http://localhost/api/health)" \
