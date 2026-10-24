@@ -105,7 +105,8 @@ pub(crate) async fn run<D: Daemon, W: Write, P: Prompt>(
             continue;
         };
         if json {
-            ctx.out().line(serde_json::json!(event))?;
+            let line = serde_json::to_string(&event).map_err(std::io::Error::other)?;
+            ctx.out().line(line)?;
         } else if let OperationEvent::Operation(op) | OperationEvent::Done(op) = &event {
             for line in step_lines(&mut seen, op) {
                 ctx.out().progress(line);
@@ -538,6 +539,11 @@ mod tests {
         assert_eq!(err.exit_code(), 1);
         assert_eq!(err.kind(), "operation_failed");
         assert_eq!(err.to_string(), "update blog failed: pull access denied");
+        assert!(
+            ctx.written().starts_with(r#"{"event":"done","data":{"#),
+            "{}",
+            ctx.written()
+        );
         let line: serde_json::Value = serde_json::from_str(ctx.written().trim()).unwrap();
         assert_eq!(line["event"], "done");
         assert_eq!(line["data"]["state"], "failed");
