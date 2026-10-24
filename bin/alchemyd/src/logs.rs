@@ -11,6 +11,12 @@
 //! app later, such as after `docker compose up` recreates it, is
 //! followed from its first line.
 //!
+//! Each request is bounded: its tail holds at most
+//! [`MAX_TAIL_BYTES`](alchemy_core::logs::MAX_TAIL_BYTES) of the newest
+//! lines, and at most [`MAX_STREAMS`] streams are open at once across
+//! both listeners, counted in [`State::log_streams`]. A request past that
+//! is refused rather than queued.
+//!
 //! The containers come from the app's entry in [`State::apps`], so they
 //! are the ones the app list shows, matched by Compose project.
 
@@ -26,6 +32,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use alchemy_api::logs::LogStream;
 use futures_util::StreamExt as _;
 use futures_util::stream::{self, BoxStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::engine::{ApiError, BollardApi, Endpoint, EndpointError};
 
@@ -93,6 +100,47 @@ pub trait LogSource: fmt::Debug + Send + Sync {
 
 /// A [`LogSource`] shared by every request.
 pub type SharedLogSource = Arc<dyn LogSource>;
+
+/// The most log streams alchemyd serves at once, across both listeners,
+/// followed or not. Each holds up to
+/// [`MAX_TAIL_BYTES`](alchemy_core::logs::MAX_TAIL_BYTES) per container
+/// while its tail is read, and a connection to the engine per container
+/// while it follows.
+pub const MAX_STREAMS: usize = 16;
+
+/// Counts the open log streams against a limit. Clones share the count.
+#[derive(Debug, Clone)]
+pub struct LogStreams {
+    permits: Arc<Semaphore>,
+}
+
+impl LogStreams {
+    /// At most `max` streams at once.
+    pub fn new(max: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(max)),
+        }
+    }
+
+    /// A place for one more stream, or `None` while every place is taken.
+    pub fn try_open(&self) -> Option<StreamPermit> {
+        let permit = self.permits.clone().try_acquire_owned().ok()?;
+        Some(StreamPermit { _permit: permit })
+    }
+}
+
+impl Default for LogStreams {
+    /// At most [`MAX_STREAMS`].
+    fn default() -> Self {
+        Self::new(MAX_STREAMS)
+    }
+}
+
+/// One open stream's place in its [`LogStreams`], given back when dropped.
+#[derive(Debug)]
+pub struct StreamPermit {
+    _permit: OwnedSemaphorePermit,
+}
 
 /// The real [`LogSource`]: the Engine API through `bollard`. Cheap to
 /// clone: clones share the client.

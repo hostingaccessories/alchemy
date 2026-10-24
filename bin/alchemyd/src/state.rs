@@ -9,6 +9,8 @@ use alchemy_api::apps::{AppList, AppSettings};
 use alchemy_core::engine::{Containers, EngineState, EngineStatus};
 use tokio::sync::watch;
 
+use crate::logs::LogStreams;
+
 /// The daemon's live state. Cheap to clone: every clone shares the same
 /// values.
 ///
@@ -30,6 +32,7 @@ struct Inner {
     app_settings: watch::Sender<AppSettings>,
     app_rescans: watch::Sender<u64>,
     operations: watch::Sender<OperationList>,
+    log_streams: LogStreams,
 }
 
 impl State {
@@ -53,6 +56,7 @@ impl State {
                 }),
                 app_rescans: watch::Sender::new(0),
                 operations: watch::Sender::new(OperationList::default()),
+                log_streams: LogStreams::default(),
             }),
         }
     }
@@ -184,6 +188,13 @@ impl State {
     /// changed; subscribers are only notified if they did.
     pub fn set_operations(&self, operations: OperationList) -> bool {
         send_if_changed(&self.inner.operations, operations)
+    }
+
+    /// The log streams open on either listener, held to
+    /// [`MAX_STREAMS`](crate::logs::MAX_STREAMS). Unlike the parts above,
+    /// it is a count to take a place in, not a value to watch.
+    pub fn log_streams(&self) -> &LogStreams {
+        &self.inner.log_streams
     }
 }
 

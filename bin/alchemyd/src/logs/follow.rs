@@ -7,8 +7,8 @@ use alchemy_api::apps::{App, AppList, ContainerState};
 use alchemy_api::logs::{LogEvent, LogLine, LogStream, LogsDone, LogsFollowing};
 use alchemy_core::engine::EngineState;
 use alchemy_core::logs::{
-    Cursor, LineSplitter, LogQueryError, Timestamp, merge_tail, parse_follow, parse_tail,
-    split_timestamp,
+    Cursor, LineSplitter, LogQueryError, MAX_TAIL_BYTES, Tail, Timestamp, merge_tail, parse_follow,
+    parse_tail, split_timestamp,
 };
 use futures_util::StreamExt as _;
 use futures_util::future::join_all;
@@ -58,6 +58,12 @@ pub enum LogsRefusal {
     /// `tail` or `follow` is not valid.
     #[error(transparent)]
     Query(#[from] LogQueryError),
+    /// [`MAX_STREAMS`](super::MAX_STREAMS) log streams are already open.
+    #[error(
+        "alchemyd is already serving {} log streams; close one and try again",
+        super::MAX_STREAMS
+    )]
+    Busy,
 }
 
 impl LogQuery {
@@ -98,16 +104,21 @@ impl LogQuery {
 /// The stream ends after [`LogEvent::Done`]. A followed stream sends
 /// that only on an error, and otherwise lasts until it is dropped, which
 /// stops reading every container.
+///
+/// It takes a place in [`State::log_streams`] until it is dropped, and is
+/// refused with [`LogsRefusal::Busy`] when none is free.
 pub fn stream(
     source: SharedLogSource,
     state: State,
     query: LogQuery,
-) -> impl Stream<Item = LogEvent> + Send + 'static {
+) -> Result<impl Stream<Item = LogEvent> + Send + 'static, LogsRefusal> {
+    let permit = state.log_streams().try_open().ok_or(LogsRefusal::Busy)?;
     let (tx, rx) = mpsc::channel(BUFFER);
     let task = AbortOnDrop(tokio::spawn(drive(source, state, query, tx)));
-    stream::unfold((rx, task), |(mut rx, task)| async move {
-        rx.recv().await.map(|event| (event, (rx, task)))
-    })
+    Ok(stream::unfold(
+        (rx, task, permit),
+        |(mut rx, task, permit)| async move { rx.recv().await.map(|event| (event, (rx, task, permit))) },
+    ))
 }
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -161,22 +172,22 @@ async fn run(
     let mut cursors = HashMap::new();
     let mut sources = Vec::with_capacity(backlogs.len());
     for (target, backlog) in targets.iter().zip(backlogs) {
-        let entries = backlog.map_err(|error| {
+        let (entries, place) = backlog.map_err(|error| {
             Stop::Failed(format!(
                 "couldn't read the logs of {}: {error}",
                 target.name
             ))
         })?;
-        let mut place = Place::default();
-        for entry in &entries {
-            place.of(entry.line.stream).record(entry.at);
-        }
-        place.seed();
         cursors.insert(target.id.clone(), place);
         sources.push(entries);
     }
     let tail = usize::try_from(query.tail).unwrap_or(usize::MAX);
+    let mut kept = Tail::new(tail, MAX_TAIL_BYTES);
     for entry in merge_tail(sources, tail, |entry| entry.at) {
+        let size = entry.size();
+        kept.push(entry, size);
+    }
+    for entry in kept.into_vec() {
         send(tx, LogEvent::Log(entry.line)).await?;
     }
     if !query.follow {
@@ -397,14 +408,17 @@ fn targets(app: &App, service: Option<&str>) -> Vec<Target> {
         .collect()
 }
 
-/// The last `tail` lines of `target`'s log. A container removed since
-/// the app list was read has none.
+/// The last `tail` lines of `target`'s log, as many of the newest as fit
+/// in [`MAX_TAIL_BYTES`], and where its outputs were left. Every line read
+/// is noted in the place, kept or not, so following never sends one the
+/// tail dropped. A container removed since the app list was read has
+/// none.
 async fn backlog(
     source: &SharedLogSource,
     endpoint: &str,
     target: &Target,
     tail: u32,
-) -> Result<Vec<Entry>, LogError> {
+) -> Result<(Vec<Entry>, Place), LogError> {
     let request = LogRequest {
         follow: false,
         tail: Some(tail),
@@ -412,16 +426,25 @@ async fn backlog(
     };
     let mut logs = source.logs(endpoint, &target.id, request);
     let mut reader = Reader::new(target);
-    let mut entries = Vec::new();
+    let mut place = Place::default();
+    let mut kept = Tail::new(usize::try_from(tail).unwrap_or(usize::MAX), MAX_TAIL_BYTES);
+    let mut keep = |entries: Vec<Entry>| {
+        for entry in entries {
+            place.of(entry.line.stream).record(entry.at);
+            let size = entry.size();
+            kept.push(entry, size);
+        }
+    };
     while let Some(item) = logs.next().await {
         match item {
-            Ok(chunk) => entries.extend(reader.push(&chunk)),
-            Err(error) if error.is_gone() => return Ok(Vec::new()),
+            Ok(chunk) => keep(reader.push(&chunk)),
+            Err(error) if error.is_gone() => return Ok((Vec::new(), Place::default())),
             Err(error) => return Err(error),
         }
     }
-    entries.extend(reader.finish());
-    Ok(entries)
+    keep(reader.finish());
+    place.seed();
+    Ok((kept.into_vec(), place))
 }
 
 /// A line ready to send, with its timestamp for ordering.
@@ -429,6 +452,17 @@ async fn backlog(
 struct Entry {
     at: Option<Timestamp>,
     line: LogLine,
+}
+
+impl Entry {
+    /// The bytes of text it holds, as counted against [`MAX_TAIL_BYTES`].
+    fn size(&self) -> usize {
+        let line = &self.line;
+        line.line.len()
+            + line.time.as_ref().map_or(0, String::len)
+            + line.container.len()
+            + line.service.len()
+    }
 }
 
 /// Turns one container's chunks into [`Entry`]s, keeping stdout and
@@ -574,6 +608,7 @@ mod tests {
     async fn collect(source: &FakeLogSource, state: &State, query: LogQuery) -> Vec<String> {
         let source: SharedLogSource = Arc::new(source.clone());
         stream(source, state.clone(), query)
+            .unwrap()
             .map(|event| render(&event))
             .collect()
             .await
@@ -748,7 +783,7 @@ mod tests {
         let source = FakeLogSource::new();
         source.write("w", LogStream::Stdout, T1, "before");
         let shared: SharedLogSource = Arc::new(source.clone());
-        let mut events = Box::pin(stream(shared, state.clone(), query(None, 10, true)));
+        let mut events = Box::pin(stream(shared, state.clone(), query(None, 10, true)).unwrap());
 
         assert_eq!(next(&mut events).await, "web Stdout before");
         assert_eq!(next(&mut events).await, "following");
@@ -795,7 +830,7 @@ mod tests {
         let source = FakeLogSource::new();
         source.write("w", LogStream::Stdout, T1, "old");
         let shared: SharedLogSource = Arc::new(source.clone());
-        let mut events = Box::pin(stream(shared, state, query(None, 0, true)));
+        let mut events = Box::pin(stream(shared, state, query(None, 0, true)).unwrap());
         assert_eq!(next(&mut events).await, "following");
         source.write("w", LogStream::Stdout, T2, "new");
         assert_eq!(next(&mut events).await, "web Stdout new");
@@ -807,7 +842,7 @@ mod tests {
         let source = FakeLogSource::new();
         source.write("w", LogStream::Stdout, T2, "out two");
         let shared: SharedLogSource = Arc::new(source.clone());
-        let mut events = Box::pin(stream(shared, state.clone(), query(None, 10, true)));
+        let mut events = Box::pin(stream(shared, state.clone(), query(None, 10, true)).unwrap());
         assert_eq!(next(&mut events).await, "web Stdout out two");
         assert_eq!(next(&mut events).await, "following");
 
@@ -866,5 +901,96 @@ mod tests {
                 .iter()
                 .all(|e| e.line.container == "blog-web-1" && e.line.service == "web")
         );
+    }
+
+    /// Line `i` of a long log: a second apart, each at the line limit, its
+    /// number first.
+    fn long_line(i: usize) -> (String, String) {
+        let secs = 8 * 60 + i;
+        (
+            format!("2024-05-06T07:{:02}:{:02}.000000000Z", secs / 60, secs % 60),
+            format!("{i:05} {}", "x".repeat(alchemy_core::logs::MAX_LINE - 6)),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_tail_keeps_only_the_newest_lines_that_fit_and_never_resends_the_rest() {
+        let state = ready_state(blog(&[
+            ("web", &[("w", RUNNING)]),
+            ("db", &[("d", RUNNING)]),
+        ]));
+        let source = FakeLogSource::new();
+        let lines = 400;
+        for i in 0..lines {
+            let (time, line) = long_line(i);
+            let id = if i % 2 == 0 { "w" } else { "d" };
+            source.write(id, LogStream::Stdout, &time, &line);
+        }
+        let shared: SharedLogSource = Arc::new(source.clone());
+        let mut events = Box::pin(stream(shared, state, query(None, 5000, true)).unwrap());
+        let mut sent = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), events.next())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                LogEvent::Log(line) => sent.push(line),
+                LogEvent::Following(_) => break,
+                LogEvent::Done(done) => panic!("{done:?}"),
+            }
+        }
+        let bytes: usize = sent
+            .iter()
+            .map(|l| {
+                l.line.len()
+                    + l.time.as_ref().map_or(0, String::len)
+                    + l.container.len()
+                    + l.service.len()
+            })
+            .sum();
+        assert!(bytes <= MAX_TAIL_BYTES, "{bytes}");
+        assert!(
+            bytes > MAX_TAIL_BYTES - 2 * alchemy_core::logs::MAX_LINE,
+            "{bytes}"
+        );
+        let numbers: Vec<usize> = sent.iter().map(|l| l.line[..5].parse().unwrap()).collect();
+        let first = lines - numbers.len();
+        assert_eq!(numbers, (first..lines).collect::<Vec<_>>());
+        assert!(first > 0, "nothing was dropped");
+
+        let (time, line) = long_line(lines);
+        source.write("w", LogStream::Stdout, &time, &line);
+        let next_line = next(&mut events).await;
+        assert!(
+            next_line.starts_with(&format!("web Stdout {lines:05} ")),
+            "{}",
+            &next_line[..20]
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_beyond_the_limit_are_refused_until_one_closes() {
+        let state = ready_state(blog(&[("web", &[("w", RUNNING)])]));
+        let source = FakeLogSource::new();
+        let shared: SharedLogSource = Arc::new(source.clone());
+        let mut open: Vec<_> = (0..super::super::MAX_STREAMS)
+            .map(|_| Box::pin(stream(shared.clone(), state.clone(), query(None, 0, true)).unwrap()))
+            .collect();
+        for events in &mut open {
+            assert_eq!(next(events).await, "following");
+        }
+        assert!(matches!(
+            stream(shared.clone(), state.clone(), query(None, 0, false)),
+            Err(LogsRefusal::Busy)
+        ));
+
+        drop(open.pop());
+        let mut events =
+            Box::pin(stream(shared.clone(), state.clone(), query(None, 0, false)).unwrap());
+        assert_eq!(next(&mut events).await, "done None");
+        assert!(events.next().await.is_none());
+        drop(events);
+        assert!(stream(shared, state, query(None, 0, false)).is_ok());
     }
 }

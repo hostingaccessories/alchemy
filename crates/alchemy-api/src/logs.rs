@@ -5,7 +5,8 @@
 //!
 //! 1. one `log` event per line of the last `tail` lines (200 by default,
 //!    at most 5000) of the app's containers, oldest first, ordered by the
-//!    engine's timestamps across containers;
+//!    engine's timestamps across containers. Only as many of the newest
+//!    of those as fit in 2 MiB are sent;
 //! 2. with `follow=true`, one `following` event, then a `log` event for
 //!    each new line as it arrives, until the client goes away;
 //! 3. without it, one `done` event, which ends the stream. A `done` with
@@ -17,7 +18,9 @@
 //! [`ErrorCode::AppNotFound`](crate::ErrorCode::AppNotFound), and an
 //! unknown service or a bad `tail` or `follow` a 400 with
 //! [`ErrorCode::BadRequest`](crate::ErrorCode::BadRequest), before any
-//! event is sent.
+//! event is sent. While alchemyd already serves 16 log streams, followed
+//! or not, a new request is a 503 with
+//! [`ErrorCode::Busy`](crate::ErrorCode::Busy).
 
 use serde::{Deserialize, Serialize, Serializer};
 

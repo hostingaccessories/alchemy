@@ -499,8 +499,19 @@ async fn app_logs(
             );
         }
     };
+    let events = match logs::stream(api.logs.clone(), api.state.clone(), query) {
+        Ok(events) => events,
+        Err(refusal) => {
+            tracing::debug!(%refusal, "refused a log stream");
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::Busy,
+                &refusal.to_string(),
+            );
+        }
+    };
     let mut shutdown = api.shutdown.clone();
-    let events = logs::stream(api.logs.clone(), api.state.clone(), query)
+    let events = events
         .map(|event| log_event(&event))
         .take_until(async move {
             let _ = shutdown.wait_for(|stop| *stop).await;
@@ -1770,6 +1781,34 @@ mod tests {
             assert_eq!(status, want, "{uri}: {body}");
             assert_eq!(body["code"], code, "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn logs_are_refused_as_busy_while_every_stream_is_taken() {
+        let state = State::new();
+        state.set_apps(app_list());
+        let taken: Vec<_> = (0..crate::logs::MAX_STREAMS)
+            .map(|_| state.log_streams().try_open().unwrap())
+            .collect();
+        let (status, body) = get_json_from(state.clone(), "/api/apps/blog/logs").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], "busy");
+        assert_eq!(
+            body["error"],
+            "alchemyd is already serving 16 log streams; close one and try again"
+        );
+
+        drop(taken);
+        let (app, _stop) = test_router(state);
+        let resp = app
+            .oneshot(
+                req(Method::GET, "/api/apps/blog/logs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

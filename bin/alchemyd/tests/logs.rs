@@ -1,7 +1,7 @@
 //! Logs wiring: `run_with` serving an app's logs over the API socket from
 //! a fake log source, matched to the app by its containers, following new
-//! lines, and ending cleanly when the client goes away or the daemon
-//! stops.
+//! lines, ending cleanly when the client goes away or the daemon stops,
+//! and refusing streams past the limit shared by both listeners.
 
 #![allow(
     clippy::unwrap_used,
@@ -24,7 +24,7 @@ use alchemyd::engine::EngineSource;
 use alchemyd::logs::FakeLogSource;
 use alchemyd::{Deps, State};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::UnixStream;
+use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{oneshot, watch};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -132,6 +132,7 @@ async fn wait_for_apps(state: &State, done: impl Fn(&AppList) -> bool) {
 struct Daemon {
     _dir: tempfile::TempDir,
     socket: PathBuf,
+    listen: SocketAddr,
     blog: PathBuf,
     state: State,
     logs: FakeLogSource,
@@ -157,6 +158,7 @@ impl Daemon {
         let config = FakeComposeConfig::new();
         config.project(blog.clone(), "blog", &["web", "db"]);
         let socket = root.join("alchemyd.sock");
+        let listen = free_port();
         let mut engine = EngineStatus::new(EngineState::Ready);
         engine.endpoint = Some("unix:///fake/docker.sock".into());
         let logs = FakeLogSource::new();
@@ -170,7 +172,7 @@ impl Daemon {
         let (stop, stop_rx) = oneshot::channel::<()>();
         let task = tokio::spawn(alchemyd::run_with(
             alchemyd::Config {
-                listen: free_port(),
+                listen,
                 socket: socket.clone(),
                 state_dir: root.join("state"),
             },
@@ -182,6 +184,7 @@ impl Daemon {
         let daemon = Self {
             _dir: dir,
             socket,
+            listen,
             blog,
             state,
             logs,
@@ -310,4 +313,60 @@ async fn follows_new_lines_across_a_restart_until_the_client_leaves() {
         .expect("daemon did not shut down")
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn log_streams_are_capped_across_both_listeners() {
+    let daemon = Daemon::start().await;
+    let uri = "/api/apps/blog/logs?service=web&follow=1&tail=0";
+
+    let mut tcp = TcpStream::connect(daemon.listen).await.unwrap();
+    let request = format!("GET {uri} HTTP/1.1\r\nHost: {}\r\n\r\n", daemon.listen);
+    tcp.write_all(request.as_bytes()).await.unwrap();
+    let mut seen = String::new();
+    while !seen.contains("event: following") {
+        let mut chunk = [0u8; 4096];
+        let n = tokio::time::timeout(TIMEOUT, tcp.read(&mut chunk))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n > 0, "closed: {seen}");
+        seen.push_str(std::str::from_utf8(&chunk[..n]).unwrap());
+    }
+
+    let mut open = Vec::new();
+    for _ in 1..alchemyd::logs::MAX_STREAMS {
+        let mut follow = daemon.get(uri).await;
+        follow.until("event: following").await;
+        open.push(follow);
+    }
+    let mut refused = daemon.get(uri).await;
+    let head = refused.until("\r\n\r\n").await;
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    refused.until("\"code\":\"busy\"").await;
+
+    drop(open.pop());
+    let logs = daemon.logs.clone();
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            logs.write(
+                "w1",
+                LogStream::Stdout,
+                "2024-05-06T07:08:09.000000000Z",
+                "ping",
+            );
+            let mut again = daemon.get(uri).await;
+            if again.until("\r\n\r\n").await.starts_with("HTTP/1.1 200") {
+                again.until("event: following").await;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("closing a stream never freed its place");
+
+    drop(tcp);
+    drop(open);
+    daemon.shut_down().await;
 }
