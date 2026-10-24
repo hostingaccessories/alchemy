@@ -241,11 +241,11 @@ impl Checker {
     async fn read_host(&self) -> (Vec<Ipv4Net>, Vec<Ipv4Net>, Option<String>) {
         let (lan, routes) = tokio::join!(self.host.lan_subnets(), self.host.routes());
         match (lan, routes) {
-            (Ok(lan), Ok(routes)) => (
-                lan,
-                routes.into_iter().map(|r| r.destination).collect(),
-                None,
-            ),
+            (Ok(lan), Ok(routes)) => {
+                let routes: Vec<Ipv4Net> = routes.into_iter().map(|r| r.destination).collect();
+                let routes = report::host_routes(&routes, &lan);
+                (lan, routes, None)
+            }
             (Err(error), _) | (_, Err(error)) => (Vec::new(), Vec::new(), Some(error.to_string())),
         }
     }

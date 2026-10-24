@@ -28,7 +28,8 @@ pub struct Findings {
     pub flavor: Option<EngineFlavor>,
     /// The LAN subnets.
     pub lan: Vec<Ipv4Net>,
-    /// Every route's destination, the default route included.
+    /// Every route's destination, the default route included; [`report`]
+    /// keeps those [`host_routes`] does.
     pub routes: Vec<Ipv4Net>,
     /// Why the host could not be read, if it could not.
     pub host_error: Option<String>,
@@ -97,6 +98,25 @@ pub fn pools_from_daemon_json(text: &str) -> Option<Vec<AddressPool>> {
     (!pools.is_empty()).then_some(pools)
 }
 
+/// The routes in `routes` that can collide with a Docker network, sorted
+/// and each once.
+///
+/// The default route, routes inside a LAN subnet (such as the host routes
+/// macOS adds for the gateway and this machine), and loopback, link-local,
+/// multicast, and broadcast routes are left out: none of them is where
+/// Docker puts networks, and the LAN is checked on its own.
+pub fn host_routes(routes: &[Ipv4Net], lan: &[Ipv4Net]) -> Vec<Ipv4Net> {
+    sorted(routes.iter().copied().filter(|route| {
+        let addr = route.network();
+        !route.is_default_route()
+            && !addr.is_loopback()
+            && !addr.is_link_local()
+            && !addr.is_multicast()
+            && !addr.is_broadcast()
+            && !lan.iter().any(|l| l.contains_net(route))
+    }))
+}
+
 /// The pools Docker carves new networks from: those the engine reported,
 /// else those `daemon_json` sets, else Docker's defaults.
 pub fn effective_pools(
@@ -148,6 +168,7 @@ pub fn report(findings: &Findings) -> NetworkReport {
         lan: sorted(findings.lan.iter().copied()),
         ..NetworkReport::default()
     };
+    let routes = host_routes(&findings.routes, &findings.lan);
     let mut warnings = Vec::new();
     let mut docker: Vec<Ipv4Net> = Vec::new();
     match &findings.engine {
@@ -171,7 +192,7 @@ pub fn report(findings: &Findings) -> NetworkReport {
                 .collect();
             let survey = survey(
                 &findings.lan,
-                &findings.routes,
+                &routes,
                 engine.bridge,
                 &engine.pools,
                 &engine.networks,
@@ -180,9 +201,10 @@ pub fn report(findings: &Findings) -> NetworkReport {
             warnings.extend(collision_warnings(&survey, &engine.networks, findings.flavor));
         }
     }
-    report.routes = sorted(findings.routes.iter().copied().filter(|route| {
-        !route.is_default_route() && !findings.lan.contains(route) && !docker.contains(route)
-    }));
+    report.routes = routes
+        .into_iter()
+        .filter(|route| !docker.contains(route))
+        .collect();
     if let Some(error) = &findings.host_error {
         warnings.push(warning(
             NetworkWarningKind::HostUnreadable,
@@ -652,6 +674,51 @@ mod tests {
             assert_eq!(report.alchemy.subnet, subnet.map(n), "{outcome:?}");
             let got: Vec<_> = report.warnings.iter().map(|w| w.kind).collect();
             assert_eq!(got, want, "{outcome:?}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn host_routes_keep_what_docker_could_collide_with() {
+        let ns = |list: &[&str]| -> Vec<Ipv4Net> { list.iter().map(|s| n(s)).collect() };
+        let cases: [(&str, Vec<Ipv4Net>, Vec<Ipv4Net>, Vec<Ipv4Net>); 4] = [
+            (
+                "macOS on 10.0.1.0/24",
+                ns(&[
+                    "0.0.0.0/0",
+                    "10.0.1.0/24",
+                    "10.0.1.1/32",
+                    "10.0.1.50/32",
+                    "127.0.0.0/8",
+                    "127.0.0.1/32",
+                    "169.254.0.0/16",
+                    "224.0.0.0/4",
+                    "255.255.255.255/32",
+                ]),
+                ns(&["10.0.1.0/24"]),
+                vec![],
+            ),
+            (
+                "VPN and Docker routes stay",
+                ns(&[
+                    "0.0.0.0/0",
+                    "100.64.0.0/10",
+                    "172.17.0.0/16",
+                    "100.64.0.0/10",
+                ]),
+                ns(&["192.168.1.0/24"]),
+                ns(&["100.64.0.0/10", "172.17.0.0/16"]),
+            ),
+            (
+                "a route wider than the LAN stays",
+                ns(&["10.0.0.0/8"]),
+                ns(&["10.0.1.0/24"]),
+                ns(&["10.0.0.0/8"]),
+            ),
+            ("nothing", vec![], vec![], vec![]),
+        ];
+        for (name, routes, lan, want) in cases {
+            assert_eq!(host_routes(&routes, &lan), want, "{name}");
         }
     }
 
