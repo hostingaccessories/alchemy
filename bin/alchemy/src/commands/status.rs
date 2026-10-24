@@ -1,12 +1,12 @@
 //! `alchemy status`: whether alchemyd is reachable, which version it runs,
-//! whether Docker is ready, and whether Docker's networks overlap the home
-//! network.
+//! whether Docker is ready, whether Docker's networks overlap the home
+//! network, and whether the web address proxy could open its ports.
 
 use std::io::Write;
 use std::path::Path;
 
 use alchemy_api::ApiEvent;
-use alchemy_api::network::{NetworkReport, NetworkWarning};
+use alchemy_api::network::{ListenerState, NetworkReport, NetworkWarning, ProxyReport};
 use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
 
 use crate::context::Context;
@@ -77,7 +77,7 @@ async fn watch<D: Daemon, W: Write>(
 }
 
 /// What `alchemy status` prints: the daemon and engine lines, then any
-/// network warnings, or one JSON object.
+/// network and proxy warnings, or one JSON object.
 pub(crate) fn status_lines(
     daemon: &DaemonInfo,
     socket: &Path,
@@ -91,6 +91,39 @@ pub(crate) fn status_lines(
     let mut lines = vec![daemon_line(daemon, socket), engine_line(engine)];
     if let Some(network) = network {
         lines.extend(warning_lines(&network.warnings));
+        lines.extend(proxy_lines(&network.proxy));
+    }
+    lines
+}
+
+/// A warning for each proxy port that couldn't be opened: port 80 first,
+/// with its fix, then each app's own port.
+pub(crate) fn proxy_lines(proxy: &ProxyReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    if proxy.host.state == ListenerState::Unavailable {
+        lines.push(format!(
+            "Warning: {}",
+            proxy.host.message.as_deref().unwrap_or(
+                "Alchemy can't listen on port 80, so addresses like http://<app>.localhost don't work."
+            )
+        ));
+        if let Some(fix) = proxy.host.fix.as_deref() {
+            lines.push(format!("  Fix: {fix}"));
+        }
+    }
+    for port in &proxy.ports {
+        if port.state != ListenerState::Unavailable {
+            continue;
+        }
+        let whose = port
+            .app
+            .as_deref()
+            .map_or_else(String::new, |app| format!("{app}'s address on "));
+        let why = port.message.as_deref().unwrap_or("it can't be opened.");
+        lines.push(format!(
+            "Warning: {whose}port {} doesn't work: {why}",
+            port.port
+        ));
     }
     lines
 }
@@ -477,6 +510,52 @@ mod tests {
         let lines: Vec<&str> = run.out.lines().collect();
         assert_eq!(lines[..2], [DAEMON_LINE, READY_LINE]);
         assert_eq!(lines[2..], warning_lines(&overlapping().warnings));
+    }
+
+    #[test]
+    fn proxy_warnings_cover_port_80_and_app_ports() {
+        use alchemy_api::network::ProxyListener;
+        let listener =
+            |port, app: Option<&str>, state, message: Option<&str>, fix: Option<&str>| {
+                ProxyListener {
+                    port,
+                    app: app.map(Into::into),
+                    state,
+                    message: message.map(Into::into),
+                    fix: fix.map(Into::into),
+                }
+            };
+        let proxy = ProxyReport {
+            reachability: None,
+            host: listener(
+                80,
+                None,
+                ListenerState::Unavailable,
+                Some(
+                    "Alchemy doesn't have permission to listen on port 80, so addresses like http://<app>.localhost don't work. Each app's own port still does.",
+                ),
+                Some("Let alchemyd use low ports."),
+            ),
+            ports: vec![
+                listener(8100, Some("blog"), ListenerState::Listening, None, None),
+                listener(
+                    8101,
+                    Some("wiki"),
+                    ListenerState::Unavailable,
+                    Some("Another program is using port 8101."),
+                    None,
+                ),
+            ],
+        };
+        assert_eq!(
+            proxy_lines(&proxy),
+            [
+                "Warning: Alchemy doesn't have permission to listen on port 80, so addresses like http://<app>.localhost don't work. Each app's own port still does.",
+                "  Fix: Let alchemyd use low ports.",
+                "Warning: wiki's address on port 8101 doesn't work: Another program is using port 8101.",
+            ]
+        );
+        assert_eq!(proxy_lines(&ProxyReport::default()), Vec::<String>::new());
     }
 
     #[tokio::test]

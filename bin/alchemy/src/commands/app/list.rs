@@ -31,7 +31,8 @@ pub(crate) async fn run<D: Daemon, W: Write>(
     Ok(())
 }
 
-/// What `alchemy app list` prints: a table of apps, then the Compose
+/// What `alchemy app list` prints: a table of apps, each with its best
+/// web address, then the Compose
 /// projects Alchemy doesn't manage, then anything worth a look, such as
 /// folders that were skipped. With `json`, the [`AppList`] as one line.
 pub(crate) fn list_lines(apps: &AppList, json: bool) -> Vec<String> {
@@ -46,6 +47,7 @@ pub(crate) fn list_lines(apps: &AppList, json: bool) -> Vec<String> {
             "NAME".to_owned(),
             "STATUS".to_owned(),
             "SERVICES".to_owned(),
+            "ADDRESS".to_owned(),
             "FOLDER".to_owned(),
         ]];
         rows.extend(apps.apps.iter().map(|app| {
@@ -55,10 +57,15 @@ pub(crate) fn list_lines(apps: &AppList, json: bool) -> Vec<String> {
             } else {
                 "-".to_owned()
             };
+            let address = app
+                .addresses
+                .first()
+                .map_or_else(|| "-".to_owned(), |a| a.url.clone());
             vec![
                 app.name.to_string(),
                 app_status(app.status, app.stop_reason),
                 services,
+                address,
                 app.dir.clone(),
             ]
         }));
@@ -137,8 +144,9 @@ fn notes(apps: &AppList) -> Vec<String> {
 )]
 pub(crate) mod tests {
     use alchemy_api::apps::{
-        App, AppContainer, AppDir, AppProblem, AppProblemKind, AppService, ContainerState,
-        ImageSource, SkipReason, SkippedApp, StackName, StackStatus, StopReason, UnmanagedApp,
+        AddressKind, AddressState, App, AppAddress, AppContainer, AppDir, AppProblem,
+        AppProblemKind, AppService, ContainerState, ImageSource, SkipReason, SkippedApp, StackName,
+        StackStatus, StopReason, UnmanagedApp,
     };
 
     use super::*;
@@ -181,7 +189,14 @@ pub(crate) mod tests {
             ],
             problems: vec![],
             stop_reason: StopReason::Unknown,
-            addresses: vec![],
+            addresses: vec![AppAddress {
+                kind: AddressKind::Port,
+                url: "http://192.168.1.20:8100/".into(),
+                state: AddressState::NotRunning,
+                service: "web".into(),
+                port: 80,
+                message: Some("Service web isn't running.".into()),
+            }],
         }
     }
 
@@ -203,6 +218,7 @@ pub(crate) mod tests {
         broken.project = None;
         broken.images = None;
         broken.services = vec![];
+        broken.addresses = vec![];
         broken.problems = vec![AppProblem {
             kind: AppProblemKind::ComposeError,
             message: "Compose can't read compose.yaml: yaml: line 4".into(),
@@ -265,9 +281,9 @@ pub(crate) mod tests {
         assert_eq!(
             list_lines(&full_list(), false),
             [
-                "NAME  STATUS          SERVICES  FOLDER",
-                "blog  partly running  1/2       /srv/apps/blog",
-                "wiki  unknown         -         /opt/stacks/wiki",
+                "NAME  STATUS          SERVICES  ADDRESS                    FOLDER",
+                "blog  partly running  1/2       http://192.168.1.20:8100/  /srv/apps/blog",
+                "wiki  unknown         -         -                          /opt/stacks/wiki",
                 "",
                 "Not managed by Alchemy:",
                 "  legacy  running                         /home/me/legacy",
