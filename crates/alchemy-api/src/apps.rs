@@ -93,11 +93,12 @@ pub struct AppAddress {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AddressKind {
-    /// A hostname such as `blog.localhost`, routed by the `Host` header
-    /// on port 80.
+    /// A hostname such as `blog.local` or `blog.localhost`, routed by the
+    /// `Host` header on port 80.
     Host,
     /// The app's own proxy port on every address of this machine, so it
-    /// works from other devices on the network.
+    /// works from other devices on the network, such as
+    /// `http://blog.local:8100/` or `http://192.168.1.20:8100/`.
     Port,
     /// A kind this build does not know.
     #[serde(other)]
@@ -112,13 +113,15 @@ pub enum AddressState {
     /// Requests reach the app.
     Ready,
     /// The app is running but can't be reached yet, such as while Alchemy
-    /// attaches it to its network, or opens or checks the port.
+    /// attaches it to its network, opens or checks the port, or announces
+    /// its `.local` name.
     Pending,
     /// The app isn't running, so the proxy answers that it's stopped.
     NotRunning,
     /// The proxy can't listen on this address's port, such as port 80
     /// without permission, or another program answers it, such as a
-    /// firewall redirect.
+    /// firewall redirect, or another device on the network uses its
+    /// `.local` name.
     Unavailable,
     /// A state this build does not know.
     #[serde(other)]
@@ -179,7 +182,8 @@ pub enum AppProblemKind {
     NetworkOverlap,
     /// A port the app publishes is already in use or reserved.
     PortConflict,
-    /// The app can't be given a web address, or only part of one; the
+    /// The app can't be given a web address, or only part of one, such
+    /// as when another device on the network uses its `.local` name; the
     /// message says what to add to its compose file.
     Route,
     /// A kind this build does not know.

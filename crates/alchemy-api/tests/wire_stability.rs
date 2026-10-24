@@ -1337,8 +1337,8 @@ fn net(cidr: &str) -> alchemy_api::network::Ipv4Net {
 fn network_report() {
     use alchemy_api::network::{
         AddressPool, AlchemyNetwork, AlchemyNetworkState, DockerNetwork, HostSide, ListenerState,
-        NetworkReport, NetworkWarning, NetworkWarningKind, PoolsSource, ProxyListener, ProxyReport,
-        Reachability,
+        MdnsBackend, MdnsReport, MdnsState, NetworkReport, NetworkWarning, NetworkWarningKind,
+        PoolsSource, ProxyListener, ProxyReport, Reachability,
     };
     let report = NetworkReport {
         engine_ready: true,
@@ -1385,6 +1385,12 @@ fn network_report() {
                 fix: None,
             }],
         },
+        mdns: MdnsReport {
+            state: MdnsState::Unavailable,
+            backend: Some(MdnsBackend::DnsSd),
+            message: Some("m".into()),
+            fix: Some("f".into()),
+        },
     };
     assert_wire(
         &report,
@@ -1399,7 +1405,8 @@ fn network_report() {
             r#""network":null}],"proxy":{"reachability":"container_ip","#,
             r#""host":{"port":80,"app":null,"state":"unavailable","message":"m","fix":"f"},"#,
             r#""ports":[{"port":8100,"app":"blog","state":"listening","message":null,"#,
-            r#""fix":null}]}}"#,
+            r#""fix":null}]},"mdns":{"state":"unavailable","backend":"dns_sd","#,
+            r#""message":"m","fix":"f"}}"#,
         ),
     );
     let older = concat!(
@@ -1407,14 +1414,77 @@ fn network_report() {
         r#""pools_source":"unknown","networks":[],"#,
         r#""alchemy":{"name":"alchemy","state":"pending","subnet":null},"warnings":[]"#,
     );
+    let proxy = r#""proxy":{"reachability":null,"host":{"port":80,"app":null,"state":"off","message":null,"fix":null},"ports":[]}"#;
     assert_wire(
         &NetworkReport::default(),
         &format!(
-            r#"{older},"proxy":{{"reachability":null,"host":{{"port":80,"app":null,"state":"off","message":null,"fix":null}},"ports":[]}}}}"#
+            r#"{older},{proxy},"mdns":{{"state":"off","backend":null,"message":null,"fix":null}}}}"#
         ),
     );
-    let older: NetworkReport = serde_json::from_str(&format!("{older}}}")).unwrap();
-    assert_eq!(older, NetworkReport::default(), "a daemon without a proxy");
+    let without_proxy: NetworkReport = serde_json::from_str(&format!("{older}}}")).unwrap();
+    assert_eq!(
+        without_proxy,
+        NetworkReport::default(),
+        "a daemon without a proxy"
+    );
+    let without_mdns: NetworkReport = serde_json::from_str(&format!("{older},{proxy}}}")).unwrap();
+    assert_eq!(
+        without_mdns,
+        NetworkReport::default(),
+        "a daemon without mDNS"
+    );
+}
+
+#[test]
+fn mdns_enums() {
+    use alchemy_api::network::{MdnsBackend, MdnsState};
+    for (state, want) in [
+        (MdnsState::Off, r#""off""#),
+        (MdnsState::Starting, r#""starting""#),
+        (MdnsState::Announcing, r#""announcing""#),
+        (MdnsState::Unavailable, r#""unavailable""#),
+        (MdnsState::Other, r#""other""#),
+    ] {
+        assert_wire(&state, want);
+    }
+    for (backend, want) in [
+        (MdnsBackend::Avahi, r#""avahi""#),
+        (MdnsBackend::DnsSd, r#""dns_sd""#),
+        (MdnsBackend::BuiltIn, r#""built_in""#),
+        (MdnsBackend::Other, r#""other""#),
+    ] {
+        assert_wire(&backend, want);
+    }
+    let future: MdnsState = serde_json::from_str(r#""paused""#).unwrap();
+    assert_eq!(future, MdnsState::Other);
+    let future: MdnsBackend = serde_json::from_str(r#""systemd_resolved""#).unwrap();
+    assert_eq!(future, MdnsBackend::Other);
+}
+
+#[test]
+fn network_settings() {
+    use alchemy_api::network::{NetworkSettings, NetworkSettingsUpdate};
+    assert_wire(&NetworkSettings { mdns: true }, r#"{"mdns":true}"#);
+    assert_wire(&NetworkSettings { mdns: false }, r#"{"mdns":false}"#);
+    assert_eq!(NetworkSettings::default(), NetworkSettings { mdns: true });
+    assert_wire(
+        &NetworkSettingsUpdate { mdns: Some(false) },
+        r#"{"mdns":false}"#,
+    );
+    assert_wire(&NetworkSettingsUpdate { mdns: None }, "{}");
+    let cases = [
+        (true, None, true),
+        (true, Some(false), false),
+        (false, Some(true), true),
+        (false, None, false),
+    ];
+    for (mdns, update, want) in cases {
+        assert_eq!(
+            NetworkSettings { mdns }.updated(NetworkSettingsUpdate { mdns: update }),
+            NetworkSettings { mdns: want },
+            "{mdns} {update:?}"
+        );
+    }
 }
 
 #[test]
