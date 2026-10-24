@@ -73,13 +73,13 @@ override, or `.env` changes.
 A folder that looks like an app but can't be one is **skipped** and listed
 with the reason, on the Apps page and in `alchemy app list`:
 
-| Reason                                     | Why                                                                                                                                                           |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The name isn't a valid app name            | The folder name is the app's name in the UI, the CLI, and the API. Rename the folder to use it (see [Adopting existing stacks](#adopting-existing-stacks)).   |
-| Another app with this name is already used | Two app folders hold a folder of the same name. The first app folder in the list wins.                                                                       |
-| The folder is a symlink                    | Alchemy only uses folders that are really inside an app folder. Add the folder it points to as an app folder instead.                                        |
+| Reason                                     | Why                                                                                                                                                            |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The name isn't a valid app name            | The folder name is the app's name in the UI, the CLI, and the API. Rename the folder to use it (see [Adopting existing stacks](#adopting-existing-stacks)).    |
+| Another app with this name is already used | Two app folders hold a folder of the same name. The first app folder in the list wins.                                                                         |
+| The folder is a symlink                    | Alchemy only uses folders that are really inside an app folder. Add the folder it points to as an app folder instead.                                          |
 | The compose file is a symlink              | So an app can't point its compose file at files elsewhere. Alchemy doesn't fall back to the next file name either, so it always reads what Compose would read. |
-| The compose file isn't a regular file      | For example, `compose.yaml` is a folder.                                                                                                                      |
+| The compose file isn't a regular file      | For example, `compose.yaml` is a folder.                                                                                                                       |
 
 Hidden folders (starting with `.`), plain files, and folders without a
 compose file are ignored without a report. A missing home is normal and
@@ -135,10 +135,67 @@ result. Things to check when adopting:
 
 ## Creating and editing apps
 
-> **Placeholder.** Creating an app and editing its compose file from
-> Alchemy is still being built. This section will describe it once it
-> ships. Until then, create the folder and compose file by hand; Alchemy
-> picks it up within a few seconds.
+Alchemy can write two files for you: an app's compose file and its `.env`.
+Every change is checked with `docker compose config` before it is saved,
+and nothing Compose rejects is ever written, so a typo never leaves a
+broken file on disk. You can still create and edit the files by hand;
+Alchemy picks up the change within a few seconds.
+
+### Creating an app
+
+On the **Apps** page, choose **Add app**. Give it a name (lowercase
+letters, digits, `-`, and `_`; it becomes the folder's name), pick the app
+folder if you have more than one, paste the compose file, and optionally a
+`.env` under **Environment file (.env)**. **Create app** opens the new
+app's page. From the CLI:
+
+```sh
+alchemy app create blog                          # copies ./compose.yaml
+alchemy app create blog --file ~/blog.yaml --env-file ~/blog.env
+cat compose.yaml | alchemy app create blog --file -
+alchemy app create blog --folder /opt/stacks     # an app folder other than the home
+alchemy app create blog --dry-run                # only check it with Compose
+```
+
+The app gets a new folder, `HOME/NAME` or `FOLDER/NAME`, holding
+`compose.yaml` and, if you gave one, `.env`. The home is created the first
+time an app goes in it. `--folder` must be one of your app folders.
+Creating an app doesn't start it; use **Create and start** (`alchemy app up
+NAME`) when you're ready.
+
+Alchemy never replaces a folder, since it may hold data: if the folder
+already exists, even empty, or another app already has the name, the app
+isn't created.
+
+### Editing an app's files
+
+Each app's page has an **Edit** section with its compose file and its
+`.env`. Change one and choose **Save**; **Undo changes** puts back what was
+loaded. From the CLI:
+
+```sh
+alchemy app edit blog         # the compose file
+alchemy app edit blog --env   # the .env
+```
+
+`alchemy app edit` opens a private copy in `$VISUAL` or `$EDITOR` (`vi` if
+neither is set), so it needs a terminal. When you quit, Compose checks it.
+If Compose rejects it, the editor opens again with Compose's message at the
+top on lines starting `# alchemy:`; quit without changing anything to give
+up. Once Compose accepts it, `alchemy` asks before saving (`--yes` skips
+the question, `--dry-run` saves nothing).
+
+- **Hand edits are never overwritten.** Alchemy saves only if the file on
+  disk is still the one you started editing. If someone changed it in the
+  meantime, by hand or from another window, nothing is saved: the web UI
+  offers **Reload it**, and the CLI keeps your copy and says where it is.
+  `alchemy app edit --force` saves your version over the change instead.
+- **Only that file is replaced,** in one step, keeping its permissions. A
+  `.env` written by Alchemy is always readable by you alone (`0600`).
+- **Saving doesn't restart anything.** Run **Update** or **Create and
+  start** to apply the change.
+- Each file can be up to 256 KiB of text. Apps whose folder or file is a
+  symlink can't be edited from Alchemy.
 
 ## Actions
 
@@ -146,16 +203,16 @@ Every app has the same actions in the web UI (on its page) and the CLI. Each
 runs `docker compose` in the app's folder, with no `-p` or `-f`, so it acts on
 the same project you would by hand.
 
-| Action  | Web UI                            | CLI                      | Runs                                                   |
-| ------- | --------------------------------- | ------------------------ | ------------------------------------------------------ |
-| Start   | Start                             | `alchemy app start NAME`   | `docker compose start`: starts existing containers     |
-| Stop    | Stop                              | `alchemy app stop NAME`    | `docker compose stop`: stops them, keeps them          |
-| Restart | Restart                           | `alchemy app restart NAME` | `docker compose restart`                               |
-| Update  | Update                            | `alchemy app update NAME`  | See below                                              |
-| Up      | More actions › Create and start   | `alchemy app up NAME`      | `docker compose up --detach`                           |
-| Pull    | More actions › Download images    | `alchemy app pull NAME`    | `docker compose pull`, without restarting anything     |
-| Build   | More actions › Build images       | `alchemy app build NAME`   | `docker compose build`, for services with `build:`     |
-| Down    | More actions › Take down          | `alchemy app down NAME`    | `docker compose down`                                  |
+| Action  | Web UI                          | CLI                        | Runs                                               |
+| ------- | ------------------------------- | -------------------------- | -------------------------------------------------- |
+| Start   | Start                           | `alchemy app start NAME`   | `docker compose start`: starts existing containers |
+| Stop    | Stop                            | `alchemy app stop NAME`    | `docker compose stop`: stops them, keeps them      |
+| Restart | Restart                         | `alchemy app restart NAME` | `docker compose restart`                           |
+| Update  | Update                          | `alchemy app update NAME`  | See below                                          |
+| Up      | More actions › Create and start | `alchemy app up NAME`      | `docker compose up --detach`                       |
+| Pull    | More actions › Download images  | `alchemy app pull NAME`    | `docker compose pull`, without restarting anything |
+| Build   | More actions › Build images     | `alchemy app build NAME`   | `docker compose build`, for services with `build:` |
+| Down    | More actions › Take down        | `alchemy app down NAME`    | `docker compose down`                              |
 
 - **Start** only starts containers that exist. For a new app, or one you
   took down, use **Create and start** (`up`), which creates the containers
@@ -261,15 +318,15 @@ app's CPU is its share of the VM. The Machines page and
 
 When an app or a service isn't running, Alchemy says why, problem first:
 
-| Shown as                         | What happened                                                                                                                          |
-| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Crashed (exit code 1)            | It exited on its own with an error, or its process was killed from outside Docker.                                                     |
-| Crashed (out of memory)          | It ran out of memory and was killed.                                                                                                   |
-| Keeps crashing                   | It crashed three times in a row, each within a minute of starting, and its restart policy keeps starting it again.                     |
-| Stopped outside Alchemy          | Someone stopped it through Docker, such as `docker stop`, `docker kill`, or `docker compose stop` run by hand.                          |
-| Stopped                          | Alchemy stopped it (Stop, Restart, or Take down), or the reason can't be told.                                                          |
-| Finished                         | It exited with code 0 on its own, as a one-off job does. A finished job doesn't make its app Partly running.                           |
-| Not running                      | It was created but never started, or the app has no containers.                                                                        |
+| Shown as                | What happened                                                                                                      |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Crashed (exit code 1)   | It exited on its own with an error, or its process was killed from outside Docker.                                 |
+| Crashed (out of memory) | It ran out of memory and was killed.                                                                               |
+| Keeps crashing          | It crashed three times in a row, each within a minute of starting, and its restart policy keeps starting it again. |
+| Stopped outside Alchemy | Someone stopped it through Docker, such as `docker stop`, `docker kill`, or `docker compose stop` run by hand.     |
+| Stopped                 | Alchemy stopped it (Stop, Restart, or Take down), or the reason can't be told.                                     |
+| Finished                | It exited with code 0 on its own, as a one-off job does. A finished job doesn't make its app Partly running.       |
+| Not running             | It was created but never started, or the app has no containers.                                                    |
 
 Alchemy remembers what it last asked of each app, so it still tells its own
 stops from someone else's after it restarts. Containers that were already
