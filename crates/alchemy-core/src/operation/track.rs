@@ -2,8 +2,23 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{Action, Operation, OperationState, Step, StepCommand, StepState, step_label};
+use super::{
+    Action, MAX_OUTPUT_LINE, Operation, OperationState, Step, StepCommand, StepState, step_label,
+};
 use crate::StackName;
+use crate::logs::{LineSplitter, TRUNCATED};
+
+/// The most characters of a build step's name kept in the tag on each of
+/// its log lines.
+const TAG_CHARS: usize = 60;
+
+/// Characters of a digest, after its algorithm, that tag the log lines of
+/// a build step whose name is unknown.
+const SHORT_DIGEST: usize = 12;
+
+/// The most bytes kept of one build log line, leaving room under
+/// [`MAX_OUTPUT_LINE`] for its tag.
+const LOG_LINE: usize = MAX_OUTPUT_LINE - 1024;
 
 /// How far along one resource is, as Compose reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,6 +51,18 @@ pub struct BuildStep {
     pub cached: bool,
     /// Why it failed.
     pub error: Option<String>,
+}
+
+/// A chunk of what a build step wrote, as `BuildKit` sends it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildLog {
+    /// The digest of the build step that wrote it.
+    pub vertex: String,
+    /// The step's stream it came from: 1 for standard output, 2 for
+    /// standard error.
+    pub stream: u8,
+    /// The bytes, which need not end at a line or a character.
+    pub data: Vec<u8>,
 }
 
 /// Something a run reported. `step` is an index into
@@ -85,12 +112,21 @@ pub enum Progress {
         /// The message.
         message: String,
     },
-    /// Build steps changed.
+    /// Build steps changed, or wrote output.
+    ///
+    /// Each complete line a build step writes becomes an output line
+    /// `NAME | LINE`, tagged with the step's name, or the start of its
+    /// digest before its name is known. Lines end at `\n`; on a line
+    /// redrawn with `\r`, as progress bars are, only the last drawing is
+    /// kept. A line still open when its step finishes or fails is written
+    /// then.
     Build {
         /// The step that reported them.
         step: usize,
         /// The build steps in this report.
         vertexes: Vec<BuildStep>,
+        /// What the build steps wrote, in order.
+        logs: Vec<BuildLog>,
     },
 }
 
@@ -152,6 +188,8 @@ struct Tally {
     resources: BTreeMap<String, Seen>,
     vertexes: BTreeMap<String, bool>,
     written: BTreeSet<(String, bool)>,
+    names: BTreeMap<String, String>,
+    logs: BTreeMap<(String, u8), LineSplitter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,7 +285,11 @@ impl Tracker {
                 text,
                 details.as_deref(),
             ),
-            Progress::Build { step, vertexes } => self.build(*step, vertexes),
+            Progress::Build {
+                step,
+                vertexes,
+                logs,
+            } => self.build(*step, vertexes, logs),
         }
     }
 
@@ -356,7 +398,10 @@ impl Tracker {
         }
     }
 
-    fn build(&mut self, index: usize, vertexes: &[BuildStep]) -> Applied {
+    /// Write each build step's start, then the log lines in the report,
+    /// then any line left open by a step that is now done, then each
+    /// step's end, so a step's output always comes between the two.
+    fn build(&mut self, index: usize, vertexes: &[BuildStep], logs: &[BuildLog]) -> Applied {
         let Some(tally) = self.tallies.get_mut(index) else {
             return Applied::default();
         };
@@ -365,12 +410,41 @@ impl Tracker {
             if vertex.name.is_empty() {
                 continue;
             }
+            tally
+                .names
+                .insert(vertex.digest.clone(), vertex.name.clone());
             let done = vertex.completed || vertex.error.is_some();
             let entry = tally.vertexes.entry(vertex.digest.clone()).or_insert(false);
             *entry |= done;
             if vertex.started && !done && tally.written.insert((vertex.digest.clone(), false)) {
                 lines.push((index, vertex.name.clone()));
             }
+        }
+        for log in logs {
+            let splitter = tally
+                .logs
+                .entry((log.vertex.clone(), log.stream))
+                .or_insert_with(|| LineSplitter::with_max(LOG_LINE));
+            for line in splitter.push(&log.data) {
+                lines.push((index, log_line(&tally.names, &log.vertex, &line)));
+            }
+        }
+        let closed: Vec<(String, u8)> = tally
+            .logs
+            .keys()
+            .filter(|(digest, _)| tally.vertexes.get(digest) == Some(&true))
+            .cloned()
+            .collect();
+        for key in closed {
+            if let Some(line) = tally.logs.remove(&key).and_then(|mut s| s.finish()) {
+                lines.push((index, log_line(&tally.names, &key.0, &line)));
+            }
+        }
+        for vertex in vertexes {
+            if vertex.name.is_empty() {
+                continue;
+            }
+            let done = vertex.completed || vertex.error.is_some();
             if done && tally.written.insert((vertex.digest.clone(), true)) {
                 let line = match (&vertex.error, vertex.cached) {
                     (Some(error), _) => format!("{}: error: {error}", vertex.name),
@@ -399,6 +473,26 @@ impl Tracker {
         step.message = message;
         true
     }
+}
+
+/// `line` from the build step `digest`, tagged with the step's name.
+fn log_line(names: &BTreeMap<String, String>, digest: &str, line: &str) -> String {
+    let shown = line.rsplit('\r').next().unwrap_or(line);
+    let tag = names.get(digest).map_or_else(
+        || {
+            let hex = digest.split_once(':').map_or(digest, |(_, hex)| hex);
+            hex.chars().take(SHORT_DIGEST).collect()
+        },
+        |name| {
+            let first = name.lines().next().unwrap_or_default();
+            let mut tag: String = first.chars().take(TAG_CHARS).collect();
+            if tag.len() < name.len() {
+                tag.push_str(TRUNCATED);
+            }
+            tag
+        },
+    );
+    format!("{tag} | {shown}")
 }
 
 /// The one-line progress of a step running `command`, from what it has
@@ -763,10 +857,205 @@ mod tests {
             ),
         ];
         for (vertexes, lines, message) in reports {
-            let applied = t.apply(&Progress::Build { step: 0, vertexes });
+            let applied = t.apply(&Progress::Build {
+                step: 0,
+                vertexes,
+                logs: Vec::new(),
+            });
             let got: Vec<&str> = applied.lines.iter().map(|(_, l)| l.as_str()).collect();
             assert_eq!(got, lines);
             assert_eq!(t.operation().steps[0].message.as_deref(), Some(message));
+        }
+    }
+
+    fn log(vertex: &str, stream: u8, data: &[u8]) -> BuildLog {
+        BuildLog {
+            vertex: vertex.to_owned(),
+            stream,
+            data: data.to_vec(),
+        }
+    }
+
+    fn build_lines(reports: Vec<(Vec<BuildStep>, Vec<BuildLog>)>) -> Vec<(usize, String)> {
+        let mut t = tracker(Action::Build, &[StepCommand::Build]);
+        t.apply(&Progress::StepStarted { step: 0 });
+        reports
+            .into_iter()
+            .flat_map(|(vertexes, logs)| {
+                t.apply(&Progress::Build {
+                    step: 0,
+                    vertexes,
+                    logs,
+                })
+                .lines
+            })
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn writes_build_step_logs_as_tagged_lines() {
+        const RUN: &str = "sha256:aaa";
+        type Report = (Vec<BuildStep>, Vec<BuildLog>);
+        let running = || vertex(RUN, "[2/2] RUN make", true, false);
+        let finished = || vertex(RUN, "[2/2] RUN make", true, true);
+        let failed = || BuildStep {
+            error: Some("exit code: 2".to_owned()),
+            ..running()
+        };
+        let long_name = format!("[2/2] RUN {}", "é".repeat(80));
+        let long_line = format!("[2/2] RUN {}{TRUNCATED} | x", "é".repeat(50));
+        let cases: Vec<(&str, Vec<Report>, Vec<&str>)> = vec![
+            (
+                "a log in several chunks",
+                vec![(
+                    vec![running()],
+                    vec![log(RUN, 1, b"hello\n"), log(RUN, 1, b"world\n")],
+                )],
+                vec![
+                    "[2/2] RUN make",
+                    "[2/2] RUN make | hello",
+                    "[2/2] RUN make | world",
+                ],
+            ),
+            (
+                "a line split across reports",
+                vec![
+                    (vec![running()], vec![log(RUN, 1, b"hel")]),
+                    (vec![], vec![log(RUN, 1, b"lo\nwor")]),
+                    (vec![], vec![log(RUN, 1, b"ld\n")]),
+                ],
+                vec![
+                    "[2/2] RUN make",
+                    "[2/2] RUN make | hello",
+                    "[2/2] RUN make | world",
+                ],
+            ),
+            (
+                "crlf",
+                vec![(vec![running()], vec![log(RUN, 1, b"a\r\nb\r\n")])],
+                vec!["[2/2] RUN make", "[2/2] RUN make | a", "[2/2] RUN make | b"],
+            ),
+            (
+                "a progress bar redrawn with cr",
+                vec![(vec![running()], vec![log(RUN, 2, b"10%\r50%\r100%\n")])],
+                vec!["[2/2] RUN make", "[2/2] RUN make | 100%"],
+            ),
+            (
+                "stdout and stderr kept apart",
+                vec![(
+                    vec![running()],
+                    vec![
+                        log(RUN, 1, b"out"),
+                        log(RUN, 2, b"err\n"),
+                        log(RUN, 1, b"put\n"),
+                    ],
+                )],
+                vec![
+                    "[2/2] RUN make",
+                    "[2/2] RUN make | err",
+                    "[2/2] RUN make | output",
+                ],
+            ),
+            (
+                "invalid utf-8",
+                vec![(vec![running()], vec![log(RUN, 1, b"a\xffb\n")])],
+                vec!["[2/2] RUN make", "[2/2] RUN make | a\u{fffd}b"],
+            ),
+            (
+                "an unknown step is tagged with its digest",
+                vec![(vec![], vec![log("sha256:0123456789abcdef0123", 1, b"hi\n")])],
+                vec!["0123456789ab | hi"],
+            ),
+            (
+                "a digest without an algorithm",
+                vec![(vec![], vec![log("abc", 1, b"hi\n")])],
+                vec!["abc | hi"],
+            ),
+            (
+                "an open line is written when the step fails",
+                vec![
+                    (
+                        vec![running()],
+                        vec![log(RUN, 2, b"make: *** [all] Error 2")],
+                    ),
+                    (vec![failed()], vec![]),
+                ],
+                vec![
+                    "[2/2] RUN make",
+                    "[2/2] RUN make | make: *** [all] Error 2",
+                    "[2/2] RUN make: error: exit code: 2",
+                ],
+            ),
+            (
+                "logs come before the end of the step that wrote them",
+                vec![(vec![finished()], vec![log(RUN, 1, b"one\nlast")])],
+                vec![
+                    "[2/2] RUN make | one",
+                    "[2/2] RUN make | last",
+                    "[2/2] RUN make: done",
+                ],
+            ),
+            (
+                "a log after its step finished",
+                vec![
+                    (vec![finished()], vec![]),
+                    (vec![], vec![log(RUN, 1, b"late")]),
+                ],
+                vec!["[2/2] RUN make: done", "[2/2] RUN make | late"],
+            ),
+            (
+                "an open line of a step still running stays open",
+                vec![(vec![running()], vec![log(RUN, 1, b"partial")])],
+                vec!["[2/2] RUN make"],
+            ),
+            (
+                "a long name is shortened in the tag",
+                vec![(
+                    vec![vertex(RUN, &long_name, false, false)],
+                    vec![log(RUN, 1, b"x\n")],
+                )],
+                vec![&long_line],
+            ),
+        ];
+        for (name, reports, want) in cases {
+            let got = build_lines(reports);
+            assert!(got.iter().all(|(step, _)| *step == 0), "{name}");
+            let got: Vec<&str> = got.iter().map(|(_, l)| l.as_str()).collect();
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn caps_build_log_lines() {
+        let name = "😀".repeat(200);
+        let long = vec![b'x'; MAX_OUTPUT_LINE * 2];
+        let cases: [(&str, Vec<BuildLog>, bool); 2] = [
+            (
+                "a long line",
+                vec![log("d", 1, &long), log("d", 1, b"\nnext\n")],
+                false,
+            ),
+            (
+                "a long open line, many chunks",
+                long.chunks(1000).map(|chunk| log("d", 1, chunk)).collect(),
+                true,
+            ),
+        ];
+        for (case, logs, finish) in cases {
+            let mut reports = vec![(vec![vertex("d", &name, true, false)], logs)];
+            if finish {
+                reports.push((vec![vertex("d", &name, true, true)], vec![]));
+            }
+            let lines = build_lines(reports);
+            let cut: Vec<&String> = lines
+                .iter()
+                .map(|(_, l)| l)
+                .filter(|l| l.contains("xxx"))
+                .collect();
+            assert_eq!(cut.len(), 1, "{case}");
+            assert!(cut[0].len() <= MAX_OUTPUT_LINE, "{case}: {}", cut[0].len());
+            assert!(cut[0].ends_with(&format!("xx{TRUNCATED}")), "{case}");
         }
     }
 

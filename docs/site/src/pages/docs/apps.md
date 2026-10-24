@@ -275,7 +275,9 @@ An action can take a while, so Alchemy shows it as steps in plain words,
 such as "Downloading images" with "2 of 3 images downloaded" under it.
 
 - **Web UI:** the app page shows the latest action and its steps, with
-  Compose's own output folded under each step. Any open window shows it,
+  Compose's own output folded under each step. While building, that
+  includes what each build step prints, such as the output of a failing
+  `RUN`, as `[2/3] RUN npm ci | ...`. Any open window shows it,
   whichever window or command started it. **Cancel** stops it.
 - **CLI:** each step is printed on stderr as it starts or fails, and the
   result on stdout. `--json` prints every event as one line on stdout. The

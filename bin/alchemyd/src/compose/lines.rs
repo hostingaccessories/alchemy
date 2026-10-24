@@ -3,7 +3,7 @@
 /// The longest line kept, in bytes. Anything past it, up to the next
 /// newline, is dropped, so a child that never writes a newline cannot grow
 /// the daemon's memory.
-pub(super) const MAX_LINE: usize = 64 * 1024;
+pub(super) const MAX_LINE: usize = alchemy_core::operation::MAX_OUTPUT_LINE;
 
 /// Turns chunks of bytes into complete lines.
 ///

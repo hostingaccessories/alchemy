@@ -4,10 +4,11 @@
 
 use alchemy_api::operations::{ActionPlan, PlannedStep};
 use alchemy_core::StackName;
-use alchemy_core::operation::{BuildStep, Progress, ResourceState, step_label};
+use alchemy_core::operation::{BuildLog, BuildStep, Progress, ResourceState, step_label};
 
 use crate::compose::{
-    BuildVertex, ComposeError, ComposeEvent, ComposePlan, OutputLine, ProgressEvent, ResourceStatus,
+    BuildVertex, ComposeError, ComposeEvent, ComposePlan, OutputLine, ProgressEvent,
+    ResourceStatus, VertexLog,
 };
 
 /// What `event` reports, in the operation model's terms.
@@ -38,6 +39,7 @@ fn line_progress(line: &OutputLine) -> Progress {
         Some(ProgressEvent::Build(build)) => Progress::Build {
             step,
             vertexes: build.vertexes.iter().map(build_step).collect(),
+            logs: build.logs.iter().map(build_log).collect(),
         },
         None => Progress::Text {
             step,
@@ -64,6 +66,14 @@ fn build_step(vertex: &BuildVertex) -> BuildStep {
         completed: vertex.completed,
         cached: vertex.cached,
         error: vertex.error.clone(),
+    }
+}
+
+fn build_log(log: &VertexLog) -> BuildLog {
+    BuildLog {
+        vertex: log.vertex.clone(),
+        stream: log.stream,
+        data: log.data.clone(),
     }
 }
 
@@ -141,6 +151,7 @@ mod tests {
     use crate::compose::{ComposeAction, ComposeCommand, ComposeProject, ImageSource, Stream};
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn maps_events_to_progress() {
         let cases = [
             (
@@ -221,6 +232,23 @@ mod tests {
                         completed: true,
                         cached: true,
                         error: None,
+                    }],
+                    logs: Vec::new(),
+                },
+            ),
+            (
+                ComposeEvent::Output(OutputLine::new(
+                    1,
+                    Stream::Stdout,
+                    r#"{"logs":[{"vertex":"sha256:b","stream":2,"data":"aGkK","timestamp":"t"}]}"#,
+                )),
+                Progress::Build {
+                    step: 1,
+                    vertexes: Vec::new(),
+                    logs: vec![BuildLog {
+                        vertex: "sha256:b".into(),
+                        stream: 2,
+                        data: b"hi\n".to_vec(),
                     }],
                 },
             ),

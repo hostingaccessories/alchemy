@@ -406,7 +406,12 @@ proxies, and `SSH_AUTH_SOCK` never do.
 events: `operation` first and on every step change, `output` for each line
 of output (from its first kept line, so a late follower misses nothing
 still held), then `done`. Each step has a plain-words `label` and a
-one-line `message`, such as "2 of 3 images downloaded". The daemon keeps
+one-line `message`, such as "2 of 3 images downloaded". During a build,
+the base64 logs in BuildKit's JSON status lines are decoded and split into
+`output` lines tagged with their build step, `[2/3] RUN npm ci | LINE`
+(the start of the step's digest before its name is known); a line still
+open when its step ends is written then. Each output line is at most
+64 KiB. The daemon keeps
 the newest 5000 output lines per operation, and finished operations in
 memory for an hour (at most 100); `GET /api/operations[?app=NAME]` lists
 recent ones, newest first, from the state database too, which keeps the

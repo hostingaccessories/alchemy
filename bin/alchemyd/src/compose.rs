@@ -39,7 +39,8 @@ pub use plan::{
     ComposeAction, ComposeCommand, ComposePlan, ComposeStep, ImageSource, UnknownAction,
 };
 pub use progress::{
-    BuildProgress, BuildVertex, ProgressEvent, ResourceProgress, ResourceStatus, parse_progress,
+    BuildProgress, BuildVertex, ProgressEvent, ResourceProgress, ResourceStatus, VertexLog,
+    parse_progress,
 };
 pub use project::{ComposeProject, ComposeProjectError};
 pub use runner::{

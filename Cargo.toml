@@ -24,6 +24,7 @@ alchemyd     = { path = "bin/alchemyd" }
 
 anyhow             = "1"
 axum               = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+base64             = { version = "0.22", default-features = false, features = ["alloc"] }
 bollard            = { version = "0.21", default-features = false, features = ["pipe"] }
 clap               = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env", "string"] }
 clap_complete      = { version = "4.6", default-features = false }

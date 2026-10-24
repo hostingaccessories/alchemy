@@ -5,13 +5,16 @@
 //! "text":"Started"}`); a run that fails ends with
 //! `{"error":true,"message":"..."}`; and `build` passes `BuildKit`'s own
 //! solve status through on standard output
-//! (`{"vertexes":[...],"statuses":[...]}`).
+//! (`{"vertexes":[...],"statuses":[...],"logs":[...]}`), where each log
+//! entry carries a chunk of a step's output in base64.
 //!
 //! [`parse_progress`] is tolerant: unknown fields are ignored, a field of
 //! the wrong type reads as missing, and anything that is not one of these
 //! shapes, including plain text, is `None`. Callers keep the raw line
 //! either way.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use serde_json::{Map, Value};
 
 /// A recognised progress line.
@@ -83,13 +86,27 @@ pub struct ResourceProgress {
 
 /// One `BuildKit` solve status line from a build.
 ///
-/// Only the build steps are kept; per-step logs and transfer statuses stay
-/// in the raw line.
+/// The build steps and their logs are kept; transfer statuses and
+/// warnings stay in the raw line.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BuildProgress {
     /// The build steps this line reports on. Empty for a line that only
     /// carries logs or transfer statuses.
     pub vertexes: Vec<BuildVertex>,
+    /// What the build steps wrote, in order. A log entry whose data is not
+    /// base64 is left out.
+    pub logs: Vec<VertexLog>,
+}
+
+/// A chunk of one `BuildKit` build step's output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexLog {
+    /// The digest of the step that wrote it.
+    pub vertex: String,
+    /// The step's stream: 1 for standard output, 2 for standard error.
+    pub stream: u8,
+    /// The bytes written, which need not end at a line.
+    pub data: Vec<u8>,
 }
 
 /// One `BuildKit` build step.
@@ -178,7 +195,30 @@ fn build(object: &Map<String, Value>) -> BuildProgress {
                 .collect()
         })
         .unwrap_or_default();
-    BuildProgress { vertexes }
+    let logs = object
+        .get("logs")
+        .and_then(Value::as_array)
+        .map(|logs| {
+            logs.iter()
+                .filter_map(Value::as_object)
+                .filter_map(vertex_log)
+                .collect()
+        })
+        .unwrap_or_default();
+    BuildProgress { vertexes, logs }
+}
+
+/// A log entry, read as standard output when its stream is missing.
+fn vertex_log(object: &Map<String, Value>) -> Option<VertexLog> {
+    Some(VertexLog {
+        vertex: string(object, "vertex")?,
+        stream: object
+            .get("stream")
+            .and_then(Value::as_u64)
+            .and_then(|s| u8::try_from(s).ok())
+            .unwrap_or(1),
+        data: STANDARD.decode(string(object, "data")?).ok()?,
+    })
 }
 
 fn vertex(object: &Map<String, Value>) -> Option<BuildVertex> {
@@ -348,18 +388,63 @@ mod tests {
                         error: Some("exit code: 1".to_owned()),
                     },
                 ],
+                logs: Vec::new(),
             }))
         );
         for line in [
             r#"{"statuses":[{"id":"transferring context:","current":2}]}"#,
-            r#"{"logs":[{"vertex":"sha256:be52","stream":1,"data":"aGkK"}]}"#,
             r#"{"vertexes":"not a list"}"#,
+            r#"{"logs":"not a list"}"#,
         ] {
             assert_eq!(
                 parse_progress(line),
                 Some(ProgressEvent::Build(BuildProgress::default())),
                 "{line}"
             );
+        }
+    }
+
+    #[test]
+    fn parses_buildkit_logs() {
+        let log = |vertex: &str, stream: u8, data: &[u8]| VertexLog {
+            vertex: vertex.to_owned(),
+            stream,
+            data: data.to_vec(),
+        };
+        let cases = [
+            (
+                "recorded from a failing RUN",
+                r#"{"vertexes":[{"digest":"sha256:9c2f","inputs":["sha256:5848"],"name":"[2/2] RUN echo building && exit 3","started":"2026-10-24T00:33:39.5Z"}],"logs":[{"vertex":"sha256:9c2f","stream":1,"data":"YnVpbGRpbmcK","timestamp":"2026-10-24T00:33:39.6Z"},{"vertex":"sha256:9c2f","stream":2,"data":"b29wcw==","timestamp":"2026-10-24T00:33:39.6Z"}]}"#,
+                vec![
+                    log("sha256:9c2f", 1, b"building\n"),
+                    log("sha256:9c2f", 2, b"oops"),
+                ],
+            ),
+            (
+                "bytes that are not utf-8",
+                r#"{"logs":[{"vertex":"sha256:a","stream":1,"data":"/w=="}]}"#,
+                vec![log("sha256:a", 1, b"\xff")],
+            ),
+            (
+                "a missing or odd stream is standard output",
+                r#"{"logs":[{"vertex":"a","data":"aGkK"},{"vertex":"b","stream":"2","data":"aGkK"},{"vertex":"c","stream":300,"data":"aGkK"}]}"#,
+                vec![
+                    log("a", 1, b"hi\n"),
+                    log("b", 1, b"hi\n"),
+                    log("c", 1, b"hi\n"),
+                ],
+            ),
+            (
+                "entries that cannot be read are left out",
+                r#"{"logs":[{"vertex":"a","stream":1,"data":"not base64!"},{"stream":1,"data":"aGkK"},{"vertex":"b","stream":1},{"vertex":"c","stream":1,"data":""},{"vertex":"d","stream":1,"data":7},"text",{"vertex":"e","stream":1,"data":"aGkK"}]}"#,
+                vec![log("e", 1, b"hi\n")],
+            ),
+        ];
+        for (name, line, want) in cases {
+            let Some(ProgressEvent::Build(build)) = parse_progress(line) else {
+                panic!("{name}: not a build line");
+            };
+            assert_eq!(build.logs, want, "{name}");
         }
     }
 
