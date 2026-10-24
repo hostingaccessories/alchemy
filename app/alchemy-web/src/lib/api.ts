@@ -280,6 +280,36 @@ export interface AppSettingsUpdate {
   extra: string[];
 }
 
+/** Mirrors `alchemy_api::logs::LogStream`; unknown outputs arrive as `other`. */
+export type LogStream = "stdout" | "stderr" | "other";
+
+/** Mirrors `alchemy_api::logs::LogLine`: one line of a container's log. */
+export interface LogLine {
+  service: string;
+  /** The container's name. */
+  container: string;
+  stream: LogStream;
+  /** When the engine received the line, as RFC 3339 in UTC, or `null`. */
+  time: string | null;
+  /** The line without its newline; a line over 8 KiB is cut and ends in `…`. */
+  line: string;
+}
+
+/** Mirrors `alchemy_api::logs::LogsDone`. `error` is safe to show as is. */
+export interface LogsDone {
+  error: string | null;
+}
+
+/**
+ * Mirrors `alchemy_api::logs::LogEvent`: one message on
+ * `GET /api/apps/{name}/logs`. `log` events carry the tail, then, when
+ * following, a `following` event and new lines; `done` ends the stream.
+ */
+export type LogEvent =
+  | { event: "log"; data: LogLine }
+  | { event: "following"; data: Record<string, never> }
+  | { event: "done"; data: LogsDone };
+
 /**
  * Mirrors `alchemy_api::ApiEvent`: one message on `GET /api/events`. The SSE
  * `event:` field is `event`, and its `data:` field is `data` as JSON.
