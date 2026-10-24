@@ -21,7 +21,8 @@
 //! [`intent`] in a [`store::Store`].
 //!
 //! Apps get web addresses from the [`proxy`], on listeners of its own
-//! that never serve the API, with the routes [`routing`] plans for it.
+//! that never serve the API, with the routes [`routing`] plans for it,
+//! and their `.local` names are announced to the LAN through [`mdns`].
 
 pub mod apps;
 pub mod auth;
@@ -32,6 +33,7 @@ pub mod guard;
 pub mod http;
 pub mod intent;
 pub mod logs;
+pub mod mdns;
 pub mod metrics;
 pub mod network;
 pub mod operations;

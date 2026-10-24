@@ -34,6 +34,7 @@ getrandom          = { version = "0.4", default-features = false }
 http-body-util     = { version = "0.1.5", default-features = false }
 hyper              = { version = "1.12", default-features = false }
 hyper-util         = { version = "0.1.21", default-features = false }
+mdns-sd            = { version = "0.21", default-features = false, features = ["async"] }
 rust-embed         = { version = "8", features = ["mime-guess"] }
 rusqlite           = { version = "0.40", default-features = false, features = ["bundled"] }
 rustix             = { version = "1", default-features = false, features = ["std", "process"] }
@@ -48,6 +49,7 @@ tower              = { version = "0.5", default-features = false, features = ["u
 tower-http         = { version = "0.7", default-features = false, features = ["cors"] }
 tracing            = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "ansi", "env-filter"] }
+zbus               = { version = "5", default-features = false, features = ["tokio"] }
 
 tauri                        = { version = "2.12", features = [] }
 tauri-build                  = { version = "2.7", features = [] }
