@@ -306,15 +306,21 @@ done
   || fail "status --watch did not report daemon ${cli_version}: $(head -n 1 "${tmp}/watch.txt")"
 kill -0 "$watch_pid" 2>/dev/null || fail "status --watch exited early: $(cat "${tmp}/watch.err")"
 
-log "Checking alchemy-helper refuses non-root"
+log "Checking every alchemy-helper operation refuses non-root"
 if [[ "$(id -u)" -ne 0 ]]; then
-  set +e
-  helper_out="$("${bin}/alchemy-helper" check 2>/dev/null)"
-  code=$?
-  set -e
-  [[ "$code" -eq 77 ]] || fail "alchemy-helper check exited ${code}, expected 77"
-  [[ "$helper_out" == '{"result":"error","operation":"check","error":"not_root"}' ]] \
-    || fail "alchemy-helper check printed: ${helper_out}"
+  uid="$(id -u)"
+  for op in check grant-low-ports revoke-low-ports \
+    "open-firewall --proxy-ports 8100-8999" "close-firewall --proxy-ports 8100-8999" \
+    "install-service --uid ${uid}" "remove-service --uid ${uid}"; do
+    read -r -a argv <<<"$op"
+    set +e
+    helper_out="$("${bin}/alchemy-helper" "${argv[@]}" 2>/dev/null)"
+    code=$?
+    set -e
+    [[ "$code" -eq 77 ]] || fail "alchemy-helper ${op} exited ${code}, expected 77"
+    [[ "$helper_out" == "{\"result\":\"error\",\"operation\":\"${argv[0]}\",\"error\":\"not_root\"}" ]] \
+      || fail "alchemy-helper ${op} printed: ${helper_out}"
+  done
 else
   log "Running as root; skipping"
 fi
