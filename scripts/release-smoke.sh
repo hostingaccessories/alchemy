@@ -120,6 +120,20 @@ done
 grep -q '^event: engine' "${tmp}/events.txt" \
   || fail "no engine event on /api/events: $(cat "${tmp}/events.txt")"
 
+log "Checking metrics on the socket"
+for _ in $(seq 1 50); do
+  metrics="$(curl -fsS --unix-socket "$socket" http://localhost/api/metrics)" \
+    || fail "GET /api/metrics on ${socket} failed"
+  [[ "$metrics" == *'"memory_total":'* ]] && break
+  sleep 0.2
+done
+[[ "$metrics" == *'"memory_total":'* ]] || fail "no machine metrics: ${metrics}"
+history="$(curl -fsS --unix-socket "$socket" 'http://localhost/api/metrics/history?range=1h')" \
+  || fail "GET /api/metrics/history on ${socket} failed"
+[[ "$history" == *'"points":[{"t":'* ]] || fail "no stored metrics point: ${history}"
+"${bin}/alchemy" --socket "$socket" machine stats | grep -q '^Memory ' \
+  || fail "alchemy machine stats did not show memory"
+
 log "Checking embedded web UI"
 index="$(curl -fsS "${base}/")" || fail "GET / failed (web UI not embedded?)"
 [[ "$index" == *'id="root"'* ]] || fail "GET / did not return the web UI"

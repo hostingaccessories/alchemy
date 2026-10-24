@@ -190,6 +190,45 @@ the real engine on this machine:
 cargo test -p alchemyd --test engine -- --ignored
 ```
 
+### Metrics
+
+The daemon samples this machine and every running container a minute
+after the last sample (the first right at startup, the second 10 seconds
+later), whether or not anyone is looking. Machine figures come from
+`sysinfo`, plus `/proc/stat` for raw CPU ticks on Linux; on macOS they
+are the Mac's own, not the VM Docker Desktop runs containers in, and the
+API, CLI, and UI say so. Container figures come from one-shot Engine API
+stats, at most 4 at a time with a 5 second timeout each. CPU is a share
+of the whole machine (or of Docker's VM), so an app's containers add up to
+the machine's figure. A figure that could not be measured is `null`,
+never 0.
+
+History is stored in the state database in five tiers, each rolled up
+from the one below and kept a little longer than its range:
+
+| Range | Point every | Kept for |
+| ----- | ----------- | -------- |
+| `1h`  | 1 minute    | 2 hours  |
+| `12h` | 10 minutes  | 13 hours |
+| `24h` | 20 minutes  | 25 hours |
+| `7d`  | 2 hours     | 8 days   |
+| `30d` | 8 hours     | 31 days  |
+
+A bucket is built once it closes, and only if the tier below has at least
+half its points, so a stretch the daemon was stopped for stays a gap; it
+catches up on restart. The pure logic lives in `alchemy_core::metrics`,
+the collector in `bin/alchemyd/src/metrics/`.
+
+`GET /api/metrics` is the latest sample, also sent as the `metrics`
+event; `GET /api/metrics/history?range=24h` is one tier's points. Both
+take `project=NAME` for one Compose project's figures. `alchemy machine
+stats` and `alchemy app stats NAME` print them, and the Machines page
+charts them. Until app discovery lands, an app is a Compose project name.
+
+```sh
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock 'http://alchemyd/api/metrics/history?range=24h&project=blog'
+```
+
 ### Web UI in debug vs release
 
 The daemon serves `app/alchemy-web/dist`. Debug builds read it from disk, so
@@ -224,6 +263,8 @@ checks:
   on the socket, where `/` is a JSON 404;
 - a rebinding `Host` and a cross-origin form `POST` are refused with 403;
 - `/api/events` streams an `engine` event to the Tauri origin;
+- `/api/metrics` reports the machine, `/api/metrics/history` has a
+  stored point, and `alchemy machine stats` prints them;
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
 - `alchemy-helper` refuses to run without root;
