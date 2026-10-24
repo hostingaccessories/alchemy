@@ -38,6 +38,9 @@ pub struct ComposeConfig {
     /// The networks its services use, by key. Compose leaves out the ones
     /// no service uses.
     pub networks: Vec<NetworkConfig>,
+    /// The top-level `x-alchemy` block as written, unvalidated, or `None`
+    /// when there is none.
+    pub x_alchemy: Option<serde_json::Value>,
 }
 
 /// One service of a [`ComposeConfig`].
@@ -53,6 +56,26 @@ pub struct ServiceConfig {
     /// The keys of the [`ComposeConfig::networks`] it joins, sorted. Empty
     /// for a service with a `network_mode`.
     pub networks: Vec<String>,
+    /// The container ports it `expose`s without publishing, in the order
+    /// Compose lists them.
+    pub expose: Vec<ExposedPort>,
+    /// Its own `x-alchemy` block as written, unvalidated, or `None` when
+    /// there is none.
+    ///
+    /// Compose 5.5 leaves service extensions out of `config --format
+    /// json` (its YAML keeps them), so this is `None` in practice; only
+    /// [`ComposeConfig::x_alchemy`] reaches Alchemy today.
+    pub x_alchemy: Option<serde_json::Value>,
+}
+
+/// One entry of a service's `expose`: container ports reachable on its
+/// networks but not published on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExposedPort {
+    /// The protocol, TCP unless the entry says otherwise.
+    pub protocol: Protocol,
+    /// The port or range.
+    pub ports: PortRange,
 }
 
 /// One network of a [`ComposeConfig`].
@@ -77,6 +100,8 @@ struct RawConfig {
     services: BTreeMap<String, RawService>,
     #[serde(default)]
     networks: BTreeMap<String, Lenient<Option<RawNetwork>>>,
+    #[serde(default, rename = "x-alchemy")]
+    x_alchemy: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -87,6 +112,10 @@ struct RawService {
     ports: Option<Lenient<Vec<Lenient<RawPort>>>>,
     #[serde(default)]
     networks: Option<Lenient<RawServiceNetworks>>,
+    #[serde(default)]
+    expose: Option<Lenient<Vec<Lenient<RawPorts>>>>,
+    #[serde(default, rename = "x-alchemy")]
+    x_alchemy: Option<serde_json::Value>,
 }
 
 /// A value Alchemy reads if it can and skips if it can't, so a shape it
@@ -178,6 +207,26 @@ impl RawPorts {
     fn is_empty(&self) -> bool {
         matches!(self, Self::Text(text) if text.trim().is_empty())
     }
+
+    /// An `expose` entry: `80`, `"80"`, `"8000-8010"`, or `"53/udp"`.
+    fn exposed(&self) -> Option<ExposedPort> {
+        match self {
+            Self::Number(_) => Some(ExposedPort {
+                protocol: Protocol::Tcp,
+                ports: self.range()?,
+            }),
+            Self::Text(text) => {
+                let (ports, protocol) = match text.trim().split_once('/') {
+                    Some((ports, protocol)) => (ports, protocol.trim().parse().ok()?),
+                    None => (text.trim(), Protocol::Tcp),
+                };
+                Some(ExposedPort {
+                    protocol,
+                    ports: ports.trim().parse().ok()?,
+                })
+            }
+        }
+    }
 }
 
 impl RawPort {
@@ -254,8 +303,10 @@ impl RawNetwork {
 impl ComposeConfig {
     /// Parse the output of `docker compose config --format json`.
     ///
-    /// A port, network, or `ipam` entry in a shape Alchemy can't read is
-    /// left out rather than failing the whole configuration.
+    /// A port, `expose`, network, or `ipam` entry in a shape Alchemy
+    /// can't read is left out rather than failing the whole
+    /// configuration. `x-alchemy` blocks are kept as written, whatever
+    /// their shape, for the route model to validate.
     pub fn parse(json: &[u8]) -> Result<Self, serde_json::Error> {
         let raw: RawConfig = serde_json::from_slice(json)?;
         Ok(Self {
@@ -278,6 +329,14 @@ impl ComposeConfig {
                         .and_then(Lenient::ok)
                         .map(RawServiceNetworks::keys)
                         .unwrap_or_default(),
+                    expose: service
+                        .expose
+                        .and_then(Lenient::ok)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|port| port.ok()?.exposed())
+                        .collect(),
+                    x_alchemy: service.x_alchemy.filter(|value| !value.is_null()),
                 })
                 .collect(),
             networks: raw
@@ -285,6 +344,7 @@ impl ComposeConfig {
                 .into_iter()
                 .map(|(key, network)| network.ok().flatten().unwrap_or_default().config(key))
                 .collect(),
+            x_alchemy: raw.x_alchemy.filter(|value| !value.is_null()),
         })
     }
 
@@ -877,6 +937,92 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn parses_exposed_ports() {
+        let config = ComposeConfig::parse(PORTS_AND_NETWORKS.as_bytes()).unwrap();
+        assert_eq!(
+            service(&config, "plain").expose,
+            [ExposedPort {
+                protocol: Protocol::Tcp,
+                ports: PortRange::single(6379).unwrap(),
+            }]
+        );
+        assert_eq!(service(&config, "web").expose, []);
+    }
+
+    #[test]
+    fn reads_each_expose_entry_leniently() {
+        let exposed = |protocol, ports: &str| ExposedPort {
+            protocol,
+            ports: ports.parse().unwrap(),
+        };
+        let cases: [(&str, Option<ExposedPort>); 11] = [
+            (r#""80""#, Some(exposed(Protocol::Tcp, "80"))),
+            ("80", Some(exposed(Protocol::Tcp, "80"))),
+            (
+                r#"" 8000-8010 ""#,
+                Some(exposed(Protocol::Tcp, "8000-8010")),
+            ),
+            (r#""53/udp""#, Some(exposed(Protocol::Udp, "53"))),
+            (r#""53/UDP""#, Some(exposed(Protocol::Udp, "53"))),
+            (r#""9000/tcp""#, Some(exposed(Protocol::Tcp, "9000"))),
+            (r#""9000/sctp""#, None),
+            (r#""0""#, None),
+            ("70000", None),
+            (r#""web""#, None),
+            (r#"{"target":80}"#, None),
+        ];
+        for (raw, want) in cases {
+            let json = format!(r#"{{"name":"a","services":{{"web":{{"expose":[{raw}]}}}}}}"#);
+            let config = ComposeConfig::parse(json.as_bytes()).unwrap();
+            assert_eq!(
+                config.services[0].expose,
+                want.into_iter().collect::<Vec<_>>(),
+                "{raw}"
+            );
+        }
+        let odd = ComposeConfig::parse(br#"{"name":"a","services":{"web":{"expose":"80"}}}"#);
+        assert_eq!(odd.unwrap().services[0].expose, []);
+    }
+
+    /// Extensions pass through as written. Compose 5.5 prints the
+    /// top-level block and drops per-service ones from its JSON, but a
+    /// version that keeps them is read the same way.
+    #[test]
+    fn keeps_x_alchemy_blocks_as_written() {
+        let json = br#"{
+            "name": "blog",
+            "x-alchemy": {"service": "web", "port": 8080, "hostname": "blog"},
+            "x-other": {"ignored": true},
+            "services": {
+                "web": {"image": "nginx", "x-alchemy": {"port": "80"}},
+                "db": {"image": "postgres", "x-alchemy": null},
+                "odd": {"image": "redis", "x-alchemy": ["not", "a", "map"]},
+                "plain": {"image": "redis"}
+            }
+        }"#;
+        let config = ComposeConfig::parse(json).unwrap();
+        assert_eq!(
+            config.x_alchemy,
+            Some(serde_json::json!({"service": "web", "port": 8080, "hostname": "blog"}))
+        );
+        assert_eq!(
+            service(&config, "web").x_alchemy,
+            Some(serde_json::json!({"port": "80"}))
+        );
+        assert_eq!(service(&config, "db").x_alchemy, None);
+        assert_eq!(
+            service(&config, "odd").x_alchemy,
+            Some(serde_json::json!(["not", "a", "map"])),
+            "the route model decides what is wrong with it"
+        );
+        assert_eq!(service(&config, "plain").x_alchemy, None);
+        assert_eq!(
+            ComposeConfig::parse(br#"{"name":"a"}"#).unwrap().x_alchemy,
+            None
+        );
     }
 
     #[test]
