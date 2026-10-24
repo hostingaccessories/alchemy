@@ -944,6 +944,7 @@ fn new_app() {
             compose: "services: {}\n".into(),
             env: Some("A=1\n".into()),
             dry_run: true,
+            start: false,
         },
         r#"{"name":"blog","folder":"/opt/stacks","compose":"services: {}\n","env":"A=1\n","dry_run":true}"#,
     );
@@ -955,7 +956,19 @@ fn new_app() {
             compose: "x".into(),
             env: None,
             dry_run: false,
+            start: false,
         }
+    );
+    assert_wire(
+        &NewApp {
+            name: "blog".into(),
+            folder: None,
+            compose: "x".into(),
+            env: None,
+            dry_run: false,
+            start: true,
+        },
+        r#"{"name":"blog","folder":null,"compose":"x","env":null,"dry_run":false,"start":true}"#,
     );
 }
 
@@ -987,6 +1000,7 @@ fn app_files() {
             content: "A=2\n".into(),
             base_hash: Some("ab12".into()),
             dry_run: false,
+            start: false,
         },
         r#"{"content":"A=2\n","base_hash":"ab12","dry_run":false}"#,
     );
@@ -996,7 +1010,58 @@ fn app_files() {
             content: String::new(),
             base_hash: None,
             dry_run: false,
+            start: false,
         }
+    );
+    assert_wire(
+        &AppFileUpdate {
+            content: "A=2\n".into(),
+            base_hash: None,
+            dry_run: false,
+            start: true,
+        },
+        r#"{"content":"A=2\n","base_hash":null,"dry_run":false,"start":true}"#,
+    );
+}
+
+#[test]
+fn saved() {
+    use alchemy_api::apps::files::{AppFile, AppFileKind, Saved};
+    let file = AppFile {
+        kind: AppFileKind::Env,
+        name: ".env".into(),
+        content: "A=1\n".into(),
+        hash: Some("ab12".into()),
+    };
+    assert_wire(
+        &Saved::new(file.clone()),
+        r#"{"kind":"env","name":".env","content":"A=1\n","hash":"ab12"}"#,
+    );
+    assert_wire(&Saved::new(blog()), BLOG);
+    assert_wire(
+        &Saved {
+            saved: file,
+            operation: Some(update()),
+            start_error: None,
+        },
+        &[
+            r#"{"kind":"env","name":".env","content":"A=1\n","hash":"ab12","operation":"#,
+            UPDATE,
+            "}",
+        ]
+        .concat(),
+    );
+    assert_wire(
+        &Saved {
+            saved: blog(),
+            operation: None,
+            start_error: Some(ErrorResponse::new(ErrorCode::Conflict, "blog is busy")),
+        },
+        &[
+            BLOG.strip_suffix('}').unwrap(),
+            r#","start_error":{"error":"blog is busy","code":"conflict"}}"#,
+        ]
+        .concat(),
     );
 }
 

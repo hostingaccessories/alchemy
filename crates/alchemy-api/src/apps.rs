@@ -18,7 +18,7 @@ pub mod files;
 pub use alchemy_core::StackName;
 pub use alchemy_core::engine::{ContainerState, Health, StopReason};
 pub use alchemy_core::stack::{ImageSource, StackStatus};
-pub use files::{AppFile, AppFileKind, AppFileUpdate, NewApp};
+pub use files::{AppFile, AppFileKind, AppFileUpdate, NewApp, Saved};
 use serde::{Deserialize, Serialize};
 
 /// Every app, every running Compose project that is not one, and how each

@@ -7,8 +7,9 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use alchemy_api::ErrorCode;
-use alchemy_api::apps::{AppFile, AppFileUpdate};
+use alchemy_api::apps::{AppFile, AppFileUpdate, Saved};
 
+use super::action::follow_start;
 use super::path_segment;
 use crate::context::{Context, Sent};
 use crate::daemon::{Daemon, Method};
@@ -34,6 +35,11 @@ pub struct Args {
     #[arg(long)]
     pub env: bool,
 
+    /// Start the app once the file is saved, and follow it to the end as
+    /// `alchemy app up` does.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub start: bool,
+
     /// The shared safety flags. --force saves over changes made to the
     /// file on disk since it was opened.
     #[command(flatten)]
@@ -42,7 +48,7 @@ pub struct Args {
 
 /// What became of one attempt to save the edited text.
 enum Attempt {
-    Saved(AppFile),
+    Saved(Box<Saved<AppFile>>),
     Rejected(String),
     Conflict(String),
 }
@@ -50,7 +56,8 @@ enum Attempt {
 /// Run `alchemy app edit`: open a private copy of the file in the editor,
 /// have alchemyd validate the result with Compose, re-open it with
 /// Compose's message on top until it passes or is left unchanged, confirm,
-/// then save it. With `--dry-run`, stop once it passes.
+/// then save it, and with `--start` start the app. With `--dry-run`, stop
+/// once it passes.
 pub(crate) async fn run<D: Daemon, W: Write, P: Prompt, E: Editor>(
     ctx: &mut Context<D, W>,
     prompt: &mut P,
@@ -92,7 +99,8 @@ pub(crate) async fn run<D: Daemon, W: Write, P: Prompt, E: Editor>(
             };
         }
         draft = edited;
-        let checked = attempt(ctx, &path, &draft, &mut base, true, args.safety.force).await?;
+        let check = Send::Check;
+        let checked = attempt(ctx, &path, &draft, &mut base, check, args.safety.force).await?;
         let saved = match checked {
             Attempt::Saved(_) => {
                 if args.safety.dry_run {
@@ -103,14 +111,16 @@ pub(crate) async fn run<D: Daemon, W: Write, P: Prompt, E: Editor>(
                 if safety::confirm(prompt, &args.safety, NAME, &question).await? == Mode::DryRun {
                     return Ok(());
                 }
-                attempt(ctx, &path, &draft, &mut base, false, args.safety.force).await?
+                let send = Send::Save { start: args.start };
+                attempt(ctx, &path, &draft, &mut base, send, args.safety.force).await?
             }
             other => other,
         };
         match saved {
             Attempt::Saved(saved) => {
-                let line = saved_line(&args.name, &saved, ctx.json());
-                return ctx.out().line(line);
+                let line = saved_line(&args.name, &saved.saved, ctx.json());
+                ctx.out().line(line)?;
+                return follow_start(ctx, &saved, &args.name, args.start).await;
             }
             Attempt::Rejected(message) => note = Some(message),
             Attempt::Conflict(message) => {
@@ -124,7 +134,16 @@ pub(crate) async fn run<D: Daemon, W: Write, P: Prompt, E: Editor>(
     }
 }
 
-/// Send `content` to be validated, or saved unless `dry_run`, against
+/// What [`attempt`] asks alchemyd to do with the edit.
+#[derive(Debug, Clone, Copy)]
+enum Send {
+    /// Validate it only.
+    Check,
+    /// Save it, then start the app if `start`.
+    Save { start: bool },
+}
+
+/// Send `content` to be validated or saved, as `send` says, against
 /// `base`. With `force`, a conflict takes the file's current hash as the
 /// new base and tries once more.
 async fn attempt<D: Daemon, W: Write>(
@@ -132,7 +151,7 @@ async fn attempt<D: Daemon, W: Write>(
     path: &str,
     content: &str,
     base: &mut Option<String>,
-    dry_run: bool,
+    send: Send,
     force: bool,
 ) -> Result<Attempt, ClientError> {
     let mut forced = false;
@@ -140,10 +159,14 @@ async fn attempt<D: Daemon, W: Write>(
         let update = AppFileUpdate {
             content: content.to_owned(),
             base_hash: base.clone(),
-            dry_run,
+            dry_run: matches!(send, Send::Check),
+            start: matches!(send, Send::Save { start: true }),
         };
-        match ctx.send::<_, AppFile>(Method::PUT, path, &update).await? {
-            Sent::Done(file) => return Ok(Attempt::Saved(file)),
+        match ctx
+            .send::<_, Saved<AppFile>>(Method::PUT, path, &update)
+            .await?
+        {
+            Sent::Done(file) => return Ok(Attempt::Saved(Box::new(file))),
             Sent::Refused(refusal) if refusal.code == ErrorCode::Invalid => {
                 return Ok(Attempt::Rejected(refusal.error));
             }
@@ -282,10 +305,14 @@ impl Scratch {
     clippy::indexing_slicing
 )]
 mod tests {
-    use alchemy_api::apps::AppFileKind;
+    use alchemy_api::apps::{AppFileKind, StackName};
+    use alchemy_api::operations::{Action, Operation, OperationEvent, OperationState};
+    use alchemy_api::{ErrorCode, ErrorResponse};
+    use clap::Parser as _;
 
     use super::*;
-    use crate::daemon::fake::FakeDaemon;
+    use crate::Cli;
+    use crate::daemon::fake::{FakeDaemon, sse};
     use crate::editor::FakeEditor;
     use crate::prompt::FakePrompt;
 
@@ -305,6 +332,7 @@ mod tests {
         Args {
             name: "blog".into(),
             env: false,
+            start: false,
             safety: Safety {
                 dry_run,
                 force,
@@ -365,6 +393,94 @@ mod tests {
         let bodies = ctx.daemon().bodies();
         assert_eq!(base(&bodies[0]), serde_json::json!(["h1", true]));
         assert_eq!(base(&bodies[1]), serde_json::json!(["h1", false]));
+    }
+
+    fn up(state: OperationState) -> Operation {
+        Operation {
+            id: "op1".into(),
+            app: StackName::new("blog").unwrap(),
+            action: Action::Up,
+            state,
+            steps: vec![],
+            started_at: 0,
+            finished_at: None,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn starts_the_app_once_saved() {
+        let new = "services:\n  web:\n    image: caddy\n";
+        let done = OperationEvent::Done(up(OperationState::Succeeded));
+        let started = Saved {
+            saved: file(new, "h2"),
+            operation: Some(up(OperationState::Running)),
+            start_error: None,
+        };
+        let refused = Saved {
+            saved: file(new, "h2"),
+            operation: None,
+            start_error: Some(ErrorResponse::new(
+                ErrorCode::Conflict,
+                "Docker isn't running, so Alchemy can't up blog",
+            )),
+        };
+        let cases = [
+            (started, Ok("saved compose.yaml for blog\nblog is up\n")),
+            (
+                refused,
+                Err("alchemyd: Docker isn't running, so Alchemy can't up blog"),
+            ),
+        ];
+        for (reply, want) in cases {
+            let fake = FakeDaemon::new()
+                .version("1.2.3", 1)
+                .ok(Method::GET, PATH, &file(OLD, "h1"))
+                .ok(Method::PUT, PATH, &file(new, "h2"))
+                .ok(Method::PUT, PATH, &reply)
+                .stream(
+                    "/api/operations/op1/events",
+                    [Ok(sse(
+                        done.name(),
+                        &serde_json::to_string(&done.data()).unwrap(),
+                    ))],
+                );
+            let mut ctx = Context::buffered(fake, false, NAME);
+            let mut args = args(false, true, false);
+            args.start = true;
+            let result = run(
+                &mut ctx,
+                &mut FakePrompt::tty([]),
+                &mut FakeEditor::saving([new]),
+                args,
+            )
+            .await;
+            match want {
+                Ok(written) => {
+                    result.unwrap();
+                    assert_eq!(ctx.written(), written);
+                }
+                Err(message) => {
+                    let err = result.unwrap_err();
+                    assert_eq!(err.to_string(), message);
+                    assert_eq!(err.exit_code(), 1);
+                    assert_eq!(ctx.written(), "saved compose.yaml for blog\n");
+                }
+            }
+            let bodies = ctx.daemon().bodies();
+            let start = |body: &str| {
+                serde_json::from_str::<serde_json::Value>(body).unwrap()["start"].clone()
+            };
+            assert_eq!(
+                start(&bodies[0]),
+                serde_json::Value::Null,
+                "checks don't start"
+            );
+            assert_eq!(start(&bodies[1]), true);
+        }
+        let err = Cli::try_parse_from(["alchemy", "app", "edit", "blog", "--start", "--dry-run"])
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be used with"), "{err}");
     }
 
     #[tokio::test]

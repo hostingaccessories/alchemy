@@ -21,9 +21,20 @@
 //! With `dry_run`, either write is checked and validated, conflicts
 //! included, and answers as it would (200 instead of 201 for a create),
 //! but nothing is written.
+//!
+//! With `start`, a write that saved also starts the app with
+//! [`Action::Up`](crate::operations::Action::Up) once alchemyd has read
+//! it again, and the answer is a [`Saved`] carrying the operation. A start
+//! that is refused does not undo the save: the answer is still 201 or
+//! 200, with the refusal in [`Saved::start_error`]. Asking for `start`
+//! with `dry_run` is 400 [`ErrorCode::BadRequest`](crate::ErrorCode::BadRequest),
+//! since a dry run saves nothing to start.
 
 pub use alchemy_core::stack::{MAX_FILE_LEN, StackFile as AppFileKind};
 use serde::{Deserialize, Serialize};
+
+use crate::ErrorResponse;
+use crate::operations::Operation;
 
 /// The body of `POST /api/apps`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +55,9 @@ pub struct NewApp {
     /// Check and validate without creating anything.
     #[serde(default)]
     pub dry_run: bool,
+    /// Start the app once it is created. Sent only when set.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub start: bool,
 }
 
 /// One of an app's files, from `GET /api/apps/{name}/files/{kind}`.
@@ -74,4 +88,46 @@ pub struct AppFileUpdate {
     /// Check and validate without saving.
     #[serde(default)]
     pub dry_run: bool,
+    /// Start the app once the file is saved. Sent only when set.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub start: bool,
+}
+
+/// The answer to a create or an update: the created [`App`](super::App)
+/// or the saved [`AppFile`] as `T`, with the fields of `T` at the top
+/// level, and how starting it went when the request asked to.
+///
+/// Without `start`, both extra fields are left out, so the body is `T`'s
+/// alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Saved<T> {
+    /// What was saved.
+    #[serde(flatten)]
+    pub saved: T,
+    /// The operation started on the app, running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Operation>,
+    /// Why the app was saved but not started, with the code and message
+    /// `POST /api/apps/{name}/actions` would have refused with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_error: Option<ErrorResponse>,
+}
+
+impl<T> Saved<T> {
+    /// `saved`, with nothing started.
+    pub fn new(saved: T) -> Self {
+        Self {
+            saved,
+            operation: None,
+            start_error: None,
+        }
+    }
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }

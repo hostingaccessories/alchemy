@@ -1232,6 +1232,60 @@ async fn app_create_validates_then_creates_and_never_replaces() {
     daemon.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn app_create_start_brings_the_new_app_up_or_says_why_not() {
+    use std::sync::Arc;
+
+    use alchemyd::apps::{AppsDeps, SystemFs};
+    use alchemyd::compose::FakeComposeConfig;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let home = root.join("apps");
+    let compose = root.join("compose.yaml");
+    std::fs::write(&compose, "services: {}\n").unwrap();
+    let config = FakeComposeConfig::new();
+    config.project(home.join("web"), "web", &[]);
+    let daemon = Daemon::start_with(EngineStatus::new(EngineState::Ready), |deps| {
+        deps.with_apps(
+            AppsDeps::new(Arc::new(SystemFs), Arc::new(config), Some(home.clone()))
+                .with_scan_interval(Duration::from_secs(60)),
+        )
+    })
+    .await;
+    let compose_str = compose.to_str().unwrap();
+
+    let start = |name| {
+        [
+            "app",
+            "create",
+            name,
+            "--file",
+            compose_str,
+            "--yes",
+            "--start",
+        ]
+    };
+    let out = run_args(&daemon.socket, &start("web")).await.unwrap();
+    assert_eq!(
+        out,
+        format!(
+            "created web in {}\nCompose project web, with no services\nweb is up\n",
+            home.join("web").display()
+        )
+    );
+
+    let err = run_args(&daemon.socket, &start("blog")).await.unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert!(
+        err.to_string().contains("Compose hasn't read blog yet"),
+        "{err}"
+    );
+    assert!(home.join("blog/compose.yaml").exists(), "the save stands");
+
+    daemon.stop().await;
+}
+
 /// Send one `GET path` with `headers` to `addr` and read the whole
 /// response, lowercasing the head.
 async fn tcp_get(addr: &str, path: &str, headers: &str) -> (String, String) {

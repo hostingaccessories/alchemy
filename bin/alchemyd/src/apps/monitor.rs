@@ -100,15 +100,26 @@ impl AppsDeps {
     }
 }
 
-/// A finished read: the stack's directory, the files it was read at, and
-/// what came of it.
-type Read = (PathBuf, BTreeMap<String, FileInfo>, ConfigOutcome);
+/// A finished read.
+#[derive(Debug)]
+struct Read {
+    /// The stack's directory.
+    dir: PathBuf,
+    /// The files it was read at.
+    files: BTreeMap<String, FileInfo>,
+    /// What came of it.
+    outcome: ConfigOutcome,
+    /// The rescan generation in effect when it started.
+    generation: u64,
+}
 
-/// When an app was last read, and at which files.
+/// When an app was last read, at which files, and in which rescan
+/// generation the read started.
 #[derive(Debug)]
 struct ReadAt {
     files: Option<BTreeMap<String, FileInfo>>,
     at: Instant,
+    generation: u64,
 }
 
 /// Keeps the app list, and the app settings in effect, in [`State`]
@@ -131,6 +142,12 @@ struct ReadAt {
 /// Docker not being installed, is retried after a while and whenever the
 /// engine becomes ready. While a changed app is read again, its previous
 /// result stays in the list.
+///
+/// Once the list holds the results of a rescan, the folders listed after
+/// it was asked for and every app read again by a read started after it,
+/// the task records its generation with [`State::set_app_scan_done`]. A
+/// read already running when a rescan arrives does not count: the app is
+/// read once more.
 pub async fn run(
     deps: AppsDeps,
     state: State,
@@ -150,6 +167,8 @@ struct Monitor {
     read_at: BTreeMap<PathBuf, ReadAt>,
     reading: BTreeSet<PathBuf>,
     swept: BTreeSet<PathBuf>,
+    generation: u64,
+    scanned: Option<u64>,
 }
 
 impl Monitor {
@@ -164,6 +183,8 @@ impl Monitor {
             read_at: BTreeMap::new(),
             reading: BTreeSet::new(),
             swept: BTreeSet::new(),
+            generation: 0,
+            scanned: None,
         }
     }
 
@@ -171,6 +192,7 @@ impl Monitor {
         let mut containers = self.state.watch_containers();
         let mut engine = self.state.watch_engine();
         let mut rescans = self.state.watch_app_rescans();
+        self.generation = *rescans.borrow_and_update();
         let mut tick = tokio::time::interval(self.deps.scan_interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut reads: FuturesUnordered<BoxFuture<'static, Read>> = FuturesUnordered::new();
@@ -183,7 +205,7 @@ impl Monitor {
                 _ = shutdown.wait_for(|stop| *stop) => return,
                 Some(read) = reads.next(), if !reads.is_empty() => self.finish(read),
                 Ok(()) = rescans.changed() => {
-                    rescans.mark_unchanged();
+                    self.generation = *rescans.borrow_and_update();
                     (reload, scan, reread) = (true, true, true);
                 }
                 _ = tick.tick() => scan = true,
@@ -204,6 +226,9 @@ impl Monitor {
             }
             self.start_reads(&mut reads);
             self.publish();
+            if let Some(done) = self.done() {
+                self.state.set_app_scan_done(done);
+            }
         }
     }
 
@@ -261,6 +286,20 @@ impl Monitor {
                 read.files = None;
             }
         }
+        self.scanned = Some(self.generation);
+    }
+
+    /// The newest rescan generation the list holds every result of, or
+    /// `None` before the first scan.
+    fn done(&self) -> Option<u64> {
+        let scanned = self.scanned?;
+        Some(
+            self.discovery
+                .stacks
+                .iter()
+                .map(|stack| self.read_at.get(&stack.dir).map_or(0, |r| r.generation))
+                .fold(scanned, u64::min),
+        )
     }
 
     /// Remove staging folders left behind in each folder not yet swept,
@@ -345,23 +384,26 @@ impl Monitor {
                 self.deps.config.clone(),
                 stack,
                 endpoint.clone(),
+                self.generation,
             )));
         }
     }
 
-    fn finish(&mut self, (dir, files, outcome): Read) {
-        self.reading.remove(&dir);
-        if !self.discovery.stacks.iter().any(|s| s.dir == dir) {
+    fn finish(&mut self, read: Read) {
+        self.reading.remove(&read.dir);
+        if !self.discovery.stacks.iter().any(|s| s.dir == read.dir) {
             return;
         }
+        let current = read.generation >= self.generation;
         self.read_at.insert(
-            dir.clone(),
+            read.dir.clone(),
             ReadAt {
-                files: Some(files),
+                files: current.then_some(read.files),
                 at: Instant::now(),
+                generation: read.generation,
             },
         );
-        self.outcomes.insert(dir, outcome);
+        self.outcomes.insert(read.dir, read.outcome);
     }
 
     fn publish(&self) {
@@ -401,7 +443,12 @@ fn sweep_folder(disk: &dyn AppDisk, folder: &Path, uid: u32, now: SystemTime) {
     }
 }
 
-async fn read(config: Arc<dyn ComposeConfigReader>, stack: FoundStack, endpoint: Endpoint) -> Read {
+async fn read(
+    config: Arc<dyn ComposeConfigReader>,
+    stack: FoundStack,
+    endpoint: Endpoint,
+    generation: u64,
+) -> Read {
     let outcome = match ComposeProject::new(&stack.dir) {
         Ok(project) => {
             ConfigOutcome::from_result(config.read(&project, &endpoint).await, stack.compose_file)
@@ -411,7 +458,12 @@ async fn read(config: Arc<dyn ComposeConfigReader>, stack: FoundStack, endpoint:
             message: error.to_string(),
         },
     };
-    (stack.dir, stack.files, outcome)
+    Read {
+        dir: stack.dir,
+        files: stack.files,
+        outcome,
+        generation,
+    }
 }
 
 #[cfg(test)]
@@ -598,6 +650,44 @@ mod tests {
         while h.config.reads(db) < 2 {
             assert!(Instant::now() < deadline, "no reread after a rescan");
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_done_rescan_has_every_app_read_again() {
+        let h = start();
+        h.config.project(format!("{HOME}/blog"), "blog", &["web"]);
+        h.fs.set(HOME, stacks(&[("blog", 1)]));
+        until(&h.state, "blog read", resolved).await;
+
+        let project = |apps: &AppList, name: &str| {
+            apps.apps
+                .iter()
+                .find(|a| a.name.as_str() == name)
+                .and_then(|a| a.project.clone())
+        };
+        let blog_and_wiki = [("blog", 1), ("wiki", 1)];
+        let cases = [
+            (
+                "an edit with the same files",
+                "blog",
+                &blog_and_wiki[..1],
+                "edited",
+            ),
+            ("a new app", "wiki", &blog_and_wiki[..], "wiki"),
+        ];
+        for (what, name, listed, want) in cases {
+            h.config.project(format!("{HOME}/{name}"), want, &["web"]);
+            h.fs.set(HOME, stacks(listed));
+            let ticket = h.state.rescan_apps();
+            tokio::time::timeout(WAIT, h.state.app_scan_done(ticket))
+                .await
+                .unwrap_or_else(|_| panic!("{what}: rescan {ticket} never done"));
+            assert_eq!(
+                project(&h.state.apps(), name).as_deref(),
+                Some(want),
+                "{what}"
+            );
         }
     }
 

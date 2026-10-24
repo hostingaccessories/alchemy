@@ -1011,6 +1011,7 @@ mod tests {
                 content: content.into(),
                 base_hash,
                 dry_run: false,
+                start: false,
             };
             self.editor().write(&self.state, "blog", kind, update).await
         }
@@ -1023,6 +1024,7 @@ mod tests {
             compose: COMPOSE.into(),
             env: Some("SECRET=1\n".into()),
             dry_run: false,
+            start: false,
         }
     }
 
@@ -1610,6 +1612,7 @@ mod tests {
             content: "services: [\n".into(),
             base_hash: base.clone(),
             dry_run: true,
+            start: false,
         };
         let saved = f
             .editor()
@@ -1785,6 +1788,7 @@ mod tests {
                 content,
                 base_hash,
                 dry_run: false,
+                start: false,
             };
             editor
                 .write(&f.state, "blog", kind, update)
@@ -1814,6 +1818,7 @@ mod tests {
                 content: "services: {}\n".into(),
                 base_hash: base,
                 dry_run: false,
+                start: false,
             };
             let err = editor
                 .write(&f.state, "blog", AppFileKind::Compose, update)

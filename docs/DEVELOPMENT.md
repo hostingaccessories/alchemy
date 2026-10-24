@@ -358,6 +358,15 @@ symlink), and is owned by the daemon's user.
   folder with its override file; a `.env` with `--env-file`. Only the
   edited file is replaced, keeping its mode and owner.
 - Both take `"dry_run": true` to check and validate without writing.
+- Both take `"start": true` to bring the app up after saving. alchemyd
+  asks the apps task to look again, waits up to 10 seconds for a scan
+  whose reads all started after the save (`State::rescan_apps` returns
+  its generation, the apps task reports it done with
+  `set_app_scan_done`), then runs `up` as `POST /api/apps/NAME/actions`
+  would. The answer adds `"operation"`, the running operation, or
+  `"start_error"`, `{"error","code"}` as that route would refuse with;
+  either way the save stands and the status is 201 or 200. Without
+  `start` neither field is sent. `start` with `dry_run` is 400.
 
 `.env` is always written `0600`, whatever the umask, and a new app's
 compose file `0644` in a `0755` folder. Symlinked app folders and files
@@ -367,15 +376,20 @@ edited. Bodies over 3 MiB are refused with 413. The code is in
 `ComposeValidator` in `bin/alchemyd/src/compose/validate.rs`.
 
 `alchemy app create NAME [--file compose.yaml] [--env-file PATH]
-[--folder PATH]` reads `compose.yaml` in the current folder unless told
-otherwise (`--file -` reads stdin). `alchemy app edit NAME [--env]` opens
+[--folder PATH] [--start]` reads `compose.yaml` in the current folder
+unless told otherwise (`--file -` reads stdin). `alchemy app edit NAME [--env]` opens
 a private `0600` copy in `$VISUAL` or `$EDITOR` (`vi` otherwise; the
 value is split on spaces, never run by a shell), re-opens it with
 Compose's message on top until Compose accepts it or it is left
 unchanged, asks, then saves. On a conflict it keeps your copy and says
 where; `--force` saves over the change on disk instead. Both take
-`--dry-run` and `--yes`. On the web, Apps has "Add app", and each app's
-page an Edit section.
+`--dry-run` and `--yes`, and `--start` (not with `--dry-run`), which
+follows the `up` alchemyd starts as `alchemy app up` does, with
+`--json` printing the save's line and then each event. If alchemyd saved
+but didn't start the app, the command prints the save and fails with
+the reason, exit 1. On the web, Apps has "Add app" with Create app and
+Create and start, and each app's page an Edit section with Save and
+Save and start.
 
 ```sh
 curl --unix-socket /run/user/1000/alchemy/alchemyd.sock -X POST \
