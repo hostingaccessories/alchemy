@@ -258,11 +258,27 @@ async fn bollard_api_maps_server_errors() {
     }
 }
 
+/// Leave a socket file at `path` that nothing listens on.
+///
+/// Other tests in this binary spawn processes, and a child forked while the
+/// listener is open keeps its descriptor until it execs, so the socket can
+/// briefly still accept connections after the drop. Wait until it refuses.
+async fn stale_socket(path: &Path) {
+    drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while std::os::unix::net::UnixStream::connect(path).is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stale socket kept accepting connections");
+}
+
 #[tokio::test]
 async fn bollard_api_reports_a_dead_socket_as_transport_error() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("docker.sock");
-    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    stale_socket(&socket).await;
     let api =
         BollardApi::connect(&Endpoint::unix(&socket).unwrap(), Duration::from_secs(5)).unwrap();
     assert!(matches!(api.ping().await, Err(ApiError::Transport(_))));
@@ -280,7 +296,7 @@ async fn system_probe_classifies_sockets() {
     let live = dir.path().join("live.sock");
     let _listener = UnixListener::bind(&live).unwrap();
     let stale = dir.path().join("stale.sock");
-    drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+    stale_socket(&stale).await;
     let file = dir.path().join("file");
     std::fs::write(&file, b"").unwrap();
     let missing = dir.path().join("missing.sock");
