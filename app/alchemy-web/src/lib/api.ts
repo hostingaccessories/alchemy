@@ -66,7 +66,16 @@ export interface SubscribeOptions {
  * Mirrors `alchemy_api::ErrorCode`. A newer daemon may send a code not listed
  * here; the Rust client reads those as `unknown`.
  */
-export type ErrorCode = "not_found" | "method_not_allowed" | "bad_request" | "internal" | "unknown";
+export type ErrorCode =
+  | "not_found"
+  | "method_not_allowed"
+  | "bad_request"
+  | "forbidden"
+  | "unsupported_media_type"
+  | "conflict"
+  | "invalid"
+  | "internal"
+  | "unknown";
 
 /** Mirrors `alchemy_api::ErrorResponse`, the body of every `/api` error. */
 export interface ErrorResponse {

@@ -88,6 +88,17 @@ pub enum ErrorCode {
     MethodNotAllowed,
     /// The request was malformed.
     BadRequest,
+    /// The daemon refused the request as unsafe, such as one from another
+    /// web origin or for a host name it does not answer to.
+    Forbidden,
+    /// The request body is not in a media type the route accepts.
+    UnsupportedMediaType,
+    /// The request conflicts with current state, such as an operation
+    /// already running on the same app.
+    Conflict,
+    /// The request was well formed but its content failed validation, such
+    /// as a compose file Compose rejects.
+    Invalid,
     /// The daemon failed while handling a valid request.
     Internal,
     /// A code this build does not know, sent by a newer daemon, or no code

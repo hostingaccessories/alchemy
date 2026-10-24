@@ -61,6 +61,13 @@ fn error_codes() {
         (ErrorCode::NotFound, r#""not_found""#),
         (ErrorCode::MethodNotAllowed, r#""method_not_allowed""#),
         (ErrorCode::BadRequest, r#""bad_request""#),
+        (ErrorCode::Forbidden, r#""forbidden""#),
+        (
+            ErrorCode::UnsupportedMediaType,
+            r#""unsupported_media_type""#,
+        ),
+        (ErrorCode::Conflict, r#""conflict""#),
+        (ErrorCode::Invalid, r#""invalid""#),
         (ErrorCode::Internal, r#""internal""#),
         (ErrorCode::Unknown, r#""unknown""#),
     ];
