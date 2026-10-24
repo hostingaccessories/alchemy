@@ -323,9 +323,12 @@ phone, or use the address with the IP.
 - **After you stop Alchemy** or turn names off, a phone or Mac may still
   find the old name for a few minutes.
 - **Addresses without a port need port 80.** On Linux, Alchemy needs
-  permission for it, and `alchemy status` shows the command that grants
-  it. If another program on this computer already takes port 80, the
-  Machines page says so, and Open uses the address with the port instead.
+  your permission for it: select **Allow port 80** on the **Machines**
+  page, or run `alchemy machine privileges grant low-ports` (see
+  [Changes that need your password](#changes-that-need-your-password)).
+  Until then, Open uses the address with the port. If another program on
+  this computer already takes port 80, the Machines page says so, and
+  Open uses the address with the port instead.
 
 To stop announcing apps, turn off **Announce apps on your network** under
 **Local names** on the **Machines** page, or run:
@@ -336,6 +339,60 @@ alchemy settings set mdns off   # on to turn it back on
 
 Apps then have no `.local` address; the others keep working. To leave
 just one app out, add `mdns: false` to its `x-alchemy` block.
+
+## Changes that need your password
+
+Alchemy itself never runs as an administrator. A few changes to the
+computer need one, and Alchemy asks first, every time, with the system's
+own password prompt. Each one can be undone. They are listed under
+**Privileges** on the **Machines** page:
+
+| Change             | What it does                                                                               | When you see it                                  |
+| ------------------ | ------------------------------------------------------------------------------------------ | ------------------------------------------------ |
+| **Port 80**        | Lets Alchemy use port 80, so apps open at `http://photos.local` with no port number.       | Linux only; a Mac doesn't need it                |
+| **Firewall**       | Opens port 80, the app ports (8100 to 8999), and local names in the firewall, all at once. | When ufw, firewalld, or the macOS firewall is on |
+| **System service** | Runs Alchemy when the computer starts, before anyone signs in, as you rather than as root. | Not offered yet                                  |
+
+Select **Allow port 80**, **Open the firewall**, or **Install the
+service**, and enter your password when the system asks. To undo one,
+select **Remove port 80 access**, **Close the firewall**, or **Remove the
+service**. Port 80 also has an **Allow port 80** button on the warning
+that says addresses on port 80 don't work.
+
+**Allowing port 80 restarts Alchemy's background service** for a moment
+so the change takes effect. Your apps keep running. The desktop app
+reconnects on its own. A browser you opened with `alchemy open` is signed
+out, so run `alchemy open` again to see the result.
+
+**When Alchemy can't show a password prompt**, for example over SSH, on a
+Linux computer with no desktop, or with a copy of Alchemy that isn't
+installed safely, the row shows a command instead. Run it in a terminal on
+that computer, then select **Try again**:
+
+```sh
+sudo /usr/libexec/alchemy/alchemy-helper grant-low-ports
+```
+
+From a terminal, the CLI does all of this for you:
+
+```sh
+alchemy machine privileges                     # what's needed, and what's allowed
+alchemy machine privileges grant low-ports     # also: firewall, system-service
+alchemy machine privileges revoke low-ports    # undo it
+```
+
+When it needs the command above, it runs it itself, so `sudo` asks for
+your password right there. Without a terminal, such as in a script, it
+prints the command and exits with status 3.
+
+Some things Alchemy never does for you:
+
+- **It doesn't add you to the `docker` group.** That gives full control of
+  the computer, so Alchemy explains it and leaves the choice to you.
+- **It doesn't edit nftables or iptables rules.** If you manage the
+  firewall that way, allow 80/tcp, 8100-8999/tcp, and 5353/udp yourself.
+- **After an upgrade or rebuild, port 80 may need allowing again** on
+  Linux, because the permission is stored on the program file.
 
 ## Progress
 

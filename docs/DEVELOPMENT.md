@@ -915,6 +915,31 @@ changes, and `last` on each action says how the latest grant or undo
 through this alchemyd ended (`done`, `cancelled`, `denied`,
 `needs_terminal`, or `failed`).
 
+`alchemy machine privileges` prints the same list, with a note for each
+action that needs something, and `grant ACTION` / `revoke ACTION`
+(`low-ports`, `firewall`, or `system-service`) follow that flow. On
+`needs_terminal` with a terminal (stdin and stderr), the CLI prints
+`Running: sudo ...`, runs alchemyd's command itself, with no shell, so
+sudo asks for the password there, then posts again. It runs at most one
+sudo command per call and refuses a command that doesn't start with
+`sudo`. Without a terminal it prints the command on stdout (the whole
+answer with `--json`) and exits 3. On `pending` it follows the
+`privileges` event until the prompt is answered; on `restarting` it waits
+up to 60 seconds for alchemyd to answer again. A cancelled or refused
+prompt, or a failed sudo, exits 1 (`privilege_failed`).
+
+The machine page has a **Privileges** section with one row per action
+(**Port 80**, **Firewall**, **System service**) and a button for the next
+step (**Allow port 80**, **Open the firewall**, **Install the service**,
+and their undos). For `needs_terminal` it shows the command with **Copy
+command** and **Try again**, which posts again, and for `needs_restart` a
+**Restart alchemyd** button. The port 80 warning carries the same control,
+keyed on `privilege: low_ports`, not on the `fix` text. While alchemyd
+restarts the UI shows a neutral "alchemyd is restarting" banner and
+reconnects; the desktop shell re-reads the new token on its own, but a
+browser signed in with `alchemy open` loses its session and has to run
+`alchemy open` again.
+
 alchemyd prompts (osascript on macOS, pkexec with a polkit agent on Linux)
 only when the helper is root-owned and no one else can write it or any
 directory above it. **A build in `target/` never qualifies, so in
@@ -943,18 +968,20 @@ elsewhere), actions that touch alchemyd are `unsupported` with
 
 `grant-low-ports` sets `cap_net_bind_service` on the `alchemyd` next to
 the helper, as the `security.capability` xattr; alchemyd then restarts in
-place to pick it up. With a development build:
+place to pick it up, keeping its PID. With a development build:
 
-```sh
-curl -sS --unix-socket "$XDG_RUNTIME_DIR/alchemy/alchemyd.sock" -X POST \
-  -H 'Content-Type: application/json' -d '{"grant":true}' \
-  http://alchemyd/api/machine/privileges/low-ports | jq -r .command.line
-# sudo /home/you/alchemy/target/release/alchemy-helper grant-low-ports
-sudo target/release/alchemy-helper grant-low-ports
-# then the same POST again: alchemyd answers "restarting" and binds port 80
+```console
+$ alchemy machine privileges grant low-ports
+alchemy-helper isn't installed safely: /home/you/alchemy/target/release/alchemy-helper is owned by UID 1000, not root.
+Running: sudo /home/you/alchemy/target/release/alchemy-helper grant-low-ports
+{"result":"ok","operation":"grant-low-ports","changed":true}
+Restarting alchemyd to put the change in effect…
+Granted low-ports; alchemyd restarted to put it in effect
 ```
 
-`revoke-low-ports` and `{"grant": false}` undo it the same way.
+`alchemy machine privileges revoke low-ports` undoes it the same way. By
+hand, the steps are: `POST` `{"grant":true}`, run the `command.line` it
+answers with, then `POST` again.
 
 - **Rebuilds drop it.** Cargo writes a new file, and the kernel clears the
   xattr on any write, so grant again after `cargo build`. Packaging will
