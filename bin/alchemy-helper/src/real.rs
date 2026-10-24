@@ -71,6 +71,14 @@ impl System for RealSystem {
         }
     }
 
+    fn read_file(&self, path: &Path) -> io::Result<Option<Vec<u8>>> {
+        match std::fs::read(path) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     fn write_file(&self, path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
         let (dir, temp) = temp_sibling(path)?;
         let result = write_new(&temp, contents, mode)
@@ -267,6 +275,17 @@ mod tests {
         assert_eq!(std::os::unix::fs::MetadataExt::uid(&meta), 0);
         assert_eq!(std::os::unix::fs::MetadataExt::gid(&meta), 0);
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn read_file_reports_a_missing_file_as_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f");
+        let sys = RealSystem;
+        assert_eq!(sys.read_file(&path).unwrap(), None);
+        std::fs::write(&path, b"x").unwrap();
+        assert_eq!(sys.read_file(&path).unwrap().as_deref(), Some(&b"x"[..]));
+        assert!(sys.read_file(tmp.path()).is_err());
     }
 
     #[test]

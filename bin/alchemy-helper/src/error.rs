@@ -21,8 +21,12 @@ pub enum Exit {
     DataErr,
     /// The target does not exist: `EX_NOINPUT`.
     NoInput,
+    /// The user the operation names does not exist: `EX_NOUSER`.
+    NoUser,
     /// The operation cannot work on this system: `EX_UNAVAILABLE`.
     Unavailable,
+    /// A fixed system command the operation runs failed: `EX_SOFTWARE`.
+    Software,
     /// A system call failed: `EX_OSERR`.
     OsErr,
     /// Writing the result failed: `EX_IOERR`.
@@ -39,7 +43,9 @@ impl Exit {
             Self::Usage => 64,
             Self::DataErr => 65,
             Self::NoInput => 66,
+            Self::NoUser => 67,
             Self::Unavailable => 69,
+            Self::Software => 70,
             Self::OsErr => 71,
             Self::IoErr => 74,
             Self::NoPerm => 77,
@@ -91,6 +97,27 @@ pub enum HelperError {
         /// What is wrong with it.
         why: &'static str,
     },
+    /// No user has the UID the operation names.
+    #[error("no user has uid {0}")]
+    NoSuchUser(u32),
+    /// The user exists, but the helper refuses to act for it.
+    #[error("user {uid}: refusing to act for it: {why}")]
+    RefusedUser {
+        /// The UID from the command line.
+        uid: u32,
+        /// What is wrong with it.
+        why: &'static str,
+    },
+    /// A fixed system command exited unsuccessfully.
+    #[error("`{command}` failed ({status}): {stderr}")]
+    CommandFailed {
+        /// The program and its arguments, space-separated.
+        command: String,
+        /// How it ended, such as `exit 1`.
+        status: String,
+        /// Its stderr, trimmed.
+        stderr: String,
+    },
     /// A system call failed.
     #[error("{path}: cannot {action}: {source}")]
     Os {
@@ -111,7 +138,9 @@ impl HelperError {
             Self::NotRoot => "not_root",
             Self::UnsupportedPlatform { .. } | Self::Ineffective { .. } => "unsupported",
             Self::NotFound(_) => "not_found",
-            Self::Refused { .. } => "refused",
+            Self::Refused { .. } | Self::RefusedUser { .. } => "refused",
+            Self::NoSuchUser(_) => "no_such_user",
+            Self::CommandFailed { .. } => "command_failed",
             Self::Os { .. } => "os_error",
         }
     }
@@ -123,7 +152,9 @@ impl HelperError {
             Self::NotRoot => Exit::NoPerm,
             Self::UnsupportedPlatform { .. } | Self::Ineffective { .. } => Exit::Unavailable,
             Self::NotFound(_) => Exit::NoInput,
-            Self::Refused { .. } => Exit::DataErr,
+            Self::Refused { .. } | Self::RefusedUser { .. } => Exit::DataErr,
+            Self::NoSuchUser(_) => Exit::NoUser,
+            Self::CommandFailed { .. } => Exit::Software,
             Self::Os { .. } => Exit::OsErr,
         }
     }
@@ -172,6 +203,21 @@ mod tests {
                 65,
             ),
             (
+                HelperError::RefusedUser { uid: 1000, why: "" },
+                "refused",
+                65,
+            ),
+            (HelperError::NoSuchUser(1000), "no_such_user", 67),
+            (
+                HelperError::CommandFailed {
+                    command: String::new(),
+                    status: String::new(),
+                    stderr: String::new(),
+                },
+                "command_failed",
+                70,
+            ),
+            (
                 HelperError::Os {
                     action: "",
                     path: path(),
@@ -194,7 +240,9 @@ mod tests {
             (Exit::Usage, 64),
             (Exit::DataErr, 65),
             (Exit::NoInput, 66),
+            (Exit::NoUser, 67),
             (Exit::Unavailable, 69),
+            (Exit::Software, 70),
             (Exit::OsErr, 71),
             (Exit::IoErr, 74),
             (Exit::NoPerm, 77),

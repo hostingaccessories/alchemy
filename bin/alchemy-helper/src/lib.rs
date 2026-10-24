@@ -24,6 +24,8 @@ mod cli;
 mod error;
 mod low_ports;
 mod real;
+mod service;
+mod sibling;
 mod system;
 
 #[cfg(test)]
@@ -34,8 +36,9 @@ use std::io::Write;
 
 pub use cli::{Operation, ParseError, parse};
 pub use error::{Exit, HelperError};
-pub use low_ports::{CAPABILITY_XATTR, DAEMON, NET_BIND_SERVICE_EP};
+pub use low_ports::{CAPABILITY_XATTR, NET_BIND_SERVICE_EP};
 pub use real::{COMMAND_PATH, RealSystem};
+pub use sibling::DAEMON;
 pub use system::{CommandOutput, FileInfo, FixedCommand, OpenError, System};
 
 /// The operating system the helper runs on. Operations take it as a
@@ -87,6 +90,8 @@ pub fn run<S: System>(
         Operation::Check => Ok(Outcome { changed: false }),
         Operation::GrantLowPorts => low_ports::grant(system, platform),
         Operation::RevokeLowPorts => low_ports::revoke(system, platform),
+        Operation::InstallService { uid } => service::install(system, platform, *uid),
+        Operation::RemoveService { uid } => service::remove(system, platform, *uid),
     }
 }
 

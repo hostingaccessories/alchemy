@@ -37,6 +37,9 @@ pub trait System {
     /// it was there.
     fn remove_xattr(&self, file: &Self::File, name: &str) -> io::Result<bool>;
 
+    /// The contents of `path`, or `None` if nothing exists there.
+    fn read_file(&self, path: &Path) -> io::Result<Option<Vec<u8>>>;
+
     /// Atomically replace `path` with a `root:root` file holding
     /// `contents` with permission bits `mode`.
     ///

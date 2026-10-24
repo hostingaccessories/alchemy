@@ -6,9 +6,10 @@
 //! is never named on the command line: it is always the `alchemyd` in the
 //! directory of the helper's own canonical executable.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use crate::system::{FileInfo, OpenError, System};
+use crate::sibling::{self, os};
+use crate::system::{FileInfo, System};
 use crate::{HelperError, Outcome, Platform};
 
 /// The extended attribute that holds file capabilities.
@@ -23,9 +24,6 @@ pub const NET_BIND_SERVICE_EP: [u8; 20] = [
     0x00, 0x00, 0x00, 0x00, // permitted, caps 32-63
     0x00, 0x00, 0x00, 0x00, // inheritable, caps 32-63
 ];
-
-/// The daemon's file name, next to the helper.
-pub const DAEMON: &str = "alchemyd";
 
 const MACOS_WHY: &str = "macOS lets any user bind ports below 1024";
 
@@ -59,7 +57,7 @@ pub(crate) fn revoke<S: System>(system: &S, platform: Platform) -> Result<Outcom
     Ok(Outcome { changed })
 }
 
-/// Open the sibling alchemyd and check it is a regular file.
+/// Open the sibling alchemyd, refusing on macOS.
 fn open_daemon<S: System>(
     system: &S,
     platform: Platform,
@@ -72,48 +70,5 @@ fn open_daemon<S: System>(
             why: MACOS_WHY,
         });
     }
-    let path = daemon_path(system)?;
-    let file = match system.open_nofollow(&path) {
-        Ok(file) => file,
-        Err(OpenError::NotFound) => return Err(HelperError::NotFound(path)),
-        Err(OpenError::Symlink) => {
-            return Err(HelperError::Refused {
-                path,
-                why: "it is a symlink",
-            });
-        }
-        Err(OpenError::Io(source)) => return Err(os("open", &path, source)),
-    };
-    let info = system
-        .inspect(&file)
-        .map_err(|source| os("inspect", &path, source))?;
-    if !info.regular {
-        return Err(HelperError::Refused {
-            path,
-            why: "it is not a regular file",
-        });
-    }
-    Ok((path, file, info))
-}
-
-/// The `alchemyd` in the directory of the helper's canonical executable.
-fn daemon_path<S: System>(system: &S) -> Result<PathBuf, HelperError> {
-    let exe = system
-        .current_exe()
-        .map_err(|source| os("resolve", Path::new("alchemy-helper"), source))?;
-    match exe.parent() {
-        Some(dir) => Ok(dir.join(DAEMON)),
-        None => Err(HelperError::Refused {
-            path: exe,
-            why: "the helper has no parent directory",
-        }),
-    }
-}
-
-fn os(action: &'static str, path: &Path, source: std::io::Error) -> HelperError {
-    HelperError::Os {
-        action,
-        path: path.to_path_buf(),
-        source,
-    }
+    sibling::open(system)
 }

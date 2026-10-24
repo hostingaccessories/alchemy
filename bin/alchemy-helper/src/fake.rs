@@ -18,6 +18,7 @@ pub enum Call {
     Xattr,
     SetXattr,
     RemoveXattr,
+    ReadFile,
     WriteFile,
     RemoveFile,
     Run,
@@ -69,6 +70,15 @@ impl FakeFile {
         self
     }
 
+    /// A regular `0o644` file holding `contents`.
+    pub fn with_contents(contents: &str) -> Self {
+        Self {
+            contents: contents.as_bytes().to_vec(),
+            mode: 0o644,
+            ..Self::regular()
+        }
+    }
+
     pub fn with_xattr(mut self, name: &str, value: &[u8]) -> Self {
         self.xattrs.insert(name.to_owned(), value.to_vec());
         self
@@ -83,6 +93,7 @@ pub struct FakeSystem {
     fail: Option<Call>,
     opened: RefCell<Vec<PathBuf>>,
     commands: RefCell<Vec<FixedCommand>>,
+    responses: HashMap<Vec<String>, CommandOutput>,
 }
 
 impl FakeSystem {
@@ -94,7 +105,38 @@ impl FakeSystem {
             fail: None,
             opened: RefCell::default(),
             commands: RefCell::default(),
+            responses: HashMap::new(),
         }
+    }
+
+    /// Make the command `argv` (program first) exit with `code` and print
+    /// `stdout`. Any other command exits 0 with no output.
+    pub fn responding(mut self, argv: &[&str], code: i32, stdout: &str) -> Self {
+        let output = CommandOutput {
+            code: Some(code),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: if code == 0 {
+                Vec::new()
+            } else {
+                format!("{} failed", argv.join(" ")).into_bytes()
+            },
+        };
+        self.responses
+            .insert(argv.iter().map(|&a| a.to_owned()).collect(), output);
+        self
+    }
+
+    /// Every command run so far, each as its program and arguments.
+    pub fn argvs(&self) -> Vec<Vec<String>> {
+        self.commands
+            .borrow()
+            .iter()
+            .map(|c| {
+                std::iter::once(c.program().to_owned())
+                    .chain(c.args().iter().cloned())
+                    .collect()
+            })
+            .collect()
     }
 
     pub fn with_file(self, path: &str, file: FakeFile) -> Self {
@@ -186,6 +228,11 @@ impl System for FakeSystem {
         self.with_open(file, |f| f.xattrs.remove(name).is_some())
     }
 
+    fn read_file(&self, path: &Path) -> io::Result<Option<Vec<u8>>> {
+        self.check(Call::ReadFile)?;
+        Ok(self.files.borrow().get(path).map(|f| f.contents.clone()))
+    }
+
     fn write_file(&self, path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
         self.check(Call::WriteFile)?;
         let file = FakeFile {
@@ -205,10 +252,17 @@ impl System for FakeSystem {
     fn run(&self, command: &FixedCommand) -> io::Result<CommandOutput> {
         self.check(Call::Run)?;
         self.commands.borrow_mut().push(command.clone());
-        Ok(CommandOutput {
-            code: Some(0),
-            ..CommandOutput::default()
-        })
+        let argv: Vec<String> = std::iter::once(command.program().to_owned())
+            .chain(command.args().iter().cloned())
+            .collect();
+        Ok(self
+            .responses
+            .get(&argv)
+            .cloned()
+            .unwrap_or_else(|| CommandOutput {
+                code: Some(0),
+                ..CommandOutput::default()
+            }))
     }
 }
 

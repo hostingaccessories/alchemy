@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::fmt;
+use std::num::NonZeroU32;
 
 use clap::{Parser, Subcommand};
 
@@ -36,6 +37,21 @@ pub enum Operation {
     GrantLowPorts,
     /// Undo grant-low-ports: remove the alchemyd file capability (Linux).
     RevokeLowPorts,
+    /// Run the alchemyd next to this helper at boot as the given user.
+    ///
+    /// Installs and starts a systemd system unit on Linux or a
+    /// launch daemon on macOS. alchemyd never runs as root.
+    InstallService {
+        /// The user alchemyd runs as: a decimal, nonzero UID.
+        #[arg(long, value_parser = parse_uid)]
+        uid: NonZeroU32,
+    },
+    /// Undo install-service: stop the service and delete it.
+    RemoveService {
+        /// The UID given to install-service.
+        #[arg(long, value_parser = parse_uid)]
+        uid: NonZeroU32,
+    },
 }
 
 impl Operation {
@@ -46,8 +62,23 @@ impl Operation {
             Self::Check => "check",
             Self::GrantLowPorts => "grant-low-ports",
             Self::RevokeLowPorts => "revoke-low-ports",
+            Self::InstallService { .. } => "install-service",
+            Self::RemoveService { .. } => "remove-service",
         }
     }
+}
+
+/// A UID as alchemyd writes it: plain decimal digits with no sign or
+/// leading zero, and never root's.
+fn parse_uid(value: &str) -> Result<NonZeroU32, String> {
+    if value == "0" {
+        return Err("the service never runs as root".to_owned());
+    }
+    let canonical = value.bytes().all(|b| b.is_ascii_digit()) && !value.starts_with('0');
+    canonical
+        .then(|| value.parse::<NonZeroU32>().ok())
+        .flatten()
+        .ok_or_else(|| "expected a decimal UID from 1 to 4294967295".to_owned())
 }
 
 /// Why [`parse`] did not produce an [`Operation`].
@@ -99,6 +130,10 @@ mod tests {
 
     use super::*;
 
+    fn uid(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).unwrap()
+    }
+
     #[test]
     fn parses_each_operation() {
         let cases = [
@@ -112,6 +147,18 @@ mod tests {
                 Operation::RevokeLowPorts,
             ),
             (&["/usr/libexec/alchemy-helper", "check"], Operation::Check),
+            (
+                &["alchemy-helper", "install-service", "--uid", "501"],
+                Operation::InstallService { uid: uid(501) },
+            ),
+            (
+                &["alchemy-helper", "remove-service", "--uid", "1000"],
+                Operation::RemoveService { uid: uid(1000) },
+            ),
+            (
+                &["alchemy-helper", "install-service", "--uid", "4294967295"],
+                Operation::InstallService { uid: uid(u32::MAX) },
+            ),
         ];
         for (argv, want) in cases {
             assert_eq!(parse(argv).unwrap(), want, "{argv:?}");
@@ -134,6 +181,30 @@ mod tests {
             &["alchemy-helper", "help"],
             &["alchemy-helper", "help", "check"],
             &["alchemy-helper", ""],
+            &["alchemy-helper", "install-service"],
+            &["alchemy-helper", "install-service", "--uid"],
+            &["alchemy-helper", "install-service", "--uid", "0"],
+            &["alchemy-helper", "install-service", "--uid", "00"],
+            &["alchemy-helper", "install-service", "--uid", "0501"],
+            &["alchemy-helper", "install-service", "--uid", "+501"],
+            &["alchemy-helper", "install-service", "--uid", "-1"],
+            &["alchemy-helper", "install-service", "--uid", " 501"],
+            &["alchemy-helper", "install-service", "--uid", "501\n"],
+            &["alchemy-helper", "install-service", "--uid", "0x1f5"],
+            &["alchemy-helper", "install-service", "--uid", "4294967296"],
+            &["alchemy-helper", "install-service", "--uid", "root"],
+            &["alchemy-helper", "install-service", "--uid", ""],
+            &[
+                "alchemy-helper",
+                "install-service",
+                "--uid",
+                "501",
+                "--uid",
+                "502",
+            ],
+            &["alchemy-helper", "install-service", "--uid", "501", "extra"],
+            &["alchemy-helper", "remove-service", "--uid", "0"],
+            &["alchemy-helper", "remove-service"],
         ];
         for argv in cases {
             let err = parse(*argv).unwrap_err();
@@ -156,10 +227,20 @@ mod tests {
         let subcommands: Vec<&str> = cli.get_subcommands().map(clap::Command::get_name).collect();
         assert_eq!(
             subcommands,
-            ["check", "grant-low-ports", "revoke-low-ports"]
+            [
+                "check",
+                "grant-low-ports",
+                "revoke-low-ports",
+                "install-service",
+                "remove-service"
+            ]
         );
         for name in subcommands {
-            assert_eq!(parse(["alchemy-helper", name]).unwrap().name(), name);
+            let argv: &[&str] = match name {
+                "install-service" | "remove-service" => &["alchemy-helper", name, "--uid", "501"],
+                _ => &["alchemy-helper", name],
+            };
+            assert_eq!(parse(argv).unwrap().name(), name);
         }
     }
 
