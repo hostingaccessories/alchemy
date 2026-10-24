@@ -1003,6 +1003,7 @@ mod tests {
                 service: Some("web".into()),
                 port: Some(8080),
                 hostname: Some("blog".into()),
+                ..XAlchemy::default()
             }))
         );
         assert_eq!(

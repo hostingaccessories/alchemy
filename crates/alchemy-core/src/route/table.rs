@@ -76,6 +76,9 @@ pub struct RouteTarget {
     pub port: u16,
     /// The label `x-alchemy` asks for, overriding the app's name.
     pub hostname: Option<HostLabel>,
+    /// Whether its `.local` name may be announced over mDNS; `x-alchemy`
+    /// turns it off with `mdns: false`.
+    pub mdns: bool,
 }
 
 /// The address the proxy connects to for a route.
@@ -118,6 +121,9 @@ pub struct Route {
     /// Where to connect, or `None` while no running container can be
     /// reached, such as when the app is stopped.
     pub upstream: Option<Upstream>,
+    /// Whether its label may be announced as `<label>.local` over mDNS,
+    /// as [`RouteTarget::mdns`].
+    pub mdns: bool,
 }
 
 /// One candidate port a service could be routed on.
@@ -239,14 +245,14 @@ impl fmt::Display for RouteProblemKind {
                 reason,
             } => write!(
                 f,
-                "The x-alchemy block can't be read: {reason}. It takes service, port, and hostname."
+                "The x-alchemy block can't be read: {reason}. It takes service, port, hostname, and mdns."
             ),
             Self::UnreadableBlock {
                 service: Some(service),
                 reason,
             } => write!(
                 f,
-                "Service {service}'s x-alchemy block can't be read: {reason}. It takes port and hostname."
+                "Service {service}'s x-alchemy block can't be read: {reason}. It takes port, hostname, and mdns."
             ),
             Self::MultipleBlocks {
                 top_level,
@@ -426,6 +432,7 @@ pub fn choose_target(
             service: port.service,
             port: port.ports.start(),
             hostname: None,
+            mdns: true,
         }
     };
     if reachability == Reachability::PublishedOnly
@@ -522,6 +529,7 @@ fn from_block(
         service,
         port,
         hostname,
+        mdns: spec.mdns,
     })
 }
 
@@ -668,6 +676,7 @@ pub fn plan_routes(apps: &[AppRouteInput], options: &RouteOptions) -> RoutePlan 
             label,
             hosts: Vec::new(),
             listen_port: app.listen_port,
+            mdns: target.mdns,
         });
     }
 
@@ -784,6 +793,7 @@ mod tests {
             service: service.map(str::to_owned),
             port,
             hostname: hostname.map(str::to_owned),
+            ..XAlchemy::default()
         })
     }
 
@@ -811,6 +821,7 @@ mod tests {
             service: service.into(),
             port,
             hostname: hostname.map(|h| HostLabel::new(h).unwrap()),
+            mdns: true,
         }
     }
 
@@ -826,12 +837,38 @@ mod tests {
     fn choosing_a_target() {
         use Reachability::{ContainerIp, PublishedOnly};
         use RouteProblemKind as P;
+        let quiet = XAlchemyBlock::Read(XAlchemy {
+            mdns: false,
+            ..XAlchemy::default()
+        });
         let cases: Vec<(&str, AppRouteInput, Reachability, Result<RouteTarget, P>)> = vec![
             (
                 "one service, one exposed port",
                 app("a", None, vec![svc("web", &["80"], &[])]),
                 ContainerIp,
                 Ok(target("web", 80, None)),
+            ),
+            (
+                "a top-level block turns mdns off",
+                app("a", Some(quiet.clone()), vec![svc("web", &["80"], &[])]),
+                ContainerIp,
+                Ok(RouteTarget {
+                    mdns: false,
+                    ..target("web", 80, None)
+                }),
+            ),
+            (
+                "a service's block turns mdns off",
+                app(
+                    "a",
+                    None,
+                    vec![with_block(svc("web", &["80"], &[]), quiet.clone())],
+                ),
+                ContainerIp,
+                Ok(RouteTarget {
+                    mdns: false,
+                    ..target("web", 80, None)
+                }),
             ),
             (
                 "one service, one published port",
@@ -1371,6 +1408,7 @@ mod tests {
                 hosts: vec!["wiki.localhost".into()],
                 listen_port: Some(8101),
                 upstream: Some(Upstream::ContainerIp(addr("10.250.0.5:80"))),
+                mdns: true,
             }
         );
         let table = &plan.table;

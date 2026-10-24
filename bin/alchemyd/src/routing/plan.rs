@@ -814,6 +814,7 @@ mod tests {
                     service: Some("app".into()),
                     port: Some(3000),
                     hostname: Some("notes".into()),
+                    ..XAlchemy::default()
                 })),
                 ..ComposeConfig::default()
             }),

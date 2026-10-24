@@ -140,7 +140,7 @@ fn app(name: &str, ip: IpAddr, listen_port: Option<u16>, running: bool) -> AppRo
         x_alchemy: Some(XAlchemyBlock::Read(XAlchemy {
             service: Some("web".into()),
             port: Some(80),
-            hostname: None,
+            ..XAlchemy::default()
         })),
         services: vec![ServiceRouteInput {
             name: "web".into(),

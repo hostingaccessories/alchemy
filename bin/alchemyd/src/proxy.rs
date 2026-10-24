@@ -425,6 +425,7 @@ mod tests {
                 service: Some("web".into()),
                 port: Some(80),
                 hostname: hostname.map(Into::into),
+                ..XAlchemy::default()
             })),
             services: vec![ServiceRouteInput {
                 name: "web".into(),
