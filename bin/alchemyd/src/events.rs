@@ -59,6 +59,7 @@ pub fn topics() -> Vec<Topic> {
     vec![
         Topic::watch(State::watch_engine, ApiEvent::Engine),
         Topic::watch(State::watch_metrics, ApiEvent::Metrics),
+        Topic::watch(State::watch_apps, ApiEvent::Apps),
     ]
 }
 

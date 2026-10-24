@@ -1,7 +1,8 @@
 //! HTTP API and web UI.
 //!
 //! Routes under `/api` return JSON, except `/api/events`, which streams
-//! [`ApiEvent`]s as server-sent events. On the TCP listener ([`router`])
+//! [`ApiEvent`]s as server-sent events. The app routes are described in
+//! [`alchemy_api::apps`]. On the TCP listener ([`router`])
 //! everything else is served from the embedded web UI build with an
 //! `index.html` fallback for client-side routing; on the Unix socket
 //! ([`api_router`]) everything else is a JSON 404.
@@ -11,14 +12,17 @@
 //! nesting it, with nothing to opt into.
 
 use std::net::IpAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use alchemy_api::apps::{App, AppList, AppSettings, AppSettingsUpdate};
 use alchemy_api::{
     ApiEvent, EngineStatus, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, MetricsRange,
     VersionResponse,
 };
-use axum::extract::rejection::QueryRejection;
+use axum::body::Bytes;
+use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{self, FromRef, Query, Request};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -32,6 +36,7 @@ use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 
 use crate::State;
+use crate::apps::{self, settings};
 use crate::events::{self, Topic};
 use crate::guard::{self, Refusal, TAURI_ORIGINS};
 use crate::store::SharedStore;
@@ -139,6 +144,9 @@ fn api(
         .route("/events", get(events))
         .route("/metrics", get(metrics))
         .route("/metrics/history", get(metrics_history))
+        .route("/apps", get(list_apps))
+        .route("/apps/{name}", get(show_app))
+        .route("/settings/apps", get(app_settings).put(set_app_settings))
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found)
         .with_state(Api {
@@ -277,6 +285,82 @@ fn bad_query(rejection: &QueryRejection) -> Response {
         ErrorCode::BadRequest,
         &format!("invalid query: {}", rejection.body_text()),
     )
+}
+
+async fn list_apps(extract::State(state): extract::State<State>) -> Json<AppList> {
+    Json(state.apps())
+}
+
+async fn show_app(
+    extract::State(state): extract::State<State>,
+    name: Result<extract::Path<String>, PathRejection>,
+) -> Response {
+    let extract::Path(name) = match name {
+        Ok(name) => name,
+        Err(rejection) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::BadRequest,
+                &rejection.body_text(),
+            );
+        }
+    };
+    match apps::find(&state.apps(), &name) {
+        Some(app) => Json::<&App>(app).into_response(),
+        None => api_error(
+            StatusCode::NOT_FOUND,
+            ErrorCode::AppNotFound,
+            &format!("no app is named {name:?}"),
+        ),
+    }
+}
+
+async fn app_settings(extract::State(state): extract::State<State>) -> Json<AppSettings> {
+    Json(state.app_settings())
+}
+
+/// Validate and store new app folder settings, put them in effect, and ask
+/// the apps task to look again. The default home comes from the settings
+/// in effect, which the apps task fills in at startup.
+async fn set_app_settings(
+    extract::State(state): extract::State<State>,
+    extract::State(store): extract::State<SharedStore>,
+    body: Bytes,
+) -> Response {
+    let update: AppSettingsUpdate = match serde_json::from_slice(&body) {
+        Ok(update) => update,
+        Err(err) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::BadRequest,
+                &format!("invalid app settings: {err}"),
+            );
+        }
+    };
+    let default_home = state.app_settings().default_home;
+    let default_home = default_home.as_deref().map(Path::new);
+    let stored = match settings::validate(&update, default_home) {
+        Ok(stored) => stored,
+        Err(err) => {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ErrorCode::Invalid,
+                &err.to_string(),
+            );
+        }
+    };
+    if let Err(err) = store.set_setting(settings::SETTINGS_KEY, &stored).await {
+        tracing::warn!(error = %err, "saving the app folder settings failed");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            "alchemyd couldn't save the settings",
+        );
+    }
+    let (_, effective) = settings::effective(&stored, default_home);
+    state.set_app_settings(effective.clone());
+    state.rescan_apps();
+    Json(effective).into_response()
 }
 
 async fn events(
@@ -994,5 +1078,189 @@ mod tests {
         let app = api_router(State::new(), memory(), rx);
         let (status, _, _) = send(app, probe.request("/api/health")).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    fn app_list() -> AppList {
+        let app: App = serde_json::from_value(serde_json::json!({
+            "name": "blog",
+            "status": "running",
+            "dir": "/srv/apps/blog",
+            "root": "/srv/apps",
+            "compose_file": "compose.yaml",
+            "project": "blog",
+            "images": "registry",
+            "services": [],
+            "problems": [],
+        }))
+        .unwrap();
+        AppList {
+            apps: vec![app],
+            ..AppList::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn apps_lists_and_shows_the_current_apps() {
+        let state = State::new();
+        state.set_apps(app_list());
+
+        let (status, body) = get_json_from(state.clone(), "/api/apps").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::to_value(app_list()).unwrap());
+
+        let (status, body) = get_json_from(state.clone(), "/api/apps/blog").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::to_value(&app_list().apps[0]).unwrap());
+
+        for (uri, name) in [
+            ("/api/apps/nope", "nope"),
+            ("/api/apps/Blog", "Blog"),
+            ("/api/apps/..%2Fetc", "../etc"),
+        ] {
+            let (status, body) = get_json_from(state.clone(), uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "error": format!("no app is named {name:?}"),
+                    "code": "app_not_found",
+                }),
+                "{uri}"
+            );
+        }
+    }
+
+    async fn put_settings(
+        state: &State,
+        store: &SharedStore,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let (_tx, rx) = watch::channel(false);
+        let mut request = req(Method::PUT, "/api/settings/apps");
+        if let Some(content_type) = content_type {
+            request = request.header(header::CONTENT_TYPE, content_type);
+        }
+        let resp = router(state.clone(), store.clone(), LISTEN, rx)
+            .oneshot(request.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    fn with_default_home(home: &str) -> State {
+        let state = State::new();
+        state.set_app_settings(AppSettings {
+            home: Some(home.into()),
+            default_home: Some(home.into()),
+            extra: vec![],
+        });
+        state
+    }
+
+    #[tokio::test]
+    async fn app_settings_are_read_from_what_is_in_effect() {
+        let state = with_default_home("/home/me/Alchemy/apps");
+        let (status, body) = get_json_from(state, "/api/settings/apps").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "home": "/home/me/Alchemy/apps",
+                "default_home": "/home/me/Alchemy/apps",
+                "extra": [],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn putting_app_settings_stores_them_and_asks_for_a_rescan() {
+        let state = with_default_home("/home/me/Alchemy/apps");
+        let store = memory();
+        let rescans = state.watch_app_rescans();
+
+        let (status, body) = put_settings(
+            &state,
+            &store,
+            Some("application/json"),
+            r#"{"home":"/srv/apps/","extra":["/opt/stacks"]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let want = serde_json::json!({
+            "home": "/srv/apps",
+            "default_home": "/home/me/Alchemy/apps",
+            "extra": ["/opt/stacks"],
+        });
+        assert_eq!(body, want);
+        assert_eq!(serde_json::to_value(state.app_settings()).unwrap(), want);
+        assert!(rescans.has_changed().unwrap());
+        assert_eq!(
+            store
+                .setting::<settings::StoredDirs>(settings::SETTINGS_KEY)
+                .await
+                .unwrap(),
+            Some(settings::StoredDirs {
+                home: Some("/srv/apps".into()),
+                extra: vec!["/opt/stacks".into()],
+            })
+        );
+
+        let (status, body) =
+            put_settings(&state, &store, Some("application/json"), r#"{"home":null}"#).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["home"], "/home/me/Alchemy/apps");
+        assert_eq!(body["extra"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn bad_app_settings_are_refused_and_change_nothing() {
+        let json = Some("application/json");
+        let cases = [
+            (
+                json,
+                r#"{"home":"apps"}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid",
+            ),
+            (
+                json,
+                r#"{"extra":["/home/me/Alchemy/apps"]}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid",
+            ),
+            (
+                json,
+                r#"{"home":3}"#,
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+            (json, "not json", StatusCode::BAD_REQUEST, "bad_request"),
+            (
+                None,
+                r#"{"home":"/srv"}"#,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+            ),
+        ];
+        for (content_type, body, want, code) in cases {
+            let state = with_default_home("/home/me/Alchemy/apps");
+            let store = memory();
+            let rescans = state.watch_app_rescans();
+            let (status, got) = put_settings(&state, &store, content_type, body).await;
+            assert_eq!(status, want, "{body}");
+            assert_eq!(got["code"], code, "{body}");
+            assert!(!rescans.has_changed().unwrap(), "{body}");
+            assert_eq!(
+                store
+                    .setting::<settings::StoredDirs>(settings::SETTINGS_KEY)
+                    .await
+                    .unwrap(),
+                None,
+                "{body}"
+            );
+        }
     }
 }
