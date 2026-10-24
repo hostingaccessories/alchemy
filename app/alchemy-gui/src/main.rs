@@ -52,8 +52,10 @@ fn state_dir(env: Option<OsString>, default: Option<PathBuf>) -> Option<PathBuf>
 /// hex digits, as alchemyd writes it.
 fn token(contents: &str) -> Option<String> {
     let token = contents.trim();
-    (token.len() == 64 && token.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
-        .then(|| token.to_owned())
+    let hex = token
+        .bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    (token.len() == 64 && hex).then(|| token.to_owned())
 }
 
 fn main() {
