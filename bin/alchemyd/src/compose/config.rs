@@ -243,15 +243,17 @@ impl CliComposeConfig {
         self
     }
 
-    async fn run(
+    /// Run `docker` with `args`, which end in `config --format json`, and
+    /// parse what it prints.
+    pub(super) async fn run(
         &self,
-        project: &ComposeProject,
+        args: &[OsString],
         endpoint: &Endpoint,
     ) -> Result<ComposeConfig, ConfigError> {
         let binary =
             find_docker_binary(&SystemProbe, &self.binaries).ok_or(ConfigError::NoDocker)?;
         let env = child_env(self.parent_env.iter().cloned(), endpoint.docker_host());
-        let mut child = docker_command(&binary, &config_args(project), &env)
+        let mut child = docker_command(&binary, args, &env)
             .spawn()
             .map_err(|source| ConfigError::Spawn {
                 binary: binary.clone(),
@@ -291,7 +293,7 @@ impl ComposeConfigReader for CliComposeConfig {
         project: &'a ComposeProject,
         endpoint: &'a Endpoint,
     ) -> BoxFuture<'a, Result<ComposeConfig, ConfigError>> {
-        Box::pin(self.run(project, endpoint))
+        Box::pin(async move { self.run(&config_args(project), endpoint).await })
     }
 }
 

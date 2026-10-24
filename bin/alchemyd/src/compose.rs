@@ -10,7 +10,9 @@
 //! Reading a project's resolved configuration, for its project name and
 //! whether it builds, sits behind [`ComposeConfigReader`] the same way:
 //! [`CliComposeConfig`] runs `docker compose config`, and
-//! [`FakeComposeConfig`] answers from a table.
+//! [`FakeComposeConfig`] answers from a table. Validating staged files
+//! before they are saved sits behind [`ComposeValidator`], which
+//! [`CliComposeConfig`] also implements and [`FakeComposeValidator`] fakes.
 //!
 //! This lives in the daemon rather than `alchemy-core` because the argv is
 //! a detail of the `docker` binary, not of the domain.
@@ -24,6 +26,7 @@ mod plan;
 mod progress;
 mod project;
 mod runner;
+mod validate;
 
 pub use cli::CliComposeRunner;
 pub use config::{
@@ -43,3 +46,4 @@ pub use runner::{
     CancelToken, Canceller, ComposeError, ComposeEvent, ComposeRunner, OutputLine, Stream,
     cancellation,
 };
+pub use validate::{ComposeCheck, ComposeValidator, FakeComposeValidator, check_args};

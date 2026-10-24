@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use alchemyd::compose::{
-    CliComposeConfig, ComposeConfigReader, ComposeProject, ConfigError, ImageSource,
+    CliComposeConfig, ComposeCheck, ComposeConfigReader, ComposeProject, ComposeValidator,
+    ConfigError, ImageSource,
 };
 use alchemyd::engine::Endpoint;
 
@@ -113,4 +114,49 @@ async fn reads_the_resolved_config_through_the_docker_binary() {
         .unwrap_err();
     assert!(matches!(err, ConfigError::Timeout { .. }), "{err:?}");
     assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn validates_staged_files_through_the_docker_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let argv_log = dir.path().join("argv.log");
+    let ok = write_script(
+        dir.path(),
+        "ok",
+        &format!(
+            "printf '%s\\n' \"$@\" > '{}'\necho '{CONFIG}'",
+            argv_log.display()
+        ),
+    );
+    let failing = write_script(
+        dir.path(),
+        "failing",
+        "echo 'services.web Additional property imagee is not allowed' >&2\nexit 1",
+    );
+    let check = ComposeCheck::new(ComposeProject::new("/srv/apps/blog").unwrap())
+        .with_file("/srv/apps/.alchemy-tmp-blog-1/compose.yaml")
+        .unwrap()
+        .with_env_file("/srv/apps/.alchemy-tmp-blog-1/.env")
+        .unwrap();
+    let endpoint = Endpoint::unix("/run/user/1000/docker.sock").unwrap();
+
+    let config = CliComposeConfig::new(&ok)
+        .validate(&check, &endpoint)
+        .await
+        .unwrap();
+    assert_eq!(config.name, "fancy");
+    assert_eq!(
+        std::fs::read_to_string(&argv_log).unwrap(),
+        "compose\n--project-directory\n/srv/apps/blog\n-f\n/srv/apps/.alchemy-tmp-blog-1/compose.yaml\n--env-file\n/srv/apps/.alchemy-tmp-blog-1/.env\nconfig\n--format\njson\n"
+    );
+
+    let err = CliComposeConfig::new(&failing)
+        .validate(&check, &endpoint)
+        .await
+        .unwrap_err();
+    assert!(err.is_invalid(), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "services.web Additional property imagee is not allowed"
+    );
 }
