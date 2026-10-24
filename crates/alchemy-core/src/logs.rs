@@ -6,10 +6,12 @@
 //! on every line, as Docker writes them (RFC 3339, UTC, nanoseconds). A
 //! [`LineSplitter`] cuts the bytes into lines, [`split_timestamp`] takes
 //! the timestamp off the front, [`merge_tail`] orders the containers'
-//! tails into one, and a [`Cursor`] remembers where each output of a
-//! container's log was left so a reconnect can skip what was already sent.
+//! tails into one, a [`Tail`] keeps each within [`MAX_TAIL_BYTES`], and a
+//! [`Cursor`] remembers where each output of a container's log was left
+//! so a reconnect can skip what was already sent.
 
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::fmt;
 
 /// Lines sent when a request names no `tail`.
@@ -24,6 +26,12 @@ pub const MAX_TAIL: u32 = 5000;
 /// Below Docker's own 16 KiB split of long lines, so a line Docker splits
 /// is always cut within its first piece.
 pub const MAX_LINE: usize = 8 * 1024;
+
+/// The most bytes of lines a request's tail holds, across all of its
+/// containers and while each one's is read. Older lines past it are
+/// dropped, so [`MAX_TAIL`] lines of up to [`MAX_LINE`] bytes from many
+/// containers cannot add up to tens of megabytes per request.
+pub const MAX_TAIL_BYTES: usize = 2 * 1024 * 1024;
 
 /// Appended to a line cut at [`MAX_LINE`].
 pub const TRUNCATED: &str = "…";
@@ -324,6 +332,70 @@ pub fn merge_tail<T>(
     merged
 }
 
+/// The newest items pushed, at most `max_lines` of them and `max_bytes`
+/// in all: a push past either limit drops the oldest first.
+///
+/// Holds a logs request's tail, so its memory stays bounded however many
+/// lines the engine sends. An item larger than `max_bytes` on its own is
+/// dropped along with everything before it.
+#[derive(Debug, Clone)]
+pub struct Tail<T> {
+    items: VecDeque<(usize, T)>,
+    bytes: usize,
+    max_lines: usize,
+    max_bytes: usize,
+}
+
+impl<T> Tail<T> {
+    /// An empty tail with these limits.
+    pub fn new(max_lines: usize, max_bytes: usize) -> Self {
+        Self {
+            items: VecDeque::new(),
+            bytes: 0,
+            max_lines,
+            max_bytes,
+        }
+    }
+
+    /// Add `item`, which counts as `size` bytes, as the newest.
+    pub fn push(&mut self, item: T, size: usize) {
+        if self.max_lines == 0 || size > self.max_bytes {
+            self.items.clear();
+            self.bytes = 0;
+            return;
+        }
+        while self.items.len() >= self.max_lines || self.bytes.saturating_add(size) > self.max_bytes
+        {
+            let Some((dropped, _)) = self.items.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(dropped);
+        }
+        self.bytes += size;
+        self.items.push_back((size, item));
+    }
+
+    /// How many items are kept.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether no item is kept.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// The bytes the kept items count as.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The kept items, oldest first.
+    pub fn into_vec(self) -> Vec<T> {
+        self.items.into_iter().map(|(_, item)| item).collect()
+    }
+}
+
 /// Where one output of a container's log, stdout or stderr, was left, so
 /// following it again after its stream ends skips every line already sent.
 ///
@@ -591,6 +663,58 @@ mod tests {
 
     fn line(source: &str, secs: Option<i64>) -> (String, Option<Timestamp>) {
         (source.to_owned(), secs.map(|s| Timestamp::new(s, 0)))
+    }
+
+    #[test]
+    fn tails_keep_the_newest_within_both_limits() {
+        type Case<'a> = (
+            &'a str,
+            usize,
+            usize,
+            &'a [(&'a str, usize)],
+            &'a [&'a str],
+            usize,
+        );
+        let cases: [Case<'_>; 7] = [
+            ("under both", 3, 10, &[("a", 2), ("b", 2)], &["a", "b"], 4),
+            (
+                "lines",
+                2,
+                10,
+                &[("a", 1), ("b", 1), ("c", 1)],
+                &["b", "c"],
+                2,
+            ),
+            (
+                "bytes",
+                5,
+                5,
+                &[("a", 2), ("b", 2), ("c", 2)],
+                &["b", "c"],
+                4,
+            ),
+            ("exactly full", 5, 4, &[("a", 2), ("b", 2)], &["a", "b"], 4),
+            ("big drops older", 5, 5, &[("a", 2), ("b", 4)], &["b"], 4),
+            (
+                "too big alone",
+                5,
+                5,
+                &[("a", 2), ("huge", 6), ("c", 1)],
+                &["c"],
+                1,
+            ),
+            ("no lines", 0, 5, &[("a", 1)], &[], 0),
+        ];
+        for (name, lines, bytes, pushes, want, want_bytes) in cases {
+            let mut tail = Tail::new(lines, bytes);
+            for (item, size) in pushes {
+                tail.push(*item, *size);
+            }
+            assert_eq!(tail.len(), want.len(), "{name}");
+            assert_eq!(tail.is_empty(), want.is_empty(), "{name}");
+            assert_eq!(tail.bytes(), want_bytes, "{name}");
+            assert_eq!(tail.into_vec(), want, "{name}");
+        }
     }
 
     #[test]
