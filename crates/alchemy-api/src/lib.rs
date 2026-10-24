@@ -12,7 +12,8 @@
 //! `GET /api/metrics/history` a [`MetricsHistory`], built from the
 //! resource-usage types in `alchemy_core::metrics`.
 //! `GET /api/events` streams [`ApiEvent`]s. The app routes and their
-//! types are in [`apps`], and an app's log stream in [`logs`].
+//! types are in [`apps`], an app's log stream in [`logs`], and the
+//! lifecycle operation routes in [`operations`].
 //!
 //! The default build is pure. Enable the `socket` feature for the daemon
 //! socket path shared by `alchemyd` and its local clients.
@@ -27,10 +28,12 @@ use serde::{Deserialize, Serialize, Serializer};
 
 pub mod apps;
 pub mod logs;
+pub mod operations;
 #[cfg(feature = "socket")]
 mod socket;
 
 pub use apps::AppList;
+pub use operations::OperationList;
 
 #[cfg(feature = "socket")]
 pub use socket::{SOCKET_ENV, SOCKET_FILE, default_socket_path, runtime_dir};
@@ -116,6 +119,8 @@ pub enum ErrorCode {
     Invalid,
     /// No app has the requested name.
     AppNotFound,
+    /// No operation has the requested id, or it is too old to be kept.
+    OperationNotFound,
     /// The daemon failed while handling a valid request.
     Internal,
     /// A code this build does not know, sent by a newer daemon, or no code
@@ -190,6 +195,10 @@ pub enum ApiEvent {
     Metrics(MetricsResponse),
     /// Every app, sent once on connect and again on every change.
     Apps(AppList),
+    /// Every operation the daemon holds in memory, running or recently
+    /// finished, newest first, sent once on connect and again on every
+    /// change.
+    Operations(OperationList),
 }
 
 impl ApiEvent {
@@ -199,6 +208,7 @@ impl ApiEvent {
             Self::Engine(_) => "engine",
             Self::Metrics(_) => "metrics",
             Self::Apps(_) => "apps",
+            Self::Operations(_) => "operations",
         }
     }
 
@@ -218,6 +228,7 @@ impl Serialize for EventData<'_> {
             ApiEvent::Engine(status) => status.serialize(serializer),
             ApiEvent::Metrics(metrics) => metrics.serialize(serializer),
             ApiEvent::Apps(apps) => apps.serialize(serializer),
+            ApiEvent::Operations(operations) => operations.serialize(serializer),
         }
     }
 }

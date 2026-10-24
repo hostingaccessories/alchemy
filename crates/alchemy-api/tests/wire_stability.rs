@@ -13,6 +13,10 @@ use alchemy_api::apps::{
     AppSettings, AppSettingsUpdate, ContainerState, Health, ImageSource, SkipReason, SkippedApp,
     StackName, StackStatus, UnmanagedApp,
 };
+use alchemy_api::operations::{
+    Action, ActionPlan, ActionRequest, Operation, OperationEvent, OperationList, OperationResponse,
+    OperationState, OutputLine, PlannedStep, Step, StepCommand, StepState,
+};
 use alchemy_api::{
     API_VERSION, ApiEvent, ContainerStatus, ContainerUsage, EngineFlavor, EngineState,
     EngineStatus, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, MachineUsage,
@@ -76,6 +80,7 @@ fn error_codes() {
         (ErrorCode::Conflict, r#""conflict""#),
         (ErrorCode::Invalid, r#""invalid""#),
         (ErrorCode::AppNotFound, r#""app_not_found""#),
+        (ErrorCode::OperationNotFound, r#""operation_not_found""#),
         (ErrorCode::Internal, r#""internal""#),
         (ErrorCode::Unknown, r#""unknown""#),
     ];
@@ -692,4 +697,207 @@ fn log_events() {
             serde_json::json!({ "event": name, "data": data })
         );
     }
+}
+fn update() -> Operation {
+    Operation {
+        id: "19a3b4c5d6e-1".into(),
+        app: StackName::new("blog").unwrap(),
+        action: Action::Update,
+        state: OperationState::Running,
+        steps: vec![
+            Step {
+                command: StepCommand::Pull,
+                label: "Downloading updates".into(),
+                state: StepState::Done,
+                message: Some("2 of 2 images downloaded".into()),
+            },
+            Step {
+                command: StepCommand::Up,
+                label: "Starting the new version".into(),
+                state: StepState::Active,
+                message: None,
+            },
+        ],
+        started_at: 1_700_000_000,
+        finished_at: None,
+        error: None,
+    }
+}
+
+const UPDATE: &str = concat!(
+    r#"{"id":"19a3b4c5d6e-1","app":"blog","action":"update","state":"running","steps":["#,
+    r#"{"command":"pull","label":"Downloading updates","state":"done","message":"2 of 2 images downloaded"},"#,
+    r#"{"command":"up","label":"Starting the new version","state":"active","message":null}],"#,
+    r#""started_at":1700000000,"finished_at":null,"error":null}"#,
+);
+
+#[test]
+fn operation() {
+    assert_wire(&update(), UPDATE);
+    let failed = Operation {
+        state: OperationState::Failed,
+        finished_at: Some(1_700_000_030),
+        error: Some("pull access denied".into()),
+        steps: vec![],
+        ..update()
+    };
+    assert_wire(
+        &failed,
+        concat!(
+            r#"{"id":"19a3b4c5d6e-1","app":"blog","action":"update","state":"failed","steps":[],"#,
+            r#""started_at":1700000000,"finished_at":1700000030,"error":"pull access denied"}"#,
+        ),
+    );
+    assert_wire(
+        &OperationResponse {
+            operation: update(),
+        },
+        &format!(r#"{{"operation":{UPDATE}}}"#),
+    );
+    assert_wire(
+        &OperationList {
+            operations: vec![update()],
+        },
+        &format!(r#"{{"operations":[{UPDATE}]}}"#),
+    );
+}
+
+#[test]
+fn operation_enums() {
+    for (action, want) in [
+        (Action::Up, r#""up""#),
+        (Action::Down, r#""down""#),
+        (Action::Start, r#""start""#),
+        (Action::Stop, r#""stop""#),
+        (Action::Restart, r#""restart""#),
+        (Action::Pull, r#""pull""#),
+        (Action::Build, r#""build""#),
+        (Action::Update, r#""update""#),
+    ] {
+        assert_wire(&action, want);
+    }
+    for (command, want) in [
+        (StepCommand::Up, r#""up""#),
+        (StepCommand::Down, r#""down""#),
+        (StepCommand::Start, r#""start""#),
+        (StepCommand::Stop, r#""stop""#),
+        (StepCommand::Restart, r#""restart""#),
+        (StepCommand::Pull, r#""pull""#),
+        (StepCommand::Build, r#""build""#),
+    ] {
+        assert_wire(&command, want);
+    }
+    for (state, want) in [
+        (OperationState::Running, r#""running""#),
+        (OperationState::Succeeded, r#""succeeded""#),
+        (OperationState::Failed, r#""failed""#),
+        (OperationState::Cancelled, r#""cancelled""#),
+        (OperationState::Interrupted, r#""interrupted""#),
+        (OperationState::Unknown, r#""unknown""#),
+    ] {
+        assert_wire(&state, want);
+    }
+    for (state, want) in [
+        (StepState::Pending, r#""pending""#),
+        (StepState::Active, r#""active""#),
+        (StepState::Done, r#""done""#),
+        (StepState::Failed, r#""failed""#),
+        (StepState::Skipped, r#""skipped""#),
+        (StepState::Unknown, r#""unknown""#),
+    ] {
+        assert_wire(&state, want);
+    }
+    let from_the_future = r#""from_the_future""#;
+    assert_eq!(
+        serde_json::from_str::<OperationState>(from_the_future).unwrap(),
+        OperationState::Unknown
+    );
+    assert_eq!(
+        serde_json::from_str::<StepState>(from_the_future).unwrap(),
+        StepState::Unknown
+    );
+    assert!(serde_json::from_str::<Action>(from_the_future).is_err());
+}
+
+#[test]
+fn action_request() {
+    assert_wire(
+        &ActionRequest {
+            action: Action::Down,
+            force: true,
+        },
+        r#"{"action":"down","force":true}"#,
+    );
+    assert_eq!(
+        serde_json::from_str::<ActionRequest>(r#"{"action":"up"}"#).unwrap(),
+        ActionRequest {
+            action: Action::Up,
+            force: false,
+        }
+    );
+    assert!(serde_json::from_str::<ActionRequest>(r#"{"action":"kill"}"#).is_err());
+}
+
+#[test]
+fn action_plan() {
+    assert_wire(
+        &ActionPlan {
+            app: StackName::new("blog").unwrap(),
+            action: Action::Down,
+            steps: vec![PlannedStep {
+                command: StepCommand::Down,
+                label: "Removing the app's containers".into(),
+                argv: vec![
+                    "docker".into(),
+                    "compose".into(),
+                    "--project-directory".into(),
+                    "/srv/apps/blog".into(),
+                    "--progress".into(),
+                    "json".into(),
+                    "down".into(),
+                ],
+            }],
+        },
+        concat!(
+            r#"{"app":"blog","action":"down","steps":[{"command":"down","#,
+            r#""label":"Removing the app's containers","argv":["docker","compose","#,
+            r#""--project-directory","/srv/apps/blog","--progress","json","down"]}]}"#,
+        ),
+    );
+}
+
+#[test]
+fn operation_events() {
+    let line = OutputLine {
+        seq: 7,
+        step: 1,
+        text: "Container blog-web-1 Started".into(),
+    };
+    let line_json = r#"{"seq":7,"step":1,"text":"Container blog-web-1 Started"}"#;
+    let cases = [
+        (
+            OperationEvent::Operation(update()),
+            "operation",
+            UPDATE.to_owned(),
+        ),
+        (OperationEvent::Output(line), "output", line_json.to_owned()),
+        (OperationEvent::Done(update()), "done", UPDATE.to_owned()),
+    ];
+    for (event, name, data) in cases {
+        assert_eq!(event.name(), name);
+        assert_eq!(serde_json::to_string(&event.data()).unwrap(), data);
+        assert_wire(&event, &format!(r#"{{"event":"{name}","data":{data}}}"#));
+    }
+}
+
+#[test]
+fn operations_event() {
+    let event = ApiEvent::Operations(OperationList {
+        operations: vec![update()],
+    });
+    assert_eq!(event.name(), "operations");
+    assert_wire(
+        &event,
+        &format!(r#"{{"event":"operations","data":{{"operations":[{UPDATE}]}}}}"#),
+    );
 }
