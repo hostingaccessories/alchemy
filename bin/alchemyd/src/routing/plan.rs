@@ -13,6 +13,7 @@ use alchemy_api::apps::{
     AddressKind, AddressState, AppAddress, AppList, AppProblem, AppProblemKind,
 };
 use alchemy_api::network::{ListenerState, MdnsReport, MdnsState, ProxyListener, ProxyReport};
+use alchemy_api::privileges::PrivilegeAction;
 use alchemy_core::engine::{ContainerState, Containers};
 use alchemy_core::mdns::{
     Announcements, LanIpv4, MdnsProblem, NameState, conflict_problems, name_states,
@@ -655,12 +656,19 @@ fn proxy_report(inputs: &RoutingInputs<'_>) -> ProxyReport {
             (ListenerState::Unavailable, Some(message), fix)
         }
     };
+    let privilege = match reach {
+        Reach::CantBind(error) if error.kind == io::ErrorKind::PermissionDenied => {
+            Some(PrivilegeAction::LowPorts)
+        }
+        _ => None,
+    };
     let host = ProxyListener {
         port: host_port,
         app: None,
         state,
         message,
         fix,
+        privilege,
     };
     let ports = inputs
         .status
@@ -682,6 +690,7 @@ fn proxy_report(inputs: &RoutingInputs<'_>) -> ProxyReport {
                 state,
                 message,
                 fix: None,
+                privilege: None,
             }
         })
         .collect();
@@ -716,18 +725,16 @@ fn host_unreachable(port: u16, reach: Reach<'_>) -> (String, Option<String>) {
 }
 
 /// What to tell people when the Host listener can't open, and how to fix
-/// it, if they can.
+/// it, if they can. Without permission, the fix is the low-ports
+/// privilege, which the listener names.
 fn host_unavailable(port: u16, error: &BindError) -> (String, Option<String>) {
     let consequence = format!("so addresses that use port {port} don't work. {HOST_CONSEQUENCE}");
     match error.kind {
         io::ErrorKind::PermissionDenied => (
-            format!(
-                "Alchemy doesn't have permission to listen on port {port}, {consequence}"
-            ),
-            Some(
-                "Let alchemyd use low ports with `sudo setcap cap_net_bind_service=+ep \"$(command -v alchemyd)\"`, then restart it."
-                    .to_owned(),
-            ),
+            format!("Alchemy doesn't have permission to listen on port {port}, {consequence}"),
+            Some(format!(
+                "Allow Alchemy to use port {port} with `alchemy machine privileges grant low-ports`, or from the machine page."
+            )),
         ),
         io::ErrorKind::AddrInUse => (
             format!("Another program is using port {port}, {consequence}"),
@@ -1376,6 +1383,58 @@ mod tests {
         let route = plan.table.get("wiki").unwrap();
         assert_eq!((route.service.as_str(), route.port), ("app", 3000));
         assert_eq!(route.hosts, ["notes.localhost"]);
+    }
+
+    #[test]
+    fn only_a_refused_port_80_names_the_low_ports_privilege() {
+        let plan = RoutePlan::default();
+        let unreserved = BTreeMap::new();
+        let cases = [
+            (
+                ListenerStatus::Unavailable(bind_error(80, io::ErrorKind::PermissionDenied)),
+                Some(PrivilegeAction::LowPorts),
+            ),
+            (
+                ListenerStatus::Unavailable(bind_error(80, io::ErrorKind::AddrInUse)),
+                None,
+            ),
+            (listening(80), None),
+            (ListenerStatus::Off, None),
+        ];
+        for (host, want) in cases {
+            let status = ProxyStatus {
+                host: host.clone(),
+                ports: BTreeMap::from([(
+                    8100,
+                    ListenerStatus::Unavailable(bind_error(8100, io::ErrorKind::PermissionDenied)),
+                )]),
+            };
+            let report = routing(&RoutingInputs {
+                plan: &plan,
+                inputs: &[],
+                reachability: Reachability::PublishedOnly,
+                unreserved: &unreserved,
+                range: PortRange::new(8100, 8999).unwrap(),
+                status: &status,
+                checks: &BTreeMap::new(),
+                addressing: Addressing {
+                    host_port: Some(80),
+                    app_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                },
+                mdns: mdns_off(&Announcements::default(), &MdnsStatus::default()),
+            })
+            .proxy;
+            assert_eq!(report.host.privilege, want, "{host:?}");
+            assert_eq!(report.ports[0].privilege, None);
+            if want.is_some() {
+                assert_eq!(
+                    report.host.fix.as_deref(),
+                    Some(
+                        "Allow Alchemy to use port 80 with `alchemy machine privileges grant low-ports`, or from the machine page."
+                    )
+                );
+            }
+        }
     }
 
     #[test]

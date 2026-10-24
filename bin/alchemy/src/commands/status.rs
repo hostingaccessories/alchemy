@@ -648,6 +648,7 @@ mod tests {
                     state: ListenerState::Unavailable,
                     message: Some(taken.into()),
                     fix: Some("Stop the program or firewall rule that takes port 80.".into()),
+                    privilege: None,
                 },
                 ports: vec![],
             },
@@ -686,6 +687,7 @@ mod tests {
                     state,
                     message: message.map(Into::into),
                     fix: fix.map(Into::into),
+                    privilege: None,
                 }
             };
         let proxy = ProxyReport {

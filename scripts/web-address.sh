@@ -283,8 +283,10 @@ case "$(jq -r .state <<<"$host_json")" in
     ;;
   unavailable)
     log "alchemyd can't bind port 80: $(jq -r .message <<<"$host_json")"
-    jq -e '.port == 80 and (.message | test("permission")) and (.fix | test("setcap cap_net_bind_service"))' \
+    jq -e '.port == 80 and (.message | test("permission")) and .privilege == "low_ports" and (.fix | test("privileges grant low-ports"))' \
       <<<"$host_json" >/dev/null || die "unexpected port 80 report: ${host_json}"
+    api /api/machine/privileges | jq -e '.privileges[] | select(.action == "low_ports") | .state | IN("needed", "needs_terminal")' \
+      >/dev/null || die "the low-ports privilege is not needed: $(api /api/machine/privileges)"
     api /api/apps | jq -e ".apps[] | select(.name == \"${app}\") | .addresses | any(.kind == \"host\" and .state == \"unavailable\")" \
       >/dev/null || die "${app}'s host address is not reported unavailable"
     alchemy status | grep -qF "Warning: Alchemy doesn't have permission to listen on port 80" \
