@@ -4,7 +4,9 @@
 //! serving the app through the proxy, with its addresses on
 //! `GET /api/apps` and the proxy's listeners on `GET /api/network`, with
 //! a listener another program answers made unavailable, and `<app>.local`
-//! routed only while the `network.mdns` setting is on.
+//! routed only while the `network.mdns` setting is on, announced through
+//! a fake announcer that follows the LAN address, the setting, conflicts,
+//! and shutdown.
 
 #![allow(
     clippy::unwrap_used,
@@ -144,12 +146,27 @@ async fn fake_app(tag: &'static str) -> SocketAddr {
     addr
 }
 
+/// A free port for a proxy port range, below the ephemeral range on
+/// Linux and macOS, so a listener another test binds to port `0` never
+/// takes it first.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
+    free_ports(1)
+}
+
+/// The first of `count` free ports in a row, as [`free_port`] picks.
+fn free_ports(count: u16) -> u16 {
+    use std::hash::{BuildHasher as _, Hasher as _};
+
+    let seed = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let start = 20_000 + u16::try_from(seed % 5_000).unwrap() * 2;
+    (start..30_000)
+        .chain(20_000..start)
+        .find(|&port| {
+            (port..port + count).all(|p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok())
+        })
         .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 async fn send(mut stream: impl AsyncRead + AsyncWrite + Unpin, request: &str) -> (String, String) {
@@ -212,10 +229,7 @@ impl Daemon {
         host: FakeNetwork,
     ) -> Self {
         let socket = dir.path().join("alchemyd.sock");
-        let listen = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        let listen = SocketAddr::from(([127, 0, 0, 1], 0));
         let (home, config) = apps;
         let deps = Deps::new(engine)
             .with_apps(
@@ -242,7 +256,8 @@ impl Daemon {
             },
         ));
         tokio::time::timeout(TIMEOUT, async {
-            while !socket.exists() {
+            while tokio::net::UnixStream::connect(&socket).await.is_err() {
+                assert!(!task.is_finished(), "the daemon stopped while starting");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -822,24 +837,6 @@ async fn eventually(what: &str, ok: impl Fn() -> bool) {
     }
 }
 
-/// A free port whose next port is free too, below the ephemeral range
-/// on Linux and macOS, so the Host listener's port `0` never lands on
-/// either.
-fn free_pair() -> u16 {
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos();
-    let start = 20_000 + u16::try_from(seed % 5_000).unwrap() * 2;
-    (start..30_000)
-        .step_by(2)
-        .find(|&port| {
-            std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
-                && std::net::TcpListener::bind(("127.0.0.1", port + 1)).is_ok()
-        })
-        .unwrap()
-}
-
 /// `wiki`, and `notes`, which opts out of `.local`, routed on two ports
 /// of their own, on a Mac whose LAN address `host` gives, announcing
 /// through `proxy`.
@@ -851,7 +848,7 @@ async fn local_names_daemon(host: FakeNetwork, proxy: ProxyDeps) -> Daemon {
     let connector = FakeConnector::new();
     connector.redirect(wiki_app, wiki_app);
     connector.redirect(notes_app, notes_app);
-    let port = free_pair();
+    let port = free_ports(2);
     let dir = tempdir();
     let (home, config) = apps_home(
         dir.path(),
@@ -1004,7 +1001,9 @@ async fn announces_local_names_and_follows_the_lan_the_setting_and_conflicts() {
     );
     announcer.set_state(&wiki_label, RecordState::Established);
     daemon
-        .app_where("wiki", |app| state_of(app, &local) == Some(AddressState::Ready))
+        .app_where("wiki", |app| {
+            state_of(app, &local) == Some(AddressState::Ready)
+        })
         .await;
 
     announcer.take(&wiki_label);
@@ -1063,8 +1062,10 @@ async fn announces_local_names_and_follows_the_lan_the_setting_and_conflicts() {
             !app.addresses.is_empty() && local_urls(app).is_empty()
         })
         .await;
-    assert!(wiki.problems.is_empty());
-    let report = daemon.report_where(|r| r.mdns.state == MdnsState::Off).await;
+    assert_eq!(wiki.problems, []);
+    let report = daemon
+        .report_where(|r| r.mdns.state == MdnsState::Off)
+        .await;
     assert_eq!(report.mdns.backend, None);
     eventually("wiki.local to be withdrawn", || {
         announcer.published().is_empty()
@@ -1079,7 +1080,9 @@ async fn announces_local_names_and_follows_the_lan_the_setting_and_conflicts() {
     let _: NetworkSettings =
         put_socket(&daemon.socket, "/api/settings/network", r#"{"mdns":true}"#).await;
     daemon
-        .app_where("wiki", |app| state_of(app, &local) == Some(AddressState::Ready))
+        .app_where("wiki", |app| {
+            state_of(app, &local) == Some(AddressState::Ready)
+        })
         .await;
     assert_eq!(announcer.published().len(), 1);
 
