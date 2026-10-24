@@ -130,6 +130,10 @@ pub struct UnmanagedApp {
     pub status: StackStatus,
     /// Its services, by name.
     pub services: Vec<AppService>,
+    /// Why it is or is not running: the most pressing of its containers'
+    /// reasons, such as a crash in one service while the others run.
+    #[serde(default)]
+    pub stop_reason: StopReason,
 }
 
 /// One app folder and what reading it found.

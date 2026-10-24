@@ -162,6 +162,16 @@ pub(crate) fn app_status(status: StackStatus, reason: StopReason) -> String {
     }
 }
 
+/// A Compose project's status in words when Alchemy doesn't manage it. As
+/// [`app_status`], except that every stop of such a project is made
+/// outside Alchemy, so only a crash says more than the status does.
+pub(crate) fn unmanaged_status(status: StackStatus, reason: StopReason) -> String {
+    match reason {
+        StopReason::StoppedOutside => status_word(status).to_owned(),
+        _ => app_status(status, reason),
+    }
+}
+
 /// A service's state in words: `running`, or why it is not, such as
 /// `crashed (exit code 1)` or `finished`. A crash in any of its containers
 /// comes first.
@@ -346,6 +356,41 @@ mod tests {
         ];
         for (status, reason, want) in cases {
             assert_eq!(app_status(status, reason), want, "{status:?} {reason:?}");
+        }
+    }
+
+    #[test]
+    fn unmanaged_status_only_explains_crashes() {
+        let crashed = StopReason::Crashed {
+            exit_code: Some(1),
+            oom: false,
+        };
+        let cases = [
+            (StackStatus::Running, StopReason::Running, "running"),
+            (
+                StackStatus::Stopped,
+                crashed,
+                "stopped, crashed (exit code 1)",
+            ),
+            (
+                StackStatus::Partial,
+                crashed,
+                "partly running, crashed (exit code 1)",
+            ),
+            (StackStatus::Stopped, StopReason::StoppedOutside, "stopped"),
+            (
+                StackStatus::Partial,
+                StopReason::StoppedOutside,
+                "partly running",
+            ),
+            (StackStatus::Stopped, StopReason::Unknown, "stopped"),
+        ];
+        for (status, reason, want) in cases {
+            assert_eq!(
+                unmanaged_status(status, reason),
+                want,
+                "{status:?} {reason:?}"
+            );
         }
     }
 

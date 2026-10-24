@@ -56,7 +56,23 @@ const empty: AppList = { apps: [], unmanaged: [], dirs: [home] };
 
 const full: AppList = {
   apps: [blog, broken],
-  unmanaged: [{ project: "legacy", dir: "/home/me/legacy", status: "running", services: [] }],
+  unmanaged: [
+    { project: "legacy", dir: "/home/me/legacy", status: "running", services: [] },
+    {
+      project: "worker",
+      dir: null,
+      status: "stopped",
+      services: [],
+      stop_reason: { kind: "crashed", exit_code: 1, oom: false },
+    },
+    {
+      project: "tools",
+      dir: "/home/me/tools",
+      status: "stopped",
+      services: [],
+      stop_reason: { kind: "stopped_outside" },
+    },
+  ],
   dirs: [
     { ...home, state: "ok", message: null },
     {
@@ -177,6 +193,8 @@ describe("Apps", () => {
     const unmanaged = screen.getByRole("region", { name: "Running outside your app folders" });
     expect(within(unmanaged).getByText("legacy")).toBeTruthy();
     expect(within(unmanaged).getByText("/home/me/legacy")).toBeTruthy();
+    expect(within(unmanaged).getByText("Stopped, crashed (exit code 1)")).toBeTruthy();
+    expect(within(unmanaged).getByText("Stopped")).toBeTruthy();
   });
 
   it("follows the apps event live", async () => {

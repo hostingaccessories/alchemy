@@ -498,6 +498,7 @@ fn app_list() -> AppList {
             dir: Some("/home/me/legacy".into()),
             status: StackStatus::Running,
             services: vec![],
+            stop_reason: StopReason::Running,
         }],
         dirs: vec![
             AppDir {
@@ -525,7 +526,7 @@ fn app_list() -> AppList {
 
 const APP_LIST_TAIL: &str = concat!(
     r#""unmanaged":[{"project":"legacy","dir":"/home/me/legacy","status":"running","#,
-    r#""services":[]}],"dirs":[{"path":"/srv/apps","home":true,"state":"ok","message":null,"#,
+    r#""services":[],"stop_reason":{"kind":"running"}}],"dirs":[{"path":"/srv/apps","home":true,"state":"ok","message":null,"#,
     r#""skipped":[{"name":"My App","path":"/srv/apps/My App","reason":"invalid_name","#,
     r#""message":"y"}]},{"path":"/opt/stacks","home":false,"state":"missing","#,
     r#""message":"z","skipped":[]}]}"#,
@@ -544,6 +545,34 @@ fn app_list_and_event() {
     assert_eq!(event.name(), "apps");
     assert_wire(&event, &format!(r#"{{"event":"apps","data":{json}}}"#));
     assert_eq!(serde_json::to_string(&event.data()).unwrap(), json);
+}
+
+#[test]
+fn unmanaged_app() {
+    let json = r#"{"project":"legacy","dir":null,"status":"stopped","services":[]"#;
+    let crashed = UnmanagedApp {
+        project: "legacy".into(),
+        dir: None,
+        status: StackStatus::Stopped,
+        services: vec![],
+        stop_reason: StopReason::Crashed {
+            exit_code: Some(1),
+            oom: false,
+        },
+    };
+    assert_wire(
+        &crashed,
+        &format!(r#"{json},"stop_reason":{{"kind":"crashed","exit_code":1,"oom":false}}}}"#),
+    );
+    let older: UnmanagedApp = serde_json::from_str(&format!("{json}}}")).unwrap();
+    assert_eq!(
+        older,
+        UnmanagedApp {
+            stop_reason: StopReason::Unknown,
+            ..crashed
+        },
+        "a daemon without stop reasons"
+    );
 }
 
 #[test]

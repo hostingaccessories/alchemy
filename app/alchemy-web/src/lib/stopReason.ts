@@ -65,6 +65,15 @@ export function appStatusLabel(status: StackStatus, reason: StopReason | undefin
 }
 
 /**
+ * The reason worth showing for a Compose project Alchemy doesn't manage.
+ * Every stop of one is made outside Alchemy, so only a crash says more than
+ * its status. Matches the CLI's `unmanaged_status`.
+ */
+export function unmanagedStopReason(reason: StopReason | undefined): StopReason | undefined {
+  return reason?.kind === "stopped_outside" ? undefined : reason;
+}
+
+/**
  * Why a service isn't running: a crash in any of its containers first,
  * else its first container's reason, else not started.
  */

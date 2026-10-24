@@ -6,6 +6,7 @@ import {
   describeStopReason,
   isStopProblem,
   serviceStopReason,
+  unmanagedStopReason,
 } from "./stopReason.ts";
 
 describe("stop reasons", () => {
@@ -47,6 +48,17 @@ describe("stop reasons", () => {
     ["unknown", crashed, "Status unknown"],
   ])("labels a %s app with %j as %s", (status, reason, want) => {
     expect(appStatusLabel(status, reason)).toBe(want);
+  });
+
+  it.each<[StackStatus, StopReason | undefined, string]>([
+    ["running", { kind: "running" }, "Running"],
+    ["stopped", crashed, "Stopped, crashed (exit code 1)"],
+    ["partial", crashed, "Partly running, crashed (exit code 1)"],
+    ["stopped", { kind: "stopped_outside" }, "Stopped"],
+    ["partial", { kind: "stopped_outside" }, "Partly running"],
+    ["stopped", undefined, "Stopped"],
+  ])("labels a %s unmanaged project with %j as %s", (status, reason, want) => {
+    expect(appStatusLabel(status, unmanagedStopReason(reason))).toBe(want);
   });
 
   it("puts a service's crash first", () => {

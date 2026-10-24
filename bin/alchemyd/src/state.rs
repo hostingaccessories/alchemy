@@ -292,6 +292,7 @@ mod tests {
             dir: None,
             status: alchemy_api::apps::StackStatus::Running,
             services: vec![],
+            stop_reason: alchemy_api::apps::StopReason::Running,
         });
         assert!(state.set_apps(apps.clone()));
         assert!(rx.has_changed().unwrap());

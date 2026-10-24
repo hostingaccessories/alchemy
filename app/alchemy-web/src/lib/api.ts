@@ -234,6 +234,8 @@ export interface UnmanagedApp {
   dir: string | null;
   status: StackStatus;
   services: AppService[];
+  /** The most pressing of its containers' reasons. Absent from an older daemon. */
+  stop_reason?: StopReason;
 }
 
 /** Mirrors `alchemy_api::apps::AppDirState`; unknown states arrive as `other`. */

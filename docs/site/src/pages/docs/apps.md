@@ -117,9 +117,9 @@ mistake.
 Compose projects with containers that belong to no app, such as one you
 started by hand from a folder Alchemy doesn't look in, are listed under
 **Running outside your app folders** on the Apps page and at the end of
-`alchemy app list`, with the folder they were started from. Alchemy shows
-them but doesn't act on them. To manage one, add its parent folder as an
-app folder.
+`alchemy app list`, with the folder they were started from and their
+status, including when one crashed. Alchemy shows them but doesn't act on
+them. To manage one, add its parent folder as an app folder.
 
 ## Adopting existing stacks
 
