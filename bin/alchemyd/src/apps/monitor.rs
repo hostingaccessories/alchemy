@@ -192,6 +192,7 @@ impl Monitor {
         let mut containers = self.state.watch_containers();
         let mut engine = self.state.watch_engine();
         let mut network = self.state.watch_network();
+        let mut routing = self.state.watch_routing();
         let mut rescans = self.state.watch_app_rescans();
         self.generation = *rescans.borrow_and_update();
         let mut tick = tokio::time::interval(self.deps.scan_interval);
@@ -217,6 +218,7 @@ impl Monitor {
                 }
                 Ok(()) = containers.changed() => {}
                 Ok(()) = network.changed() => {}
+                Ok(()) = routing.changed() => {}
             }
             if reload {
                 self.load_settings().await;
@@ -411,6 +413,7 @@ impl Monitor {
     fn publish(&self) {
         let containers = self.state.containers();
         let network = self.state.network();
+        let routing = self.state.routing();
         let list = app_list(&Inputs {
             discovery: &self.discovery,
             home: self.dirs.as_ref().map(StackDirs::home),
@@ -418,6 +421,7 @@ impl Monitor {
             containers: &containers,
             engine_ready: self.state.engine().state == EngineState::Ready,
             network: &network,
+            routing: &routing.apps,
         });
         self.state.set_app_configs(self.outcomes.clone());
         self.state.set_apps(list);

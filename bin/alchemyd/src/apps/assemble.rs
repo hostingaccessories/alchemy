@@ -20,6 +20,7 @@ use alchemy_core::stack::{
 };
 
 use crate::compose::{ComposeConfig, ConfigError};
+use crate::routing::AppRouting;
 
 /// What reading one stack's configuration came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +82,8 @@ pub struct Inputs<'a> {
     /// The latest check of Docker's networks against the host's, to flag
     /// app networks that overlap the LAN or a route.
     pub network: &'a NetworkReport,
+    /// Each app's web addresses and route problems, by app name.
+    pub routing: &'a BTreeMap<String, AppRouting>,
 }
 
 /// The app list for `inputs`.
@@ -157,6 +160,10 @@ fn app(
             app.images = Some(config.images());
             app.problems
                 .extend(network_overlaps(config, inputs.network));
+            if let Some(routing) = inputs.routing.get(app.name.as_str()) {
+                app.addresses.clone_from(&routing.addresses);
+                app.problems.extend(routing.problems.iter().cloned());
+            }
         }
         Some(ConfigOutcome::Failed { kind, message }) => app.problems.push(AppProblem {
             kind: *kind,
@@ -531,6 +538,7 @@ mod tests {
             containers,
             engine_ready,
             network: &NetworkReport::default(),
+            routing: &BTreeMap::new(),
         })
     }
 
@@ -992,6 +1000,7 @@ mod tests {
                 containers: &Containers::new(),
                 engine_ready: true,
                 network: &network,
+                routing: &BTreeMap::new(),
             });
             let problems: Vec<(AppProblemKind, &str)> = got.apps[0]
                 .problems
@@ -1004,6 +1013,81 @@ mod tests {
                 .collect();
             assert_eq!(problems, want, "{name}");
         }
+    }
+
+    #[test]
+    fn routing_adds_addresses_and_problems_to_read_apps() {
+        use alchemy_api::apps::{AddressKind, AddressState, AppAddress};
+        let found = discovery(&[("/srv/apps", &["blog", "wiki", "new"])]);
+        let configs = BTreeMap::from([
+            (
+                PathBuf::from("/srv/apps/blog"),
+                config("blog", &[("web", false)]),
+            ),
+            (
+                PathBuf::from("/srv/apps/wiki"),
+                config("wiki", &[("app", false)]),
+            ),
+        ]);
+        let address = AppAddress {
+            kind: AddressKind::Port,
+            url: "http://192.168.1.20:8100/".into(),
+            state: AddressState::Ready,
+            service: "web".into(),
+            port: 80,
+            message: None,
+        };
+        let problem = AppProblem {
+            kind: AppProblemKind::Route,
+            message: "Add an x-alchemy block.".into(),
+        };
+        let routing = BTreeMap::from([
+            (
+                "blog".to_owned(),
+                AppRouting {
+                    addresses: vec![address.clone()],
+                    problems: vec![],
+                },
+            ),
+            (
+                "wiki".to_owned(),
+                AppRouting {
+                    addresses: vec![],
+                    problems: vec![problem.clone()],
+                },
+            ),
+            (
+                "new".to_owned(),
+                AppRouting {
+                    addresses: vec![address.clone()],
+                    problems: vec![problem.clone()],
+                },
+            ),
+        ]);
+        let got = app_list(&Inputs {
+            discovery: &found,
+            home: Some(Path::new("/srv/apps")),
+            configs: &configs,
+            containers: &Containers::new(),
+            engine_ready: true,
+            network: &NetworkReport::default(),
+            routing: &routing,
+        });
+        let by_name = |name: &str| got.apps.iter().find(|a| a.name.as_str() == name).unwrap();
+        assert_eq!(by_name("blog").addresses, [address]);
+        assert_eq!(by_name("blog").problems, Vec::<AppProblem>::new());
+        assert_eq!(by_name("wiki").addresses, Vec::<AppAddress>::new());
+        assert_eq!(by_name("wiki").problems, [problem]);
+        assert_eq!(
+            by_name("new").addresses,
+            Vec::<AppAddress>::new(),
+            "not read yet"
+        );
+        assert_eq!(
+            by_name("new").problems,
+            Vec::<AppProblem>::new(),
+            "not read yet"
+        );
     }
 
     #[test]

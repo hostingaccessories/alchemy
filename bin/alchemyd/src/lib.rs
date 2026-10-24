@@ -21,7 +21,7 @@
 //! [`intent`] in a [`store::Store`].
 //!
 //! Apps get web addresses from the [`proxy`], on listeners of its own
-//! that never serve the API.
+//! that never serve the API, with the routes [`routing`] plans for it.
 
 pub mod apps;
 pub mod auth;
@@ -37,6 +37,7 @@ pub mod network;
 pub mod operations;
 pub mod ports;
 pub mod proxy;
+pub mod routing;
 mod secure_fs;
 pub mod session;
 pub mod socket;
@@ -64,10 +65,11 @@ use crate::metrics::{Collector, MetricsSource, SystemMetrics};
 use crate::network::{FakeNetwork, SharedNetwork, SystemNetwork};
 use crate::operations::{OperationRunner, Operations, SystemRunner};
 use crate::ports::PortRegistry;
-use crate::proxy::{ProxyConfig, ProxyStatus, TcpConnector};
+use crate::proxy::ProxyStatus;
+use crate::routing::{ProxyDeps, ProxyHandle};
 use crate::session::{Auth, TokenFile};
 use crate::store::{SharedStore, SqliteStore, StateLock};
-use crate::subnets::{FakeDaemonConfig, FakeEngineNetworks, SubnetsDeps};
+use crate::subnets::{EngineNetworks, FakeDaemonConfig, FakeEngineNetworks, SubnetsDeps};
 
 /// Default HTTP listen address. Loopback only: the TCP listener's token
 /// keeps out other processes and users on this machine, but there is no
@@ -108,8 +110,10 @@ pub struct Deps<E, M = SystemMetrics> {
     /// Where the host's LAN subnets, routes, and listeners are read.
     pub network: SharedNetwork,
     /// Where Docker's networks and `daemon.json` are read, and the
-    /// `alchemy` network is created.
+    /// `alchemy` network is created and joined.
     pub subnets: SubnetsDeps,
+    /// Where the web address proxy listens and how it reaches apps.
+    pub proxy: ProxyDeps,
 }
 
 impl<E> Deps<E> {
@@ -128,9 +132,12 @@ impl<E> Deps<E> {
     /// [`FakeComposeValidator`](compose::FakeComposeValidator) that
     /// accepts everything. The host network is a
     /// [`FakeNetwork`] with nothing on it, and Docker's networks are a
-    /// [`FakeEngineNetworks`] with none and no `daemon.json`. Use
+    /// [`FakeEngineNetworks`] with none and no `daemon.json`. The proxy
+    /// is [`ProxyDeps::loopback`]: app ports on loopback, no Host
+    /// listener, and a connector that reaches nothing. Use
     /// [`Self::with_apps`], [`Self::with_runner`], [`Self::with_editor`],
-    /// [`Self::with_network`], and [`Self::with_subnets`] to change them.
+    /// [`Self::with_network`], [`Self::with_subnets`], and
+    /// [`Self::with_proxy`] to change them.
     pub fn new(engine: E) -> Self {
         Self {
             state: State::new(),
@@ -152,6 +159,7 @@ impl<E> Deps<E> {
                 Arc::new(FakeEngineNetworks::new()),
                 Arc::new(FakeDaemonConfig::new()),
             ),
+            proxy: ProxyDeps::loopback(),
         }
     }
 }
@@ -169,6 +177,7 @@ impl<E, M> Deps<E, M> {
             editor: self.editor,
             network: self.network,
             subnets: self.subnets,
+            proxy: self.proxy,
         }
     }
 
@@ -213,6 +222,13 @@ impl<E, M> Deps<E, M> {
         self.subnets = subnets;
         self
     }
+
+    /// Run the web address proxy with `proxy`.
+    #[must_use]
+    pub fn with_proxy(mut self, proxy: ProxyDeps) -> Self {
+        self.proxy = proxy;
+        self
+    }
 }
 
 impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
@@ -225,6 +241,7 @@ impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
             .with_editor(AppEditor::system())
             .with_network(Arc::new(SystemNetwork::new()))
             .with_subnets(SubnetsDeps::system())
+            .with_proxy(ProxyDeps::system())
     }
 }
 
@@ -241,7 +258,8 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::
 /// until this returns. The state database in it is then opened, created,
 /// or migrated; a corrupt or too-new one fails startup before either
 /// listener is bound. The engine task, the metrics collector, the apps
-/// task, and the network check run alongside the listeners. An engine
+/// task, the network check, the web address proxy, and the routing task
+/// that feeds it run alongside the listeners. An engine
 /// that is absent or broken never fails startup; it only shows up in the
 /// engine status. Neither does a missing or unreadable app folder, which
 /// shows up in the app list, nor a network that overlaps, which shows up
@@ -263,13 +281,7 @@ pub async fn run_with(
     let (_state_lock, sqlite) = open_state(&config.state_dir).await?;
     let db = sqlite.path().to_owned();
     let store: SharedStore = Arc::new(sqlite);
-    match intent::load(&*store, &deps.state).await {
-        Ok(count) => tracing::debug!(count, "stop intents loaded"),
-        Err(error) => tracing::warn!(
-            %error,
-            "cannot read stop intents; apps Alchemy stopped may show as stopped outside it"
-        ),
-    }
+    load_intents(&store, &deps.state).await;
 
     let ports = PortRegistry::new(deps.state.clone(), store.clone(), deps.network.clone());
     let operations = recovered_operations(deps.runner, &deps.state, &store, &ports).await;
@@ -291,7 +303,14 @@ pub async fn run_with(
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let background = spawn_background(
+    let mut background = Vec::from(spawn_proxy(
+        deps.proxy,
+        listen,
+        (deps.subnets.engine.clone(), deps.network.clone(), &ports),
+        &deps.state,
+        &shutdown_rx,
+    ));
+    background.extend(spawn_background(
         deps.engine,
         deps.metrics,
         deps.apps,
@@ -299,7 +318,7 @@ pub async fn run_with(
         &deps.state,
         &store,
         &shutdown_rx,
-    );
+    ));
     let socket_task = tokio::spawn(
         axum::serve(
             socket_listener,
@@ -341,7 +360,6 @@ pub async fn run_with(
         .with_graceful_shutdown(stopped(shutdown_rx.clone()))
         .into_future(),
     );
-    let (_routes, _proxy_status, proxy_task) = spawn_proxy(listen, shutdown_rx);
 
     shutdown.await;
     shutdown_tx.send_replace(true);
@@ -353,16 +371,26 @@ pub async fn run_with(
     }
     let socket_result = socket_task.await;
     let http_result = http_task.await;
-    let proxy_result = proxy_task.await;
     drop(token_file);
     drop(socket_file);
     for (name, result) in background_results {
         result.with_context(|| format!("{name} task failed"))?;
     }
-    proxy_result.context("proxy task failed")?;
     socket_result.context("API socket task failed")??;
     http_result.context("HTTP task failed")??;
     Ok(())
+}
+
+/// Load the stop intents in `store` into `state`. A failure only means
+/// apps Alchemy stopped may show as stopped outside it.
+async fn load_intents(store: &SharedStore, state: &State) {
+    match intent::load(&**store, state).await {
+        Ok(count) => tracing::debug!(count, "stop intents loaded"),
+        Err(error) => tracing::warn!(
+            %error,
+            "cannot read stop intents; apps Alchemy stopped may show as stopped outside it"
+        ),
+    }
 }
 
 /// The daemon's operations, with what a daemon that stopped mid-run left
@@ -435,27 +463,43 @@ fn spawn_background(
     ]
 }
 
-/// Start the web address [`proxy`], which never routes to `api`, with an
-/// empty route table, so it binds nothing until routes are sent. Returns
-/// the table's sender, the proxy's status, and its task.
+/// Start the web address [`proxy`] as `deps` says, never routing to
+/// `api`, and the [`routing`] task that feeds it routes, each with its
+/// name. The proxy starts with an empty route table, so it binds nothing
+/// until routes arrive. Routing attaches containers through `routing.0`,
+/// reads the LAN address through `routing.1`, and reserves ports through
+/// `routing.2`.
 fn spawn_proxy(
+    deps: ProxyDeps,
     api: SocketAddr,
-    shutdown: watch::Receiver<bool>,
-) -> (
-    watch::Sender<RouteTable>,
-    watch::Receiver<ProxyStatus>,
-    JoinHandle<()>,
-) {
+    routing: (Arc<dyn EngineNetworks>, SharedNetwork, &PortRegistry),
+    state: &State,
+    shutdown: &watch::Receiver<bool>,
+) -> [(&'static str, JoinHandle<()>); 2] {
+    let (engine, network, ports) = routing;
     let (routes_tx, routes_rx) = watch::channel(RouteTable::default());
     let (status_tx, status_rx) = watch::channel(ProxyStatus::default());
-    let task = tokio::spawn(proxy::run(
-        ProxyConfig::system(api),
-        Arc::new(TcpConnector),
+    let proxy = tokio::spawn(proxy::run(
+        deps.config(vec![api]),
+        deps.connector.clone(),
         routes_rx,
         status_tx,
-        shutdown,
+        shutdown.clone(),
     ));
-    (routes_tx, status_rx, task)
+    let handle = ProxyHandle {
+        routes: routes_tx,
+        status: status_rx,
+    };
+    let routing = tokio::spawn(routing::run(
+        deps,
+        engine,
+        network,
+        state.clone(),
+        ports.clone(),
+        handle,
+        shutdown.clone(),
+    ));
+    [("routing", routing), ("proxy", proxy)]
 }
 
 fn warn_if_exposed(listen: SocketAddr) {

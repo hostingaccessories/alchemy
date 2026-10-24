@@ -297,7 +297,13 @@ impl Listeners {
                         kind: error.kind(),
                         message: error.to_string(),
                     };
-                    tracing::warn!(?listen, %failure, "proxy listener unavailable");
+                    let again =
+                        status.borrow().get(listen) == ListenerStatus::Unavailable(failure.clone());
+                    if again {
+                        tracing::debug!(?listen, %failure, "proxy listener still unavailable");
+                    } else {
+                        tracing::warn!(?listen, %failure, "proxy listener unavailable");
+                    }
                     status.send_modify(|s| s.set(listen, ListenerStatus::Unavailable(failure)));
                 }
             }

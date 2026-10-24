@@ -480,7 +480,9 @@ async fn engine(extract::State(state): extract::State<State>) -> Json<EngineStat
 }
 
 async fn network(extract::State(state): extract::State<State>) -> Json<NetworkReport> {
-    Json(state.network())
+    let mut report = state.network();
+    report.proxy = state.routing().proxy;
+    Json(report)
 }
 
 /// `?app=NAME` or `?project=NAME` on the metrics routes.

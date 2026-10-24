@@ -15,6 +15,7 @@ use tokio::sync::watch;
 
 use crate::apps::ConfigOutcome;
 use crate::logs::LogStreams;
+use crate::routing::Routing;
 
 /// The daemon's live state. Cheap to clone: every clone shares the same
 /// values.
@@ -41,6 +42,7 @@ struct Inner {
     app_scans: watch::Sender<u64>,
     operations: watch::Sender<OperationList>,
     network: watch::Sender<NetworkReport>,
+    routing: watch::Sender<Routing>,
     log_streams: LogStreams,
 }
 
@@ -69,6 +71,7 @@ impl State {
                 app_scans: watch::Sender::new(0),
                 operations: watch::Sender::new(OperationList::default()),
                 network: watch::Sender::new(NetworkReport::default()),
+                routing: watch::Sender::new(Routing::default()),
                 log_streams: LogStreams::default(),
             }),
         }
@@ -193,6 +196,13 @@ impl State {
         self.inner.app_configs.borrow().get(dir).cloned()
     }
 
+    /// Subscribe to changes to [`Self::app_configs`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_app_configs(&self) -> watch::Receiver<BTreeMap<PathBuf, ConfigOutcome>> {
+        self.inner.app_configs.subscribe()
+    }
+
     /// Replace every app's configuration outcome. Returns whether they
     /// changed.
     pub fn set_app_configs(&self, configs: BTreeMap<PathBuf, ConfigOutcome>) -> bool {
@@ -287,6 +297,25 @@ impl State {
     /// are only notified if it did.
     pub fn set_network(&self, network: NetworkReport) -> bool {
         send_if_changed(&self.inner.network, network)
+    }
+
+    /// What the routing task last decided: each app's web addresses and
+    /// route problems, and the proxy's listeners.
+    pub fn routing(&self) -> Routing {
+        self.inner.routing.borrow().clone()
+    }
+
+    /// Subscribe to changes to [`Self::routing`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_routing(&self) -> watch::Receiver<Routing> {
+        self.inner.routing.subscribe()
+    }
+
+    /// Replace the routing. Returns whether it changed; subscribers are
+    /// only notified if it did.
+    pub fn set_routing(&self, routing: Routing) -> bool {
+        send_if_changed(&self.inner.routing, routing)
     }
 
     /// The log streams open on either listener, held to

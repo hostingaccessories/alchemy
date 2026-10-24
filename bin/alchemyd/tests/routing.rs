@@ -1,0 +1,495 @@
+//! Routing wiring: `run_with` planning routes from the apps task's
+//! Compose configurations and the engine's containers, reserving each
+//! app's proxy port, attaching containers to the `alchemy` network, and
+//! serving the app through the proxy, with its addresses on
+//! `GET /api/apps` and the proxy's listeners on `GET /api/network`.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
+use std::collections::BTreeMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use alchemy_api::apps::{AddressKind, AddressState, App, AppList, AppProblemKind};
+use alchemy_api::network::{ListenerState, NetworkReport, Reachability};
+use alchemy_api::ports::PortList;
+use alchemy_core::engine::{
+    ContainerState, ContainerStatus, EngineFlavor, EngineState, EngineStatus,
+};
+use alchemy_core::ports::{PortHolder, PortRange, Protocol, PublishedPort};
+use alchemy_core::route::{EngineFacts, ExposedPort, HostOs};
+use alchemyd::apps::{AppsDeps, SystemFs};
+use alchemyd::compose::{ComposeConfig, FakeComposeConfig, FakeConfig, ServiceConfig};
+use alchemyd::engine::{DockerNetwork, EngineSource};
+use alchemyd::proxy::FakeConnector;
+use alchemyd::routing::ProxyDeps;
+use alchemyd::subnets::{FakeDaemonConfig, FakeEngineNetworks, SubnetsDeps};
+use alchemyd::{Deps, State};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+
+const TIMEOUT: Duration = Duration::from_secs(10);
+const ENDPOINT: &str = "unix:///run/fake/docker.sock";
+
+/// A ready engine with `facts`, running `containers`.
+struct Engine {
+    facts: EngineFacts,
+    containers: Vec<ContainerStatus>,
+}
+
+impl EngineSource for Engine {
+    async fn run(self, state: State, mut shutdown: watch::Receiver<bool>) {
+        state.update_containers(|c| c.replace_all(self.containers));
+        let mut status = EngineStatus::new(EngineState::Ready);
+        status.endpoint = Some(ENDPOINT.to_owned());
+        status.flavor = self.facts.flavor;
+        state.set_engine(status);
+        state.set_engine_facts(Some(self.facts));
+        let _ = shutdown.wait_for(|stop| *stop).await;
+    }
+}
+
+fn running(name: &str, project: &str, service: &str) -> ContainerStatus {
+    let mut c = ContainerStatus::new(name, name, ContainerState::Running);
+    c.project = Some(project.into());
+    c.service = Some(service.into());
+    c
+}
+
+fn tcp(published: u16, target: u16) -> PublishedPort {
+    PublishedPort::new(Protocol::Tcp, PortRange::single(published).ok())
+        .with_target(PortRange::single(target).ok())
+}
+
+fn service(name: &str, expose: &[&str], ports: Vec<PublishedPort>) -> ServiceConfig {
+    ServiceConfig {
+        name: name.into(),
+        expose: expose
+            .iter()
+            .map(|e| e.parse::<ExposedPort>().unwrap())
+            .collect(),
+        ports,
+        ..ServiceConfig::default()
+    }
+}
+
+/// An apps home holding `apps`, each with its Compose project and
+/// services.
+fn apps_home(dir: &Path, apps: Vec<(&str, Vec<ServiceConfig>)>) -> (PathBuf, FakeComposeConfig) {
+    let home = dir.join("apps");
+    for (app, _) in &apps {
+        std::fs::create_dir_all(home.join(app)).unwrap();
+        std::fs::write(home.join(app).join("compose.yaml"), "services: {}\n").unwrap();
+    }
+    let home = home.canonicalize().unwrap();
+    let config = FakeComposeConfig::new();
+    for (app, services) in apps {
+        config.set(
+            home.join(app),
+            FakeConfig::Config(ComposeConfig {
+                name: app.into(),
+                services,
+                ..ComposeConfig::default()
+            }),
+        );
+    }
+    (home, config)
+}
+
+/// A fake app on loopback that answers every request with `tag` and the
+/// `Host` it was sent.
+async fn fake_app(tag: &'static str) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut buf = [0_u8; 1024];
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                }
+                let head = String::from_utf8_lossy(&seen).to_ascii_lowercase();
+                let host = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("host: "))
+                    .unwrap_or("")
+                    .to_owned();
+                let body = format!("{tag} {host}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    addr
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+async fn send(mut stream: impl AsyncRead + AsyncWrite + Unpin, request: &str) -> (String, String) {
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut seen = String::new();
+    tokio::time::timeout(TIMEOUT, stream.read_to_string(&mut seen))
+        .await
+        .unwrap()
+        .unwrap();
+    let (head, body) = seen.split_once("\r\n\r\n").unwrap();
+    (head.to_ascii_lowercase(), body.to_owned())
+}
+
+async fn get_socket<T: serde::de::DeserializeOwned>(socket: &Path, uri: &str) -> T {
+    let request = format!("GET {uri} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let (head, body) = send(
+        tokio::net::UnixStream::connect(socket).await.unwrap(),
+        &request,
+    )
+    .await;
+    assert!(head.starts_with("http/1.1 200"), "{uri}: {head}");
+    serde_json::from_str(&body).unwrap()
+}
+
+async fn get_tcp(addr: SocketAddr, host: &str) -> (String, String) {
+    let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    send(
+        tokio::net::TcpStream::connect(addr).await.unwrap(),
+        &request,
+    )
+    .await
+}
+
+struct Daemon {
+    state: State,
+    socket: PathBuf,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    _dir: tempfile::TempDir,
+}
+
+impl Daemon {
+    async fn start(
+        dir: tempfile::TempDir,
+        engine: Engine,
+        apps: (PathBuf, FakeComposeConfig),
+        networks: FakeEngineNetworks,
+        proxy: ProxyDeps,
+    ) -> Self {
+        let socket = dir.path().join("alchemyd.sock");
+        let listen = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (home, config) = apps;
+        let deps = Deps::new(engine)
+            .with_apps(
+                AppsDeps::new(Arc::new(SystemFs), Arc::new(config), Some(home))
+                    .with_scan_interval(Duration::from_millis(20)),
+            )
+            .with_subnets(SubnetsDeps::new(
+                Arc::new(networks),
+                Arc::new(FakeDaemonConfig::new()),
+            ))
+            .with_proxy(proxy);
+        let state = deps.state.clone();
+        let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(alchemyd::run_with(
+            alchemyd::Config {
+                listen,
+                socket: socket.clone(),
+                state_dir: dir.path().join("state"),
+            },
+            deps,
+            async {
+                let _ = stop_rx.await;
+            },
+        ));
+        tokio::time::timeout(TIMEOUT, async {
+            while !socket.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        Self {
+            state,
+            socket,
+            stop,
+            task,
+            _dir: dir,
+        }
+    }
+
+    async fn app_where(&self, name: &str, done: impl Fn(&App) -> bool) -> App {
+        let mut apps = self.state.watch_apps();
+        let find = |list: &AppList| list.apps.iter().find(|a| a.name.as_str() == name).cloned();
+        tokio::time::timeout(
+            TIMEOUT,
+            apps.wait_for(|list| find(list).is_some_and(|app| done(&app))),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name} never got there: {:?}", find(&self.state.apps())))
+        .unwrap();
+        find(&self.state.apps()).unwrap()
+    }
+
+    async fn stop(self) {
+        self.stop.send(()).unwrap();
+        tokio::time::timeout(TIMEOUT, self.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
+
+fn tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("rt")
+        .tempdir_in("/tmp")
+        .unwrap()
+}
+
+fn alchemy_network() -> DockerNetwork {
+    DockerNetwork {
+        id: "a".into(),
+        name: "alchemy".into(),
+        driver: Some("bridge".into()),
+        subnets: vec!["10.89.0.0/24".parse().unwrap()],
+        labels: BTreeMap::new(),
+        project: None,
+    }
+}
+
+/// What the API says about `blog`, routed on `port`, and the `worker`
+/// app next to it that has no port to route to.
+async fn serves_the_blog_on_the_api(daemon: &Daemon, port: u16) {
+    let blog: App = get_socket(&daemon.socket, "/api/apps/blog").await;
+    assert_eq!(blog.addresses[0].url, format!("http://127.0.0.1:{port}/"));
+    assert_eq!(blog.addresses[0].service, "web");
+    assert_eq!(blog.addresses[0].port, 80);
+    let worker: App = get_socket(&daemon.socket, "/api/apps/worker").await;
+    assert_eq!(worker.addresses, []);
+    assert_eq!(worker.problems.len(), 1, "{worker:?}");
+    assert_eq!(worker.problems[0].kind, AppProblemKind::Route);
+
+    let report: NetworkReport = get_socket(&daemon.socket, "/api/network").await;
+    assert_eq!(report.proxy.reachability, Some(Reachability::ContainerIp));
+    assert_eq!(report.proxy.host.state, ListenerState::Off);
+    assert_eq!(report.proxy.ports.len(), 1);
+    assert_eq!(report.proxy.ports[0].port, port);
+    assert_eq!(report.proxy.ports[0].app.as_deref(), Some("blog"));
+    assert_eq!(report.proxy.ports[0].state, ListenerState::Listening);
+
+    let ports: PortList = get_socket(&daemon.socket, "/api/ports").await;
+    assert!(
+        ports
+            .ports
+            .iter()
+            .any(|c| c.port.published == PortRange::single(port).ok()
+                && c.holder
+                    == PortHolder::Reservation {
+                        owner: "proxy:blog".into()
+                    }),
+        "{ports:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn serves_an_unpublished_app_on_its_reserved_port_once_attached() {
+    let upstream = fake_app("blog").await;
+    let container_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, 2)), 80);
+    let connector = FakeConnector::new();
+    connector.redirect(container_ip, upstream);
+    let port = free_port();
+    let networks = FakeEngineNetworks::new();
+    networks.set_networks(vec![alchemy_network()]);
+
+    let dir = tempdir();
+    let apps = apps_home(
+        dir.path(),
+        vec![
+            ("blog", vec![service("web", &["80"], vec![])]),
+            (
+                "worker",
+                vec![service("queue", &[], vec![]), service("jobs", &[], vec![])],
+            ),
+        ],
+    );
+    let daemon = Daemon::start(
+        dir,
+        Engine {
+            facts: EngineFacts {
+                host_os: HostOs::Linux,
+                flavor: Some(EngineFlavor::DockerEngine),
+                rootless: false,
+            },
+            containers: vec![running("blog-web-1", "blog", "web")],
+        },
+        apps,
+        networks.clone(),
+        ProxyDeps::loopback()
+            .with_connector(Arc::new(connector))
+            .with_range(PortRange::single(port).unwrap())
+            .with_interval(Duration::from_millis(50)),
+    )
+    .await;
+
+    let url = format!("http://127.0.0.1:{port}/");
+    let pending = daemon
+        .app_where("blog", |app| {
+            app.addresses.iter().any(|a| {
+                a.url == url
+                    && a.message.as_deref()
+                        == Some("Alchemy is connecting service web to the alchemy network.")
+            })
+        })
+        .await;
+    assert_eq!(pending.addresses.len(), 1, "{pending:?}");
+    assert_eq!(pending.addresses[0].kind, AddressKind::Port);
+    assert_eq!(pending.addresses[0].state, AddressState::Pending);
+    tokio::time::timeout(TIMEOUT, async {
+        while networks.connected().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        networks.connected(),
+        [("alchemy".to_owned(), "blog-web-1".to_owned())]
+    );
+
+    daemon.state.update_containers(|c| {
+        let mut attached = running("blog-web-1", "blog", "web");
+        attached
+            .networks
+            .insert("alchemy".into(), Ipv4Addr::new(10, 89, 0, 2));
+        c.replace_all([attached])
+    });
+    daemon
+        .app_where("blog", |app| {
+            app.addresses
+                .first()
+                .is_some_and(|a| a.state == AddressState::Ready)
+        })
+        .await;
+    let (head, body) = get_tcp(SocketAddr::from(([127, 0, 0, 1], port)), "anything").await;
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(body, "blog anything");
+
+    serves_the_blog_on_the_api(&daemon, port).await;
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn routes_published_ports_by_host_where_container_ips_are_out_of_reach() {
+    let upstream = fake_app("wiki").await;
+    let connector = FakeConnector::new();
+    connector.redirect(upstream, upstream);
+    let port = free_port();
+
+    let dir = tempdir();
+    let apps = apps_home(
+        dir.path(),
+        vec![
+            (
+                "wiki",
+                vec![service("app", &[], vec![tcp(upstream.port(), 3000)])],
+            ),
+            ("blog", vec![service("web", &["80"], vec![])]),
+        ],
+    );
+    let mut wiki = running("wiki-app-1", "wiki", "app");
+    wiki.ports = vec![tcp(upstream.port(), 3000)];
+    let daemon = Daemon::start(
+        dir,
+        Engine {
+            facts: EngineFacts {
+                host_os: HostOs::MacOs,
+                flavor: Some(EngineFlavor::DockerDesktop),
+                rootless: false,
+            },
+            containers: vec![wiki],
+        },
+        apps,
+        FakeEngineNetworks::new(),
+        ProxyDeps::loopback()
+            .with_connector(Arc::new(connector))
+            .with_range(PortRange::single(port).unwrap())
+            .with_host_listen(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .with_interval(Duration::from_millis(50)),
+    )
+    .await;
+
+    let wiki = daemon
+        .app_where("wiki", |app| {
+            app.addresses.len() == 2 && app.addresses.iter().all(|a| a.state == AddressState::Ready)
+        })
+        .await;
+    let host = wiki
+        .addresses
+        .iter()
+        .find(|a| a.kind == AddressKind::Host)
+        .unwrap();
+    let host_port: u16 = host
+        .url
+        .strip_prefix("http://wiki.localhost:")
+        .and_then(|rest| rest.strip_suffix('/'))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (head, body) = get_tcp(
+        SocketAddr::from(([127, 0, 0, 1], host_port)),
+        &format!("WIKI.localhost:{host_port}"),
+    )
+    .await;
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(body, format!("wiki wiki.localhost:{host_port}"));
+    let (head, _) = get_tcp(
+        SocketAddr::from(([127, 0, 0, 1], host_port)),
+        "nobody.localhost",
+    )
+    .await;
+    assert!(head.starts_with("http/1.1 404"), "{head}");
+
+    let blog = daemon
+        .app_where("blog", |app| {
+            app.problems.iter().any(|p| p.kind == AppProblemKind::Route)
+        })
+        .await;
+    assert_eq!(blog.addresses, []);
+    assert_eq!(
+        blog.problems[0].message,
+        "Publish port 80 of service web to reach this app. This Docker engine only lets the host reach published ports."
+    );
+
+    let report: NetworkReport = get_socket(&daemon.socket, "/api/network").await;
+    assert_eq!(report.proxy.reachability, Some(Reachability::PublishedOnly));
+    assert_eq!(report.proxy.host.state, ListenerState::Listening);
+    assert_eq!(report.proxy.host.port, host_port);
+
+    daemon.stop().await;
+}

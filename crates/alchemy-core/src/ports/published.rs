@@ -84,6 +84,12 @@ pub enum PortRangeError {
 }
 
 impl PortRange {
+    /// Every usable port, 1 to 65535.
+    pub const ALL: Self = Self {
+        start: 1,
+        end: u16::MAX,
+    };
+
     /// The ports from `start` to `end`, inclusive.
     pub fn new(start: u16, end: u16) -> Result<Self, PortRangeError> {
         if start == 0 {
