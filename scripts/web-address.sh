@@ -13,9 +13,11 @@
 # Usage: scripts/web-address.sh
 #   WEB_ADDR_PORT          HTTP port for the test daemon (default 17242)
 #   WEB_ADDR_SKIP_BUILD=1  reuse existing target/release binaries
-#   WEB_ADDR_SETCAP=1      when port 80 is refused, grant alchemyd
-#                          cap_net_bind_service with sudo setcap, restart
-#                          it, and check Host routing too
+#   WEB_ADDR_GRANT=1       when port 80 is refused, grant low ports through
+#                          alchemy-helper the way `alchemy machine
+#                          privileges` does (sudo, then alchemyd re-execs
+#                          itself), check Host routing too, then revoke
+#                          them and check port 80 is refused again
 
 set -euo pipefail
 
@@ -48,9 +50,9 @@ cd "$root"
 
 if [[ "${WEB_ADDR_SKIP_BUILD:-}" != 1 ]]; then
   log "Building release binaries"
-  cargo build --release --locked -p alchemyd -p alchemy
+  cargo build --release --locked -p alchemyd -p alchemy -p alchemy-helper
 fi
-for exe in alchemyd alchemy; do
+for exe in alchemyd alchemy alchemy-helper; do
   [[ -x "${bin}/${exe}" ]] || fail "missing ${bin}/${exe}"
 done
 
@@ -64,6 +66,10 @@ granted=""
 
 alchemy() { "${bin}/alchemy" --socket "$socket" "$@"; }
 api() { curl -fsS --unix-socket "$socket" "http://alchemyd$1"; }
+post() {
+  curl -fsS --unix-socket "$socket" -X POST -H 'Content-Type: application/json' \
+    -d "$2" "http://alchemyd$1"
+}
 
 start_daemon() {
   "${bin}/alchemyd" --listen "127.0.0.1:${port}" --socket "$socket" \
@@ -85,7 +91,7 @@ cleanup() {
     docker compose --project-directory "${apps_dir}/${app}" down --timeout 1 >/dev/null 2>&1 || true
   fi
   if [[ -n "$granted" ]]; then
-    as_root setcap -r "${bin}/alchemyd" 2>/dev/null || true
+    as_root "${bin}/alchemy-helper" revoke-low-ports >/dev/null 2>&1 || true
   fi
   rm -rf "$tmp"
 }
@@ -110,6 +116,44 @@ wait_for() {
     sleep 0.5
   done
   die "timed out waiting for ${what}: ${answer}"
+}
+
+# can_bind_low_ports: the running alchemyd has cap_net_bind_service in
+# its effective set. /proc/<pid>/status stays readable after a secure exec.
+can_bind_low_ports() {
+  local eff
+  eff="$(awk '/^CapEff:/ {print $2}' "/proc/${daemon_pid}/status")"
+  (((16#${eff} >> 10) & 1))
+}
+
+# change_low_ports GRANT OPERATION: grant (true) or revoke (false) low
+# ports the way `alchemy machine privileges` does when alchemyd can't
+# prompt (here, because target/ isn't root-owned): POST the change, run
+# the sudo command alchemyd answers with, POST it again, and wait for
+# alchemyd to re-exec itself, keeping its PID.
+change_low_ports() {
+  local grant="$1" operation="$2" helper change starts
+  helper="$(realpath "${bin}/alchemy-helper")"
+  change="$(post /api/machine/privileges/low-ports "{\"grant\":${grant}}")" \
+    || die "POST /api/machine/privileges/low-ports with grant ${grant} failed"
+  jq -e --arg helper "$helper" --arg op "$operation" \
+    '.outcome == "needs_terminal" and .command.argv == ["sudo", $helper, $op]' <<<"$change" >/dev/null \
+    || die "expected alchemyd to ask for sudo ${helper} ${operation}: ${change}"
+  log "Running $(jq -r .command.line <<<"$change")"
+  as_root "$helper" "$operation" >"${tmp}/helper.json" \
+    || die "alchemy-helper ${operation} failed: $(cat "${tmp}/helper.json")"
+  jq -e --arg op "$operation" '.result == "ok" and .operation == $op and .changed' "${tmp}/helper.json" >/dev/null \
+    || die "unexpected alchemy-helper result: $(cat "${tmp}/helper.json")"
+  starts="$(grep -c 'alchemyd listening' "${tmp}/alchemyd.log")"
+  change="$(post /api/machine/privileges/low-ports "{\"grant\":${grant}}")" \
+    || die "the second POST /api/machine/privileges/low-ports failed"
+  jq -e '.outcome == "restarting"' <<<"$change" >/dev/null || die "expected alchemyd to restart: ${change}"
+  for _ in $(seq 1 100); do
+    (($(grep -c 'alchemyd listening' "${tmp}/alchemyd.log") > starts)) && return 0
+    kill -0 "$daemon_pid" 2>/dev/null || die "alchemyd exited instead of re-executing itself"
+    sleep 0.2
+  done
+  die "alchemyd did not restart after ${operation}"
 }
 
 ip_int() {
@@ -291,21 +335,37 @@ case "$(jq -r .state <<<"$host_json")" in
       >/dev/null || die "${app}'s host address is not reported unavailable"
     alchemy status | grep -qF "Warning: Alchemy doesn't have permission to listen on port 80" \
       || die "alchemy status does not warn about port 80"
-    if [[ "${WEB_ADDR_SETCAP:-}" == 1 ]]; then
-      log "Granting alchemyd cap_net_bind_service and restarting it"
-      stop_daemon
+    if [[ "${WEB_ADDR_GRANT:-}" == 1 ]]; then
+      log "Granting low ports through alchemy-helper"
+      can_bind_low_ports && die "alchemyd already has cap_net_bind_service"
       granted=1
-      as_root setcap cap_net_bind_service=+ep "${bin}/alchemyd"
-      start_daemon
+      change_low_ports true grant-low-ports
       wait_for "port 80 and ${app}'s addresses after the restart" \
         ".apps[] | select(.name == \"${app}\") | .addresses // [] | map(select(.state == \"ready\") | .url) | index(\"http://${app}.localhost/\") != null and any(.[]; test(\"^http://[0-9.]+:\"))" \
         /api/apps
+      api /api/network | jq -e '.proxy.host.state == "listening"' >/dev/null \
+        || die "port 80 is not listening after the grant: $(api /api/network | jq -c .proxy.host)"
+      api /api/machine/privileges | jq -e '.privileges[] | select(.action == "low_ports") | .state == "granted"' \
+        >/dev/null || die "the low-ports privilege is not granted: $(api /api/machine/privileges)"
+      can_bind_low_ports || die "alchemyd restarted without cap_net_bind_service"
       api /api/apps | jq -e --arg url "$port_url" ".apps[] | select(.name == \"${app}\") | .addresses | any(.url == \$url)" \
         >/dev/null || die "${app} lost its port ${proxy_port} across a restart"
       check_echo port-restart "http://127.0.0.1:${proxy_port}/" "127.0.0.1:${proxy_port}"
       check_host
+
+      log "Revoking low ports through alchemy-helper"
+      change_low_ports false revoke-low-ports
+      granted=""
+      wait_for "port 80 to be refused again" \
+        '.proxy.host.state == "unavailable" and .proxy.host.privilege == "low_ports"' /api/network
+      api /api/machine/privileges | jq -e '.privileges[] | select(.action == "low_ports") | .state | IN("needed", "needs_terminal")' \
+        >/dev/null || die "the low-ports privilege is not needed again: $(api /api/machine/privileges)"
+      can_bind_low_ports && die "alchemyd kept cap_net_bind_service after the revoke"
+      wait_for "${app}'s port address after the second restart" \
+        ".apps[] | select(.name == \"${app}\") | .addresses // [] | any(.url == \"${port_url}\" and .state == \"ready\")" \
+        /api/apps
     else
-      log "Skipping Host routing on port 80; set WEB_ADDR_SETCAP=1 to grant the capability"
+      log "Skipping Host routing on port 80; set WEB_ADDR_GRANT=1 to grant low ports"
     fi
     ;;
   *) die "unexpected port 80 listener: ${host_json}" ;;
