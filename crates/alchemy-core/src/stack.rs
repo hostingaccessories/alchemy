@@ -6,6 +6,7 @@
 
 mod dirs;
 mod discovery;
+mod files;
 mod status;
 
 use std::fmt;
@@ -17,6 +18,10 @@ pub use dirs::{MAX_EXTRA_DIRS, StackDirs, StackDirsError, default_stack_home};
 pub use discovery::{
     COMPOSE_FILES, DirReport, DirState, Discovery, EntryKind, FileInfo, FoundStack, ListedDir,
     ListedEntry, Listing, OVERRIDE_FILES, SkipReason, Skipped, WATCHED_FILES, discover,
+};
+pub use files::{
+    CreateRootError, ENV_FILE, FileContentError, MAX_FILE_LEN, MAX_MESSAGE_LEN, NEW_COMPOSE_FILE,
+    STAGING_PREFIX, StackFile, check_content, create_root, scrub, staging_prefix,
 };
 pub use status::{ImageSource, ServiceRun, StackStatus, stack_status};
 
