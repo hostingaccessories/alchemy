@@ -25,14 +25,26 @@ pub struct Migration {
 }
 
 /// Every migration, oldest first.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "settings",
-    sql: "CREATE TABLE settings (
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "settings",
+        sql: "CREATE TABLE settings (
             key   TEXT PRIMARY KEY NOT NULL,
             value TEXT NOT NULL
           ) STRICT;",
-}];
+    },
+    Migration {
+        version: 2,
+        name: "metrics",
+        sql: "CREATE TABLE metrics (
+            step INTEGER NOT NULL,
+            ts   INTEGER NOT NULL,
+            data TEXT NOT NULL,
+            PRIMARY KEY (step, ts)
+          ) STRICT, WITHOUT ROWID;",
+    },
+];
 
 /// The schema version this build migrates databases to.
 pub fn latest() -> i64 {
@@ -181,7 +193,10 @@ mod tests {
         }
         let mut conn = Connection::open_in_memory().unwrap();
         apply(&mut conn, MIGRATIONS).unwrap();
-        assert!(tables(&conn).contains(&"settings".to_owned()));
+        let tables = tables(&conn);
+        for table in ["settings", "metrics"] {
+            assert!(tables.contains(&table.to_owned()), "{table}");
+        }
     }
 
     #[test]

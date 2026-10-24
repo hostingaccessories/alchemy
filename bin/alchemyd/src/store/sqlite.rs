@@ -15,7 +15,7 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension as _};
 use tokio::sync::{mpsc, oneshot};
 
 use super::migrations::{self, MIGRATIONS, MigrateError};
-use super::{DB_FILE, Store, StoreError};
+use super::{DB_FILE, MetricRow, Store, StoreError};
 use crate::secure_fs;
 
 /// How long a statement waits on a lock held by another connection, such
@@ -130,6 +130,69 @@ impl Store for SqliteStore {
             })
             .await
         })
+    }
+
+    fn insert_metrics(&self, rows: Vec<MetricRow>) -> BoxFuture<'_, Result<(), StoreError>> {
+        Box::pin(self.call(move |conn| {
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO metrics (step, ts, data) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (step, ts) DO NOTHING",
+                )?;
+                for row in rows {
+                    stmt.execute((row.step, row.ts, row.data))?;
+                }
+            }
+            tx.commit()
+        }))
+    }
+
+    fn metric_rows(
+        &self,
+        step: i64,
+        from: i64,
+        to: i64,
+    ) -> BoxFuture<'_, Result<Vec<MetricRow>, StoreError>> {
+        Box::pin(self.call(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT ts, data FROM metrics
+                 WHERE step = ?1 AND ts >= ?2 AND ts < ?3 ORDER BY ts",
+            )?;
+            stmt.query_map((step, from, to), |row| {
+                Ok(MetricRow {
+                    step,
+                    ts: row.get(0)?,
+                    data: row.get(1)?,
+                })
+            })?
+            .collect()
+        }))
+    }
+
+    fn metric_times(
+        &self,
+        step: i64,
+        from: i64,
+        to: i64,
+    ) -> BoxFuture<'_, Result<Vec<i64>, StoreError>> {
+        Box::pin(self.call(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT ts FROM metrics WHERE step = ?1 AND ts >= ?2 AND ts < ?3 ORDER BY ts",
+            )?;
+            stmt.query_map((step, from, to), |row| row.get(0))?
+                .collect()
+        }))
+    }
+
+    fn prune_metrics(&self, step: i64, before: i64) -> BoxFuture<'_, Result<u64, StoreError>> {
+        Box::pin(self.call(move |conn| {
+            let deleted = conn.execute(
+                "DELETE FROM metrics WHERE step = ?1 AND ts < ?2",
+                (step, before),
+            )?;
+            Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
+        }))
     }
 }
 
