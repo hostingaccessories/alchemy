@@ -11,11 +11,24 @@ const setTheme = vi.hoisted(() => vi.fn(async (_theme: "light" | "dark" | null) 
 
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ setTheme }) }));
 
+/** What the stubbed daemon answers, by URL; anything else gets the version. */
+const ANSWERS: Record<string, unknown> = {
+  "/api/apps": { apps: [], unmanaged: [], dirs: [] },
+  "/api/settings/apps": {
+    home: "/home/me/Alchemy/apps",
+    default_home: "/home/me/Alchemy/apps",
+    extra: [],
+  },
+};
+
 beforeEach(() => {
   vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal(
     "fetch",
-    vi.fn(async () => new Response(JSON.stringify({ version: "9.9.9", api: 1 }), { status: 200 })),
+    vi.fn(async (url: string) => {
+      const body = ANSWERS[url] ?? { version: "9.9.9", api: 1 };
+      return new Response(JSON.stringify(body), { status: 200 });
+    }),
   );
 });
 
