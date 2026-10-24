@@ -7,12 +7,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use alchemy_core::engine::{
-    ContainerEvent, ContainerState, ContainerStatus, EngineStatus, Health, flavor_from_platform,
-    parse_action,
+    ContainerEvent, ContainerState, ContainerStatus, EngineStatus, Health, InspectedExit,
+    flavor_from_platform, parse_action, parse_timestamp_ms,
 };
 use alchemy_core::metrics::{ContainerSample, DiskIo, Traffic, container_memory};
 use bollard::models::{
-    ContainerStatsResponse, ContainerSummary, EventMessage, EventMessageTypeEnum, SystemVersion,
+    ContainerInspectResponse, ContainerStatsResponse, ContainerSummary, EventMessage,
+    EventMessageTypeEnum, SystemVersion,
 };
 use bollard::query_parameters::{EventsOptions, ListContainersOptions, StatsOptions};
 use bollard::{ClientVersion, Docker};
@@ -46,6 +47,18 @@ pub trait DockerApi {
     fn events(
         &self,
     ) -> impl Stream<Item = Result<ContainerEvent, ApiError>> + Send + Unpin + 'static;
+
+    /// `GET /containers/{id}/json`, reduced to how its last run ended, or
+    /// `None` if the engine did not say.
+    ///
+    /// The default reports nothing, for engines whose tests do not care.
+    fn inspect_exit(
+        &self,
+        id: String,
+    ) -> impl Future<Output = Result<Option<InspectedExit>, ApiError>> + Send {
+        drop(id);
+        std::future::ready(Ok(None))
+    }
 }
 
 /// Why an Engine API call failed.
@@ -181,7 +194,28 @@ fn container_event(message: EventMessage) -> Option<ContainerEvent> {
     event.project = attributes.remove(PROJECT_LABEL);
     event.service = attributes.remove(SERVICE_LABEL);
     event.working_dir = attributes.remove(WORKING_DIR_LABEL);
+    event.exit_code = attributes.remove("exitCode").and_then(|c| c.parse().ok());
+    event.signal = attributes.remove("signal").and_then(|s| s.parse().ok());
+    event.at = message
+        .time_nano
+        .map(|nanos| nanos / 1_000_000)
+        .or_else(|| message.time.map(|secs| secs.saturating_mul(1_000)));
     Some(event)
+}
+
+fn inspected_exit(response: ContainerInspectResponse) -> Option<InspectedExit> {
+    let state = response.state?;
+    let time = |t: Option<String>| t.as_deref().and_then(parse_timestamp_ms);
+    Some(InspectedExit {
+        exit_code: state.exit_code,
+        oom_killed: state.oom_killed.unwrap_or(false),
+        started_at: time(state.started_at),
+        finished_at: time(state.finished_at),
+        restart_count: response
+            .restart_count
+            .and_then(|count| u32::try_from(count).ok())
+            .unwrap_or(0),
+    })
 }
 
 /// The API version the client is configured with.
@@ -258,6 +292,11 @@ impl DockerApi for BollardApi {
                 })
             })
             .boxed()
+    }
+
+    async fn inspect_exit(&self, id: String) -> Result<Option<InspectedExit>, ApiError> {
+        let response = self.docker.inspect_container(&id, None).await?;
+        Ok(inspected_exit(response))
     }
 }
 
@@ -493,6 +532,104 @@ mod tests {
         ];
         for (input, want) in cases {
             assert_eq!(container_event(input.clone()), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn container_event_reads_exit_code_signal_and_time() {
+        use EventMessageTypeEnum::CONTAINER;
+        let with = |action: &str, attrs: &[(&str, &str)], time: Option<i64>, nanos: Option<i64>| {
+            EventMessage {
+                actor: Some(EventActor {
+                    id: Some("abc".into()),
+                    attributes: Some(labels(attrs)),
+                }),
+                time,
+                time_nano: nanos,
+                ..message(CONTAINER, action, "abc")
+            }
+        };
+        let cases = [
+            (
+                with(
+                    "die",
+                    &[("exitCode", "137")],
+                    Some(1_700_000_000),
+                    Some(1_700_000_000_123_456_789),
+                ),
+                Some(137),
+                None,
+                Some(1_700_000_000_123),
+            ),
+            (
+                with("kill", &[("signal", "15")], Some(1_700_000_000), None),
+                None,
+                Some(15),
+                Some(1_700_000_000_000),
+            ),
+            (
+                with("die", &[("exitCode", "x"), ("signal", "TERM")], None, None),
+                None,
+                None,
+                None,
+            ),
+        ];
+        for (input, exit_code, signal, at) in cases {
+            let event = container_event(input.clone()).unwrap();
+            assert_eq!(
+                (event.exit_code, event.signal, event.at),
+                (exit_code, signal, at),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inspected_exit_maps_the_last_run() {
+        use bollard::models::ContainerState as State;
+        let full = ContainerInspectResponse {
+            state: Some(State {
+                exit_code: Some(137),
+                oom_killed: Some(true),
+                started_at: Some("2024-05-01T12:00:00Z".into()),
+                finished_at: Some("2024-05-01T12:00:01.5Z".into()),
+                ..State::default()
+            }),
+            restart_count: Some(4),
+            ..ContainerInspectResponse::default()
+        };
+        let never = ContainerInspectResponse {
+            state: Some(State {
+                exit_code: Some(0),
+                started_at: Some("0001-01-01T00:00:00Z".into()),
+                finished_at: Some("0001-01-01T00:00:00Z".into()),
+                ..State::default()
+            }),
+            restart_count: Some(-1),
+            ..ContainerInspectResponse::default()
+        };
+        let cases = [
+            (
+                full,
+                Some(InspectedExit {
+                    exit_code: Some(137),
+                    oom_killed: true,
+                    started_at: Some(1_714_564_800_000),
+                    finished_at: Some(1_714_564_801_500),
+                    restart_count: 4,
+                }),
+            ),
+            (
+                never,
+                Some(InspectedExit {
+                    exit_code: Some(0),
+                    ..InspectedExit::default()
+                }),
+            ),
+            (ContainerInspectResponse::default(), None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(inspected_exit(input.clone()), want, "{input:?}");
         }
     }
 

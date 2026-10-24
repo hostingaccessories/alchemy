@@ -22,6 +22,9 @@ use crate::State;
 /// How often to probe an engine that is not ready.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Stopped containers inspected at once after a listing.
+const INSPECT_CONCURRENCY: usize = 4;
+
 /// Something that keeps the engine and container parts of [`State`]
 /// current until shutdown.
 ///
@@ -202,6 +205,10 @@ where
 /// The event stream is polled before the listing so its request goes out
 /// first; events that arrive during the listing are buffered and applied
 /// on top of it, so nothing between the two is lost.
+///
+/// A listing says a container stopped but not how. Compose containers
+/// stopped with no exit known yet are inspected alongside the events, a
+/// few at a time, so each connection inspects a container at most once.
 async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
     let mut events = api.events();
     let mut pending: Vec<ContainerEvent> = Vec::new();
@@ -239,20 +246,36 @@ async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
             })
     });
 
+    let mut inspections = futures_util::stream::iter(state.containers().needs_inspect())
+        .map(|id| async move {
+            let result = api.inspect_exit(id.clone()).await;
+            (id, result)
+        })
+        .buffer_unordered(INSPECT_CONCURRENCY);
     loop {
-        match events.next().await {
-            Some(Ok(event)) => {
-                delivered = true;
-                state.update_containers(|containers| containers.apply(&event));
-            }
-            Some(Err(error)) => {
-                tracing::debug!(error = %error, "Docker event stream failed");
-                return Outcome::Disconnected { delivered };
-            }
-            None => {
-                tracing::debug!("Docker event stream ended");
-                return Outcome::Disconnected { delivered };
-            }
+        tokio::select! {
+            biased;
+            item = events.next() => match item {
+                Some(Ok(event)) => {
+                    delivered = true;
+                    state.update_containers(|containers| containers.apply(&event));
+                }
+                Some(Err(error)) => {
+                    tracing::debug!(error = %error, "Docker event stream failed");
+                    return Outcome::Disconnected { delivered };
+                }
+                None => {
+                    tracing::debug!("Docker event stream ended");
+                    return Outcome::Disconnected { delivered };
+                }
+            },
+            Some((id, result)) = inspections.next() => match result {
+                Ok(Some(exit)) => {
+                    state.update_containers(|containers| containers.record_inspect(&id, exit));
+                }
+                Ok(None) => {}
+                Err(error) => tracing::debug!(error = %error, id, "inspecting a stopped container failed"),
+            },
         }
     }
 }
