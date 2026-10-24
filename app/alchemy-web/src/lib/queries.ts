@@ -19,6 +19,27 @@ export const versionQuery = queryOptions({
   retry: false,
 });
 
+/**
+ * `GET /api/session`: whether this page is signed in to alchemyd. It fails
+ * with a 401 `unauthorized` (`isSignedOut`) until the browser has been
+ * through `alchemy open`, or while the shell lacks the daemon's token. Rerun
+ * with the version probe whenever the event stream drops.
+ */
+export const sessionQuery = queryOptions({
+  queryKey: ["session"],
+  queryFn: ({ signal }) => api.session(signal),
+  retry: false,
+});
+
+/**
+ * `GET /api/settings/apps`: the app folders in effect. Saving them replaces
+ * this query's data with the daemon's answer.
+ */
+export const appSettingsQuery = queryOptions({
+  queryKey: ["settings", "apps"],
+  queryFn: ({ signal }) => api.appSettings(signal),
+});
+
 /** A query whose data is one event's payload. */
 export interface LiveQuery<K extends ApiEventName> {
   queryKey: DataTag<QueryKey, ApiEventData<K>, DefaultError>;
@@ -37,6 +58,21 @@ export const liveQueries = {
   engine: queryOptions({
     queryKey: ["engine"],
     queryFn: ({ signal }) => api.engine(signal),
+    staleTime: Infinity,
+  }),
+  metrics: queryOptions({
+    queryKey: ["metrics"],
+    queryFn: ({ signal }) => api.metrics(signal),
+    staleTime: Infinity,
+  }),
+  apps: queryOptions({
+    queryKey: ["apps"],
+    queryFn: ({ signal }) => api.apps(signal),
+    staleTime: Infinity,
+  }),
+  operations: queryOptions({
+    queryKey: ["operations"],
+    queryFn: ({ signal }) => api.operations(signal),
     staleTime: Infinity,
   }),
 } satisfies { [K in ApiEventName]: LiveQuery<K> };

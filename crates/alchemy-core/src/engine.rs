@@ -6,6 +6,7 @@
 //! and [`ContainerEvent`]s.
 
 mod container;
+mod stop;
 
 use std::time::Duration;
 
@@ -14,6 +15,10 @@ use serde::{Deserialize, Serialize};
 pub use container::{
     ContainerAction, ContainerEvent, ContainerState, ContainerStatus, Containers, Health,
     parse_action,
+};
+pub use stop::{
+    CLOCK_SLACK_MS, CRASH_LOOP, InspectedExit, Intent, IntentAction, SHORT_RUN_MS, StopReason,
+    Trail, is_stop_signal, parse_timestamp_ms, stop_reason, summarize,
 };
 
 /// How usable the Docker engine is right now.

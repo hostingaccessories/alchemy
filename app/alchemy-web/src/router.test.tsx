@@ -3,12 +3,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 
 import { FakeEventSource, renderAt } from "./test/render.tsx";
 
+/** What the stubbed daemon answers, by URL; anything else gets the version. */
+const ANSWERS: Record<string, unknown> = {
+  "/api/apps": { apps: [], unmanaged: [], dirs: [] },
+  "/api/settings/apps": {
+    home: "/home/me/Alchemy/apps",
+    default_home: "/home/me/Alchemy/apps",
+    extra: [],
+  },
+};
+
 beforeEach(() => {
   FakeEventSource.instances = [];
   vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal(
     "fetch",
-    vi.fn(async () => new Response(JSON.stringify({ version: "9.9.9", api: 1 }), { status: 200 })),
+    vi.fn(async (url: string) => {
+      if (url.startsWith("/api/metrics")) {
+        return new Promise<Response>(() => {});
+      }
+      const body = ANSWERS[url] ?? { version: "9.9.9", api: 1 };
+      return new Response(JSON.stringify(body), { status: 200 });
+    }),
   );
 });
 
@@ -39,7 +55,7 @@ describe("router", () => {
     await renderAt(path);
     expect(heading()).toBe(title);
     expect(current()).toEqual([title]);
-    expect(within(screen.getByRole("main")).getByText(text)).toBeTruthy();
+    expect(await within(screen.getByRole("main")).findByText(text)).toBeTruthy();
     expect(await screen.findByText("alchemyd 9.9.9")).toBeTruthy();
   });
 
@@ -52,7 +68,7 @@ describe("router", () => {
   const missing: [string, string[]][] = [
     ["/nope", []],
     ["/stacks", []],
-    ["/apps/missing", ["Apps"]],
+    ["/apps/blog/missing", ["Apps"]],
   ];
 
   it.each(missing)("renders the 404 inside the layout for %s", async (path, active) => {

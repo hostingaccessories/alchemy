@@ -6,16 +6,24 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use alchemy_api::logs::LogStream;
 use alchemy_core::engine::{
-    ContainerEvent, ContainerState, ContainerStatus, EngineStatus, Health, flavor_from_platform,
-    parse_action,
+    ContainerEvent, ContainerState, ContainerStatus, EngineStatus, Health, InspectedExit,
+    flavor_from_platform, parse_action, parse_timestamp_ms,
 };
-use bollard::models::{ContainerSummary, EventMessage, EventMessageTypeEnum, SystemVersion};
-use bollard::query_parameters::{EventsOptions, ListContainersOptions};
+use alchemy_core::metrics::{ContainerSample, DiskIo, Traffic, container_memory};
+use bollard::container::LogOutput;
+use bollard::models::{
+    ContainerInspectResponse, ContainerStatsResponse, ContainerSummary, EventMessage,
+    EventMessageTypeEnum, SystemVersion,
+};
+use bollard::query_parameters::{EventsOptions, ListContainersOptions, LogsOptions, StatsOptions};
 use bollard::{ClientVersion, Docker};
+use futures_util::stream::BoxStream;
 use futures_util::{Stream, StreamExt as _};
 
 use super::Endpoint;
+use crate::logs::{LogChunk, LogRequest};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -43,6 +51,18 @@ pub trait DockerApi {
     fn events(
         &self,
     ) -> impl Stream<Item = Result<ContainerEvent, ApiError>> + Send + Unpin + 'static;
+
+    /// `GET /containers/{id}/json`, reduced to how its last run ended, or
+    /// `None` if the engine did not say.
+    ///
+    /// The default reports nothing, for engines whose tests do not care.
+    fn inspect_exit(
+        &self,
+        id: String,
+    ) -> impl Future<Output = Result<Option<InspectedExit>, ApiError>> + Send {
+        drop(id);
+        std::future::ready(Ok(None))
+    }
 }
 
 /// Why an Engine API call failed.
@@ -121,6 +141,7 @@ impl EngineVersion {
 
 const PROJECT_LABEL: &str = "com.docker.compose.project";
 const SERVICE_LABEL: &str = "com.docker.compose.service";
+const WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
 
 fn engine_version(version: SystemVersion) -> EngineVersion {
     EngineVersion {
@@ -155,6 +176,7 @@ fn container_status(summary: ContainerSummary) -> Option<ContainerStatus> {
     status.image = summary.image.filter(|i| !i.is_empty());
     status.project = labels.remove(PROJECT_LABEL);
     status.service = labels.remove(SERVICE_LABEL);
+    status.working_dir = labels.remove(WORKING_DIR_LABEL);
     status.health = summary
         .health
         .and_then(|h| h.status)
@@ -175,7 +197,29 @@ fn container_event(message: EventMessage) -> Option<ContainerEvent> {
     event.image = attributes.remove("image");
     event.project = attributes.remove(PROJECT_LABEL);
     event.service = attributes.remove(SERVICE_LABEL);
+    event.working_dir = attributes.remove(WORKING_DIR_LABEL);
+    event.exit_code = attributes.remove("exitCode").and_then(|c| c.parse().ok());
+    event.signal = attributes.remove("signal").and_then(|s| s.parse().ok());
+    event.at = message
+        .time_nano
+        .map(|nanos| nanos / 1_000_000)
+        .or_else(|| message.time.map(|secs| secs.saturating_mul(1_000)));
     Some(event)
+}
+
+fn inspected_exit(response: ContainerInspectResponse) -> Option<InspectedExit> {
+    let state = response.state?;
+    let time = |t: Option<String>| t.as_deref().and_then(parse_timestamp_ms);
+    Some(InspectedExit {
+        exit_code: state.exit_code,
+        oom_killed: state.oom_killed.unwrap_or(false),
+        started_at: time(state.started_at),
+        finished_at: time(state.finished_at),
+        restart_count: response
+            .restart_count
+            .and_then(|count| u32::try_from(count).ok())
+            .unwrap_or(0),
+    })
 }
 
 /// The API version the client is configured with.
@@ -253,6 +297,134 @@ impl DockerApi for BollardApi {
             })
             .boxed()
     }
+
+    async fn inspect_exit(&self, id: String) -> Result<Option<InspectedExit>, ApiError> {
+        let response = self.docker.inspect_container(&id, None).await?;
+        Ok(inspected_exit(response))
+    }
+}
+
+impl BollardApi {
+    /// `GET /containers/{id}/stats?stream=false&one-shot=true`: one reading
+    /// of `container`'s raw counters, without waiting for the engine to
+    /// compute a delta of its own.
+    pub async fn container_stats(
+        &self,
+        container: &ContainerStatus,
+    ) -> Result<ContainerSample, ApiError> {
+        let options = StatsOptions {
+            stream: false,
+            one_shot: true,
+        };
+        let stats = self
+            .docker
+            .stats(&container.id, Some(options))
+            .next()
+            .await
+            .ok_or_else(|| ApiError::Decode("the engine sent no stats".into()))??;
+        Ok(container_sample(container, stats))
+    }
+
+    /// `GET /containers/{id}/logs` for stdout and stderr, with Docker's
+    /// timestamp before every line, as raw chunks in the order the engine
+    /// sends them.
+    ///
+    /// Without `follow` the stream ends after the lines asked for; with
+    /// it, when the container stops or the connection drops.
+    pub fn logs(
+        &self,
+        id: &str,
+        request: &LogRequest,
+    ) -> BoxStream<'static, Result<LogChunk, ApiError>> {
+        let options = LogsOptions {
+            follow: request.follow,
+            stdout: true,
+            stderr: true,
+            since: request
+                .since
+                .map_or(0, |secs| i32::try_from(secs.max(0)).unwrap_or(i32::MAX)),
+            until: 0,
+            timestamps: true,
+            tail: request
+                .tail
+                .map_or_else(|| "all".to_owned(), |n| n.to_string()),
+        };
+        self.docker
+            .logs(id, Some(options))
+            .filter_map(|item| {
+                std::future::ready(match item {
+                    Ok(output) => log_chunk(output).map(Ok),
+                    Err(error) => Some(Err(ApiError::from(error))),
+                })
+            })
+            .boxed()
+    }
+}
+
+/// A log frame as a [`LogChunk`]. A container with a terminal writes
+/// everything to its console, which is reported as stdout; stdin echoes
+/// are dropped.
+fn log_chunk(output: LogOutput) -> Option<LogChunk> {
+    let (stream, bytes) = match output {
+        LogOutput::StdOut { message } | LogOutput::Console { message } => {
+            (LogStream::Stdout, message)
+        }
+        LogOutput::StdErr { message } => (LogStream::Stderr, message),
+        LogOutput::StdIn { .. } => return None,
+    };
+    Some(LogChunk {
+        stream,
+        bytes: bytes.to_vec(),
+    })
+}
+
+/// The raw counters in `stats`, labelled with `container`'s identity.
+fn container_sample(container: &ContainerStatus, stats: ContainerStatsResponse) -> ContainerSample {
+    let cpu = stats.cpu_stats.unwrap_or_default();
+    let memory = stats.memory_stats.unwrap_or_default();
+    let cache = memory.stats.unwrap_or_default();
+    let net = stats.networks.map(|networks| {
+        networks
+            .values()
+            .fold(Traffic::default(), |total, network| Traffic {
+                rx: total.rx.saturating_add(network.rx_bytes.unwrap_or(0)),
+                tx: total.tx.saturating_add(network.tx_bytes.unwrap_or(0)),
+            })
+    });
+    let block = stats
+        .blkio_stats
+        .and_then(|blkio| blkio.io_service_bytes_recursive)
+        .map(|entries| {
+            entries.iter().fold(DiskIo::default(), |total, entry| {
+                let value = entry.value.unwrap_or(0);
+                match entry.op.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                    Some("read") => DiskIo {
+                        read: total.read.saturating_add(value),
+                        ..total
+                    },
+                    Some("write") => DiskIo {
+                        written: total.written.saturating_add(value),
+                        ..total
+                    },
+                    _ => total,
+                }
+            })
+        });
+    ContainerSample {
+        id: container.id.clone(),
+        name: container.name.clone(),
+        project: container.project.clone(),
+        service: container.service.clone(),
+        cpu_usage: cpu.cpu_usage.and_then(|u| u.total_usage).unwrap_or(0),
+        system_cpu: cpu.system_cpu_usage,
+        memory: container_memory(
+            memory.usage.unwrap_or(0),
+            cache.get("total_inactive_file").copied(),
+            cache.get("inactive_file").copied(),
+        ),
+        net,
+        block,
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +467,7 @@ mod tests {
             labels: Some(labels(&[
                 (PROJECT_LABEL, "blog"),
                 (SERVICE_LABEL, "db"),
+                (WORKING_DIR_LABEL, "/srv/blog"),
                 ("other", "x"),
             ])),
             health: Some(ContainerSummaryHealth {
@@ -307,6 +480,7 @@ mod tests {
         want.image = Some("postgres:16".into());
         want.project = Some("blog".into());
         want.service = Some("db".into());
+        want.working_dir = Some("/srv/blog".into());
         want.health = Some(Health::Healthy);
         let no_health = ContainerSummary {
             health: Some(ContainerSummaryHealth {
@@ -362,6 +536,7 @@ mod tests {
                     ("image", "postgres:16"),
                     (PROJECT_LABEL, "blog"),
                     (SERVICE_LABEL, "db"),
+                    (WORKING_DIR_LABEL, "/srv/blog"),
                 ])),
             }),
             ..EventMessage::default()
@@ -376,6 +551,7 @@ mod tests {
         start.image = Some("postgres:16".into());
         start.project = Some("blog".into());
         start.service = Some("db".into());
+        start.working_dir = Some("/srv/blog".into());
         let mut healthy = start.clone();
         healthy.action = ContainerAction::Health(Health::Healthy);
         let bare = EventMessage {
@@ -412,6 +588,104 @@ mod tests {
         ];
         for (input, want) in cases {
             assert_eq!(container_event(input.clone()), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn container_event_reads_exit_code_signal_and_time() {
+        use EventMessageTypeEnum::CONTAINER;
+        let with = |action: &str, attrs: &[(&str, &str)], time: Option<i64>, nanos: Option<i64>| {
+            EventMessage {
+                actor: Some(EventActor {
+                    id: Some("abc".into()),
+                    attributes: Some(labels(attrs)),
+                }),
+                time,
+                time_nano: nanos,
+                ..message(CONTAINER, action, "abc")
+            }
+        };
+        let cases = [
+            (
+                with(
+                    "die",
+                    &[("exitCode", "137")],
+                    Some(1_700_000_000),
+                    Some(1_700_000_000_123_456_789),
+                ),
+                Some(137),
+                None,
+                Some(1_700_000_000_123),
+            ),
+            (
+                with("kill", &[("signal", "15")], Some(1_700_000_000), None),
+                None,
+                Some(15),
+                Some(1_700_000_000_000),
+            ),
+            (
+                with("die", &[("exitCode", "x"), ("signal", "TERM")], None, None),
+                None,
+                None,
+                None,
+            ),
+        ];
+        for (input, exit_code, signal, at) in cases {
+            let event = container_event(input.clone()).unwrap();
+            assert_eq!(
+                (event.exit_code, event.signal, event.at),
+                (exit_code, signal, at),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inspected_exit_maps_the_last_run() {
+        use bollard::models::ContainerState as State;
+        let full = ContainerInspectResponse {
+            state: Some(State {
+                exit_code: Some(137),
+                oom_killed: Some(true),
+                started_at: Some("2024-05-01T12:00:00Z".into()),
+                finished_at: Some("2024-05-01T12:00:01.5Z".into()),
+                ..State::default()
+            }),
+            restart_count: Some(4),
+            ..ContainerInspectResponse::default()
+        };
+        let never = ContainerInspectResponse {
+            state: Some(State {
+                exit_code: Some(0),
+                started_at: Some("0001-01-01T00:00:00Z".into()),
+                finished_at: Some("0001-01-01T00:00:00Z".into()),
+                ..State::default()
+            }),
+            restart_count: Some(-1),
+            ..ContainerInspectResponse::default()
+        };
+        let cases = [
+            (
+                full,
+                Some(InspectedExit {
+                    exit_code: Some(137),
+                    oom_killed: true,
+                    started_at: Some(1_714_564_800_000),
+                    finished_at: Some(1_714_564_801_500),
+                    restart_count: 4,
+                }),
+            ),
+            (
+                never,
+                Some(InspectedExit {
+                    exit_code: Some(0),
+                    ..InspectedExit::default()
+                }),
+            ),
+            (ContainerInspectResponse::default(), None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(inspected_exit(input.clone()), want, "{input:?}");
         }
     }
 
@@ -495,5 +769,110 @@ mod tests {
             BollardApi::connect(&endpoint, BollardApi::DEFAULT_TIMEOUT),
             Err(ApiError::SocketNotFound(_))
         ));
+    }
+
+    #[test]
+    fn container_sample_maps_raw_stats() {
+        use bollard::models::{
+            ContainerBlkioStatEntry, ContainerBlkioStats, ContainerCpuStats, ContainerCpuUsage,
+            ContainerMemoryStats, ContainerNetworkStats,
+        };
+        let entry = |op: &str, value| ContainerBlkioStatEntry {
+            op: Some(op.into()),
+            value: Some(value),
+            ..ContainerBlkioStatEntry::default()
+        };
+        let network = |rx, tx| ContainerNetworkStats {
+            rx_bytes: Some(rx),
+            tx_bytes: Some(tx),
+            ..ContainerNetworkStats::default()
+        };
+        let full = ContainerStatsResponse {
+            cpu_stats: Some(ContainerCpuStats {
+                cpu_usage: Some(ContainerCpuUsage {
+                    total_usage: Some(500),
+                    ..ContainerCpuUsage::default()
+                }),
+                system_cpu_usage: Some(10_000),
+                ..ContainerCpuStats::default()
+            }),
+            memory_stats: Some(ContainerMemoryStats {
+                usage: Some(1_000),
+                stats: Some(HashMap::from([("inactive_file".to_owned(), 300)])),
+                ..ContainerMemoryStats::default()
+            }),
+            networks: Some(HashMap::from([
+                ("eth0".to_owned(), network(100, 10)),
+                ("eth1".to_owned(), network(5, 1)),
+            ])),
+            blkio_stats: Some(ContainerBlkioStats {
+                io_service_bytes_recursive: Some(vec![
+                    entry("read", 40),
+                    entry("write", 7),
+                    entry("Read", 2),
+                    entry("discard", 99),
+                ]),
+                ..ContainerBlkioStats::default()
+            }),
+            ..ContainerStatsResponse::default()
+        };
+        let mut container = ContainerStatus::new("abc", "blog-db-1", ContainerState::Running);
+        container.project = Some("blog".into());
+        container.service = Some("db".into());
+
+        let got = container_sample(&container, full);
+        assert_eq!(
+            got,
+            ContainerSample {
+                id: "abc".into(),
+                name: "blog-db-1".into(),
+                project: Some("blog".into()),
+                service: Some("db".into()),
+                cpu_usage: 500,
+                system_cpu: Some(10_000),
+                memory: 700,
+                net: Some(Traffic { rx: 105, tx: 11 }),
+                block: Some(DiskIo {
+                    read: 42,
+                    written: 7
+                }),
+            }
+        );
+
+        let empty = container_sample(&container, ContainerStatsResponse::default());
+        assert_eq!(
+            (empty.cpu_usage, empty.system_cpu, empty.memory),
+            (0, None, 0)
+        );
+        assert_eq!((empty.net, empty.block), (None, None), "host network");
+    }
+
+    #[test]
+    fn log_chunk_maps_log_frames() {
+        let bytes = || axum::body::Bytes::from_static(b"hi\n");
+        let chunk = |stream| {
+            Some(LogChunk {
+                stream,
+                bytes: b"hi\n".to_vec(),
+            })
+        };
+        let cases = [
+            (
+                LogOutput::StdOut { message: bytes() },
+                chunk(LogStream::Stdout),
+            ),
+            (
+                LogOutput::StdErr { message: bytes() },
+                chunk(LogStream::Stderr),
+            ),
+            (
+                LogOutput::Console { message: bytes() },
+                chunk(LogStream::Stdout),
+            ),
+            (LogOutput::StdIn { message: bytes() }, None),
+        ];
+        for (output, want) in cases {
+            assert_eq!(log_chunk(output.clone()), want, "{output:?}");
+        }
     }
 }

@@ -1,10 +1,12 @@
 import { Link, Outlet } from "@tanstack/react-router";
 import { Boxes, FlaskConical, type LucideIcon, Server, Settings } from "lucide-react";
-import { useState } from "react";
+import { type ReactNode, useState } from "react";
 
 import type { ApiError } from "../lib/api.ts";
-import { useDaemonConnection } from "../lib/live.tsx";
+import { useDaemonConnection, useSignedOut } from "../lib/live.tsx";
+import { isTauri } from "../lib/platform.ts";
 import { useWindowTheme } from "../lib/theme.ts";
+import { Code } from "./Code.tsx";
 import { DaemonStatus } from "./DaemonStatus.tsx";
 import { Notice } from "./Notice.tsx";
 import { HeaderSlotContext } from "./PageHeader.tsx";
@@ -25,6 +27,7 @@ const NAV: { to: "/apps" | "/machines" | "/settings"; label: string; icon: Lucid
 export function Layout() {
   const [slot, setSlot] = useState<HTMLElement | null>(null);
   const daemon = useDaemonConnection();
+  const signedOut = useSignedOut();
   useWindowTheme();
 
   return (
@@ -59,6 +62,7 @@ export function Layout() {
           </div>
         </header>
         {daemon.kind === "offline" && <DaemonUnreachable error={daemon.error} />}
+        {daemon.kind === "online" && signedOut && <SignedOut />}
         <main className="min-h-0 flex-1 overflow-y-auto px-6 py-6">
           <HeaderSlotContext value={slot}>
             <Outlet />
@@ -67,6 +71,42 @@ export function Layout() {
       </div>
     </div>
   );
+}
+
+/**
+ * Shown while `alchemyd` answers but refuses this page as not signed in. A
+ * browser signs in through `alchemy open`; the shell signs in with the
+ * daemon's token on its own, so there it means the token couldn't be read.
+ * It clears itself once the event stream connects.
+ */
+function SignedOut() {
+  const { title, body } = signedOutText();
+  return (
+    <div role="alert" className="shrink-0 border-b border-border bg-warn/10 px-6 py-3">
+      <Notice tone="warn" title={title}>
+        <p>{body}</p>
+      </Notice>
+    </div>
+  );
+}
+
+/** What to say about being signed out, in the browser or the shell. */
+function signedOutText(): { title: string; body: ReactNode } {
+  if (isTauri()) {
+    return {
+      title: "Alchemy can't sign in to alchemyd",
+      body: "Check that alchemyd is running as you on this machine. Alchemy tries again on its own.",
+    };
+  }
+  return {
+    title: "You're signed out of alchemyd",
+    body: (
+      <>
+        Run <Code>alchemy open</Code> in a terminal on this machine to open Alchemy in your browser,
+        signed in.
+      </>
+    ),
+  };
 }
 
 /**

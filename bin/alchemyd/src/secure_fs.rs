@@ -1,9 +1,10 @@
 //! Filesystem hardening for daemon-owned paths.
 //!
 //! The API socket's only access control is filesystem permissions, so the
-//! runtime directory is forced to `0o700` and the socket to `0o600`. If
-//! another user owns a pre-existing directory the `chmod` fails and the
-//! daemon refuses to start rather than trust it.
+//! runtime directory is forced to `0o700` and the socket to `0o600`. The
+//! state directory and database get the same modes. If another user owns
+//! a pre-existing path the `chmod` fails and the daemon refuses to start
+//! rather than trust it.
 
 use std::io;
 use std::path::Path;
@@ -17,6 +18,23 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
 /// Force `path`'s mode to `0o600`.
 pub fn restrict_to_owner(path: &Path) -> io::Result<()> {
     set_mode(path, 0o600)
+}
+
+/// Create the regular file `path` if it is missing, never truncating it,
+/// and force its mode to `0o600`.
+///
+/// A new file is created `0o600` rather than tightened afterwards, so it is
+/// never readable by others in between.
+pub fn create_private_file(path: &Path) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?;
+    restrict_to_owner(path)
 }
 
 #[cfg(unix)]
@@ -53,6 +71,21 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         create_private_dir(&dir).unwrap();
         assert_eq!(mode(&dir), 0o700);
+    }
+
+    #[test]
+    fn create_private_file_keeps_contents_and_tightens_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let new = tmp.path().join("new");
+        create_private_file(&new).unwrap();
+        assert_eq!(mode(&new), 0o600);
+
+        let existing = tmp.path().join("existing");
+        std::fs::write(&existing, b"keep").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+        create_private_file(&existing).unwrap();
+        assert_eq!(mode(&existing), 0o600);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep");
     }
 
     #[test]

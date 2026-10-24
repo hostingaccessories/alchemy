@@ -30,19 +30,40 @@ impl Color {
 
 /// A command's results sink: stdout in the binary, a buffer in tests.
 ///
-/// Results only: diagnostics and errors go to stderr, and are reported
-/// by the caller of [`crate::run`], not written here.
+/// Results go to `out`. Errors go to stderr, and are reported by the
+/// caller of [`crate::run`], not written here; progress a person watches
+/// while a command works goes to stderr through [`Self::progress`].
 pub(crate) struct Output<W> {
     out: W,
+    progress: Box<dyn Write + Send>,
     json: bool,
     color: Color,
+    #[cfg(test)]
+    captured: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl<W: Write> Output<W> {
     /// Results written to `out`, as JSON when `json` is set, styled only
     /// when `color` allows it.
     pub(crate) fn new(out: W, json: bool, color: Color) -> Self {
-        Self { out, json, color }
+        #[cfg(test)]
+        {
+            let captured = std::sync::Arc::default();
+            Self {
+                out,
+                progress: Box::new(Captured(std::sync::Arc::clone(&captured))),
+                json,
+                color,
+                captured,
+            }
+        }
+        #[cfg(not(test))]
+        Self {
+            out,
+            progress: Box::new(std::io::stderr()),
+            json,
+            color,
+        }
     }
 
     /// Whether `--json` was given: commands then write one JSON document,
@@ -52,10 +73,6 @@ impl<W: Write> Output<W> {
     }
 
     /// Whether results may use ANSI styling. Never with `--json`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no command styles its output yet")
-    )]
     pub(crate) fn color(&self) -> bool {
         self.color == Color::On && !self.json
     }
@@ -66,6 +83,31 @@ impl<W: Write> Output<W> {
         self.out.flush()?;
         Ok(())
     }
+
+    /// Write `line` to stderr as progress. Failing to is not an error: the
+    /// command's results still go to stdout.
+    pub(crate) fn progress(&mut self, line: impl Display) {
+        let _ = writeln!(self.progress, "{line}").and_then(|()| self.progress.flush());
+    }
+}
+
+/// A progress sink that keeps what is written, for tests.
+#[cfg(test)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -73,6 +115,17 @@ impl<W> Output<W> {
     /// The sink, to inspect what was written.
     pub(crate) fn get_ref(&self) -> &W {
         &self.out
+    }
+
+    /// Everything written as progress so far.
+    pub(crate) fn progress_written(&self) -> String {
+        String::from_utf8_lossy(
+            &self
+                .captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned()
     }
 }
 

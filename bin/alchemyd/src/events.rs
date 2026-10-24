@@ -56,7 +56,12 @@ impl fmt::Debug for Topic {
 
 /// Every topic the daemon publishes on `/api/events`.
 pub fn topics() -> Vec<Topic> {
-    vec![Topic::watch(State::watch_engine, ApiEvent::Engine)]
+    vec![
+        Topic::watch(State::watch_engine, ApiEvent::Engine),
+        Topic::watch(State::watch_metrics, ApiEvent::Metrics),
+        Topic::watch(State::watch_apps, ApiEvent::Apps),
+        Topic::watch(State::watch_operations, ApiEvent::Operations),
+    ]
 }
 
 /// Merge every topic into one stream, until `shutdown` becomes `true` or

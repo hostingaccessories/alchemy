@@ -84,7 +84,28 @@ fn generated_man_pages_render() {
     assert_eq!(
         names,
         [
+            "alchemy-app-build.1",
+            "alchemy-app-create.1",
+            "alchemy-app-down.1",
+            "alchemy-app-edit.1",
+            "alchemy-app-list.1",
+            "alchemy-app-logs.1",
+            "alchemy-app-pull.1",
+            "alchemy-app-restart.1",
+            "alchemy-app-show.1",
+            "alchemy-app-start.1",
+            "alchemy-app-stats.1",
+            "alchemy-app-stop.1",
+            "alchemy-app-up.1",
+            "alchemy-app-update.1",
+            "alchemy-app.1",
             "alchemy-completions.1",
+            "alchemy-machine-stats.1",
+            "alchemy-machine.1",
+            "alchemy-open.1",
+            "alchemy-settings-set.1",
+            "alchemy-settings-show.1",
+            "alchemy-settings.1",
             "alchemy-status.1",
             "alchemy-version.1",
             "alchemy.1"
@@ -107,6 +128,8 @@ fn generated_man_pages_render() {
     assert!(top.contains("alchemy-status(1)"), "{top}");
     assert!(top.contains("alchemy-completions(1)"), "{top}");
     assert!(top.contains("alchemy-version(1)"), "{top}");
+    assert!(top.contains("alchemy-app(1)"), "{top}");
+    assert!(top.contains("alchemy-settings(1)"), "{top}");
 }
 
 /// Render `page` with the first renderer installed: `man -l` where it

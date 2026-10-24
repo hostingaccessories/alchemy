@@ -54,6 +54,7 @@ impl Daemon {
         let config = alchemyd::Config {
             listen: free_port(),
             socket: socket.clone(),
+            state_dir: dir.path().join("state"),
         };
         let deps = Deps::new(FixedEngine(engine));
         let state = deps.state.clone();
@@ -257,6 +258,7 @@ async fn a_second_daemon_refuses_a_live_socket() {
     let config = alchemyd::Config {
         listen: free_port(),
         socket: first.socket.clone(),
+        state_dir: first.socket.with_file_name("state"),
     };
     let deps = Deps::new(FixedEngine(EngineStatus::new(EngineState::Ready)));
     let err = alchemyd::run_with(config, deps, std::future::pending())
@@ -267,4 +269,53 @@ async fn a_second_daemon_refuses_a_live_socket() {
     let (head, _) = get(&first.socket, "/api/health").await;
     assert!(head.starts_with("http/1.1 200"), "{head}");
     first.shutdown().await;
+}
+
+/// Send `request` as written, then read the whole response, lowercasing
+/// the head.
+async fn exchange(path: &Path, request: &str) -> (String, String) {
+    let mut stream = connect(path).await;
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Raw {
+        stream,
+        seen: String::new(),
+    };
+    let head = raw.until("\r\n\r\n").await.to_ascii_lowercase();
+    (head, raw.rest().await)
+}
+
+fn code(body: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(body).unwrap()["code"].clone()
+}
+
+#[tokio::test]
+async fn socket_wants_json_on_mutations_but_ignores_host_and_origin() {
+    let daemon = Daemon::start(EngineStatus::new(EngineState::Ready));
+
+    let (head, _) = exchange(
+        &daemon.socket,
+        "GET /api/health HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+
+    let (head, body) = exchange(
+        &daemon.socket,
+        "POST /api/health HTTP/1.1\r\nHost: alchemyd\r\nOrigin: https://evil.example\r\n\
+         Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    )
+    .await;
+    assert!(head.starts_with("http/1.1 405"), "{head}");
+    assert_eq!(code(&body), "method_not_allowed");
+
+    let (head, body) = exchange(
+        &daemon.socket,
+        "POST /api/health HTTP/1.1\r\nHost: alchemyd\r\nContent-Type: text/plain\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+    )
+    .await;
+    assert!(head.starts_with("http/1.1 415"), "{head}");
+    assert_eq!(code(&body), "unsupported_media_type");
+
+    daemon.shutdown().await;
 }

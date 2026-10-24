@@ -51,7 +51,9 @@ async fn watch<D: Daemon, W: Write>(
         let Some(event) = events.next().await? else {
             return Err(ClientError::Disconnected);
         };
-        let ApiEvent::Engine(engine) = event;
+        let ApiEvent::Engine(engine) = event else {
+            continue;
+        };
         let line = engine_line(&engine);
         if last_line.is_none() {
             print_status(ctx, daemon, &engine)?;
@@ -390,6 +392,11 @@ mod tests {
             engine(EngineState::NotRunning),
             engine(EngineState::Starting),
             Ok(sse("some_future_topic", "{}")),
+            Ok(sse(
+                "metrics",
+                r#"{"at":null,"interval":60,"containers_in_vm":false,"machine":null,"projects":[],"containers":[]}"#,
+            )),
+            Ok(sse("apps", r#"{"apps":[],"unmanaged":[],"dirs":[]}"#)),
             engine_event(&api_only),
             engine_event(&ready()),
         ]);

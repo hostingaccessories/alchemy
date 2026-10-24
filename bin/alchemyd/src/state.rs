@@ -3,8 +3,13 @@
 
 use std::sync::Arc;
 
+use alchemy_api::MetricsResponse;
+use alchemy_api::OperationList;
+use alchemy_api::apps::{AppList, AppSettings};
 use alchemy_core::engine::{Containers, EngineState, EngineStatus};
 use tokio::sync::watch;
+
+use crate::logs::LogStreams;
 
 /// The daemon's live state. Cheap to clone: every clone shares the same
 /// values.
@@ -22,16 +27,36 @@ pub struct State {
 struct Inner {
     engine: watch::Sender<EngineStatus>,
     containers: watch::Sender<Containers>,
+    metrics: watch::Sender<MetricsResponse>,
+    apps: watch::Sender<AppList>,
+    app_settings: watch::Sender<AppSettings>,
+    app_rescans: watch::Sender<u64>,
+    operations: watch::Sender<OperationList>,
+    log_streams: LogStreams,
 }
 
 impl State {
     /// Fresh state: the engine is reported as not running, with no
-    /// containers, until the engine monitor's first probe says otherwise.
+    /// containers, until the engine monitor's first probe says otherwise,
+    /// and there are no metrics until the collector's first sample.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
                 engine: watch::Sender::new(EngineStatus::new(EngineState::NotRunning)),
                 containers: watch::Sender::new(Containers::new()),
+                metrics: watch::Sender::new(MetricsResponse {
+                    interval: u32::try_from(crate::metrics::INTERVAL.as_secs()).unwrap_or(u32::MAX),
+                    ..MetricsResponse::default()
+                }),
+                apps: watch::Sender::new(AppList::default()),
+                app_settings: watch::Sender::new(AppSettings {
+                    home: None,
+                    default_home: None,
+                    extra: Vec::new(),
+                }),
+                app_rescans: watch::Sender::new(0),
+                operations: watch::Sender::new(OperationList::default()),
+                log_streams: LogStreams::default(),
             }),
         }
     }
@@ -79,6 +104,109 @@ impl State {
     pub fn update_containers(&self, update: impl FnOnce(&mut Containers) -> bool) -> bool {
         self.inner.containers.send_if_modified(update)
     }
+
+    /// The latest metrics sample.
+    pub fn metrics(&self) -> MetricsResponse {
+        self.inner.metrics.borrow().clone()
+    }
+
+    /// Subscribe to new metrics samples.
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_metrics(&self) -> watch::Receiver<MetricsResponse> {
+        self.inner.metrics.subscribe()
+    }
+
+    /// Replace the latest metrics. Returns whether they changed;
+    /// subscribers are only notified if they did.
+    pub fn set_metrics(&self, metrics: MetricsResponse) -> bool {
+        self.inner.metrics.send_if_modified(|current| {
+            if *current == metrics {
+                false
+            } else {
+                *current = metrics;
+                true
+            }
+        })
+    }
+    /// The current app list.
+    pub fn apps(&self) -> AppList {
+        self.inner.apps.borrow().clone()
+    }
+
+    /// Subscribe to app list changes.
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_apps(&self) -> watch::Receiver<AppList> {
+        self.inner.apps.subscribe()
+    }
+
+    /// Replace the app list. Returns whether it changed; subscribers are
+    /// only notified if it did.
+    pub fn set_apps(&self, apps: AppList) -> bool {
+        send_if_changed(&self.inner.apps, apps)
+    }
+
+    /// The app folder settings in effect.
+    pub fn app_settings(&self) -> AppSettings {
+        self.inner.app_settings.borrow().clone()
+    }
+
+    /// Replace the app folder settings in effect. Returns whether they
+    /// changed.
+    pub fn set_app_settings(&self, settings: AppSettings) -> bool {
+        send_if_changed(&self.inner.app_settings, settings)
+    }
+
+    /// Ask the apps task to reload its settings, list every app folder,
+    /// and read every app's configuration again, without waiting for its
+    /// next scan.
+    pub fn rescan_apps(&self) {
+        self.inner
+            .app_rescans
+            .send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Subscribe to [`Self::rescan_apps`] requests.
+    pub fn watch_app_rescans(&self) -> watch::Receiver<u64> {
+        self.inner.app_rescans.subscribe()
+    }
+
+    /// Every operation held in memory, newest first.
+    pub fn operations(&self) -> OperationList {
+        self.inner.operations.borrow().clone()
+    }
+
+    /// Subscribe to changes to [`Self::operations`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_operations(&self) -> watch::Receiver<OperationList> {
+        self.inner.operations.subscribe()
+    }
+
+    /// Replace the operations held in memory. Returns whether they
+    /// changed; subscribers are only notified if they did.
+    pub fn set_operations(&self, operations: OperationList) -> bool {
+        send_if_changed(&self.inner.operations, operations)
+    }
+
+    /// The log streams open on either listener, held to
+    /// [`MAX_STREAMS`](crate::logs::MAX_STREAMS). Unlike the parts above,
+    /// it is a count to take a place in, not a value to watch.
+    pub fn log_streams(&self) -> &LogStreams {
+        &self.inner.log_streams
+    }
+}
+
+fn send_if_changed<T: PartialEq>(sender: &watch::Sender<T>, value: T) -> bool {
+    sender.send_if_modified(|current| {
+        if *current == value {
+            false
+        } else {
+            *current = value;
+            true
+        }
+    })
 }
 
 impl Default for State {
@@ -150,6 +278,35 @@ mod tests {
             state.containers().get("abc").unwrap().state,
             ContainerState::Exited
         );
+    }
+
+    #[test]
+    fn set_apps_notifies_only_on_change() {
+        let state = State::new();
+        let rx = state.watch_apps();
+        assert!(!state.set_apps(AppList::default()));
+        assert!(!rx.has_changed().unwrap());
+        let mut apps = AppList::default();
+        apps.unmanaged.push(alchemy_api::apps::UnmanagedApp {
+            project: "legacy".into(),
+            dir: None,
+            status: alchemy_api::apps::StackStatus::Running,
+            services: vec![],
+        });
+        assert!(state.set_apps(apps.clone()));
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(state.apps(), apps);
+    }
+
+    #[test]
+    fn rescans_wake_subscribers() {
+        let state = State::new();
+        let mut rx = state.watch_app_rescans();
+        state.rescan_apps();
+        assert!(rx.has_changed().unwrap());
+        rx.mark_unchanged();
+        state.rescan_apps();
+        assert!(rx.has_changed().unwrap());
     }
 
     #[test]

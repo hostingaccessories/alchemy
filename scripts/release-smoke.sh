@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Release build smoke test: build the web UI and release binaries, run
-# alchemyd on a throwaway socket and port, and check the daemon, embedded
-# UI, CLI, and helper end to end.
+# alchemyd on a throwaway socket, port, and state directory, and check the
+# daemon, embedded UI, CLI, and helper end to end.
 #
 # Usage: scripts/release-smoke.sh
 #   SMOKE_PORT  HTTP port for the test daemon (default 17240)
@@ -32,6 +32,7 @@ done
 
 tmp="$(mktemp -d)"
 socket="${tmp}/alchemyd.sock"
+state_dir="${tmp}/state"
 daemon_pid=""
 events_pid=""
 watch_pid=""
@@ -52,7 +53,7 @@ trap cleanup EXIT
 
 log "Starting alchemyd on ${base}"
 "${bin}/alchemyd" --listen "127.0.0.1:${port}" --socket "$socket" \
-  >"${tmp}/alchemyd.log" 2>&1 &
+  --state-dir "$state_dir" >"${tmp}/alchemyd.log" 2>&1 &
 daemon_pid=$!
 
 ready=""
@@ -69,13 +70,74 @@ if [[ -z "$ready" ]]; then
   fail "alchemyd did not become healthy"
 fi
 
+log "Checking the state database"
+db="${state_dir}/alchemy.db"
+[[ -f "$db" ]] || fail "alchemyd did not create ${db}"
+db_mode="$(stat -c '%a' "$db" 2>/dev/null || stat -f '%Lp' "$db")"
+dir_mode="$(stat -c '%a' "$state_dir" 2>/dev/null || stat -f '%Lp' "$state_dir")"
+[[ "$db_mode" == 600 ]] || fail "${db} has mode ${db_mode}, expected 600"
+[[ "$dir_mode" == 700 ]] || fail "${state_dir} has mode ${dir_mode}, expected 700"
+
+log "Checking the TCP token"
+token_file="${state_dir}/tcp-token"
+[[ -f "$token_file" ]] || fail "alchemyd did not write ${token_file}"
+token_mode="$(stat -c '%a' "$token_file" 2>/dev/null || stat -f '%Lp' "$token_file")"
+[[ "$token_mode" == 600 ]] || fail "${token_file} has mode ${token_mode}, expected 600"
+token="$(cat "$token_file")"
+[[ "${#token}" == 64 ]] || fail "${token_file} does not hold a 64-character token"
+bearer="Authorization: Bearer ${token}"
+
 log "Checking /api/health"
 health="$(curl -fsS "${base}/api/health")"
 [[ "$health" == *'"ok"'* ]] || fail "unexpected health response: ${health}"
 
-log "Checking /api/engine"
-engine="$(curl -fsS "${base}/api/engine")"
+log "Checking /api/apps and /api/engine need signing in"
+for path in /api/apps /api/engine; do
+  unsigned_code="$(curl -sS -o "${tmp}/unsigned.json" -w '%{http_code}' "${base}${path}")" \
+    || fail "unsigned GET ${path} failed"
+  [[ "$unsigned_code" == 401 ]] || fail "unsigned GET ${path} returned ${unsigned_code}, expected 401"
+  grep -q '"code":"unauthorized"' "${tmp}/unsigned.json" \
+    || fail "unsigned GET ${path} was not a JSON 401: $(cat "${tmp}/unsigned.json")"
+done
+wrong_code="$(curl -sS -o /dev/null -w '%{http_code}' \
+  -H "Authorization: Bearer $(printf '0%.0s' $(seq 1 64))" "${base}/api/apps")" \
+  || fail "GET /api/apps with a wrong token failed"
+[[ "$wrong_code" == 401 ]] || fail "a wrong token returned ${wrong_code}, expected 401"
+engine="$(curl -fsS -H "$bearer" "${base}/api/engine")"
 [[ "$engine" == *'"state":'* ]] || fail "unexpected engine response: ${engine}"
+
+log "Signing in with alchemy open --print"
+login_url="$("${bin}/alchemy" --socket "$socket" open --print)" || fail "alchemy open --print failed"
+[[ "$login_url" == "${base}/login?code="* ]] || fail "unexpected sign-in link: ${login_url}"
+jar="${tmp}/cookies.txt"
+login_code="$(curl -sS -o /dev/null -D "${tmp}/login.head" -w '%{http_code}' -c "$jar" "$login_url")" \
+  || fail "GET /login failed"
+[[ "$login_code" == 303 ]] || fail "GET /login returned ${login_code}, expected 303"
+grep -qi '^set-cookie: alchemy_session_.*HttpOnly; SameSite=Strict; Path=/api' "${tmp}/login.head" \
+  || fail "GET /login set no private session cookie: $(cat "${tmp}/login.head")"
+cookie_apps="$(curl -fsS -b "$jar" "${base}/api/apps")" || fail "GET /api/apps with the cookie failed"
+[[ "$cookie_apps" == *'"apps":'* ]] || fail "unexpected apps response: ${cookie_apps}"
+again_code="$(curl -sS -o /dev/null -w '%{http_code}' "$login_url")" || fail "second GET /login failed"
+[[ "$again_code" == 401 ]] || fail "a sign-in link worked twice (${again_code})"
+launch_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "$bearer" \
+  -H 'Content-Type: application/json' -d '{}' "${base}/api/session/launch")" \
+  || fail "POST /api/session/launch over TCP failed"
+[[ "$launch_code" == 403 ]] || fail "launch codes were issued over TCP (${launch_code})"
+
+log "Checking a rebinding Host, a cross-origin POST, and a cross-site GET are refused"
+rebind_code="$(curl -sS -o "${tmp}/rebind.json" -w '%{http_code}' \
+  -H 'Host: evil.example' "${base}/api/health")" || fail "rebinding GET failed"
+[[ "$rebind_code" == 403 ]] || fail "rebinding Host returned ${rebind_code}, expected 403"
+grep -q '"code":"forbidden"' "${tmp}/rebind.json" \
+  || fail "rebinding Host was not a JSON 403: $(cat "${tmp}/rebind.json")"
+form_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Origin: https://evil.example' -d 'a=b' "${base}/api/health")" \
+  || fail "cross-origin POST failed"
+[[ "$form_code" == 403 ]] || fail "cross-origin POST returned ${form_code}, expected 403"
+site_code="$(curl -sS -o /dev/null -w '%{http_code}' \
+  -H 'Sec-Fetch-Site: cross-site' "${base}/api/health")" \
+  || fail "cross-site GET failed"
+[[ "$site_code" == 403 ]] || fail "cross-site GET returned ${site_code}, expected 403"
 
 log "Checking /api/health on the socket"
 sock_health="$(curl -fsS --unix-socket "$socket" http://localhost/api/health)" \
@@ -90,7 +152,7 @@ grep -q '"code":"not_found"' "${tmp}/sock-root.json" \
   || fail "GET / on the socket was not a JSON 404: $(cat "${tmp}/sock-root.json")"
 
 log "Opening /api/events"
-curl -fsSN -H 'Origin: tauri://localhost' "${base}/api/events" \
+curl -fsSN -H 'Origin: tauri://localhost' -H "$bearer" "${base}/api/events" \
   >"${tmp}/events.txt" 2>/dev/null &
 events_pid=$!
 for _ in $(seq 1 50); do
@@ -99,6 +161,45 @@ for _ in $(seq 1 50); do
 done
 grep -q '^event: engine' "${tmp}/events.txt" \
   || fail "no engine event on /api/events: $(cat "${tmp}/events.txt")"
+
+log "Checking metrics on the socket"
+for _ in $(seq 1 50); do
+  metrics="$(curl -fsS --unix-socket "$socket" http://localhost/api/metrics)" \
+    || fail "GET /api/metrics on ${socket} failed"
+  [[ "$metrics" == *'"memory_total":'* ]] && break
+  sleep 0.2
+done
+[[ "$metrics" == *'"memory_total":'* ]] || fail "no machine metrics: ${metrics}"
+history="$(curl -fsS --unix-socket "$socket" 'http://localhost/api/metrics/history?range=1h')" \
+  || fail "GET /api/metrics/history on ${socket} failed"
+[[ "$history" == *'"points":[{"t":'* ]] || fail "no stored metrics point: ${history}"
+"${bin}/alchemy" --socket "$socket" machine stats | grep -q '^Memory ' \
+  || fail "alchemy machine stats did not show memory"
+
+log "Checking operations on the socket"
+operations="$(curl -fsS --unix-socket "$socket" http://localhost/api/operations)" \
+  || fail "GET /api/operations on ${socket} failed"
+[[ "$operations" == '{"operations":[]}' ]] || fail "unexpected operations: ${operations}"
+refused="$(curl -sS --unix-socket "$socket" -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Content-Type: application/json' -d '{"action":"up"}' \
+  http://localhost/api/apps/smoke-missing/actions)"
+[[ "$refused" == 404 ]] || fail "an action on a missing app answered ${refused}, not 404"
+
+log "Checking app discovery in a throwaway app home"
+apps_dir="${tmp}/apps"
+mkdir -p "${apps_dir}/Not_An_App"
+printf 'services: {}\n' >"${apps_dir}/Not_An_App/compose.yaml"
+"${bin}/alchemy" --socket "$socket" settings set app-home "$apps_dir" >/dev/null \
+  || fail "alchemy settings set app-home failed"
+for _ in $(seq 1 50); do
+  apps="$("${bin}/alchemy" --socket "$socket" --json app list)" \
+    || fail "alchemy app list failed"
+  [[ "$apps" == *'"reason":"invalid_name"'* ]] && break
+  sleep 0.2
+done
+[[ "$apps" == *"\"path\":\"${apps_dir}\""* ]] || fail "app list does not search ${apps_dir}: ${apps}"
+[[ "$apps" == *'"apps":[]'* ]] || fail "an empty app home listed apps: ${apps}"
+[[ "$apps" == *'"reason":"invalid_name"'* ]] || fail "Not_An_App was not reported as skipped: ${apps}"
 
 log "Checking embedded web UI"
 index="$(curl -fsS "${base}/")" || fail "GET / failed (web UI not embedded?)"
@@ -149,6 +250,7 @@ set -e
 daemon_pid=""
 [[ "$code" -eq 0 ]] || { cat "${tmp}/alchemyd.log" >&2; fail "alchemyd exited ${code}"; }
 [[ ! -e "$socket" ]] || fail "socket ${socket} left behind after shutdown"
+[[ ! -e "$token_file" ]] || fail "token ${token_file} left behind after shutdown"
 set +e
 wait "$events_pid"
 set -e
@@ -163,5 +265,27 @@ watch_pid=""
 [[ "$code" -eq 69 ]] || fail "status --watch exited ${code}, expected 69: $(cat "${tmp}/watch.err")"
 grep -q 'alchemyd closed the connection' "${tmp}/watch.err" \
   || fail "status --watch did not report the disconnect: $(cat "${tmp}/watch.err")"
+
+log "Checking alchemyd refuses a corrupt state database"
+bad_state="${tmp}/bad-state"
+mkdir -p "$bad_state"
+head -c 8192 /dev/zero | tr '\0' 'Z' >"${bad_state}/alchemy.db"
+"${bin}/alchemyd" --listen "127.0.0.1:${port}" --socket "${tmp}/bad.sock" \
+  --state-dir "$bad_state" >"${tmp}/bad.log" 2>&1 &
+daemon_pid=$!
+for _ in $(seq 1 50); do
+  kill -0 "$daemon_pid" 2>/dev/null || break
+  sleep 0.2
+done
+kill -0 "$daemon_pid" 2>/dev/null && fail "alchemyd started on a corrupt state database"
+set +e
+wait "$daemon_pid"
+code=$?
+set -e
+daemon_pid=""
+[[ "$code" -ne 0 ]] || fail "alchemyd exited 0 on a corrupt state database"
+grep -q 'corrupt or not a SQLite database' "${tmp}/bad.log" \
+  || fail "alchemyd did not explain the corrupt database: $(cat "${tmp}/bad.log")"
+[[ ! -e "${tmp}/bad.sock" ]] || fail "alchemyd bound its socket before refusing the database"
 
 log "Release smoke test passed"

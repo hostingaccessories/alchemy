@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use alchemy_core::engine::{
     ContainerAction, ContainerEvent, ContainerState, ContainerStatus, Containers, EngineFlavor,
-    EngineState, EngineStatus, Health, reconnect_delay,
+    EngineState, EngineStatus, Health, InspectedExit, StopReason, reconnect_delay,
 };
 use alchemyd::engine::{
     ApiError, BollardApi, CliError, Connector, DockerApi, DockerCli, Endpoint, EngineMonitor,
@@ -38,6 +38,10 @@ const CONTAINERS_JSON: &str = r#"[
    "Health":{"Status":"healthy","FailingStreak":0}},
   {"Id":"def","Names":["/scratch"],"Image":"alpine","State":"exited","Status":"Exited (0)","Labels":{}}
 ]"#;
+
+const INSPECT_JSON: &str = r#"{"Id":"def","Name":"/scratch","RestartCount":2,
+  "State":{"Status":"exited","Running":false,"OOMKilled":true,"ExitCode":137,
+   "StartedAt":"2024-05-01T12:00:00Z","FinishedAt":"2024-05-01T12:00:01.5Z"}}"#;
 
 const EVENTS_JSON: &str = concat!(
     r#"{"Type":"network","Action":"connect","Actor":{"ID":"net1","Attributes":{"name":"bridge"}},"time":1}"#,
@@ -107,6 +111,7 @@ impl FakeEngine {
                         "/_ping" => ("200 OK", "OK"),
                         "/version" => ("200 OK", VERSION_JSON),
                         "/containers/json" => ("200 OK", CONTAINERS_JSON),
+                        "/containers/def/json" => ("200 OK", INSPECT_JSON),
                         "/events" => ("200 OK", EVENTS_JSON),
                         _ => ("404 Not Found", r#"{"message":"page not found"}"#),
                     };
@@ -185,6 +190,29 @@ async fn bollard_api_lists_all_containers() {
 }
 
 #[tokio::test]
+async fn bollard_api_inspects_how_a_container_exited() {
+    let engine = FakeEngine::start();
+    let exit = engine.api().inspect_exit("def".into()).await.unwrap();
+    assert_eq!(
+        exit,
+        Some(InspectedExit {
+            exit_code: Some(137),
+            oom_killed: true,
+            started_at: Some(1_714_564_800_000),
+            finished_at: Some(1_714_564_801_500),
+            restart_count: 2,
+        })
+    );
+    let missing = engine.api().inspect_exit("nope".into()).await.unwrap_err();
+    assert!(
+        matches!(missing, ApiError::Server { status: 404, .. }),
+        "{missing:?}"
+    );
+    let requests = engine.requests();
+    assert_eq!(unversioned(&requests[0]), "/containers/def/json");
+}
+
+#[tokio::test]
 async fn bollard_api_streams_container_events_until_the_connection_ends() {
     let engine = FakeEngine::start();
     let events: Vec<_> = engine.api().events().collect().await;
@@ -230,11 +258,27 @@ async fn bollard_api_maps_server_errors() {
     }
 }
 
+/// Leave a socket file at `path` that nothing listens on.
+///
+/// Other tests in this binary spawn processes, and a child forked while the
+/// listener is open keeps its descriptor until it execs, so the socket can
+/// briefly still accept connections after the drop. Wait until it refuses.
+async fn stale_socket(path: &Path) {
+    drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while std::os::unix::net::UnixStream::connect(path).is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stale socket kept accepting connections");
+}
+
 #[tokio::test]
 async fn bollard_api_reports_a_dead_socket_as_transport_error() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("docker.sock");
-    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    stale_socket(&socket).await;
     let api =
         BollardApi::connect(&Endpoint::unix(&socket).unwrap(), Duration::from_secs(5)).unwrap();
     assert!(matches!(api.ping().await, Err(ApiError::Transport(_))));
@@ -252,7 +296,7 @@ async fn system_probe_classifies_sockets() {
     let live = dir.path().join("live.sock");
     let _listener = UnixListener::bind(&live).unwrap();
     let stale = dir.path().join("stale.sock");
-    drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+    stale_socket(&stale).await;
     let file = dir.path().join("file");
     std::fs::write(&file, b"").unwrap();
     let missing = dir.path().join("missing.sock");
@@ -394,6 +438,7 @@ struct Host {
     connect: Option<SocketConnect>,
     ping_ok: bool,
     containers: Vec<ContainerStatus>,
+    inspected: Vec<(String, InspectedExit)>,
     streams: Vec<mpsc::UnboundedSender<Result<ContainerEvent, ApiError>>>,
     calls: Vec<&'static str>,
 }
@@ -481,6 +526,19 @@ impl DockerApi for ScriptedApi {
             rx.recv().await.map(|item| (item, rx))
         })
         .boxed()
+    }
+
+    fn inspect_exit(
+        &self,
+        id: String,
+    ) -> impl Future<Output = Result<Option<InspectedExit>, ApiError>> + Send {
+        let host = self.call("inspect");
+        let found = host
+            .inspected
+            .iter()
+            .find(|(known, _)| *known == id)
+            .map(|(_, exit)| *exit);
+        ready(Ok(found))
     }
 }
 
@@ -803,6 +861,7 @@ async fn run_daemon_until(deps: Deps<impl EngineSource>, pred: impl FnMut(&Engin
     let config = alchemyd::Config {
         listen: "127.0.0.1:0".parse().unwrap(),
         socket: dir.path().join("alchemyd.sock"),
+        state_dir: dir.path().join("state"),
     };
     let state = deps.state.clone();
     let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -839,4 +898,85 @@ async fn run_with_starts_without_docker() {
         s.state == EngineState::NotRunning && s.endpoint.is_some()
     })
     .await;
+}
+
+fn in_blog(id: &str, state: ContainerState) -> ContainerStatus {
+    let mut status = ContainerStatus::new(id, id, state);
+    status.project = Some("blog".into());
+    status
+}
+
+fn reason_of(containers: &Containers, id: &str) -> Option<StopReason> {
+    containers.get(id).map(|c| c.stop_reason)
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitor_inspects_stopped_containers_and_tells_stops_from_crashes() {
+    let (host, monitor) = scripted_monitor(&unix(SOCKET));
+    ready_host(&host);
+    {
+        let mut h = host.lock().unwrap();
+        h.containers = vec![
+            in_blog("old", ContainerState::Exited),
+            in_blog("web", ContainerState::Running),
+            in_blog("db", ContainerState::Running),
+            ContainerStatus::new("loose", "loose", ContainerState::Exited),
+        ];
+        let crashed = InspectedExit {
+            exit_code: Some(1),
+            ..InspectedExit::default()
+        };
+        h.inspected = vec![("old".into(), crashed), ("loose".into(), crashed)];
+    }
+    let run = spawn_monitor(monitor);
+    let crashed = StopReason::Crashed {
+        exit_code: Some(1),
+        oom: false,
+    };
+    containers_until(&run.state, |c| reason_of(c, "old") == Some(crashed)).await;
+    let inspects = host
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|c| **c == "inspect")
+        .count();
+    assert_eq!(inspects, 1, "only stopped Compose containers are inspected");
+    assert_eq!(
+        reason_of(&run.state.containers(), "loose"),
+        Some(StopReason::Unknown)
+    );
+
+    let at = |action, ms| {
+        let mut event = ContainerEvent::new("web", action);
+        event.at = Some(ms);
+        event
+    };
+    let mut kill = at(ContainerAction::Kill, 1_000);
+    kill.signal = Some(15);
+    let mut die = at(ContainerAction::Die, 1_100);
+    die.exit_code = Some(0);
+    for event in [kill, die, at(ContainerAction::Stop, 1_100)] {
+        send(&host, event);
+    }
+    containers_until(&run.state, |c| {
+        reason_of(c, "web") == Some(StopReason::StoppedOutside)
+    })
+    .await;
+
+    let mut die = ContainerEvent::new("db", ContainerAction::Die);
+    die.exit_code = Some(137);
+    send(&host, ContainerEvent::new("db", ContainerAction::Oom));
+    send(&host, die);
+    let containers =
+        containers_until(&run.state, |c| has_state(c, "db", ContainerState::Exited)).await;
+    assert_eq!(
+        reason_of(&containers, "db"),
+        Some(StopReason::Crashed {
+            exit_code: Some(137),
+            oom: true
+        })
+    );
+
+    run.stop().await;
 }

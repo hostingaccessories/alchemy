@@ -36,12 +36,13 @@ enum Script {
 }
 
 /// Answers requests from a script, in order, and records every request as
-/// `METHOD path`. A request that does not match the next scripted one
-/// panics.
+/// `METHOD path`, and every body sent. A request that does not match the
+/// next scripted one panics.
 #[derive(Default)]
 pub(crate) struct FakeDaemon {
     script: VecDeque<(String, Script)>,
     requests: Vec<String>,
+    bodies: Vec<String>,
 }
 
 impl FakeDaemon {
@@ -101,6 +102,26 @@ impl FakeDaemon {
         )
     }
 
+    /// Open the event stream at `path`, send `items`, then end it.
+    pub(crate) fn stream(
+        self,
+        path: &str,
+        items: impl IntoIterator<Item = Result<SseEvent, ClientError>>,
+    ) -> Self {
+        let items = items.into_iter().collect();
+        self.push(
+            &Method::GET,
+            path,
+            Script::Events(Ok(Opened::Stream(items))),
+        )
+    }
+
+    /// Refuse the event stream at `path` with `status` and the raw `body`.
+    pub(crate) fn refuse_stream(self, path: &str, status: u16, body: Vec<u8>) -> Self {
+        let refused = Opened::Refused(Reply { status, body });
+        self.push(&Method::GET, path, Script::Events(Ok(refused)))
+    }
+
     /// Refuse the event stream with `status` and the raw `body`.
     pub(crate) fn refuse_events(self, status: u16, body: Vec<u8>) -> Self {
         let refused = Opened::Refused(Reply { status, body });
@@ -115,6 +136,11 @@ impl FakeDaemon {
     /// Every request received so far, in order, as `METHOD path`.
     pub(crate) fn requests(&self) -> &[String] {
         &self.requests
+    }
+
+    /// Every request body received so far, in order, as text.
+    pub(crate) fn bodies(&self) -> &[String] {
+        &self.bodies
     }
 
     fn push(mut self, method: &Method, path: &str, script: Script) -> Self {
@@ -144,7 +170,11 @@ impl Daemon for FakeDaemon {
         &mut self,
         method: Method,
         path: &str,
+        body: Option<&[u8]>,
     ) -> impl Future<Output = Result<Reply, ClientError>> {
+        if let Some(body) = body {
+            self.bodies.push(String::from_utf8_lossy(body).into_owned());
+        }
         ready(match self.next(&method, path) {
             Script::One(reply) => reply,
             Script::Events(_) => panic!("{method} {path} is scripted as events"),

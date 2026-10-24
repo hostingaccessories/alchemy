@@ -2,6 +2,7 @@ import { Boxes, Plus, Trash2 } from "lucide-react";
 import { type ReactNode, useState } from "react";
 
 import { Advanced } from "../components/Advanced.tsx";
+import { AppStatus } from "../components/AppStatus.tsx";
 import { Button } from "../components/Button.tsx";
 import { Code } from "../components/Code.tsx";
 import { ConfirmDialog } from "../components/ConfirmDialog.tsx";
@@ -13,6 +14,7 @@ import { Loading } from "../components/Loading.tsx";
 import { Notice } from "../components/Notice.tsx";
 import { PageHeader } from "../components/PageHeader.tsx";
 import { ProgressSteps, type Step } from "../components/ProgressSteps.tsx";
+import { type SparkPoint, Sparkline } from "../components/Sparkline.tsx";
 import { ApiError, NO_RESPONSE } from "../lib/api.ts";
 
 const PULL_OUTPUT = `[+] Pulling 3/3
@@ -38,6 +40,12 @@ const RUNNING: Step[] = [
   { id: "pull", label: "Download Nextcloud", state: "active", message: "212 MB of 540 MB" },
   { id: "start", label: "Start Nextcloud", state: "pending" },
 ];
+
+/** Half an hour of a minute-by-minute series, with ten minutes missing. */
+const SPARK: SparkPoint[] = Array.from({ length: 31 }, (_, i) => ({
+  t: i * 60,
+  v: i >= 12 && i < 22 ? null : 30 + 25 * Math.sin(i / 3),
+}));
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -168,8 +176,29 @@ export function ComponentGallery() {
         </EmptyState>
       </Section>
 
+      <Section title="AppStatus">
+        <div className="flex flex-wrap gap-4">
+          <AppStatus status="running" />
+          <AppStatus status="partial" />
+          <AppStatus status="stopped" />
+          <AppStatus status="unknown" />
+        </div>
+      </Section>
+
       <Section title="Loading">
         <Loading label="Loading apps…" />
+      </Section>
+
+      <Section title="Sparkline">
+        <Sparkline
+          points={SPARK}
+          step={60}
+          from={0}
+          to={1800}
+          max={100}
+          label="CPU over the last 30 minutes, with a gap"
+          className="h-8 w-64"
+        />
       </Section>
 
       <Section title="ErrorState">

@@ -41,16 +41,38 @@ and the daemon serves no UI until it exists.
 | `pnpm gui`                       | Tauri desktop shell in dev mode (starts the web dev server)          |
 | `pnpm docs`                      | Documentation site dev server                                        |
 
+The web UI on the TCP port needs signing in. Open it with
+`cargo run -p alchemy -- open`, which opens a one-time sign-in link in
+your browser. For the dev server, run
+`cargo run -p alchemy -- open --url-base http://localhost:5173`: Vite
+passes `/login` and `/api` on to the daemon, keeping the `Host`, so the
+session cookie belongs to `localhost:5173`. `pnpm gui` needs nothing: the
+shell reads the daemon's token itself. See
+[Signing in to the TCP port](#signing-in-to-the-tcp-port).
+
 Daemon settings, as flags or environment variables:
 
-| Flag       | Variable         | Default                                                            |
-| ---------- | ---------------- | ------------------------------------------------------------------ |
-| `--listen` | `ALCHEMY_LISTEN` | `127.0.0.1:7240`                                                   |
-| `--socket` | `ALCHEMY_SOCKET` | `$XDG_RUNTIME_DIR/alchemy/alchemyd.sock`, else a per-user temp dir |
-|            | `ALCHEMY_LOG`    | `info` (any `tracing` filter, e.g. `alchemyd=debug`)               |
-| `--daemon` | `ALCHEMY_DAEMON` | CLI only: the daemon as a URL; only `unix:///path` for now         |
+| Flag          | Variable            | Default                                                            |
+| ------------- | ------------------- | ------------------------------------------------------------------ |
+| `--listen`    | `ALCHEMY_LISTEN`    | `127.0.0.1:7240`                                                   |
+| `--socket`    | `ALCHEMY_SOCKET`    | `$XDG_RUNTIME_DIR/alchemy/alchemyd.sock`, else a per-user temp dir |
+| `--state-dir` | `ALCHEMY_STATE_DIR` | The per-user state directory, below                                |
+|               | `ALCHEMY_LOG`       | `info` (any `tracing` filter, e.g. `alchemyd=debug`)               |
+| `--daemon`    | `ALCHEMY_DAEMON`    | CLI only: the daemon as a URL; only `unix:///path` for now         |
 
-The CLI honours `--socket` and `ALCHEMY_SOCKET` the same way.
+The state directory is `$XDG_STATE_HOME/alchemy` (else
+`~/.local/state/alchemy`) on Linux and `~/Library/Application Support/Alchemy`
+on macOS. It holds `alchemy.db`, the daemon's SQLite database of the app
+folder settings, operation and metrics history, and stop intents, and
+`tcp-token`, which signs clients in to the TCP port
+([Signing in to the TCP port](#signing-in-to-the-tcp-port)). The directory is `0700` and the database and token `0600`. A
+database that is corrupt, or was written by a newer alchemyd, stops startup
+with a message saying so; move it aside to start fresh. Point
+`--state-dir` at a temporary directory to run a throwaway daemon. The schema
+lives in `bin/alchemyd/src/store/migrations.rs`, which explains how to add
+a migration.
+
+The CLI honours `--socket` and `ALCHEMY_SOCKET` the same way as the daemon.
 `--daemon unix:///path/to/alchemyd.sock` is the same as
 `--socket /path/to/alchemyd.sock`; passing both is a usage error. Precedence
 is `--daemon` or `--socket`, then `ALCHEMY_DAEMON`, then `ALCHEMY_SOCKET`,
@@ -70,17 +92,96 @@ daemon; `alchemy --version` shows the CLI's alone, without contacting it.
 ### Calling the API
 
 The socket and the TCP port serve the same `/api`; only TCP serves the web
-UI. `alchemy status` prints the socket path. Any host name works on the
-socket.
+UI and `/login`. `alchemy status` prints the socket path. Any host name
+works on the socket. On the port, everything under `/api` but
+`/api/health` and `/api/version` needs the daemon's token or a browser
+session, as below.
 
 ```sh
 curl --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/version
 curl http://127.0.0.1:7240/api/version
+curl -H "Authorization: Bearer $(cat ~/.local/state/alchemy/tcp-token)" http://127.0.0.1:7240/api/apps
 curl -N --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/events
 ```
 
 `/api/events` is a server-sent event stream; `-N` prints each event as it
 arrives.
+
+The TCP port only answers a `Host` of `localhost`, `tauri.localhost`, a
+loopback address, or the `--listen` address (any address when listening on
+`0.0.0.0` or `::`), with any port, so a DNS-rebinding page can't reach it. A
+daemon bound to a LAN address is reached by that address, not a host name.
+Anything that isn't `GET`, `HEAD`, or `OPTIONS` must send
+`Content-Type: application/json`, body or not, on both the port and the
+socket (415 `unsupported_media_type` otherwise). On the port it is also
+refused when it carries an `Origin` other than its own or the desktop
+shell's (403 `forbidden`). Any request under `/api` on the port, `GET`
+included, is refused the same way when the browser marks it
+`Sec-Fetch-Site: cross-site` or `same-site` and its `Origin` isn't the
+shell's, so another page can't open log streams with `no-cors` fetches;
+requests without the header, like `curl`'s, pass. The socket ignores
+`Host`, `Origin`, and `Sec-Fetch-Site`: no browser can open it.
+
+```sh
+curl -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:7240/api/...
+```
+
+### Signing in to the TCP port
+
+The guard checks keep other web pages off the port, but any process or
+other user on the machine can connect to loopback, and the API can create
+an app, which runs as root through Docker, or read an app's `.env`. So the
+port requires signing in (`bin/alchemyd/src/auth.rs`, the live state in
+`session.rs`), after the guard checks and before any route. The socket
+needs none: its `0600` mode is the access control. Full accounts, for
+other machines, are M13 ([#16](https://github.com/hostingaccessories/alchemy/issues/16)).
+
+- **Token.** Each start, once both listeners are bound and before either
+  serves a request, alchemyd writes 256 random bits from the OS, as hex, to
+  `tcp-token` in the state directory, `0600`, replacing the last one in
+  one rename. Shutdown removes it. Every request under `/api` on the port
+  but `GET /api/health` and `GET /api/version` must send it as
+  `Authorization: Bearer TOKEN`, or a session cookie; anything else is 401
+  `unauthorized` with `WWW-Authenticate: Bearer`. A wrong bearer is
+  refused even beside a good cookie. Comparison is constant-time. A
+  restart signs everything out.
+- **Browser sessions.** `alchemy open` asks the socket for a launch code
+  (`POST /api/session/launch`, which the port refuses with 403) and opens
+  `http://127.0.0.1:7240/login?code=CODE`. `GET /login` uses the code up,
+  whatever happens, and answers `303` to `/` with `Cache-Control:
+  no-store`, `Referrer-Policy: no-referrer`, and
+  `Set-Cookie: alchemy_session_PORT=ID; HttpOnly; SameSite=Strict;
+  Path=/api`. A code works once, within 60 seconds. The cookie holds a
+  random session id, never the token, and the daemon keeps only SHA-256
+  digests of ids and codes (at most 64 sessions and 16 codes). It has no
+  `Secure`, since browsers refuse that over plain `http://127.0.0.1`, and
+  no `Max-Age`. Browsers send a cookie to every port on its host, so the
+  name carries the daemon's port and the path is `/api` only, but any
+  other page served from `127.0.0.1` whose path starts with `/api` gets it
+  too; this is why sessions end with the daemon. `GET /api/session` says
+  how a request got in (`socket`, `token`, or `cookie`).
+- **Why `alchemy open` doesn't pass the link to the browser.** A process's
+  arguments are readable by every user (`ps`, `/proc/PID/cmdline`), so
+  another user could read the code and use it first. `alchemy open`
+  writes a `0600` page with the link, `open.html` in the `0700` runtime
+  directory, and opens that file with `/usr/bin/open` on macOS or the
+  first `xdg-open` in an absolute `PATH` directory on Linux, never through
+  a shell. Browsers confined away from that directory, such as Ubuntu's
+  Firefox snap, can't read the page; use `alchemy open --print`, which
+  prints the link instead, as `alchemy open` also does when it finds no
+  opener. `--json` prints `{"url","opened","expires_in"}`.
+- **The desktop shell** serves the UI from its own origin, so the cookie
+  never reaches it. Its `daemon_token` command (`app/alchemy-gui`, allowed
+  for the main window only) reads `tcp-token` from the same state
+  directory as alchemyd, honouring `ALCHEMY_STATE_DIR`, and the UI sends
+  it as a bearer token (`src/lib/platform.ts`). After a 401 it reads the
+  file again and retries once, since a restarted daemon has a new token.
+  `EventSource` can't send headers, so in the shell event streams are read
+  with `fetch` (`src/lib/stream.ts`) rather than putting a credential in a
+  URL. CORS allows `Authorization` from the shell's origins only.
+- **The web UI** shows "You're signed out of alchemyd" while
+  `GET /api/session` answers 401, and the daemon status keeps using the
+  public version probe.
 
 ### Shell completions
 
@@ -95,8 +196,8 @@ alchemy completions fish > ~/.config/fish/completions/alchemy.fish
 
 ### Remote daemon over SSH
 
-Until then, reach a daemon on another machine by forwarding its socket over
-SSH, as the user that runs alchemyd there, and pointing `--socket` at the
+Until remote daemons have authentication, reach one on another machine by
+forwarding its socket over SSH, as the user that runs alchemyd there, and pointing `--socket` at the
 local end. `alchemy status` on the server prints the remote path.
 
 ```sh
@@ -109,6 +210,10 @@ alchemy --socket "$HOME/.alchemyd-server.sock" status
 The local socket is created `0600`, but anyone who can open it controls the
 remote daemon, so keep it in a directory only you can write to.
 `StreamLocalBindUnlink` replaces a socket left behind by an earlier session.
+
+For the remote web UI, forward its port too (`-L 7240:127.0.0.1:7240`)
+and run `alchemy --socket "$HOME/.alchemyd-server.sock" open`: the link
+names the server's loopback address, which the tunnel brings to yours.
 
 ### Docker engine
 
@@ -157,11 +262,261 @@ or `Docker Desktop isn't running at …` when Docker Desktop is installed.
 Docker Desktop or the engine service while the daemon runs shows the
 transitions live.
 
-The engine tests use fakes and run without Docker. One ignored test talks to
-the real engine on this machine:
+The engine tests use fakes and run without Docker; the few that need the
+real engine are listed in [Tests that need Docker](#tests-that-need-docker).
+
+### Apps
+
+An app is a folder holding a compose file inside one of the app folders.
+The home, `~/Alchemy/apps` unless chosen otherwise, is searched first and
+is where new apps go; other folders, such as an existing `/opt/stacks`,
+are searched after it in order. Both are settings in the state database,
+changed with `PUT /api/settings/apps`, `alchemy settings set app-home
+PATH|default`, `alchemy settings set app-folders [PATH]...`, or the
+Settings page. Paths must be full paths.
+
+Discovery only reads. It never creates, changes, or removes anything in
+an app folder, and never creates the home either: a missing home is
+reported as normal until the first app is added, which creates it. The
+rules, decided in `alchemy_core::stack::discover` over a directory
+listing:
+
+- The compose file is the first of `compose.yaml`, `compose.yml`,
+  `docker-compose.yaml`, `docker-compose.yml` that exists, as Compose
+  picks it. If that one is a symlink, or not a regular file, the folder is
+  skipped rather than falling back to a later name, so Alchemy and a
+  hand-run `docker compose` always read the same file.
+- The app's name is the folder's name. A folder that is a symlink, or whose
+  name isn't a valid app name (`[a-z0-9][a-z0-9_-]*`, at most 63
+  characters), is skipped. So is a name already found in an earlier
+  folder: the first folder wins.
+- Skipped folders are reported in `dirs[].skipped` of `/api/apps`, by
+  `alchemy app list`, and on the Apps page. Hidden folders, files, and
+  folders without a compose file are ignored without a report.
+
+The daemon lists the folders every 5 seconds and runs `docker compose
+--project-directory DIR config --format json` for an app only when it is
+new or its compose file, overrides, or `.env` changed (by size and
+modification time), at most 4 at a time, to learn the project name Compose
+resolves (folder name, `name:`, or `COMPOSE_PROJECT_NAME` in the app's
+`.env`) and whether any
+service builds. Saving the settings lists and reads everything again at
+once. Containers are matched to apps by their
+`com.docker.compose.project` label; Compose projects that match no app are
+listed read-only as unmanaged, with the folder from their
+`com.docker.compose.project.working_dir` label.
+
+An app's status is `running` when every service Compose lists has a
+running container, `partial` when some do, `stopped` when none do, and
+`unknown` while Docker isn't ready or Compose can't read the app (the
+reason is in `problems`). `GET /api/apps` is the whole list, also sent as
+the `apps` event; `GET /api/apps/NAME` is one app, or 404
+`app_not_found`. `alchemy app list` and `alchemy app show NAME` print
+them. The code is in `bin/alchemyd/src/apps/`.
 
 ```sh
-cargo test -p alchemyd --test engine -- --ignored
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/apps
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock -X PUT \
+  -H 'Content-Type: application/json' -d '{"home":null,"extra":["/opt/stacks"]}' \
+  http://alchemyd/api/settings/apps
+```
+
+### Creating and editing apps
+
+Alchemy writes only an app's compose file and its `.env`, and never
+leaves a broken one on disk. Each file is at most 256 KiB of UTF-8 text
+without NUL bytes. A write is staged in a hidden
+`.alchemy-tmp-NAME-XXXX` folder inside the app folder it goes to,
+validated with `docker compose --project-directory DIR [-f FILE]
+[--env-file FILE] config`, and only then moved into place with one
+rename. If Compose rejects it, the answer is 422 `invalid` with
+Compose's own message, staging paths removed, and nothing changes.
+
+- `POST /api/apps` (`{"name","folder","compose","env"}`) creates
+  `FOLDER/NAME` holding `compose.yaml` and, if given, `.env`. `folder` is
+  the home when `null` and must otherwise be one of the app folders; the
+  home is created on first use. A folder that already exists, empty or
+  not, or a name another app has, is 409 `conflict`: Alchemy never
+  replaces a folder, since it may hold data. It answers 201 with the app.
+- `GET /api/apps/NAME/files/compose` (or `env`) answers
+  `{"kind","name","content","hash"}`, with `hash` (SHA-256, hex) also as
+  the `ETag`. A missing `.env` is empty with a `null` hash.
+- `PUT /api/apps/NAME/files/compose` (or `env`) takes
+  `{"content","base_hash"}`. `base_hash` is the hash the edit started
+  from, in the body rather than `If-Match` so the CLI and web UI send it
+  the same way; if the file on disk no longer has it, checked before
+  staging and again after Compose runs, the answer is 409 `conflict` and
+  the hand edit stays. A compose file is validated against the app's own
+  folder with its override file; a `.env` with `--env-file`. Only the
+  edited file is replaced, keeping its mode and owner.
+- Both take `"dry_run": true` to check and validate without writing.
+
+`.env` is always written `0600`, whatever the umask, and a new app's
+compose file `0644` in a `0755` folder. Symlinked app folders and files
+are refused, never followed, and only apps in the app folders can be
+edited. Bodies over 3 MiB are refused with 413. The code is in
+`bin/alchemyd/src/apps/edit.rs` and `disk.rs`; validation is
+`ComposeValidator` in `bin/alchemyd/src/compose/validate.rs`.
+
+`alchemy app create NAME [--file compose.yaml] [--env-file PATH]
+[--folder PATH]` reads `compose.yaml` in the current folder unless told
+otherwise (`--file -` reads stdin). `alchemy app edit NAME [--env]` opens
+a private `0600` copy in `$VISUAL` or `$EDITOR` (`vi` otherwise; the
+value is split on spaces, never run by a shell), re-opens it with
+Compose's message on top until Compose accepts it or it is left
+unchanged, asks, then saves. On a conflict it keeps your copy and says
+where; `--force` saves over the change on disk instead. Both take
+`--dry-run` and `--yes`. On the web, Apps has "Add app", and each app's
+page an Edit section.
+
+```sh
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"hello","compose":"services:\n  web:\n    image: nginx\n","dry_run":true}' \
+  http://alchemyd/api/apps
+```
+
+### Lifecycle actions
+
+`POST /api/apps/NAME/actions` with `{"action":"up"}` (or `down`, `start`,
+`stop`, `restart`, `pull`, `build`, `update`; `"force":true` acts on an
+app that shares its Compose project with another) starts an operation
+and answers 202 with it. Update pulls, then runs `up --detach`; for an
+app that builds, the pull skips buildable services and a `build --pull`
+runs between them. One operation runs per app at a time: a second action
+is 409 `conflict`, as is one before Compose has read the app or while
+Docker isn't running. Before Compose runs, the operation records the stop
+intent (`up` for an update; nothing for `pull` and `build`), and leaves it
+when it fails.
+
+Every `docker compose` the daemon runs, for actions, reads, and
+validation, is `docker compose --project-directory DIR ...` with no `-p`,
+so Compose resolves the project as it would by hand (only validation adds
+`-f` for its staged file). Its environment is an allowlist
+(`bin/alchemyd/src/compose/env.rs`): `PATH`, `HOME`, the locale, `TMPDIR`,
+`DOCKER_CONFIG`, and a few more pass through, with `DOCKER_HOST` set to
+the engine the daemon found; `COMPOSE_*`, the other `DOCKER_*` variables,
+proxies, and `SSH_AUTH_SOCK` never do.
+
+`GET /api/operations/ID/events` streams the operation as server-sent
+events: `operation` first and on every step change, `output` for each line
+of output (from its first kept line, so a late follower misses nothing
+still held), then `done`. Each step has a plain-words `label` and a
+one-line `message`, such as "2 of 3 images downloaded". The daemon keeps
+the newest 5000 output lines per operation, and finished operations in
+memory for an hour (at most 100); `GET /api/operations[?app=NAME]` lists
+recent ones, newest first, from the state database too, which keeps the
+latest 1000. The `operations` event carries the ones in memory.
+`POST /api/operations/ID/cancel` stops one. Shutdown interrupts running
+operations and stores them as `interrupted`; ones a crashed daemon left
+running are marked so at the next start. `GET /api/apps/NAME/plan?action=down`
+returns the command lines an action would run, changing nothing.
+
+`alchemy app up|down|start|stop|restart|pull|build|update NAME` starts
+one and follows it: each step on stderr as it starts or fails, the result
+on stdout, and with `--json` every event as one line on stdout. `down`
+asks first (`--yes` skips the question, and without a terminal it refuses
+with exit 3); `--dry-run` prints the plan. A failed, cancelled, or
+interrupted operation exits 1 with kind `operation_failed`. Ctrl-C stops
+following, but the operation keeps running in the daemon. The app page
+has the same actions, with Down, Pull, and Build under More actions. The
+pure model is `alchemy_core::operation`, the manager
+`bin/alchemyd/src/operations/`.
+
+```sh
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock -X POST \
+  -H 'Content-Type: application/json' -d '{"action":"restart"}' \
+  http://alchemyd/api/apps/blog/actions
+curl -N --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/operations/ID/events
+```
+
+### Logs
+
+`GET /api/apps/NAME/logs` streams an app's logs as server-sent events,
+read from the Engine API, never a `docker compose logs` process. The
+containers are the app's, as `/api/apps` lists them; `service=web`
+limits them to one service (400 `bad_request` for one the app doesn't
+have). It sends the last `tail` lines (200 by default, at most 5000, and
+only the newest that fit in 2 MiB) across the containers in the order
+Docker timestamped them, as one `log` event each, then `done`. At most 16
+log streams are open at once across the port and the socket; past that
+a request is 503 `busy`. With `follow=true` it sends `following` instead
+of `done` and then each new line as it arrives, until the client leaves:
+a container that stops is picked up again, without repeating a line, when
+it starts, and one Compose creates later is followed from its first line.
+A `done` with an `error` means the logs couldn't be read; a stream that
+ends without `done` was cut off. Lines over 8 KiB are cut and end in `…`,
+and bytes that aren't UTF-8 become U+FFFD. `alchemy app logs NAME
+[SERVICE] [-f] [--tail N]` prints `service | line` (NDJSON with
+`--json`), and the app page has a Logs section. The pure line handling
+is in `alchemy_core::logs`, the reading in `bin/alchemyd/src/logs/`.
+
+```sh
+curl -N --unix-socket /run/user/1000/alchemy/alchemyd.sock 'http://alchemyd/api/apps/blog/logs?service=web&follow=true'
+```
+
+### Stopped or crashed
+
+Every container, and every app, carries a `stop_reason`: running,
+stopped by Alchemy, stopped outside Alchemy, crashed (with its exit code
+and whether it ran out of memory), keeps crashing, or finished. The pure
+rules live in `alchemy_core::engine::stop`. They read the container's
+events (`docker stop` sends `kill`, `die`, then `stop`; an out-of-memory
+kill sends `oom` then `die`; a process killed from the host sends only
+`die`) and the last action Alchemy recorded for its Compose project
+(`bin/alchemyd/src/intent.rs`), which is stored so it survives a restart.
+Containers already stopped when the daemon connects are inspected once
+for their exit code. A one-off job that exits 0 doesn't make its app
+partly running.
+
+To see each case, run an app and then:
+
+```sh
+docker compose stop web               # Stopped outside Alchemy
+docker kill --signal=KILL blog-web-1  # Stopped outside Alchemy
+sudo kill -9 "$(docker inspect -f '{{.State.Pid}}' blog-web-1)"  # Crashed (exit code 137), Linux
+```
+
+### Metrics
+
+The daemon samples this machine and every running container a minute
+after the last sample (the first right at startup, the second 10 seconds
+later), whether or not anyone is looking. Machine figures come from
+`sysinfo`, plus `/proc/stat` for raw CPU ticks on Linux; on macOS they
+are the Mac's own, not the VM Docker Desktop runs containers in, and the
+API, CLI, and UI say so. Container figures come from one-shot Engine API
+stats, at most 4 at a time with a 5 second timeout each. CPU is a share
+of the whole machine (or of Docker's VM), so an app's containers add up to
+the machine's figure. A figure that could not be measured is `null`,
+never 0.
+
+History is stored in the state database in five tiers, each rolled up
+from the one below and kept a little longer than its range:
+
+| Range | Point every | Kept for |
+| ----- | ----------- | -------- |
+| `1h`  | 1 minute    | 2 hours  |
+| `12h` | 10 minutes  | 13 hours |
+| `24h` | 20 minutes  | 25 hours |
+| `7d`  | 2 hours     | 8 days   |
+| `30d` | 8 hours     | 31 days  |
+
+A bucket is built once it closes, and only if the tier below has at least
+half its points, so a stretch the daemon was stopped for stays a gap; it
+catches up on restart. The pure logic lives in `alchemy_core::metrics`,
+the collector in `bin/alchemyd/src/metrics/`.
+
+`GET /api/metrics` is the latest sample, also sent as the `metrics`
+event; `GET /api/metrics/history?range=24h` is one tier's points. Both
+take `app=NAME` for one app's figures, by folder name like every other
+app route: the daemon resolves it to the app's Compose project (404
+`app_not_found` for an unknown app, no figures while Compose has not read
+it yet). `project=NAME` still asks for a Compose project by name; giving
+both is a 400. `alchemy machine stats` and `alchemy app stats NAME` print
+them, and the Machines page charts them.
+
+```sh
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock 'http://alchemyd/api/metrics/history?range=24h&app=blog'
 ```
 
 ### Web UI in debug vs release
@@ -183,6 +538,33 @@ cargo deny check
 pnpm ready   # format, lint, and type checks, web tests, web build
 ```
 
+### Tests that need Docker
+
+Everything in the gate runs without Docker. A few tests talk to the real
+engine on this machine instead, so they are `#[ignore]`d and CI skips them.
+Run them by name with `--ignored`:
+
+```sh
+cargo test -p alchemyd --test engine -- --ignored   # finds and pings the engine
+cargo test -p alchemyd --test escape -- --ignored   # the escape hatch, below
+```
+
+The escape test (`bin/alchemyd/tests/escape.rs`) proves that Alchemy leaves
+apps manageable by hand. It starts alchemyd on a temporary app home with
+the real engine monitor, `docker compose config`, app editor, and
+`docker compose` runner. One app is written by hand and named after its
+folder; the other is created through `POST /api/apps` with a top-level
+`name:`. It brings both up through `POST /api/apps/NAME/actions`. Then it
+stops the daemon and, in each app's folder, runs `docker compose ps`,
+`stop`, and `up --detach` with no `-p` or `-f`, checking each time that
+they act on the same containers, with the same
+`com.docker.compose.project` label, that Alchemy started. Finally a new
+daemon must see the same containers running, and `down` through it removes
+them. It needs `busybox:1.37`, pulled if missing, and takes a few seconds
+once the image is present. A guard runs `docker compose down` in both
+folders even when an assertion fails, and the temporary directory is
+removed with it.
+
 ## 5. Release smoke test
 
 ```sh
@@ -190,15 +572,34 @@ scripts/release-smoke.sh
 ```
 
 This builds the web UI and release binaries, runs `alchemyd` on a temporary
-socket and port `17240` (override with `SMOKE_PORT`), and checks:
+socket, state directory, and port `17240` (override with `SMOKE_PORT`), and
+checks:
 
-- `/api/health` and `/api/engine` respond on the port, and `/api/health`
-  on the socket, where `/` is a JSON 404;
-- `/api/events` streams an `engine` event to the Tauri origin;
+- the daemon creates its state database `0600` in a `0700` directory,
+  and its TCP token `0600` beside it;
+- `/api/health` responds on the port without signing in, while
+  `/api/apps` and `/api/engine` are 401 without the token or with a wrong
+  one, and `/api/engine` answers with it;
+- `alchemy open --print` prints a sign-in link whose `/login` sets a
+  private session cookie that `/api/apps` accepts, the link works only
+  once, and the port refuses to issue launch codes;
+- `/api/health` responds on the socket, where `/` is a JSON 404;
+- a rebinding `Host`, a cross-origin form `POST`, and a cross-site `GET`
+  are refused with 403;
+- `/api/events` streams an `engine` event to the Tauri origin with the token;
+- `/api/metrics` reports the machine, `/api/metrics/history` has a
+  stored point, and `alchemy machine stats` prints them;
+- `/api/operations` answers, and an action on an app that doesn't exist
+  is refused with 404;
+- `alchemy settings set app-home` points the daemon at an empty temporary
+  folder, and `alchemy app list` then lists no apps and reports a folder
+  with an invalid name as skipped, all without Docker;
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
 - `alchemy-helper` refuses to run without root;
-- the daemon shuts down cleanly on `SIGTERM` and removes its socket.
+- the daemon shuts down cleanly on `SIGTERM` and removes its socket and
+  token;
+- the daemon refuses a corrupt state database before binding its socket.
 
 Set `SMOKE_SKIP_BUILD=1` to reuse an existing build. CI runs it on Linux and
 macOS.
@@ -260,8 +661,13 @@ const volumes = useQuery({
 });
 ```
 
-Mutations call `request("POST" | "PUT" | "DELETE", path, { body })`. A failed
-request rejects with an `ApiError`, whose `message` is safe to show.
+Mutations call `request("POST" | "PUT" | "DELETE", path, { body })`, which
+sends `Content-Type: application/json` even without a body, as alchemyd
+requires. A failed request rejects with an `ApiError`, whose `message` is
+safe to show. A route needs no wiring of its own for the Host, Origin,
+and content-type checks or for signing in: nesting it under `/api` in
+`http.rs` puts it behind them (`bin/alchemyd/src/guard.rs`, `auth.rs`),
+and `request` signs the shell's requests.
 
 ### Live updates
 
@@ -331,7 +737,8 @@ route in `alchemy-api` and `alchemyd` if it needs data the daemon doesn't
 serve yet ([Talking to alchemyd](#talking-to-alchemyd)). Usage
 errors, `--json` errors, exit codes, `--daemon` and `--socket`, the version
 handshake, ctrl-c, help, completions, and man pages already apply to every
-command; nothing else needs wiring. The examples add `alchemy app list`;
+command; nothing else needs wiring. The examples walk through a simplified `alchemy app list` (the real one,
+in `src/commands/app/list.rs`, has no `--all`);
 paths are relative to `bin/alchemy/`.
 
 ### Naming
@@ -414,7 +821,9 @@ status and a body or raw server-sent events, and has the real
 - `ctx.daemon_info()` is the daemon's version and API version, from a
   `GET /api/version` handshake that the first request performs once.
 - `ctx.get::<T>(path)` sends `GET path` and decodes the JSON body as `T`,
-  an `alchemy-api` type.
+  an `alchemy-api` type. `ctx.put::<B, T>(path, &body)` sends `body` as
+  JSON the same way; every request but `GET` declares
+  `Content-Type: application/json`, as alchemyd requires.
 - `ctx.events()` follows `GET /api/events` and returns a `Subscription`.
   Its `next()` gives the next `ApiEvent`, skipping event names this build
   doesn't know, and `Ok(None)` when the daemon ends the stream; a command
@@ -479,7 +888,7 @@ message. `kind` is a contract.
 | Exit | When                                                    | `kind`                                                                   |
 | ---- | ------------------------------------------------------- | ------------------------------------------------------------------------ |
 | 0    | It did what was asked                                   |                                                                          |
-| 1    | It failed, for example alchemyd refused it              | `daemon`, `runtime`                                                      |
+| 1    | It failed, for example alchemyd refused it              | `daemon`, `runtime`, `operation_failed`, `editor`, `file`                |
 | 2    | The command line or daemon target is invalid            | `usage`, `remote_daemon`, `invalid_target`                               |
 | 3    | Confirmation was declined, or needed without a terminal | `declined`, `confirmation_required`                                      |
 | 69   | alchemyd is unreachable or went away                    | `daemon_unreachable`, `disconnected`                                     |
@@ -529,12 +938,14 @@ pub(crate) async fn run<D: Daemon, W: Write, P: Prompt>(
 }
 ```
 
-Its arm in `run_with` passes `prompt`. The first such command must delete
-the `expect(unused_variables)` on `run_with`, which stands in until one
-exists. alchemyd has no plan request yet: the first destructive command
-adds one to `alchemy-api`, along with its JSON shape. The hidden
-`safety-probe` command in `src/commands/safety_probe.rs` shows the flow,
-and its JSON isn't a contract.
+Its arm in `run_with` passes `prompt`. alchemyd's plan request for
+lifecycle actions is `GET /api/apps/NAME/plan?action=ACTION`, an
+`ActionPlan` in `alchemy-api`; `src/commands/app/action.rs` shows the
+whole flow, and a new destructive command adds its own plan route.
+`app create` and `app edit` instead send `"dry_run": true`, which
+validates without writing. The hidden `safety-probe` command in
+`src/commands/safety_probe.rs` is the smallest example, and its JSON
+isn't a contract.
 
 ### Help, completions, and man pages
 
@@ -589,3 +1000,50 @@ Finally, run [the gate](#4-the-gate). It builds `alchemy` with the
 ```sh
 cargo clippy -p alchemy --lib --bins --locked -- -D warnings
 ```
+
+## 9. Adding an app action
+
+An app action runs through every layer, but most of them are tables that
+the compiler walks you through. The examples add a `pause` action; paths
+are from the repository root.
+
+1. **The model** (`crates/alchemy-core/src/operation.rs`). Add the variant
+   to `Action`, `Action::ALL`, and `as_str`, and a `StepCommand` if it
+   runs a `docker compose` subcommand no other action does. Give each new
+   step a label in `step_label`, decide in `intent_action` what stop
+   intent it records (`None` if it leaves containers alone, as `pull`
+   does), and, for a new `StepCommand`, its verb in the progress message
+   in `operation/track.rs` ("1 of 2 containers paused"). `Action` is
+   exhaustive, so `cargo build` lists every match that needs an arm. Each
+   of these functions is table-tested in its module; add the rows.
+2. **The plan** (`bin/alchemyd/src/compose/plan.rs`). Add its steps to
+   `ComposePlan::new`, with any flags, and a row to `plans_every_action`.
+   Steps run in order, and an operation stops at the first that fails.
+3. **The wire** (`crates/alchemy-api`). `Action` and `StepCommand` are
+   re-exported there, so a new variant is a contract addition: add its
+   rows to the action and step tests in `tests/wire_stability.rs`, and
+   the name to `Action` (and `StepCommand`) in
+   `app/alchemy-web/src/lib/api.ts`. No `API_VERSION` bump: an older
+   daemon refuses the unknown action with 400.
+4. **The CLI** (`bin/alchemy`). Add a `Verb` variant taking
+   `action::Args` in `src/commands/app.rs`, whose doc comment is its help;
+   its arm in `run_with` in `src/lib.rs`; and its name, progress word, and
+   result in the matches in `src/commands/app/action.rs`. If it removes
+   anything, make it ask first, as `down` does there. Add
+   `alchemy-app-pause.1` to the man page lists, as in
+   [Help, completions, and man pages](#help-completions-and-man-pages).
+5. **The web UI** (`app/alchemy-web/src/components/AppActions.tsx`). Add
+   its words to `BUTTONS`, `RUNNING`, and `DONE` (`tsc` fails until all
+   three have it), and its button to `PRIMARY` or under More actions; a
+   destructive one goes in a `ConfirmDialog`. Cover it in
+   `src/routes/app-actions.test.tsx`.
+6. **The docs.** Add it to [Lifecycle actions](#lifecycle-actions) and to
+   the user guide's action table in `docs/site/src/pages/docs/apps.md`.
+
+Nothing else needs wiring: the route, the one-operation-per-app rule,
+progress, history, cancel, and the `operations` event apply to every
+action. `bin/alchemyd/tests/operations.rs` runs actions end to end
+against a `FakeComposeRunner` scripted per action with `with_script`;
+add a case there when the action's steps or intent are new. Then run
+[the gate](#4-the-gate), and the escape test if it changes what Compose
+runs.

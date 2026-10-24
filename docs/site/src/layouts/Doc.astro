@@ -1,0 +1,25 @@
+---
+import Base from "./Base.astro";
+
+interface Props {
+  frontmatter: {
+    title: string;
+    description?: string;
+  };
+}
+
+const { frontmatter } = Astro.props;
+---
+
+<Base title={`${frontmatter.title} · Alchemy`} description={frontmatter.description}>
+  <main class="mx-auto max-w-3xl px-4 py-12">
+    <nav class="mb-8 text-sm text-stone-400">
+      <a href="/" class="hover:text-stone-100">Alchemy</a>
+      <span aria-hidden="true"> / </span>
+      <span>Docs</span>
+    </nav>
+    <article class="doc">
+      <slot />
+    </article>
+  </main>
+</Base>

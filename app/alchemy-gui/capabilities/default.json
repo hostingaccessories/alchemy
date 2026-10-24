@@ -1,11 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissions for the main window. Keep this minimal: the UI talks to alchemyd over HTTP, not Tauri commands. Beyond core:default it may only open https: links in the default browser and set the title bar's light or dark theme.",
+  "description": "Permissions for the main window. Keep this minimal: the UI talks to alchemyd over HTTP, not Tauri commands. Beyond core:default it may only open https: links in the default browser, set the title bar's light or dark theme, and read alchemyd's TCP token to sign its requests.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-set-theme",
+    "allow-daemon-token",
     {
       "identifier": "opener:allow-open-url",
       "allow": [{ "url": "https://*" }]

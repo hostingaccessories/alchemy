@@ -3,9 +3,11 @@
 //! Each subcommand maps to HTTP requests against `alchemyd`'s API on its
 //! Unix socket. The CLI holds no state of its own.
 
+pub mod browser;
 pub mod commands;
 mod context;
 mod daemon;
+pub mod editor;
 mod error;
 mod output;
 pub mod prompt;
@@ -17,11 +19,13 @@ use std::ffi::OsStr;
 use std::io::Write;
 use std::path::PathBuf;
 
+use alchemy_api::operations::Action;
 use clap::{Parser, Subcommand};
 
-use crate::commands::{completions, generate_man, status, version};
+use crate::commands::{app, completions, generate_man, machine, open, settings, status, version};
 use crate::context::Context;
 use crate::daemon::HttpDaemon;
+use crate::editor::TerminalEditor;
 use crate::output::Output;
 use crate::prompt::{Prompt, TtyPrompt};
 use crate::target::{Sources, Target};
@@ -72,9 +76,30 @@ pub enum Command {
     /// whether Docker is ready.
     Status(commands::status::Args),
 
+    /// Work with apps: the Compose projects Alchemy runs, found in the app
+    /// folders.
+    App(commands::app::Args),
+
+    /// Work with the machines Alchemy runs apps on. For now, only this
+    /// one.
+    Machine(commands::machine::Args),
+
+    /// Show and change alchemyd's settings, such as where it looks for
+    /// apps.
+    Settings(commands::settings::Args),
+
     /// Show the versions of alchemy and alchemyd, and the protocol each
     /// speaks.
     Version(commands::version::Args),
+
+    /// Open Alchemy's web UI in your browser, signed in.
+    ///
+    /// alchemyd's web UI only answers a browser that has signed in. This
+    /// asks alchemyd, over its socket, for a link that signs the browser
+    /// in, and opens it. The link works once, within a minute. With
+    /// --print, or when no browser can be opened, it prints the link
+    /// instead, to open by hand or on the other end of an SSH tunnel.
+    Open(commands::open::Args),
 
     /// Write a shell completion script to stdout.
     Completions(commands::completions::Args),
@@ -100,13 +125,6 @@ pub async fn run<W: Write>(cli: Cli, out: &mut W, color: Color) -> Result<(), Cl
 }
 
 /// [`run`], asking for confirmation on `prompt` instead of the terminal.
-#[cfg_attr(
-    not(feature = "test-command"),
-    expect(
-        unused_variables,
-        reason = "no destructive command exists outside tests until M4"
-    )
-)]
 pub async fn run_with<W: Write, P: Prompt>(
     cli: Cli,
     out: &mut W,
@@ -130,6 +148,76 @@ pub async fn run_with<W: Write, P: Prompt>(
     match command {
         Command::Status(args) => status::run(&mut context(out, status::NAME)?, args).await,
         Command::Version(args) => version::run(&mut context(out, version::NAME)?, args).await,
+        Command::Open(args) => open::run_system(&mut context(out, open::NAME)?, args).await,
+        Command::App(args) => match args.command {
+            app::Verb::List(args) => {
+                app::list::run(&mut context(out, app::list::NAME)?, args).await
+            }
+            app::Verb::Show(args) => {
+                app::show::run(&mut context(out, app::show::NAME)?, args).await
+            }
+            app::Verb::Logs(args) => {
+                app::logs::run(&mut context(out, app::logs::NAME)?, args).await
+            }
+            app::Verb::Create(args) => {
+                let mut context = context(out, app::create::NAME)?;
+                app::create::run(&mut context, prompt, args).await
+            }
+            app::Verb::Edit(args) => {
+                let mut context = context(out, app::edit::NAME)?;
+                app::edit::run(&mut context, prompt, &mut TerminalEditor, args).await
+            }
+            app::Verb::Stats(args) => {
+                let mut context = context(out, app::stats::NAME)?;
+                app::stats::run(&mut context, args).await
+            }
+            app::Verb::Up(args) => {
+                let mut context = context(out, app::action::name(Action::Up))?;
+                app::action::run(&mut context, prompt, Action::Up, args).await
+            }
+            app::Verb::Down(args) => {
+                let mut context = context(out, app::action::name(Action::Down))?;
+                app::action::run(&mut context, prompt, Action::Down, args).await
+            }
+            app::Verb::Start(args) => {
+                let mut context = context(out, app::action::name(Action::Start))?;
+                app::action::run(&mut context, prompt, Action::Start, args).await
+            }
+            app::Verb::Stop(args) => {
+                let mut context = context(out, app::action::name(Action::Stop))?;
+                app::action::run(&mut context, prompt, Action::Stop, args).await
+            }
+            app::Verb::Restart(args) => {
+                let mut context = context(out, app::action::name(Action::Restart))?;
+                app::action::run(&mut context, prompt, Action::Restart, args).await
+            }
+            app::Verb::Pull(args) => {
+                let mut context = context(out, app::action::name(Action::Pull))?;
+                app::action::run(&mut context, prompt, Action::Pull, args).await
+            }
+            app::Verb::Build(args) => {
+                let mut context = context(out, app::action::name(Action::Build))?;
+                app::action::run(&mut context, prompt, Action::Build, args).await
+            }
+            app::Verb::Update(args) => {
+                let mut context = context(out, app::action::name(Action::Update))?;
+                app::action::run(&mut context, prompt, Action::Update, args).await
+            }
+        },
+        Command::Machine(args) => match args.command {
+            machine::Verb::Stats(args) => {
+                let mut context = context(out, machine::stats::NAME)?;
+                machine::stats::run(&mut context, args).await
+            }
+        },
+        Command::Settings(args) => match args.command {
+            settings::Verb::Show(args) => {
+                settings::show::run(&mut context(out, settings::show::NAME)?, args).await
+            }
+            settings::Verb::Set(args) => {
+                settings::set::run(&mut context(out, settings::set::NAME)?, args).await
+            }
+        },
         Command::Completions(args) => completions::run(out, &args),
         Command::GenerateMan(args) => generate_man::run(&args),
         #[cfg(feature = "test-command")]

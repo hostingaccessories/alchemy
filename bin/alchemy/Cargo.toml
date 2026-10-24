@@ -30,8 +30,10 @@ clap_mangen    = { workspace = true }
 http-body-util = { workspace = true }
 hyper          = { workspace = true, features = ["client", "http1"] }
 hyper-util     = { workspace = true, features = ["tokio"] }
+rustix         = { workspace = true }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
+tempfile       = { workspace = true }
 thiserror      = { workspace = true }
 tokio          = { workspace = true, features = ["rt", "net", "time", "macros", "signal", "sync"] }
 
@@ -42,7 +44,6 @@ alchemy      = { path = ".", features = ["test-command"] }
 alchemyd     = { workspace = true }
 axum         = { workspace = true }
 futures-util = { workspace = true }
-tempfile     = { workspace = true }
 tokio        = { workspace = true, features = ["rt-multi-thread", "sync", "test-util"] }
 
 [lints]

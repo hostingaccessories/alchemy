@@ -4,7 +4,11 @@
 use std::io::Write;
 use std::path::Path;
 
-use alchemy_api::{ApiEvent, EngineStatus, ErrorCode, ErrorResponse, VersionResponse};
+use alchemy_api::{
+    ApiEvent, AppList, EngineStatus, ErrorCode, ErrorResponse, MetricsResponse, OperationList,
+    VersionResponse,
+};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::daemon::{Daemon, DaemonInfo, EventStream, Method, Opened, Reply};
@@ -72,22 +76,96 @@ impl<D: Daemon, W: Write> Context<D, W> {
     /// error status comes back as a [`ClientError`].
     pub(crate) async fn get<T: DeserializeOwned>(&mut self, path: &str) -> Result<T, ClientError> {
         let daemon = self.daemon_info().await?.version.clone();
-        let reply = self.daemon.request(Method::GET, path).await?;
+        let reply = self.daemon.request(Method::GET, path, None).await?;
         accept(&reply, &daemon, self.command)?;
         decode(&reply.body)
     }
 
+    /// `PUT` `body` as JSON to `path` and decode the JSON answer, as
+    /// [`Self::get`] does.
+    pub(crate) async fn put<B: Serialize, T: DeserializeOwned>(
+        &mut self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, ClientError> {
+        let daemon = self.daemon_info().await?.version.clone();
+        let body = serde_json::to_vec(body).map_err(|e| ProtocolError::Http(e.to_string()))?;
+        let reply = self.daemon.request(Method::PUT, path, Some(&body)).await?;
+        accept(&reply, &daemon, self.command)?;
+        decode(&reply.body)
+    }
+
+    /// `POST` `body` as JSON to `path` and decode the JSON answer, as
+    /// [`Self::get`] does.
+    pub(crate) async fn post<B: Serialize, T: DeserializeOwned>(
+        &mut self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, ClientError> {
+        let daemon = self.daemon_info().await?.version.clone();
+        let body = serde_json::to_vec(body).map_err(|e| ProtocolError::Http(e.to_string()))?;
+        let reply = self.daemon.request(Method::POST, path, Some(&body)).await?;
+        accept(&reply, &daemon, self.command)?;
+        decode(&reply.body)
+    }
+
+    /// Send `body` as JSON to `path` with `method` and decode the JSON
+    /// answer. A 409 `conflict` or 422 `invalid` comes back as
+    /// [`Sent::Refused`] for the command to act on; any other error status
+    /// is a [`ClientError`], as with [`Self::get`].
+    pub(crate) async fn send<B: Serialize, T: DeserializeOwned>(
+        &mut self,
+        method: Method,
+        path: &str,
+        body: &B,
+    ) -> Result<Sent<T>, ClientError> {
+        let daemon = self.daemon_info().await?.version.clone();
+        let body = serde_json::to_vec(body).map_err(|e| ProtocolError::Http(e.to_string()))?;
+        let reply = self.daemon.request(method, path, Some(&body)).await?;
+        if matches!(reply.status, 409 | 422) {
+            let refusal = error_reply(&reply)?;
+            if matches!(refusal.code, ErrorCode::Conflict | ErrorCode::Invalid) {
+                return Ok(Sent::Refused(refusal));
+            }
+        }
+        accept(&reply, &daemon, self.command)?;
+        decode(&reply.body).map(Sent::Done)
+    }
+
     /// Follow [`EVENTS_PATH`]. A refusal comes back as a [`ClientError`].
     pub(crate) async fn events(&mut self) -> Result<Subscription<D::Events>, ClientError> {
+        self.stream(EVENTS_PATH)
+            .await
+            .map(|inner| Subscription { inner })
+    }
+
+    /// Follow the event stream at `path`, such as an app's logs, as raw
+    /// events. A refusal comes back as a [`ClientError`], as with
+    /// [`Self::get`].
+    pub(crate) async fn stream(&mut self, path: &str) -> Result<D::Events, ClientError> {
         let daemon = self.daemon_info().await?.version.clone();
-        match self.daemon.events(EVENTS_PATH).await? {
-            Opened::Stream(inner) => Ok(Subscription { inner }),
+        match self.daemon.events(path).await? {
+            Opened::Stream(inner) => Ok(inner),
             Opened::Refused(reply) => match accept(&reply, &daemon, self.command) {
                 Ok(()) => Err(ClientError::Unexpected(status_text(reply.status))),
                 Err(err) => Err(err),
             },
         }
     }
+}
+
+/// Decode the JSON `data` of a raw event as `T`.
+pub(crate) fn decode_data<T: DeserializeOwned>(raw: &SseEvent) -> Result<T, ClientError> {
+    decode(raw.data.as_bytes())
+}
+
+/// What [`Context::send`] came to.
+#[derive(Debug)]
+pub(crate) enum Sent<T> {
+    /// The daemon did it and answered with this.
+    Done(T),
+    /// The daemon refused it as a `conflict` or as `invalid`.
+    Refused(ErrorResponse),
 }
 
 /// The events from [`Context::events`], decoded.
@@ -114,12 +192,19 @@ impl<S: EventStream> Subscription<S> {
 pub(crate) fn decode_event(raw: &SseEvent) -> Result<Option<ApiEvent>, ClientError> {
     match raw.event.as_str() {
         "engine" => decode::<EngineStatus>(raw.data.as_bytes()).map(|e| Some(ApiEvent::Engine(e))),
+        "metrics" => {
+            decode::<MetricsResponse>(raw.data.as_bytes()).map(|m| Some(ApiEvent::Metrics(m)))
+        }
+        "apps" => decode::<AppList>(raw.data.as_bytes()).map(|a| Some(ApiEvent::Apps(a))),
+        "operations" => {
+            decode::<OperationList>(raw.data.as_bytes()).map(|o| Some(ApiEvent::Operations(o)))
+        }
         _ => Ok(None),
     }
 }
 
 async fn handshake<D: Daemon>(daemon: &mut D) -> Result<DaemonInfo, ClientError> {
-    let reply = daemon.request(Method::GET, VERSION_PATH).await?;
+    let reply = daemon.request(Method::GET, VERSION_PATH, None).await?;
     if !is_success(reply.status) {
         let err = error_reply(&reply)?;
         return Err(ClientError::Daemon(err.error));
@@ -183,6 +268,11 @@ impl<D: Daemon> Context<D, Vec<u8>> {
     /// Everything written to the output so far.
     pub(crate) fn written(&self) -> String {
         String::from_utf8_lossy(self.out.get_ref()).into_owned()
+    }
+
+    /// Everything written as progress, to stderr, so far.
+    pub(crate) fn progress_written(&self) -> String {
+        self.out.progress_written()
     }
 
     /// The daemon client, to inspect what was sent.
@@ -398,7 +488,15 @@ mod tests {
 
     #[test]
     fn decode_event_knows_every_api_event_name() {
-        let events = [ApiEvent::Engine(engine(EngineState::Starting))];
+        let events = [
+            ApiEvent::Engine(engine(EngineState::Starting)),
+            ApiEvent::Metrics(MetricsResponse {
+                interval: 60,
+                ..MetricsResponse::default()
+            }),
+            ApiEvent::Apps(AppList::default()),
+            ApiEvent::Operations(OperationList::default()),
+        ];
         for event in events {
             let raw = SseEvent {
                 event: event.name().to_owned(),

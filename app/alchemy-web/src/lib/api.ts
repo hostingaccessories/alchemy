@@ -1,4 +1,5 @@
-import { apiBase } from "./platform.ts";
+import { apiBase, authHeaders, forgetDaemonToken, isTauri } from "./platform.ts";
+import { CLOSED, type EventStream, openEventStream } from "./stream.ts";
 
 /** Mirrors `alchemy_api::HealthResponse`. */
 export interface HealthResponse {
@@ -34,10 +35,420 @@ export interface EngineStatus {
 }
 
 /**
+ * Mirrors `alchemy_api::StopReason`: why a container is or is not running.
+ * `unknown` is also what a kind this build does not know means.
+ */
+export type StopReason =
+  | { kind: "running" }
+  | { kind: "paused" }
+  | { kind: "not_started" }
+  | { kind: "stopped_by_alchemy" }
+  | { kind: "stopped_outside" }
+  | { kind: "crashed"; exit_code: number | null; oom: boolean }
+  | { kind: "crash_looping"; exit_code: number | null; oom: boolean }
+  | { kind: "finished" }
+  | { kind: "unknown" };
+
+/** Mirrors `alchemy_api::ContainerStatus`. */
+export interface ContainerStatus {
+  id: string;
+  name: string;
+  image: string | null;
+  project: string | null;
+  service: string | null;
+  /** The Compose project folder, from its `working_dir` label. */
+  working_dir: string | null;
+  state: ContainerState;
+  health: Health | null;
+  /** Absent from a daemon older than stop reasons; treat as `unknown`. */
+  stop_reason?: StopReason;
+}
+
+/**
+ * Mirrors `alchemy_api::MachineUsage`. CPU is a percentage of the whole
+ * machine, rates are bytes per second, and sizes are bytes. `null` means not
+ * measured, never zero. On macOS this is the Mac, not Docker Desktop's VM.
+ */
+export interface MachineUsage {
+  cpu: number | null;
+  /** The highest `cpu` within a rolled-up point. */
+  cpu_max: number | null;
+  cpus: number;
+  /** The 1, 5, and 15 minute load averages, where the OS has them. */
+  load: [number, number, number] | null;
+  memory_used: number;
+  memory_total: number;
+  swap_used: number;
+  swap_total: number;
+  disk_used: number | null;
+  disk_total: number | null;
+  disk_read: number | null;
+  disk_write: number | null;
+  net_rx: number | null;
+  net_tx: number | null;
+}
+
+/** Mirrors `alchemy_api::ContainerUsage`. CPU is a share of the whole engine host. */
+export interface ContainerUsage {
+  id: string;
+  name: string;
+  project: string | null;
+  service: string | null;
+  cpu: number | null;
+  cpu_max: number | null;
+  memory: number;
+  memory_max: number | null;
+  net_rx: number | null;
+  net_tx: number | null;
+  block_read: number | null;
+  block_write: number | null;
+}
+
+/** Mirrors `alchemy_api::ProjectUsage`: one Compose project (an app) added up. */
+export interface ProjectUsage {
+  name: string;
+  containers: number;
+  cpu: number | null;
+  memory: number;
+  net_rx: number | null;
+  net_tx: number | null;
+}
+
+/**
+ * Mirrors `alchemy_api::MetricsResponse`, returned by `GET /api/metrics` and
+ * sent as the `metrics` event after every sample.
+ */
+export interface MetricsResponse {
+  /** Unix seconds of the sample, or `null` before the first. */
+  at: number | null;
+  /** Seconds between samples. */
+  interval: number;
+  /** Containers run in a VM (Docker Desktop, macOS): machine figures are the host, not the VM. */
+  containers_in_vm: boolean;
+  machine: MachineUsage | null;
+  projects: ProjectUsage[];
+  containers: ContainerUsage[];
+}
+
+/** Mirrors `alchemy_api::MetricsRange`. */
+export type MetricsRange = "1h" | "12h" | "24h" | "7d" | "30d";
+
+/** Mirrors `alchemy_api::MetricsPoint`. `t` is Unix seconds. */
+export interface MetricsPoint {
+  t: number;
+  machine: MachineUsage | null;
+  projects: ProjectUsage[];
+  containers: ContainerUsage[];
+}
+
+/**
+ * Mirrors `alchemy_api::MetricsHistory`, returned by
+ * `GET /api/metrics/history`. Points more than one `step` apart have a gap
+ * between them, which charts draw as a gap.
+ */
+export interface MetricsHistory {
+  range: MetricsRange;
+  step: number;
+  /** The project asked for or the asked-for app's, `null` for the machine or an unread app. */
+  project: string | null;
+  points: MetricsPoint[];
+}
+
+/**
+ * Narrows `/api/metrics` and `/api/metrics/history` to one app, by its
+ * folder name, or to one Compose project. An unknown app is a 404
+ * `app_not_found`; an app Compose hasn't read yet has no figures.
+ */
+export type MetricsFilter = { app: string } | { project: string };
+
+/**
+ * Mirrors `alchemy_api::apps::StackStatus`. A status a newer daemon sends
+ * that this build doesn't know should be treated as `unknown`.
+ */
+export type StackStatus = "running" | "partial" | "stopped" | "unknown";
+
+/** Mirrors `alchemy_api::apps::ImageSource`. */
+export type ImageSource = "registry" | "build";
+
+/** Mirrors `alchemy_core::engine::ContainerState`. */
+export type ContainerState =
+  | "created"
+  | "running"
+  | "paused"
+  | "restarting"
+  | "removing"
+  | "exited"
+  | "dead";
+
+/** Mirrors `alchemy_core::engine::Health`. */
+export type Health = "starting" | "healthy" | "unhealthy";
+
+/** Mirrors `alchemy_api::apps::AppContainer`. */
+export interface AppContainer {
+  id: string;
+  name: string;
+  image: string | null;
+  state: ContainerState;
+  health: Health | null;
+  /** Absent from a daemon older than stop reasons; treat as `unknown`. */
+  stop_reason?: StopReason;
+}
+
+/** Mirrors `alchemy_api::apps::AppService`. */
+export interface AppService {
+  name: string;
+  containers: AppContainer[];
+}
+
+/** Mirrors `alchemy_api::apps::AppProblemKind`; unknown kinds arrive as `other`. */
+export type AppProblemKind = "compose_error" | "compose_unavailable" | "shared_project" | "other";
+
+/** Mirrors `alchemy_api::apps::AppProblem`. `message` is safe to show as is. */
+export interface AppProblem {
+  kind: AppProblemKind;
+  message: string;
+}
+
+/** Mirrors `alchemy_api::apps::App`, returned by `GET /api/apps/{name}`. */
+export interface App {
+  /** The app's name: its folder's name. */
+  name: string;
+  status: StackStatus;
+  /** The app's folder. */
+  dir: string;
+  /** The app folder it was found in. */
+  root: string;
+  compose_file: string;
+  /** The Compose project name; `null` until Compose has read the app, or when it can't. */
+  project: string | null;
+  images: ImageSource | null;
+  services: AppService[];
+  problems: AppProblem[];
+  /** The most pressing of its containers' reasons. Absent from an older daemon. */
+  stop_reason?: StopReason;
+}
+
+/** Mirrors `alchemy_api::apps::UnmanagedApp`. */
+export interface UnmanagedApp {
+  project: string;
+  dir: string | null;
+  status: StackStatus;
+  services: AppService[];
+}
+
+/** Mirrors `alchemy_api::apps::AppDirState`; unknown states arrive as `other`. */
+export type AppDirState = "ok" | "missing" | "not_a_directory" | "unreadable" | "other";
+
+/** Mirrors `alchemy_api::apps::SkipReason`; unknown reasons arrive as `other`. */
+export type SkipReason =
+  | "invalid_name"
+  | "duplicate"
+  | "linked_compose_file"
+  | "compose_file_not_regular"
+  | "linked_folder"
+  | "other";
+
+/** Mirrors `alchemy_api::apps::SkippedApp`. */
+export interface SkippedApp {
+  name: string;
+  path: string;
+  reason: SkipReason;
+  message: string;
+}
+
+/** Mirrors `alchemy_api::apps::AppDir`. */
+export interface AppDir {
+  path: string;
+  /** Whether this is the home, where new apps go. */
+  home: boolean;
+  state: AppDirState;
+  /** Why the folder can't be used, when `state` isn't `ok`. */
+  message: string | null;
+  skipped: SkippedApp[];
+}
+
+/** Mirrors `alchemy_api::apps::AppList`, returned by `GET /api/apps` and sent as `apps`. */
+export interface AppList {
+  apps: App[];
+  unmanaged: UnmanagedApp[];
+  dirs: AppDir[];
+}
+
+/** Mirrors `alchemy_api::apps::AppSettings`, returned by `GET /api/settings/apps`. */
+export interface AppSettings {
+  /** The home in effect: the chosen one, else `default_home`. */
+  home: string | null;
+  default_home: string | null;
+  extra: string[];
+}
+
+/** Mirrors `alchemy_api::apps::AppSettingsUpdate`, the body of `PUT /api/settings/apps`. */
+export interface AppSettingsUpdate {
+  /** A full path, or `null` for the default home. */
+  home: string | null;
+  extra: string[];
+}
+
+/** Mirrors `alchemy_api::apps::files::MAX_FILE_LEN`: the most bytes a compose file or `.env` holds. */
+export const MAX_FILE_LEN = 256 * 1024;
+
+/** Mirrors `alchemy_api::apps::files::NewApp`, the body of `POST /api/apps`. */
+export interface NewApp {
+  name: string;
+  /** A configured app folder as a full path, or `null` for the home. */
+  folder: string | null;
+  compose: string;
+  /** Saved as `.env`, readable by its owner alone; `null` writes none. */
+  env: string | null;
+  dry_run: boolean;
+}
+
+/** Mirrors `alchemy_api::apps::files::AppFileKind`, also the route's path segment. */
+export type AppFileKind = "compose" | "env";
+
+/** Mirrors `alchemy_api::apps::files::AppFile`, from `GET /api/apps/{name}/files/{kind}`. */
+export interface AppFile {
+  kind: AppFileKind;
+  /** Its name in the app's folder, such as `compose.yaml` or `.env`. */
+  name: string;
+  /** Empty when the file doesn't exist. */
+  content: string;
+  /** SHA-256 of the bytes in hex, sent back as `base_hash`; `null` when the file doesn't exist. */
+  hash: string | null;
+}
+
+/**
+ * Mirrors `alchemy_api::apps::files::AppFileUpdate`, the body of
+ * `PUT /api/apps/{name}/files/{kind}`. A `base_hash` that no longer matches
+ * the file on disk is refused with 409 `conflict`; Compose rejecting the
+ * content is 422 `invalid` with Compose's message.
+ */
+export interface AppFileUpdate {
+  content: string;
+  base_hash: string | null;
+  dry_run: boolean;
+}
+
+/** Mirrors `alchemy_api::logs::LogStream`; unknown outputs arrive as `other`. */
+export type LogStream = "stdout" | "stderr" | "other";
+
+/** Mirrors `alchemy_api::logs::LogLine`: one line of a container's log. */
+export interface LogLine {
+  service: string;
+  /** The container's name. */
+  container: string;
+  stream: LogStream;
+  /** When the engine received the line, as RFC 3339 in UTC, or `null`. */
+  time: string | null;
+  /** The line without its newline; a line over 8 KiB is cut and ends in `…`. */
+  line: string;
+}
+
+/** Mirrors `alchemy_api::logs::LogsDone`. `error` is safe to show as is. */
+export interface LogsDone {
+  error: string | null;
+}
+
+/**
+ * Mirrors `alchemy_api::logs::LogEvent`: one message on
+ * `GET /api/apps/{name}/logs`. `log` events carry the tail, then, when
+ * following, a `following` event and new lines; `done` ends the stream.
+ */
+export type LogEvent =
+  | { event: "log"; data: LogLine }
+  | { event: "following"; data: Record<string, never> }
+  | { event: "done"; data: LogsDone };
+/** Mirrors `alchemy_api::operations::Action`: a lifecycle action on an app. */
+export type Action = "up" | "down" | "start" | "stop" | "restart" | "pull" | "build" | "update";
+
+/** Mirrors `alchemy_api::operations::StepCommand`: the `docker compose` subcommand a step runs. */
+export type StepCommand = "up" | "down" | "start" | "stop" | "restart" | "pull" | "build";
+
+/** Mirrors `alchemy_api::operations::OperationState`; unknown states arrive as `unknown`. */
+export type OperationState =
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "interrupted"
+  | "unknown";
+
+/** Mirrors `alchemy_api::operations::StepState`; unknown states arrive as `unknown`. */
+export type OperationStepState = "pending" | "active" | "done" | "failed" | "skipped" | "unknown";
+
+/** Mirrors `alchemy_api::operations::Step`. */
+export interface OperationStep {
+  command: StepCommand;
+  /** What the step does, in plain words: "Downloading the app". */
+  label: string;
+  state: OperationStepState;
+  /** Progress while it runs, or the problem when it failed. */
+  message: string | null;
+}
+
+/** Mirrors `alchemy_api::operations::Operation`: an action run on one app. */
+export interface Operation {
+  id: string;
+  app: string;
+  action: Action;
+  state: OperationState;
+  steps: OperationStep[];
+  /** Unix seconds. */
+  started_at: number;
+  /** Unix seconds, or `null` while it runs. */
+  finished_at: number | null;
+  /** Why it did not succeed, safe to show. */
+  error: string | null;
+}
+
+/** Mirrors `alchemy_api::operations::ActionRequest`, the body of `POST /api/apps/{name}/actions`. */
+export interface ActionRequest {
+  action: Action;
+  /** Go ahead even though another app shares this app's Compose project. */
+  force?: boolean;
+}
+
+/** Mirrors `alchemy_api::operations::OperationResponse`. */
+export interface OperationResponse {
+  operation: Operation;
+}
+
+/** Mirrors `alchemy_api::OperationList`, returned by `GET /api/operations` and sent as `operations`. */
+export interface OperationList {
+  /** Newest first. */
+  operations: Operation[];
+}
+
+/** Mirrors `alchemy_api::operations::OutputLine`: one line of an operation's raw output. */
+export interface OutputLine {
+  /** Counts up from 0; a gap means older lines were dropped. */
+  seq: number;
+  /** Index into {@link Operation.steps}. */
+  step: number;
+  text: string;
+}
+
+/**
+ * Mirrors `alchemy_api::operations::OperationEvent`: one message on
+ * `GET /api/operations/{id}/events`. `done` is always last.
+ */
+export type OperationEvent =
+  | { event: "operation"; data: Operation }
+  | { event: "output"; data: OutputLine }
+  | { event: "done"; data: Operation };
+
+/** Every event name on an operation's stream. */
+const OPERATION_EVENT_NAMES: readonly OperationEvent["event"][] = ["operation", "output", "done"];
+
+/**
  * Mirrors `alchemy_api::ApiEvent`: one message on `GET /api/events`. The SSE
  * `event:` field is `event`, and its `data:` field is `data` as JSON.
  */
-export type ApiEvent = { event: "engine"; data: EngineStatus };
+export type ApiEvent =
+  | { event: "engine"; data: EngineStatus }
+  | { event: "metrics"; data: MetricsResponse }
+  | { event: "apps"; data: AppList }
+  | { event: "operations"; data: OperationList };
 
 /** Every SSE event name the daemon sends. */
 export type ApiEventName = ApiEvent["event"];
@@ -46,7 +457,12 @@ export type ApiEventName = ApiEvent["event"];
 export type ApiEventData<K extends ApiEventName> = Extract<ApiEvent, { event: K }>["data"];
 
 /** One key per event name, so adding an {@link ApiEvent} variant fails to compile until listed. */
-const EVENT_NAMES: { [K in ApiEventName]: K } = { engine: "engine" };
+const EVENT_NAMES: { [K in ApiEventName]: K } = {
+  engine: "engine",
+  metrics: "metrics",
+  apps: "apps",
+  operations: "operations",
+};
 
 /** The event names {@link subscribe} listens for. Others are ignored. */
 export const API_EVENT_NAMES: readonly ApiEventName[] = Object.values(EVENT_NAMES);
@@ -66,7 +482,35 @@ export interface SubscribeOptions {
  * Mirrors `alchemy_api::ErrorCode`. A newer daemon may send a code not listed
  * here; the Rust client reads those as `unknown`.
  */
-export type ErrorCode = "not_found" | "method_not_allowed" | "bad_request" | "internal" | "unknown";
+export type ErrorCode =
+  | "not_found"
+  | "method_not_allowed"
+  | "bad_request"
+  | "forbidden"
+  | "unauthorized"
+  | "unsupported_media_type"
+  | "conflict"
+  | "invalid"
+  | "app_not_found"
+  | "operation_not_found"
+  | "busy"
+  | "internal"
+  | "unknown";
+
+/**
+ * Mirrors `alchemy_api::session::SessionAuth`: how a request was let in. A
+ * kind this build doesn't know arrives as `unknown`.
+ */
+export type SessionAuth = "socket" | "token" | "cookie" | "unknown";
+
+/**
+ * Mirrors `alchemy_api::session::SessionResponse`, returned by
+ * `GET /api/session`. On the TCP port it answers 401 `unauthorized` until the
+ * browser has signed in with `alchemy open` or the shell sends the token.
+ */
+export interface SessionResponse {
+  auth: SessionAuth;
+}
 
 /** Mirrors `alchemy_api::ErrorResponse`, the body of every `/api` error. */
 export interface ErrorResponse {
@@ -90,12 +534,24 @@ export const NO_RESPONSE = 0;
  */
 export class ApiError extends Error {
   readonly status: number;
+  /** The daemon's {@link ErrorCode}, or `null` when it sent none. */
+  readonly code: ErrorCode | null;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code: ErrorCode | null = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
   }
+}
+
+/**
+ * Whether `error` is alchemyd refusing a request that isn't signed in: a
+ * browser that hasn't been through `alchemy open`, or a shell without the
+ * daemon's current token.
+ */
+export function isSignedOut(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 401 && error.code === "unauthorized";
 }
 
 /** Options for {@link request}. */
@@ -109,23 +565,27 @@ function isAbort(err: unknown): boolean {
   return err instanceof DOMException && err.name === "AbortError";
 }
 
-/** The daemon's {@link ErrorResponse} text, or a generic line for any other body. */
-async function errorMessage(res: Response): Promise<string> {
+/** The error in `res`: the daemon's {@link ErrorResponse}, or a generic line for any other body. */
+async function responseError(res: Response): Promise<ApiError> {
   let body: unknown;
   try {
     body = await res.json();
   } catch {
     body = null;
   }
-  const error = (body as Partial<ErrorResponse> | null)?.error;
-  return typeof error === "string" && error !== ""
-    ? error
-    : `alchemyd answered with HTTP ${res.status}`;
+  const { error, code } = (body ?? {}) as Partial<ErrorResponse>;
+  const message =
+    typeof error === "string" && error !== "" ? error : `alchemyd answered with HTTP ${res.status}`;
+  return new ApiError(res.status, message, typeof code === "string" ? code : null);
 }
 
 /**
  * Send one request to `/api{path}` and return the JSON response, or
  * `undefined` for `204 No Content`. `body`, when given, is sent as JSON.
+ * Every method but `GET` declares `content-type: application/json`, body or
+ * not, because alchemyd refuses a mutating request without it (415). In the
+ * desktop shell it also sends the daemon's token, and after a 401 reads the
+ * token again and retries once, since alchemyd makes a new one each start.
  * Rejects with an {@link ApiError} for every failure except an abort, which
  * rejects with the `AbortError` unchanged.
  */
@@ -134,22 +594,32 @@ export async function request<T>(
   path: string,
   { body, signal }: RequestOptions = {},
 ): Promise<T> {
-  const init: RequestInit = { method, signal };
-  if (body !== undefined) {
-    init.headers = { "content-type": "application/json" };
-    init.body = JSON.stringify(body);
-  }
+  const send = async (): Promise<Response> => {
+    const headers: Record<string, string> = await authHeaders();
+    if (method !== "GET") {
+      headers["content-type"] = "application/json";
+    }
+    const init: RequestInit = { method, signal, headers };
+    if (body !== undefined) {
+      init.body = JSON.stringify(body);
+    }
+    return fetch(`${apiBase()}/api${path}`, init);
+  };
 
   let res: Response;
   try {
-    res = await fetch(`${apiBase()}/api${path}`, init);
+    res = await send();
+    if (res.status === 401 && isTauri()) {
+      forgetDaemonToken();
+      res = await send();
+    }
   } catch (err) {
     if (isAbort(err)) throw err;
     throw new ApiError(NO_RESPONSE, "alchemyd is not reachable");
   }
 
   if (!res.ok) {
-    throw new ApiError(res.status, await errorMessage(res));
+    throw await responseError(res);
   }
   if (res.status === 204) {
     return undefined as T;
@@ -169,9 +639,6 @@ export async function request<T>(
  */
 export const RESUBSCRIBE_DELAY_MS = 2000;
 
-/** `EventSource.CLOSED`: the browser will not reconnect on its own. */
-const EVENT_SOURCE_CLOSED = 2;
-
 /**
  * Open `GET /api/events` and call `onEvent` for every event. The first
  * `engine` event carries the current status, so no separate fetch is needed.
@@ -186,17 +653,17 @@ export function subscribe(
 ): () => void {
   let closed = false;
   let retry: ReturnType<typeof setTimeout> | undefined;
-  let source: EventSource;
+  let source: EventStream;
 
   const open = () => {
     retry = undefined;
-    const current = new EventSource(`${apiBase()}/api/events`);
+    const current = openEventStream(`${apiBase()}/api/events`);
     source = current;
     for (const name of API_EVENT_NAMES) {
-      current.addEventListener(name, (message: MessageEvent<string>) => {
+      current.addEventListener(name, (message) => {
         let data: unknown;
         try {
-          data = JSON.parse(message.data);
+          data = JSON.parse((message as MessageEvent<string>).data);
         } catch {
           return;
         }
@@ -206,7 +673,7 @@ export function subscribe(
     current.addEventListener("open", () => options.onOpen?.());
     current.addEventListener("error", () => {
       options.onError?.();
-      if (!closed && retry === undefined && current.readyState === EVENT_SOURCE_CLOSED) {
+      if (!closed && retry === undefined && current.readyState === CLOSED) {
         retry = setTimeout(open, RESUBSCRIBE_DELAY_MS);
       }
     });
@@ -220,9 +687,63 @@ export function subscribe(
   };
 }
 
+/**
+ * Follow `GET /api/operations/{id}/events`, calling `onEvent` for each event
+ * until `done`, then closing the stream. The daemon replays the output it
+ * kept first, so following late misses nothing it still has.
+ *
+ * Returns a function that closes the stream.
+ */
+export function followOperation(id: string, onEvent: (event: OperationEvent) => void): () => void {
+  const source = openEventStream(`${apiBase()}/api/operations/${encodeURIComponent(id)}/events`);
+  for (const name of OPERATION_EVENT_NAMES) {
+    source.addEventListener(name, (message) => {
+      let data: unknown;
+      try {
+        data = JSON.parse((message as MessageEvent<string>).data);
+      } catch {
+        return;
+      }
+      onEvent({ event: name, data } as OperationEvent);
+      if (name === "done") {
+        source.close();
+      }
+    });
+  }
+  return () => source.close();
+}
+
 export const api = {
   health: (signal?: AbortSignal) => request<HealthResponse>("GET", "/health", { signal }),
   version: (signal?: AbortSignal) => request<VersionResponse>("GET", "/version", { signal }),
+  session: (signal?: AbortSignal) => request<SessionResponse>("GET", "/session", { signal }),
   engine: (signal?: AbortSignal) => request<EngineStatus>("GET", "/engine", { signal }),
+  metrics: (signal?: AbortSignal, filter?: MetricsFilter) => {
+    const query = new URLSearchParams(filter).toString();
+    return request<MetricsResponse>("GET", query === "" ? "/metrics" : `/metrics?${query}`, {
+      signal,
+    });
+  },
+  metricsHistory: (range: MetricsRange, filter?: MetricsFilter, signal?: AbortSignal) => {
+    const query = new URLSearchParams({ range, ...filter });
+    return request<MetricsHistory>("GET", `/metrics/history?${query.toString()}`, { signal });
+  },
+  apps: (signal?: AbortSignal) => request<AppList>("GET", "/apps", { signal }),
+  app: (name: string, signal?: AbortSignal) =>
+    request<App>("GET", `/apps/${encodeURIComponent(name)}`, { signal }),
+  appSettings: (signal?: AbortSignal) => request<AppSettings>("GET", "/settings/apps", { signal }),
+  setAppSettings: (update: AppSettingsUpdate) =>
+    request<AppSettings>("PUT", "/settings/apps", { body: update }),
+  startAction: (name: string, body: ActionRequest) =>
+    request<OperationResponse>("POST", `/apps/${encodeURIComponent(name)}/actions`, { body }),
+  operations: (signal?: AbortSignal) => request<OperationList>("GET", "/operations", { signal }),
+  cancelOperation: (id: string) =>
+    request<OperationResponse>("POST", `/operations/${encodeURIComponent(id)}/cancel`),
+  followOperation,
+  createApp: (app: NewApp) => request<App>("POST", "/apps", { body: app }),
+  appFile: (name: string, kind: AppFileKind, signal?: AbortSignal) =>
+    request<AppFile>("GET", `/apps/${encodeURIComponent(name)}/files/${kind}`, { signal }),
+  saveAppFile: (name: string, kind: AppFileKind, update: AppFileUpdate) =>
+    request<AppFile>("PUT", `/apps/${encodeURIComponent(name)}/files/${kind}`, { body: update }),
   subscribe,
 };
