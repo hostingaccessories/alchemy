@@ -246,7 +246,8 @@ async fn require_host(
 }
 
 async fn require_browser_safe(req: Request, next: Next) -> Response {
-    match guard::check_origin(req.method(), req.headers())
+    match guard::check_fetch_site(req.uri().path(), req.headers())
+        .and_then(|()| guard::check_origin(req.method(), req.headers()))
         .and_then(|()| guard::check_content_type(req.method(), req.headers()))
     {
         Ok(()) => next.run(req).await,
@@ -1527,6 +1528,76 @@ mod tests {
                 serde_json::json!({ "error": Refusal::Host.message(), "code": "forbidden" }),
                 "{method} {uri}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_site_requests_are_refused_on_the_tcp_listener_only() {
+        let cases = [
+            ("/api/health", None, None, true),
+            ("/api/health", Some("same-origin"), None, true),
+            ("/api/health", Some("none"), None, true),
+            ("/api/health", Some("cross-site"), None, false),
+            ("/api/health", Some("same-site"), None, false),
+            (
+                "/api/apps/blog/logs?follow=true",
+                Some("cross-site"),
+                None,
+                false,
+            ),
+            (
+                "/api/health",
+                Some("cross-site"),
+                Some("https://evil.example"),
+                false,
+            ),
+            (
+                "/api/health",
+                Some("cross-site"),
+                Some("tauri://localhost"),
+                true,
+            ),
+            (
+                "/api/health",
+                Some("cross-site"),
+                Some("http://tauri.localhost"),
+                true,
+            ),
+            ("/", Some("cross-site"), None, true),
+        ];
+        for (uri, site, origin, passes) in cases {
+            let mut request = req(Method::GET, uri);
+            if let Some(site) = site {
+                request = request.header("sec-fetch-site", site);
+            }
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            let (app, _stop) = test_router(State::new());
+            let (status, _, body) = send(app, request.body(Body::empty()).unwrap()).await;
+            let what = format!("{uri} {site:?} {origin:?}");
+            if passes {
+                assert_ne!(status, StatusCode::FORBIDDEN, "{what}");
+            } else {
+                assert_eq!(status, StatusCode::FORBIDDEN, "{what}");
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                    serde_json::json!({
+                        "error": Refusal::CrossSite.message(),
+                        "code": "forbidden",
+                    }),
+                    "{what}"
+                );
+            }
+
+            let (_stop, rx) = watch::channel(false);
+            let socket = api_router(State::new(), memory(), rx, no_logs(), ops(&State::new()));
+            let mut request = req(Method::GET, uri);
+            if let Some(site) = site {
+                request = request.header("sec-fetch-site", site);
+            }
+            let (status, _, _) = send(socket, request.body(Body::empty()).unwrap()).await;
+            assert_ne!(status, StatusCode::FORBIDDEN, "socket {what}");
         }
     }
 

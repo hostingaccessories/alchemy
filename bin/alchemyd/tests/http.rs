@@ -169,84 +169,162 @@ fn code(body: &str) -> serde_json::Value {
     serde_json::from_str::<serde_json::Value>(body).unwrap()["code"].clone()
 }
 
+/// A daemon serving on a free port until [`Self::stop`].
+struct Daemon {
+    listen: SocketAddr,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    _dir: tempfile::TempDir,
+}
+
+impl Daemon {
+    fn start() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let listen = free_port();
+        let config = alchemyd::Config {
+            listen,
+            socket: dir.path().join("alchemyd.sock"),
+            state_dir: dir.path().join("state"),
+        };
+        let deps = Deps::new(FixedEngine(EngineStatus::new(EngineState::Ready)));
+        let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(alchemyd::run_with(config, deps, async {
+            let _ = stop_rx.await;
+        }));
+        Self {
+            listen,
+            stop,
+            task,
+            _dir: dir,
+        }
+    }
+
+    /// Send each request and check its status and error code.
+    async fn assert_answers(&self, cases: Vec<(&str, String, &str, &str)>) {
+        for (name, request, status, want) in cases {
+            let (head, body) = exchange(self.listen, &request).await;
+            assert!(
+                head.starts_with(&format!("http/1.1 {status}")),
+                "{name}: {head}"
+            );
+            assert!(
+                head.contains("content-type: application/json"),
+                "{name}: {head}"
+            );
+            assert_eq!(code(&body), want, "{name}");
+        }
+    }
+
+    async fn stop(self) {
+        self.stop.send(()).unwrap();
+        tokio::time::timeout(TIMEOUT, self.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn tcp_listener_refuses_rebinding_cross_origin_and_non_json_requests() {
-    let dir = tempfile::tempdir().unwrap();
-    let listen = free_port();
-    let config = alchemyd::Config {
-        listen,
-        socket: dir.path().join("alchemyd.sock"),
-        state_dir: dir.path().join("state"),
-    };
-    let deps = Deps::new(FixedEngine(EngineStatus::new(EngineState::Ready)));
-    let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let daemon = tokio::spawn(alchemyd::run_with(config, deps, async {
-        let _ = stop_rx.await;
-    }));
+    let daemon = Daemon::start();
+    let listen = daemon.listen;
     let host = format!("Host: {listen}\r\n");
     let same_origin = format!("{host}Origin: http://{listen}\r\n");
 
-    let cases = [
-        (
-            "rebinding host",
-            "GET /api/health HTTP/1.1\r\nHost: evil.example:7240\r\nConnection: close\r\n\r\n"
-                .to_owned(),
-            "403",
-            "forbidden",
-        ),
-        (
-            "cross-origin form post",
-            post(&format!(
-                "{host}Origin: https://evil.example\r\n\
+    daemon
+        .assert_answers(vec![
+            (
+                "rebinding host",
+                "GET /api/health HTTP/1.1\r\nHost: evil.example:7240\r\nConnection: close\r\n\r\n"
+                    .to_owned(),
+                "403",
+                "forbidden",
+            ),
+            (
+                "cross-origin form post",
+                post(&format!(
+                    "{host}Origin: https://evil.example\r\n\
                  Content-Type: application/x-www-form-urlencoded\r\n"
-            )),
-            "403",
-            "forbidden",
-        ),
-        (
-            "text/plain post",
-            post(&format!("{same_origin}Content-Type: text/plain\r\n")),
-            "415",
-            "unsupported_media_type",
-        ),
-        (
-            "same-origin json post",
-            post(&format!("{same_origin}Content-Type: application/json\r\n")),
-            "405",
-            "method_not_allowed",
-        ),
-        (
-            "tauri json post",
-            post(&format!(
-                "{host}Origin: tauri://localhost\r\nContent-Type: application/json\r\n"
-            )),
-            "405",
-            "method_not_allowed",
-        ),
-        (
-            "localhost get",
-            "GET /api/nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_owned(),
-            "404",
-            "not_found",
-        ),
-    ];
-    for (name, request, status, want) in cases {
-        let (head, body) = exchange(listen, &request).await;
-        assert!(
-            head.starts_with(&format!("http/1.1 {status}")),
-            "{name}: {head}"
-        );
-        assert!(
-            head.contains("content-type: application/json"),
-            "{name}: {head}"
-        );
-        assert_eq!(code(&body), want, "{name}");
-    }
+                )),
+                "403",
+                "forbidden",
+            ),
+            (
+                "text/plain post",
+                post(&format!("{same_origin}Content-Type: text/plain\r\n")),
+                "415",
+                "unsupported_media_type",
+            ),
+            (
+                "same-origin json post",
+                post(&format!("{same_origin}Content-Type: application/json\r\n")),
+                "405",
+                "method_not_allowed",
+            ),
+            (
+                "tauri json post",
+                post(&format!(
+                    "{host}Origin: tauri://localhost\r\nContent-Type: application/json\r\n"
+                )),
+                "405",
+                "method_not_allowed",
+            ),
+            (
+                "localhost get",
+                "GET /api/nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_owned(),
+                "404",
+                "not_found",
+            ),
+        ])
+        .await;
+    daemon.stop().await;
+}
 
-    stop.send(()).unwrap();
-    tokio::time::timeout(TIMEOUT, daemon)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+#[tokio::test]
+async fn tcp_listener_refuses_reads_sent_for_pages_on_other_sites() {
+    let daemon = Daemon::start();
+    let host = format!("Host: {}\r\n", daemon.listen);
+
+    daemon
+        .assert_answers(vec![
+            (
+                "cross-site no-cors get",
+                format!(
+                    "GET /api/apps/blog/logs?follow=true HTTP/1.1\r\n{host}\
+                 Sec-Fetch-Site: cross-site\r\nConnection: close\r\n\r\n"
+                ),
+                "403",
+                "forbidden",
+            ),
+            (
+                "same-site get from another localhost port",
+                format!(
+                    "GET /api/nope HTTP/1.1\r\n{host}Origin: http://localhost:8080\r\n\
+                 Sec-Fetch-Site: same-site\r\nConnection: close\r\n\r\n"
+                ),
+                "403",
+                "forbidden",
+            ),
+            (
+                "same-origin get",
+                format!(
+                    "GET /api/nope HTTP/1.1\r\n{host}Sec-Fetch-Site: same-origin\r\n\
+                 Connection: close\r\n\r\n"
+                ),
+                "404",
+                "not_found",
+            ),
+            (
+                "tauri cross-site get",
+                format!(
+                    "GET /api/nope HTTP/1.1\r\n{host}Origin: tauri://localhost\r\n\
+                 Sec-Fetch-Site: cross-site\r\nConnection: close\r\n\r\n"
+                ),
+                "404",
+                "not_found",
+            ),
+        ])
+        .await;
+    daemon.stop().await;
 }

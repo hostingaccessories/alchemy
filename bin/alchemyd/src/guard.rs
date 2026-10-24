@@ -15,7 +15,13 @@
 //! 3. every mutating request whose `Content-Type` is not
 //!    `application/json`, with or without a body ([`check_content_type`]).
 //!    JSON is not a CORS-safelisted type, so a cross-origin caller must
-//!    pass a preflight first, and CORS answers that only for the shell.
+//!    pass a preflight first, and CORS answers that only for the shell;
+//! 4. every request under `/api`, whatever its method, that the browser
+//!    marks as sent by a page on another site and that does not come from
+//!    one of [`TAURI_ORIGINS`] ([`check_fetch_site`]). A page cannot read
+//!    the answer to a `no-cors` `GET`, but it can send one in a loop, and
+//!    each log stream it opens holds daemon memory and a connection to
+//!    the engine.
 //!
 //! A request is mutating unless its method is `GET`, `HEAD`, or `OPTIONS`.
 //!
@@ -51,13 +57,15 @@ pub enum Refusal {
     Origin,
     /// A mutating request did not declare a JSON body.
     ContentType,
+    /// A browser sent the request for a page on another site.
+    CrossSite,
 }
 
 impl Refusal {
     /// The HTTP status to answer with.
     pub fn status(self) -> StatusCode {
         match self {
-            Self::Host | Self::Origin => StatusCode::FORBIDDEN,
+            Self::Host | Self::Origin | Self::CrossSite => StatusCode::FORBIDDEN,
             Self::ContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
         }
     }
@@ -65,7 +73,7 @@ impl Refusal {
     /// The [`ErrorCode`] to answer with.
     pub fn code(self) -> ErrorCode {
         match self {
-            Self::Host | Self::Origin => ErrorCode::Forbidden,
+            Self::Host | Self::Origin | Self::CrossSite => ErrorCode::Forbidden,
             Self::ContentType => ErrorCode::UnsupportedMediaType,
         }
     }
@@ -78,9 +86,14 @@ impl Refusal {
             }
             Self::Origin => "cross-origin request refused",
             Self::ContentType => "content type must be application/json",
+            Self::CrossSite => "cross-site request refused",
         }
     }
 }
+
+/// `Sec-Fetch-Site`, which browsers send on every request to say how the
+/// page that sent it relates to the request's origin.
+static SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
 
 /// Whether `method` can change daemon state, and so gets the origin and
 /// content-type checks.
@@ -124,6 +137,51 @@ pub fn check_content_type(method: &Method, headers: &HeaderMap) -> Result<(), Re
         Some(content_type) if is_json(content_type) => Ok(()),
         _ => Err(Refusal::ContentType),
     }
+}
+
+/// Refuse a request for `path` that a browser sent for a page on another
+/// site, unless it comes from the Tauri shell. Only paths under `/api` are
+/// checked; see [`is_api_path`] and [`fetch_site_allowed`].
+///
+/// A request without `Sec-Fetch-Site` passes: the CLI, `curl`, and
+/// browsers too old to send it. Those browsers are still held to the
+/// origin and content-type checks for anything that changes state.
+pub fn check_fetch_site(path: &str, headers: &HeaderMap) -> Result<(), Refusal> {
+    if !is_api_path(path) || !headers.contains_key(&SEC_FETCH_SITE) {
+        return Ok(());
+    }
+    let origin = if headers.contains_key(header::ORIGIN) {
+        match single(headers, &header::ORIGIN) {
+            Some(origin) => Some(origin),
+            None => return Err(Refusal::CrossSite),
+        }
+    } else {
+        None
+    };
+    match single(headers, &SEC_FETCH_SITE) {
+        Some(site) if fetch_site_allowed(site, origin) => Ok(()),
+        _ => Err(Refusal::CrossSite),
+    }
+}
+
+/// Whether a request whose `Sec-Fetch-Site` is `site` and whose `Origin`,
+/// if any, is `origin` may reach the API.
+///
+/// `same-origin` is the web UI, served by the daemon or through the dev
+/// server's proxy, which passes the browser's header on; `none` is the
+/// user typing a URL or opening a bookmark. Anything else, `same-site`
+/// and `cross-site` included, passes only from one of [`TAURI_ORIGINS`]:
+/// the shell's pages are cross-site to `http://127.0.0.1:7240`, and their
+/// requests carry its `Origin`, which no other page can send. `same-site`
+/// is refused too, since every port on `localhost` is the same site.
+pub fn fetch_site_allowed(site: &str, origin: Option<&str>) -> bool {
+    matches!(site, "same-origin" | "none") || origin.is_some_and(|o| TAURI_ORIGINS.contains(&o))
+}
+
+/// Whether `path` is [`alchemy_api::API_PREFIX`] or under it.
+pub fn is_api_path(path: &str) -> bool {
+    path.strip_prefix(alchemy_api::API_PREFIX)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// Whether a daemon listening on `listen` answers to the `Host` value
@@ -437,10 +495,107 @@ mod tests {
     }
 
     #[test]
+    fn fetch_site_allowed_table() {
+        let cases = [
+            ("same-origin", None, true),
+            ("same-origin", Some("http://127.0.0.1:7240"), true),
+            ("none", None, true),
+            ("cross-site", Some("tauri://localhost"), true),
+            ("cross-site", Some("http://tauri.localhost"), true),
+            ("same-site", Some("tauri://localhost"), true),
+            ("cross-site", None, false),
+            ("cross-site", Some("https://evil.example"), false),
+            ("cross-site", Some("null"), false),
+            ("cross-site", Some("tauri://LOCALHOST"), false),
+            ("same-site", None, false),
+            ("same-site", Some("http://localhost:8080"), false),
+            ("Same-Origin", None, false),
+            ("", None, false),
+            ("something-new", None, false),
+        ];
+        for (site, origin, want) in cases {
+            assert_eq!(
+                fetch_site_allowed(site, origin),
+                want,
+                "{site:?} from {origin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_api_path_table() {
+        let cases = [
+            ("/api", true),
+            ("/api/", true),
+            ("/api/apps/blog/logs", true),
+            ("/apis", false),
+            ("/api-docs", false),
+            ("/", false),
+            ("/apps/blog", false),
+            ("/assets/api/x.js", false),
+            ("", false),
+        ];
+        for (path, want) in cases {
+            assert_eq!(is_api_path(path), want, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn check_fetch_site_table() {
+        let site = |value| (SEC_FETCH_SITE.clone(), value);
+        let logs = "/api/apps/blog/logs";
+        let cases = [
+            (logs, headers(&[]), Ok(())),
+            (logs, headers(&[site("same-origin")]), Ok(())),
+            (logs, headers(&[site("none")]), Ok(())),
+            (
+                logs,
+                headers(&[site("cross-site")]),
+                Err(Refusal::CrossSite),
+            ),
+            (logs, headers(&[site("same-site")]), Err(Refusal::CrossSite)),
+            (
+                logs,
+                headers(&[site("cross-site"), (header::ORIGIN, "tauri://localhost")]),
+                Ok(()),
+            ),
+            (
+                logs,
+                headers(&[site("cross-site"), (header::ORIGIN, "https://evil.example")]),
+                Err(Refusal::CrossSite),
+            ),
+            (
+                logs,
+                headers(&[
+                    site("cross-site"),
+                    (header::ORIGIN, "tauri://localhost"),
+                    (header::ORIGIN, "https://evil.example"),
+                ]),
+                Err(Refusal::CrossSite),
+            ),
+            (
+                logs,
+                headers(&[site("same-origin"), site("cross-site")]),
+                Err(Refusal::CrossSite),
+            ),
+            ("/", headers(&[site("cross-site")]), Ok(())),
+            ("/apps/blog", headers(&[site("cross-site")]), Ok(())),
+        ];
+        for (path, map, want) in cases {
+            assert_eq!(check_fetch_site(path, &map), want, "{path} {map:?}");
+        }
+    }
+
+    #[test]
     fn refusals_map_to_status_and_code() {
         for (refusal, status, code) in [
             (Refusal::Host, StatusCode::FORBIDDEN, ErrorCode::Forbidden),
             (Refusal::Origin, StatusCode::FORBIDDEN, ErrorCode::Forbidden),
+            (
+                Refusal::CrossSite,
+                StatusCode::FORBIDDEN,
+                ErrorCode::Forbidden,
+            ),
             (
                 Refusal::ContentType,
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
