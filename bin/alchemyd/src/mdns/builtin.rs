@@ -9,7 +9,7 @@
 //! On a conflict while probing, `mdns-sd` renames the host silently
 //! (`immich.local.` to `immich-2.local.`) and reports a `NameChange` for
 //! the A record. Names never change silently in Alchemy, so the backend
-//! unregisters the service at once and reports [`RecordState::Conflict`].
+//! unregisters the service at once and reports [`RecordState::Conflict`](super::RecordState::Conflict).
 //! A later conflict goes unreported, as with avahi (#100).
 //!
 //! Not used on macOS, where raw multicast from a launchd agent may need
