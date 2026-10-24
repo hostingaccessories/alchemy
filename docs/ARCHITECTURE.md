@@ -35,15 +35,15 @@ Everything below follows from the line at the top of this page.
 
 ## 2. Crates and dependency direction
 
-| Crate            | Path                  | Role                                                                |
-| ---------------- | --------------------- | ------------------------------------------------------------------- |
-| `alchemy-core`   | `crates/alchemy-core` | Pure domain model (stacks, the Docker engine, and their invariants) |
-| `alchemy-api`    | `crates/alchemy-api`  | HTTP API types; the socket path behind the `socket` feature         |
-| `alchemyd`       | `bin/alchemyd`        | Daemon: HTTP API on TCP and a Unix socket, embedded web UI          |
-| `alchemy`        | `bin/alchemy`         | CLI, an HTTP client over the Unix socket                            |
-| `alchemy-helper` | `bin/alchemy-helper`  | Privileged one-shot                                                 |
-| `alchemy-gui`    | `app/alchemy-gui`     | Tauri desktop shell around the web UI                               |
-| `alchemy-web`    | `app/alchemy-web`     | React web UI, served by the daemon and bundled into the shell       |
+| Crate            | Path                  | Role                                                                                           |
+| ---------------- | --------------------- | ---------------------------------------------------------------------------------------------- |
+| `alchemy-core`   | `crates/alchemy-core` | Pure domain model (stacks, the Docker engine, operations, logs, metrics, and their invariants) |
+| `alchemy-api`    | `crates/alchemy-api`  | HTTP API types; the socket path behind the `socket` feature                                    |
+| `alchemyd`       | `bin/alchemyd`        | Daemon: HTTP API on TCP and a Unix socket, embedded web UI                                     |
+| `alchemy`        | `bin/alchemy`         | CLI, an HTTP client over the Unix socket                                                       |
+| `alchemy-helper` | `bin/alchemy-helper`  | Privileged one-shot                                                                            |
+| `alchemy-gui`    | `app/alchemy-gui`     | Tauri desktop shell around the web UI                                                          |
+| `alchemy-web`    | `app/alchemy-web`     | React web UI, served by the daemon and bundled into the shell                                  |
 
 Internal dependencies flow strictly downhill, with no cycles:
 
@@ -148,7 +148,7 @@ A change is complete when:
 - every side effect is behind a trait and tested with a fake;
 - wiring has an integration test in the crate's `tests/`;
 - public items are documented;
-- the full gate in [DEVELOPMENT.md](DEVELOPMENT.md#the-gate) passes.
+- the full gate in [DEVELOPMENT.md](DEVELOPMENT.md#4-the-gate) passes.
 
 If a task would break one of these rules, such as adding I/O to a pure
 crate, routing a side effect around a trait, giving the GUI privileged
