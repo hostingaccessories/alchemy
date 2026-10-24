@@ -5,6 +5,7 @@ import { useState } from "react";
 import { EngineStatusView } from "../components/EngineStatus.tsx";
 import { Loading } from "../components/Loading.tsx";
 import { PageHeader } from "../components/PageHeader.tsx";
+import { PortsSection } from "../components/Ports.tsx";
 import { AppUsageTable, MachineUsageView, RangePicker } from "../components/Usage.tsx";
 import { type MetricsRange, api } from "../lib/api.ts";
 import { useDaemonConnection } from "../lib/live.tsx";
@@ -42,6 +43,7 @@ function MachinesPage() {
         )}
       </section>
       {online && <Usage />}
+      {online && <PortsSection />}
     </div>
   );
 }

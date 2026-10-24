@@ -1,7 +1,14 @@
 import { act, cleanup, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import type { App, AppList, EngineStatus, MetricsHistory, MetricsResponse } from "../lib/api.ts";
+import type {
+  App,
+  AppList,
+  EngineStatus,
+  MetricsHistory,
+  MetricsResponse,
+  PortList,
+} from "../lib/api.ts";
 import { FakeEventSource, renderAt } from "../test/render.tsx";
 
 const ready: EngineStatus = {
@@ -32,6 +39,9 @@ let historyRequests: string[] = [];
 
 /** Whether the stubbed daemon predates `/api/metrics`. */
 let oldDaemon = false;
+
+/** What the stubbed `GET /api/ports` answers; `null` never answers. */
+let portList: PortList | null = null;
 
 const GIB = 1024 ** 3;
 
@@ -107,6 +117,7 @@ beforeEach(() => {
   daemonUp = true;
   historyRequests = [];
   oldDaemon = false;
+  portList = null;
   FakeEventSource.instances = [];
   vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal(
@@ -115,10 +126,15 @@ beforeEach(() => {
       if (!daemonUp) {
         throw new TypeError("connection refused");
       }
-      if (oldDaemon && url.startsWith("/api/metrics")) {
+      if (oldDaemon && (url.startsWith("/api/metrics") || url === "/api/ports")) {
         return new Response(JSON.stringify({ error: "not found", code: "not_found" }), {
           status: 404,
         });
+      }
+      if (url === "/api/ports") {
+        return portList === null
+          ? new Promise<Response>(() => {})
+          : new Response(JSON.stringify(portList), { status: 200 });
       }
       if (url === "/api/engine" || url === "/api/metrics" || url === "/api/apps") {
         return new Promise<Response>(() => {});
@@ -368,5 +384,83 @@ describe("Machines", () => {
     expect(await screen.findByRole("img", { name: "CPU over the last hour" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "1h" }).getAttribute("aria-pressed")).toBe("true");
     expect(historyRequests).toContain("/api/metrics/history?range=1h");
+  });
+
+  it("lists every port and who holds it, linking apps", async () => {
+    const tcp = (published: string, host_ip: string | null = null) => ({
+      protocol: "tcp" as const,
+      host_ip,
+      published,
+      target: null,
+    });
+    portList = {
+      ports: [
+        {
+          port: tcp("3000"),
+          holder: { kind: "app", app: "wiki", service: "app" },
+          source: "declared",
+        },
+        {
+          port: tcp("8080"),
+          holder: { kind: "app", app: "blog", service: "web" },
+          source: "live",
+        },
+        {
+          port: tcp("8443"),
+          holder: { kind: "reservation", owner: "proxy" },
+          source: "reserved",
+        },
+        {
+          port: tcp("9000", "0.0.0.0"),
+          holder: { kind: "program", process: "nc", pid: 42 },
+          source: "live",
+        },
+      ],
+      warnings: ["alchemyd couldn't read which programs are listening on this machine."],
+    };
+    await renderOnline();
+    const blog: App = {
+      name: "blog",
+      status: "running",
+      dir: "/home/me/Alchemy/apps/blog",
+      root: "/home/me/Alchemy/apps",
+      compose_file: "compose.yaml",
+      project: "blog",
+      images: "registry",
+      services: [],
+      problems: [],
+      stop_reason: { kind: "running" },
+    };
+    await act(async () => {
+      source().emit("apps", JSON.stringify({ apps: [blog], unmanaged: [], dirs: [] }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const ports = await screen.findByRole("region", { name: "Ports" });
+    const live = await within(ports).findByRole("row", { name: /8080\/tcp/ });
+    expect(within(live).getByText("In use")).toBeTruthy();
+    expect(within(live).getByRole("link", { name: "blog" }).getAttribute("href")).toBe(
+      "/apps/blog",
+    );
+    const declared = within(ports).getByRole("row", { name: /3000\/tcp/ });
+    expect(within(declared).getByText("Declared")).toBeTruthy();
+    expect(within(declared).getByText("app of wiki")).toBeTruthy();
+    expect(within(declared).queryByRole("link")).toBeNull();
+    const reserved = within(ports).getByRole("row", { name: /8443\/tcp/ });
+    expect(within(reserved).getByText("Reserved for proxy")).toBeTruthy();
+    const nc = within(ports).getByRole("row", { name: /9000\/tcp/ });
+    expect(within(nc).getByText("0.0.0.0")).toBeTruthy();
+    expect(within(nc).getByText("nc (pid 42)")).toBeTruthy();
+    expect(within(ports).getByText(/couldn't read which programs are listening/)).toBeTruthy();
+    expect(
+      within(ports).getByText(/Declared ports belong to apps that aren't running/),
+    ).toBeTruthy();
+  });
+
+  it("says when alchemyd is too old to list ports", async () => {
+    oldDaemon = true;
+    await renderOnline();
+    const ports = screen.getByRole("region", { name: "Ports" });
+    expect(await within(ports).findByText(/doesn't list ports/)).toBeTruthy();
   });
 });

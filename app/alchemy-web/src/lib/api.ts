@@ -82,6 +82,36 @@ export interface PublishedPort {
 }
 
 /**
+ * Mirrors `alchemy_api::ports::PortSource`: reserved by Alchemy, declared by
+ * a stopped app's Compose file, or held right now.
+ */
+export type PortSource = "reserved" | "declared" | "live";
+
+/**
+ * Mirrors `alchemy_api::ports::PortHolder`. A `program`'s process and pid
+ * are null when the OS doesn't reveal them.
+ */
+export type PortHolder =
+  | { kind: "app"; app: string; service: string }
+  | { kind: "container"; name: string }
+  | { kind: "reservation"; owner: string }
+  | { kind: "program"; process: string | null; pid: number | null };
+
+/** Mirrors `alchemy_api::ports::PortClaim`. */
+export interface PortClaim {
+  port: PublishedPort;
+  holder: PortHolder;
+  source: PortSource;
+}
+
+/** Mirrors `alchemy_api::ports::PortList`, from `GET /api/ports`. */
+export interface PortList {
+  ports: PortClaim[];
+  /** What alchemyd couldn't find out, as sentences. Empty when complete. */
+  warnings: string[];
+}
+
+/**
  * Mirrors `alchemy_api::MachineUsage`. CPU is a percentage of the whole
  * machine, rates are bytes per second, and sizes are bytes. `null` means not
  * measured, never zero. On macOS this is the Mac, not Docker Desktop's VM.
@@ -764,6 +794,7 @@ export const api = {
     const query = new URLSearchParams({ range, ...filter });
     return request<MetricsHistory>("GET", `/metrics/history?${query.toString()}`, { signal });
   },
+  ports: (signal?: AbortSignal) => request<PortList>("GET", "/ports", { signal }),
   apps: (signal?: AbortSignal) => request<AppList>("GET", "/apps", { signal }),
   app: (name: string, signal?: AbortSignal) =>
     request<App>("GET", `/apps/${encodeURIComponent(name)}`, { signal }),
