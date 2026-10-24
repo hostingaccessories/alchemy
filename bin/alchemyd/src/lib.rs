@@ -4,8 +4,9 @@
 //! ([`http`]) through two front doors over the same state:
 //!
 //! - a TCP listener, which adds the embedded web UI, CORS for the Tauri
-//!   shell, and the [`guard`] checks against other web pages, used by
-//!   browsers and the shell, and
+//!   shell, the [`guard`] checks against other web pages, and signing in
+//!   with this start's token or a browser session ([`auth`], [`session`]),
+//!   used by browsers and the shell, and
 //! - a per-user Unix socket ([`socket`]) serving the API alone, used by
 //!   the `alchemy` CLI and `alchemy-helper`.
 //!
@@ -16,6 +17,7 @@
 //! persists settings, history, and stop [`intent`] in a [`store::Store`].
 
 pub mod apps;
+pub mod auth;
 pub mod compose;
 pub mod engine;
 pub mod events;
@@ -26,6 +28,7 @@ pub mod logs;
 pub mod metrics;
 pub mod operations;
 mod secure_fs;
+pub mod session;
 pub mod socket;
 mod state;
 pub mod store;
@@ -35,7 +38,7 @@ pub use state::State;
 
 use std::future::{Future, IntoFuture as _};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -46,10 +49,12 @@ use crate::engine::{EngineMonitor, EngineSource, SystemConnector, SystemProbe};
 use crate::logs::{SharedLogSource, SystemLogs};
 use crate::metrics::{Collector, MetricsSource, SystemMetrics};
 use crate::operations::{OperationRunner, Operations, SystemRunner};
+use crate::session::{Auth, TokenFile};
 use crate::store::{SharedStore, SqliteStore};
 
-/// Default HTTP listen address. Loopback only: the API has no
-/// authentication yet.
+/// Default HTTP listen address. Loopback only: the TCP listener's token
+/// keeps out other processes and users on this machine, but there is no
+/// login fit for other machines yet.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7240";
 
 /// Runtime configuration for [`run`].
@@ -190,6 +195,10 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::
 /// Neither does a missing or unreadable app folder, which shows up in the
 /// app list.
 ///
+/// Once both listeners are bound, and before either serves a request, a
+/// new TCP token is written to [`alchemy_api::TCP_TOKEN_FILE`] in the
+/// state directory; it is removed again on shutdown.
+///
 /// Operations a previous daemon left running are marked interrupted at
 /// startup. On shutdown, running operations are interrupted and stored
 /// before the listeners close.
@@ -198,13 +207,7 @@ pub async fn run_with(
     deps: Deps<impl EngineSource, impl MetricsSource>,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
-    if !config.listen.ip().is_loopback() {
-        tracing::warn!(
-            listen = %config.listen,
-            "HTTP API is bound to a non-loopback address and has no authentication yet"
-        );
-    }
-
+    warn_if_exposed(config.listen);
     let sqlite = SqliteStore::open(&config.state_dir)
         .await
         .context("opening the state database")?;
@@ -228,12 +231,14 @@ pub async fn run_with(
     let http_listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("binding HTTP listener {}", config.listen))?;
+    let (listen, auth, token_file) = sign_in_state(&http_listener, &config.state_dir)?;
 
     tracing::info!(
         version = alchemy_core::VERSION,
-        http = %config.listen,
+        http = %listen,
         socket = %config.socket.display(),
         state = %db.display(),
+        token = %token_file.path().display(),
         "alchemyd listening"
     );
 
@@ -258,6 +263,7 @@ pub async fn run_with(
                     shutdown_rx.clone(),
                     deps.logs.clone(),
                     operations.clone(),
+                    auth.clone(),
                 ),
                 deps.editor.clone(),
             ),
@@ -272,7 +278,10 @@ pub async fn run_with(
                 http::router(
                     deps.state,
                     store,
-                    config.listen.ip(),
+                    http::Tcp {
+                        listen: listen.ip(),
+                        auth,
+                    },
                     shutdown_rx.clone(),
                     deps.logs,
                     operations.clone(),
@@ -293,6 +302,7 @@ pub async fn run_with(
     let apps_result = apps_task.await;
     let socket_result = socket_task.await;
     let http_result = http_task.await;
+    drop(token_file);
     drop(socket_file);
     engine_result.context("engine task failed")?;
     metrics_result.context("metrics task failed")?;
@@ -300,6 +310,31 @@ pub async fn run_with(
     socket_result.context("API socket task failed")??;
     http_result.context("HTTP task failed")??;
     Ok(())
+}
+
+fn warn_if_exposed(listen: SocketAddr) {
+    if !listen.ip().is_loopback() {
+        tracing::warn!(
+            %listen,
+            "HTTP API is bound to a non-loopback address, where its token travels in the clear"
+        );
+    }
+}
+
+/// The address `listener` is bound to, and a new token for it, written to
+/// its file in `state_dir`.
+fn sign_in_state(
+    listener: &tokio::net::TcpListener,
+    state_dir: &Path,
+) -> anyhow::Result<(SocketAddr, Auth, TokenFile)> {
+    let listen = listener
+        .local_addr()
+        .context("reading the HTTP listener's address")?;
+    let auth = Auth::generate(listen).context("making the TCP token")?;
+    let path = alchemy_api::tcp_token_path(state_dir);
+    let file = TokenFile::write(&path, auth.token())
+        .with_context(|| format!("writing the TCP token to {}", path.display()))?;
+    Ok((listen, auth, file))
 }
 
 async fn stopped(mut shutdown: watch::Receiver<bool>) {

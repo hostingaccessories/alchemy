@@ -24,6 +24,7 @@ axum               = { workspace = true }
 bollard            = { workspace = true }
 clap               = { workspace = true }
 futures-util       = { workspace = true }
+getrandom          = { workspace = true }
 rust-embed         = { workspace = true }
 rusqlite           = { workspace = true }
 rustix             = { workspace = true, features = ["fs"] }

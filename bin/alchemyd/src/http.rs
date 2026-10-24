@@ -12,7 +12,10 @@
 //!
 //! Both routers apply the request checks in [`crate::guard`] before any
 //! route sees a request, so a route added under `/api` is covered by
-//! nesting it, with nothing to opt into.
+//! nesting it, with nothing to opt into. The TCP listener then requires
+//! signing in, as [`crate::auth`] describes, for every `/api` route but
+//! health and version; it also serves `/login`, which redeems a launch
+//! code that only the socket's `POST /api/session/launch` issues.
 //!
 //! Creating apps and editing their files needs an [`AppEditor`], which
 //! [`with_editor`] adds to either router; without one those routes answer
@@ -30,6 +33,7 @@ use alchemy_api::logs::LogEvent;
 use alchemy_api::operations::{
     Action, ActionRequest, OperationEvent, OperationList, OperationResponse,
 };
+use alchemy_api::session::{SessionAuth, SessionResponse};
 use alchemy_api::{
     ApiEvent, EngineStatus, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, MetricsRange,
     VersionResponse,
@@ -51,11 +55,13 @@ use tower_http::cors::CorsLayer;
 
 use crate::State;
 use crate::apps::{self, AppEditor, settings};
+use crate::auth::{LAUNCH_PATH, LOGIN_PATH};
 use crate::events::{self, Topic};
 use crate::guard::{self, Refusal, TAURI_ORIGINS};
 use crate::logs::{self, LogQuery, LogsRefusal, SharedLogSource};
 use crate::metrics::Scope;
 use crate::operations::{CancelError, Operations, StartError};
+use crate::session::Auth;
 use crate::store::SharedStore;
 
 /// How often `/api/events` sends an SSE comment while idle, so proxies and
@@ -73,6 +79,32 @@ struct Api {
     shutdown: watch::Receiver<bool>,
     logs: SharedLogSource,
     operations: Operations,
+    door: Door,
+}
+
+/// Which front door [`api`] is serving, for the one route that differs.
+#[derive(Debug, Clone)]
+enum Door {
+    /// The Unix socket, which issues launch codes from its [`Auth`].
+    Socket(Auth),
+    /// The TCP listener, which refuses to.
+    Tcp,
+}
+
+/// What the TCP listener adds to the API: the address it is bound to, for
+/// the `Host` check, and its sign-in state.
+#[derive(Debug, Clone)]
+pub struct Tcp {
+    /// The address the listener is bound to.
+    pub listen: IpAddr,
+    /// The token, launch codes, and sessions it accepts.
+    pub auth: Auth,
+}
+
+impl FromRef<Api> for Door {
+    fn from_ref(api: &Api) -> Self {
+        api.door.clone()
+    }
 }
 
 impl FromRef<Api> for Operations {
@@ -100,31 +132,41 @@ impl FromRef<Api> for SharedStore {
 /// sender is dropped), so open `/api/events` connections do not hold up
 /// graceful shutdown. Only the socket's share of the [`crate::guard`]
 /// checks applies; see [`socket_checks`]. App logs are read through
-/// `logs`, and lifecycle actions run through `operations`.
+/// `logs`, and lifecycle actions run through `operations`. Launch codes
+/// for the TCP listener are issued from `auth`.
 pub fn api_router(
     state: State,
     store: SharedStore,
     shutdown: watch::Receiver<bool>,
     logs: SharedLogSource,
     operations: Operations,
+    auth: Auth,
 ) -> Router {
     socket_checks(
         Router::new()
             .nest(
                 alchemy_api::API_PREFIX,
-                api(state, store, events::topics(), shutdown, logs, operations),
+                api(
+                    state,
+                    store,
+                    events::topics(),
+                    shutdown,
+                    logs,
+                    operations,
+                    Door::Socket(auth),
+                ),
             )
             .fallback(api_not_found),
     )
 }
 
-/// Build the full router for the TCP listener bound to `listen`: the
-/// [`api_router`] routes, CORS for the desktop shell, the web UI, and every
-/// [`crate::guard`] check.
+/// Build the full router for the TCP listener `tcp`: the [`api_router`]
+/// routes, CORS for the desktop shell, the web UI, `/login`, every
+/// [`crate::guard`] check, and signing in.
 pub fn router(
     state: State,
     store: SharedStore,
-    listen: IpAddr,
+    tcp: Tcp,
     shutdown: watch::Receiver<bool>,
     logs: SharedLogSource,
     operations: Operations,
@@ -132,7 +174,7 @@ pub fn router(
     router_with_topics(
         state,
         store,
-        listen,
+        tcp,
         events::topics(),
         shutdown,
         logs,
@@ -145,33 +187,40 @@ pub fn router(
 pub fn router_with_topics(
     state: State,
     store: SharedStore,
-    listen: IpAddr,
+    tcp: Tcp,
     topics: Vec<Topic>,
     shutdown: watch::Receiver<bool>,
     logs: SharedLogSource,
     operations: Operations,
 ) -> Router {
+    let login = Router::new()
+        .route(LOGIN_PATH, get(login))
+        .with_state(tcp.auth.clone());
     tcp_checks(
         Router::new()
             .nest(
                 alchemy_api::API_PREFIX,
-                api(state, store, topics, shutdown, logs, operations),
+                api(state, store, topics, shutdown, logs, operations, Door::Tcp),
             )
+            .merge(login)
             .fallback(crate::web::serve),
-        listen,
+        tcp,
     )
 }
 
-/// Wrap `routes` the way the TCP listener bound to `listen` serves them.
+/// Wrap `routes` the way the TCP listener `tcp` serves them.
 ///
 /// The `Host` check is outermost, so it covers CORS preflights too. The
 /// origin and content-type checks sit inside CORS, so a refusal sent to the
 /// desktop shell still carries the headers it needs to read the error.
-pub fn tcp_checks(routes: Router, listen: IpAddr) -> Router {
+/// Signing in is checked last, after every refusal that needs no
+/// credential, and inside CORS for the same reason.
+pub fn tcp_checks(routes: Router, tcp: Tcp) -> Router {
     routes
+        .layer(middleware::from_fn_with_state(tcp.auth, require_auth))
         .layer(middleware::from_fn(require_browser_safe))
         .layer(cors())
-        .layer(middleware::from_fn_with_state(listen, require_host))
+        .layer(middleware::from_fn_with_state(tcp.listen, require_host))
 }
 
 /// Give `router`'s app file routes `editor` to create and edit apps with.
@@ -193,10 +242,13 @@ fn api(
     shutdown: watch::Receiver<bool>,
     logs: SharedLogSource,
     operations: Operations,
+    door: Door,
 ) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
+        .route("/session", get(session))
+        .route(LAUNCH_PATH, post(launch))
         .route("/engine", get(engine))
         .route("/events", get(events))
         .route("/metrics", get(metrics))
@@ -231,6 +283,7 @@ fn api(
             shutdown,
             logs,
             operations,
+            door,
         })
 }
 
@@ -262,6 +315,38 @@ async fn require_json(req: Request, next: Next) -> Response {
     }
 }
 
+async fn require_auth(
+    extract::State(auth): extract::State<Auth>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    if crate::auth::is_public(req.method(), req.uri().path()) {
+        return next.run(req).await;
+    }
+    match auth.authenticate(req.headers()) {
+        Some(how) => {
+            req.extensions_mut().insert(how);
+            next.run(req).await
+        }
+        None => unauthorized(),
+    }
+}
+
+/// 401, with the `WWW-Authenticate` challenge RFC 9110 asks for.
+fn unauthorized() -> Response {
+    tracing::debug!("refused a request that is not signed in");
+    let mut resp = api_error(
+        StatusCode::UNAUTHORIZED,
+        ErrorCode::Unauthorized,
+        "not signed in: run `alchemy open` to open Alchemy in your browser",
+    );
+    resp.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer realm=\"alchemyd\""),
+    );
+    resp
+}
+
 fn refuse(refusal: Refusal) -> Response {
     tracing::debug!(?refusal, "refused request");
     api_error(refusal.status(), refusal.code(), refusal.message())
@@ -271,8 +356,99 @@ fn cors() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(TAURI_ORIGINS.map(HeaderValue::from_static))
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_headers([header::CONTENT_TYPE])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
 }
+
+/// `GET /api/session`. A request that reached it over TCP was let in by
+/// [`require_auth`], which says how; one without that came over the
+/// socket.
+async fn session(how: Option<Extension<SessionAuth>>) -> Json<SessionResponse> {
+    Json(SessionResponse {
+        auth: how.map_or(SessionAuth::Socket, |Extension(how)| how),
+    })
+}
+
+/// `POST /api/session/launch`, which only the socket answers: a launch
+/// code is a way in to the TCP listener for whoever can open the socket.
+async fn launch(extract::State(door): extract::State<Door>) -> Response {
+    let Door::Socket(auth) = door else {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            ErrorCode::Forbidden,
+            "launch codes are issued only on the alchemyd socket: run `alchemy open`",
+        );
+    };
+    match auth.launch() {
+        Ok(launch) => ([(header::CACHE_CONTROL, "no-store")], Json(launch)).into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "cannot make a launch code");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "cannot make a launch code",
+            )
+        }
+    }
+}
+
+/// `?code=` on `/login`.
+#[derive(Debug, Deserialize)]
+struct LoginQuery {
+    code: Option<String>,
+}
+
+/// `GET /login?code=CODE` on the TCP listener: redeem a launch code, set
+/// the session cookie, and send the browser to the web UI. Nothing it
+/// answers is cached, and the code never leaves in a `Referer`.
+async fn login(
+    extract::State(auth): extract::State<Auth>,
+    query: Result<Query<LoginQuery>, QueryRejection>,
+) -> Response {
+    let code = query.ok().and_then(|Query(q)| q.code).unwrap_or_default();
+    let private = [
+        (header::CACHE_CONTROL, "no-store"),
+        (header::REFERRER_POLICY, "no-referrer"),
+    ];
+    match auth.login(&code) {
+        Ok(Some(cookie)) => (
+            StatusCode::SEE_OTHER,
+            private,
+            [
+                (header::LOCATION, "/".to_owned()),
+                (header::SET_COOKIE, cookie),
+            ],
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::UNAUTHORIZED,
+            private,
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            LOGIN_REFUSED,
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "cannot start a session");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                private,
+                "cannot start a session",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// What `/login` shows for a code that is unknown, used, or expired.
+const LOGIN_REFUSED: &str = concat!(
+    "<!doctype html>\n<html lang=\"en\">\n<meta charset=\"utf-8\">\n",
+    "<title>Alchemy</title>\n<h1>This sign-in link no longer works</h1>\n",
+    "<p>A link from <code>alchemy open</code> works once, within a minute. ",
+    "Run <code>alchemy open</code> again for a new one.</p>\n</html>\n",
+);
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
@@ -807,20 +983,40 @@ mod tests {
     use super::*;
     use alchemy_api::EngineState;
     use axum::body::{Body, BodyDataStream, to_bytes};
-    use axum::http::Request;
     use axum::http::request::Builder;
+    use axum::http::{HeaderName, Request};
     use axum::routing::post;
     use tower::ServiceExt as _;
 
     const LISTEN: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
     const HOST: &str = "127.0.0.1:7240";
+    const TOKEN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
-    /// A request as a same-origin browser page sends it.
+    /// Sign-in state whose token is [`TOKEN`].
+    fn test_auth() -> Auth {
+        Auth::with_token(TOKEN.to_owned(), HOST.parse().unwrap())
+    }
+
+    /// The TCP listener on [`LISTEN`], accepting [`TOKEN`].
+    fn tcp() -> Tcp {
+        Tcp {
+            listen: LISTEN,
+            auth: test_auth(),
+        }
+    }
+
+    fn bearer() -> String {
+        format!("Bearer {TOKEN}")
+    }
+
+    /// A request as a same-origin browser page sends it, signed in with
+    /// the token.
     fn req(method: Method, uri: &str) -> Builder {
         Request::builder()
             .method(method)
             .uri(uri)
             .header(header::HOST, HOST)
+            .header(header::AUTHORIZATION, bearer())
     }
 
     fn memory() -> SharedStore {
@@ -855,7 +1051,7 @@ mod tests {
         let engine = Topic::watch(State::watch_engine, ApiEvent::Engine);
         let operations = ops(&state);
         (
-            router_with_topics(state, memory(), LISTEN, vec![engine], rx, logs, operations),
+            router_with_topics(state, memory(), tcp(), vec![engine], rx, logs, operations),
             tx,
         )
     }
@@ -1174,7 +1370,7 @@ mod tests {
         let app = router_with_topics(
             State::new(),
             memory(),
-            LISTEN,
+            tcp(),
             vec![topic(a_rx), topic(b_rx)],
             stop_rx,
             no_logs(),
@@ -1313,15 +1509,22 @@ mod tests {
             ("/theme.js", StatusCode::NOT_FOUND),
         ] {
             let (_stop, rx) = watch::channel(false);
-            let resp = api_router(State::new(), memory(), rx, no_logs(), ops(&State::new()))
-                .oneshot(
-                    req(Method::GET, uri)
-                        .header(header::ORIGIN, "tauri://localhost")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
+            let resp = api_router(
+                State::new(),
+                memory(),
+                rx,
+                no_logs(),
+                ops(&State::new()),
+                test_auth(),
+            )
+            .oneshot(
+                req(Method::GET, uri)
+                    .header(header::ORIGIN, "tauri://localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
             assert_eq!(resp.status(), status, "{uri}");
             assert!(
                 resp.headers()
@@ -1391,8 +1594,12 @@ mod tests {
             }
         }
 
+        /// The request, signed in with the token.
         fn request(&self, uri: &str) -> Request<Body> {
-            let mut builder = Request::builder().method(self.method.clone()).uri(uri);
+            let mut builder = Request::builder()
+                .method(self.method.clone())
+                .uri(uri)
+                .header(header::AUTHORIZATION, bearer());
             for (name, value) in [
                 (header::HOST, self.host),
                 (header::ORIGIN, self.origin),
@@ -1499,7 +1706,7 @@ mod tests {
         ];
         for (name, host, origin, content_type, refused) in cases {
             let probe = Probe::post(host, origin, content_type);
-            let app = tcp_checks(things(), LISTEN);
+            let app = tcp_checks(things(), tcp());
             let (status, _, body) = send(app, probe.request("/api/things")).await;
             match refused {
                 None => assert_eq!(status, StatusCode::NO_CONTENT, "{name}"),
@@ -1602,7 +1809,14 @@ mod tests {
             }
 
             let (_stop, rx) = watch::channel(false);
-            let socket = api_router(State::new(), memory(), rx, no_logs(), ops(&State::new()));
+            let socket = api_router(
+                State::new(),
+                memory(),
+                rx,
+                no_logs(),
+                ops(&State::new()),
+                test_auth(),
+            );
             let mut request = req(Method::GET, uri);
             if let Some(site) = site {
                 request = request.header("sec-fetch-site", site);
@@ -1620,12 +1834,12 @@ mod tests {
             .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
             .body(Body::empty())
             .unwrap();
-        let (status, acao, _) = send(tcp_checks(things(), LISTEN), preflight).await;
+        let (status, acao, _) = send(tcp_checks(things(), tcp()), preflight).await;
         assert!(status.is_success(), "{status}");
         assert_eq!(acao.as_deref(), Some("tauri://localhost"));
 
         let probe = Probe::post(Some(HOST), Some("tauri://localhost"), Some("text/plain"));
-        let app = tcp_checks(things(), LISTEN);
+        let app = tcp_checks(things(), tcp());
         let (status, acao, body) = send(app, probe.request("/api/things")).await;
         assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
         assert_eq!(acao.as_deref(), Some("tauri://localhost"));
@@ -1654,7 +1868,13 @@ mod tests {
             ("nas.lan:7240", "http://nas.lan:7240", StatusCode::FORBIDDEN),
         ] {
             let probe = Probe::post(Some(host), Some(origin), JSON);
-            let app = tcp_checks(things(), lan);
+            let app = tcp_checks(
+                things(),
+                Tcp {
+                    listen: lan,
+                    auth: test_auth(),
+                },
+            );
             let (status, _, _) = send(app, probe.request("/api/things")).await;
             assert_eq!(status, want, "{host}");
         }
@@ -1690,9 +1910,371 @@ mod tests {
             origin: None,
             content_type: None,
         };
-        let app = api_router(State::new(), memory(), rx, no_logs(), ops(&State::new()));
+        let app = api_router(
+            State::new(),
+            memory(),
+            rx,
+            no_logs(),
+            ops(&State::new()),
+            test_auth(),
+        );
         let (status, _, _) = send(app, probe.request("/api/health")).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The socket router sharing `auth` with a TCP router.
+    fn socket_with(auth: &Auth) -> Router {
+        let (_stop, rx) = watch::channel(false);
+        api_router(
+            State::new(),
+            memory(),
+            rx,
+            no_logs(),
+            ops(&State::new()),
+            auth.clone(),
+        )
+    }
+
+    /// The TCP router accepting `auth`.
+    fn tcp_with(auth: &Auth) -> Router {
+        let (_stop, rx) = watch::channel(false);
+        router(
+            State::new(),
+            memory(),
+            Tcp {
+                listen: LISTEN,
+                auth: auth.clone(),
+            },
+            rx,
+            no_logs(),
+            ops(&State::new()),
+        )
+    }
+
+    /// A same-origin request with only `credential` set, if any.
+    fn unsigned(
+        method: Method,
+        uri: &str,
+        credential: Option<(HeaderName, String)>,
+    ) -> Request<Body> {
+        let mutating = guard::is_mutating(&method);
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, HOST);
+        if mutating {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+        }
+        if let Some((name, value)) = credential {
+            builder = builder.header(name, value);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    /// Launch a code on `auth`'s socket, redeem it on its TCP listener, and
+    /// return the `name=value` pair the browser would send back.
+    async fn sign_in(auth: &Auth) -> String {
+        let (status, _, body) = send(
+            socket_with(auth),
+            unsigned(Method::POST, "/api/session/launch", None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let launch: alchemy_api::session::LaunchResponse = serde_json::from_slice(&body).unwrap();
+        let resp = tcp_with(auth)
+            .oneshot(unsigned(
+                Method::GET,
+                &format!("/login?code={}", launch.code),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let cookie = resp.headers()[header::SET_COOKIE].to_str().unwrap();
+        cookie.split(';').next().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn tcp_requires_signing_in_except_for_health_and_version() {
+        let auth = test_auth();
+        let cookie = sign_in(&auth).await;
+        let wrong = format!("Bearer {}", "2".repeat(64));
+        let stale = format!("{}={}", auth.cookie_name(), "3".repeat(64));
+        let token = Some((header::AUTHORIZATION, bearer()));
+        let session = Some((header::COOKIE, cookie));
+        let cases = [
+            (Method::GET, "/api/health", None, StatusCode::OK),
+            (Method::HEAD, "/api/health", None, StatusCode::OK),
+            (Method::GET, "/api/version", None, StatusCode::OK),
+            (Method::GET, "/api/engine", None, StatusCode::UNAUTHORIZED),
+            (Method::GET, "/api/apps", None, StatusCode::UNAUTHORIZED),
+            (Method::POST, "/api/apps", None, StatusCode::UNAUTHORIZED),
+            (
+                Method::GET,
+                "/api/apps/blog/files/env",
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Method::PUT,
+                "/api/settings/apps",
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (Method::GET, "/api/events", None, StatusCode::UNAUTHORIZED),
+            (Method::GET, "/api/session", None, StatusCode::UNAUTHORIZED),
+            (Method::POST, "/api/health", None, StatusCode::UNAUTHORIZED),
+            (Method::GET, "/api/nope", None, StatusCode::UNAUTHORIZED),
+            (Method::GET, "/api/engine", token.clone(), StatusCode::OK),
+            (
+                Method::GET,
+                "/api/nope",
+                token.clone(),
+                StatusCode::NOT_FOUND,
+            ),
+            (Method::GET, "/api/engine", session.clone(), StatusCode::OK),
+            (
+                Method::GET,
+                "/api/engine",
+                Some((header::AUTHORIZATION, wrong)),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Method::GET,
+                "/api/engine",
+                Some((header::COOKIE, stale)),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Method::POST,
+                "/api/health",
+                token,
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::POST,
+                "/api/health",
+                session,
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+        ];
+        for (method, uri, credential, want) in cases {
+            let what = format!("{method} {uri} {credential:?}");
+            let resp = tcp_with(&auth)
+                .oneshot(unsigned(method, uri, credential))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), want, "{what}");
+            if want == StatusCode::UNAUTHORIZED {
+                assert_eq!(
+                    resp.headers()[header::WWW_AUTHENTICATE],
+                    "Bearer realm=\"alchemyd\"",
+                    "{what}"
+                );
+                let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(error_code(&body), "unauthorized", "{what}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_web_ui_needs_no_sign_in() {
+        let auth = test_auth();
+        for uri in ["/", "/apps/blog", "/settings"] {
+            let resp = tcp_with(&auth)
+                .oneshot(unsigned(Method::GET, uri, None))
+                .await
+                .unwrap();
+            assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_refusals_come_before_signing_in() {
+        let auth = test_auth();
+        let cases = [
+            (
+                "rebinding host",
+                Probe::post(Some("evil.example"), None, JSON),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "cross-origin",
+                Probe::post(Some(HOST), Some("https://evil.example"), JSON),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "not json",
+                Probe::post(Some(HOST), None, Some("text/plain")),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+        ];
+        for (name, probe, want) in cases {
+            let mut request = probe.request("/api/apps");
+            request.headers_mut().remove(header::AUTHORIZATION);
+            let (status, _, _) = send(tcp_with(&auth), request).await;
+            assert_eq!(status, want, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_tauri_shell_reads_a_refusal_and_may_send_its_token() {
+        let auth = test_auth();
+        let preflight = req(Method::OPTIONS, "/api/apps")
+            .header(header::ORIGIN, "tauri://localhost")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+            .body(Body::empty())
+            .unwrap();
+        let resp = tcp_with(&auth).oneshot(preflight).await.unwrap();
+        assert!(resp.status().is_success(), "{}", resp.status());
+        let allowed = resp.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(allowed.contains("authorization"), "{allowed}");
+
+        let mut request = unsigned(Method::GET, "/api/apps", None);
+        request.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("tauri://localhost"),
+        );
+        let (status, acao, body) = send(tcp_with(&auth), request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(acao.as_deref(), Some("tauri://localhost"));
+        assert_eq!(error_code(&body), "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn launch_codes_come_from_the_socket_only() {
+        let auth = test_auth();
+        let (status, _, body) = send(
+            socket_with(&auth),
+            unsigned(Method::POST, "/api/session/launch", None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let launch: alchemy_api::session::LaunchResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(launch.expires_in, 60);
+        assert_eq!(
+            launch.url,
+            format!("http://127.0.0.1:7240/login?code={}", launch.code)
+        );
+
+        let refused = [
+            (None, StatusCode::UNAUTHORIZED, "unauthorized"),
+            (
+                Some((header::AUTHORIZATION, bearer())),
+                StatusCode::FORBIDDEN,
+                "forbidden",
+            ),
+        ];
+        for (credential, want, code) in refused {
+            let what = format!("{credential:?}");
+            let (status, _, body) = send(
+                tcp_with(&auth),
+                unsigned(Method::POST, "/api/session/launch", credential),
+            )
+            .await;
+            assert_eq!(status, want, "{what}");
+            assert_eq!(error_code(&body), code, "{what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn login_redeems_a_code_once_and_sets_a_private_cookie() {
+        let auth = test_auth();
+        let (_, _, body) = send(
+            socket_with(&auth),
+            unsigned(Method::POST, "/api/session/launch", None),
+        )
+        .await;
+        let launch: alchemy_api::session::LaunchResponse = serde_json::from_slice(&body).unwrap();
+        let login = format!("/login?code={}", launch.code);
+
+        let resp = tcp_with(&auth)
+            .oneshot(unsigned(Method::GET, &login, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let headers = resp.headers();
+        assert_eq!(headers[header::LOCATION], "/");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
+        let cookie = headers[header::SET_COOKIE].to_str().unwrap();
+        assert!(
+            cookie.ends_with("; HttpOnly; SameSite=Strict; Path=/api"),
+            "{cookie}"
+        );
+        assert!(cookie.starts_with("alchemy_session_7240="), "{cookie}");
+        assert!(!cookie.contains(TOKEN), "{cookie}");
+        let pair = cookie.split(';').next().unwrap().to_owned();
+
+        let (status, _, body) = send(
+            tcp_with(&auth),
+            unsigned(Method::GET, "/api/session", Some((header::COOKIE, pair))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({ "auth": "cookie" })
+        );
+
+        for uri in [
+            login.as_str(),
+            "/login",
+            "/login?code=",
+            "/login?code=nope",
+            "/login?code=1111111111111111111111111111111111111111111111111111111111111111",
+        ] {
+            let resp = tcp_with(&auth)
+                .oneshot(unsigned(Method::GET, uri, None))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            let headers = resp.headers();
+            assert!(headers.get(header::SET_COOKIE).is_none(), "{uri}");
+            assert_eq!(headers[header::CACHE_CONTROL], "no-store", "{uri}");
+            assert_eq!(headers[header::REFERRER_POLICY], "no-referrer", "{uri}");
+            assert_eq!(
+                headers[header::CONTENT_TYPE],
+                "text/html; charset=utf-8",
+                "{uri}"
+            );
+        }
+
+        let resp = socket_with(&auth)
+            .oneshot(unsigned(Method::GET, "/login", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "the socket has no /login"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_says_how_a_request_was_let_in() {
+        let auth = test_auth();
+        let cases = [
+            (socket_with(&auth), None, "socket"),
+            (
+                tcp_with(&auth),
+                Some((header::AUTHORIZATION, bearer())),
+                "token",
+            ),
+        ];
+        for (app, credential, want) in cases {
+            let (status, _, body) =
+                send(app, unsigned(Method::GET, "/api/session", credential)).await;
+            assert_eq!(status, StatusCode::OK, "{want}");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({ "auth": want })
+            );
+        }
     }
 
     fn app_list() -> AppList {
@@ -1874,7 +2456,7 @@ data: {"service":"web","container":"blog-web-1","stream":"stdout","time":"2024-0
         let resp = router(
             state.clone(),
             store.clone(),
-            LISTEN,
+            tcp(),
             rx,
             no_logs(),
             ops(state),
@@ -2032,7 +2614,7 @@ data: {"service":"web","container":"blog-web-1","stream":"stdout","time":"2024-0
         router(
             state.clone(),
             memory(),
-            LISTEN,
+            tcp(),
             rx,
             no_logs(),
             operations.clone(),

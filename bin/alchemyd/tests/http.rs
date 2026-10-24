@@ -10,6 +10,7 @@
 )]
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alchemy_core::engine::{EngineState, EngineStatus};
@@ -28,6 +29,23 @@ impl EngineSource for FixedEngine {
     async fn run(self, state: State, mut shutdown: watch::Receiver<bool>) {
         state.set_engine(self.0);
         let _ = shutdown.wait_for(|stop| *stop).await;
+    }
+}
+
+/// The token this start of the daemon wrote to `state_dir`, once it has.
+async fn read_token(state_dir: &Path) -> String {
+    let path = alchemy_api::tcp_token_path(state_dir);
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        if let Ok(token) = std::fs::read_to_string(&path) {
+            return token;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no token at {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -102,12 +120,17 @@ async fn events_stream_reaches_the_tauri_origin_and_ends_on_shutdown() {
     }));
 
     let mut stream = connect(listen).await;
+    let token = read_token(&dir.path().join("state")).await;
     stream
         .write_all(
-            b"GET /api/events HTTP/1.1\r\n\
-              Host: 127.0.0.1\r\n\
-              Origin: tauri://localhost\r\n\
-              Accept: text/event-stream\r\n\r\n",
+            format!(
+                "GET /api/events HTTP/1.1\r\n\
+                 Host: 127.0.0.1\r\n\
+                 Origin: tauri://localhost\r\n\
+                 Authorization: Bearer {token}\r\n\
+                 Accept: text/event-stream\r\n\r\n"
+            )
+            .as_bytes(),
         )
         .await
         .unwrap();
@@ -172,6 +195,8 @@ fn code(body: &str) -> serde_json::Value {
 /// A daemon serving on a free port until [`Self::stop`].
 struct Daemon {
     listen: SocketAddr,
+    socket: PathBuf,
+    state_dir: PathBuf,
     stop: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
     _dir: tempfile::TempDir,
@@ -179,12 +204,17 @@ struct Daemon {
 
 impl Daemon {
     fn start() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("ah")
+            .tempdir_in("/tmp")
+            .unwrap();
         let listen = free_port();
+        let socket = dir.path().join("alchemyd.sock");
+        let state_dir = dir.path().join("state");
         let config = alchemyd::Config {
             listen,
-            socket: dir.path().join("alchemyd.sock"),
-            state_dir: dir.path().join("state"),
+            socket: socket.clone(),
+            state_dir: state_dir.clone(),
         };
         let deps = Deps::new(FixedEngine(EngineStatus::new(EngineState::Ready)));
         let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -193,10 +223,41 @@ impl Daemon {
         }));
         Self {
             listen,
+            socket,
+            state_dir,
             stop,
             task,
             _dir: dir,
         }
+    }
+
+    /// An `Authorization` header line with this start's token.
+    async fn auth(&self) -> String {
+        format!(
+            "Authorization: Bearer {}\r\n",
+            read_token(&self.state_dir).await
+        )
+    }
+
+    /// Send `request` to the socket as written and read the whole
+    /// response, lowercasing the head.
+    async fn over_socket(&self, request: &str) -> (String, String) {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let mut stream = loop {
+            match tokio::net::UnixStream::connect(&self.socket).await {
+                Ok(stream) => break stream,
+                Err(err) if tokio::time::Instant::now() > deadline => panic!("connect: {err}"),
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut seen = String::new();
+        tokio::time::timeout(TIMEOUT, stream.read_to_string(&mut seen))
+            .await
+            .unwrap()
+            .unwrap();
+        let (head, body) = seen.split_once("\r\n\r\n").unwrap();
+        (head.to_ascii_lowercase(), body.to_owned())
     }
 
     /// Send each request and check its status and error code.
@@ -229,6 +290,7 @@ impl Daemon {
 async fn tcp_listener_refuses_rebinding_cross_origin_and_non_json_requests() {
     let daemon = Daemon::start();
     let listen = daemon.listen;
+    let auth = daemon.auth().await;
     let host = format!("Host: {listen}\r\n");
     let same_origin = format!("{host}Origin: http://{listen}\r\n");
 
@@ -236,15 +298,17 @@ async fn tcp_listener_refuses_rebinding_cross_origin_and_non_json_requests() {
         .assert_answers(vec![
             (
                 "rebinding host",
-                "GET /api/health HTTP/1.1\r\nHost: evil.example:7240\r\nConnection: close\r\n\r\n"
-                    .to_owned(),
+                format!(
+                    "GET /api/health HTTP/1.1\r\nHost: evil.example:7240\r\n{auth}\
+                     Connection: close\r\n\r\n"
+                ),
                 "403",
                 "forbidden",
             ),
             (
                 "cross-origin form post",
                 post(&format!(
-                    "{host}Origin: https://evil.example\r\n\
+                    "{host}{auth}Origin: https://evil.example\r\n\
                  Content-Type: application/x-www-form-urlencoded\r\n"
                 )),
                 "403",
@@ -257,22 +321,32 @@ async fn tcp_listener_refuses_rebinding_cross_origin_and_non_json_requests() {
                 "unsupported_media_type",
             ),
             (
-                "same-origin json post",
+                "same-origin json post without the token",
                 post(&format!("{same_origin}Content-Type: application/json\r\n")),
+                "401",
+                "unauthorized",
+            ),
+            (
+                "same-origin json post",
+                post(&format!(
+                    "{same_origin}{auth}Content-Type: application/json\r\n"
+                )),
                 "405",
                 "method_not_allowed",
             ),
             (
                 "tauri json post",
                 post(&format!(
-                    "{host}Origin: tauri://localhost\r\nContent-Type: application/json\r\n"
+                    "{host}{auth}Origin: tauri://localhost\r\nContent-Type: application/json\r\n"
                 )),
                 "405",
                 "method_not_allowed",
             ),
             (
                 "localhost get",
-                "GET /api/nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_owned(),
+                format!(
+                    "GET /api/nope HTTP/1.1\r\nHost: localhost\r\n{auth}Connection: close\r\n\r\n"
+                ),
                 "404",
                 "not_found",
             ),
@@ -284,7 +358,7 @@ async fn tcp_listener_refuses_rebinding_cross_origin_and_non_json_requests() {
 #[tokio::test]
 async fn tcp_listener_refuses_reads_sent_for_pages_on_other_sites() {
     let daemon = Daemon::start();
-    let host = format!("Host: {}\r\n", daemon.listen);
+    let host = format!("Host: {}\r\n{}", daemon.listen, daemon.auth().await);
 
     daemon
         .assert_answers(vec![
@@ -327,4 +401,170 @@ async fn tcp_listener_refuses_reads_sent_for_pages_on_other_sites() {
         ])
         .await;
     daemon.stop().await;
+}
+
+fn get(path: &str, headers: &str) -> String {
+    format!("GET {path} HTTP/1.1\r\n{headers}Connection: close\r\n\r\n")
+}
+
+/// The value of header `name` in a lowercased response head.
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(": "))
+}
+
+#[tokio::test]
+async fn a_browser_signs_in_with_a_launch_code_from_the_socket() {
+    let daemon = Daemon::start();
+    let host = format!("Host: {}\r\n", daemon.listen);
+
+    daemon
+        .assert_answers(vec![
+            (
+                "apps without signing in",
+                get("/api/apps", &host),
+                "401",
+                "unauthorized",
+            ),
+            (
+                "a launch code over TCP",
+                post_to(
+                    "/api/session/launch",
+                    &format!("{host}Content-Type: application/json\r\n"),
+                ),
+                "401",
+                "unauthorized",
+            ),
+            (
+                "a launch code over TCP with the token",
+                post_to(
+                    "/api/session/launch",
+                    &format!(
+                        "{host}{}Content-Type: application/json\r\n",
+                        daemon.auth().await
+                    ),
+                ),
+                "403",
+                "forbidden",
+            ),
+        ])
+        .await;
+
+    let (head, body) = daemon
+        .over_socket(&post_to(
+            "/api/session/launch",
+            "Host: alchemyd\r\nContent-Type: application/json\r\n",
+        ))
+        .await;
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(header(&head, "cache-control"), Some("no-store"), "{head}");
+    let launch: alchemy_api::session::LaunchResponse = serde_json::from_str(&body).unwrap();
+    let login = format!("/login?code={}", launch.code);
+    assert_eq!(launch.url, format!("http://{}{login}", daemon.listen));
+
+    let (head, _) = exchange(daemon.listen, &get(&login, &host)).await;
+    assert!(head.starts_with("http/1.1 303"), "{head}");
+    assert_eq!(header(&head, "location"), Some("/"), "{head}");
+    assert_eq!(
+        header(&head, "referrer-policy"),
+        Some("no-referrer"),
+        "{head}"
+    );
+    let set_cookie = header(&head, "set-cookie").unwrap();
+    assert!(
+        set_cookie.ends_with("; httponly; samesite=strict; path=/api"),
+        "{set_cookie}"
+    );
+    let cookie = format!("Cookie: {}\r\n", set_cookie.split(';').next().unwrap());
+
+    let (head, body) = exchange(daemon.listen, &get("/api/apps", &format!("{host}{cookie}"))).await;
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(body.contains("\"apps\":"), "{body}");
+    let (head, body) = exchange(
+        daemon.listen,
+        &get("/api/session", &format!("{host}{cookie}")),
+    )
+    .await;
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(body, r#"{"auth":"cookie"}"#);
+
+    let (head, _) = exchange(daemon.listen, &get(&login, &host)).await;
+    assert!(head.starts_with("http/1.1 401"), "used twice: {head}");
+    assert!(header(&head, "set-cookie").is_none(), "{head}");
+    daemon.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn each_start_writes_a_private_token_and_shutdown_removes_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let first = Daemon::start();
+    let path = alchemy_api::tcp_token_path(&first.state_dir);
+    let token = read_token(&first.state_dir).await;
+    assert_eq!(token.len(), 64, "{token}");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+
+    let host = format!("Host: {}\r\n", first.listen);
+    let (head, _) = exchange(
+        first.listen,
+        &get("/api/apps", &format!("{host}{}", first.auth().await)),
+    )
+    .await;
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+
+    let state_dir = first.state_dir.clone();
+    let dir = tempfile::Builder::new()
+        .prefix("ah")
+        .tempdir_in("/tmp")
+        .unwrap();
+    first.stop.send(()).unwrap();
+    tokio::time::timeout(TIMEOUT, first.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!path.exists(), "the token outlived the daemon");
+
+    let listen = free_port();
+    let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(alchemyd::run_with(
+        alchemyd::Config {
+            listen,
+            socket: dir.path().join("alchemyd.sock"),
+            state_dir: state_dir.clone(),
+        },
+        Deps::new(FixedEngine(EngineStatus::new(EngineState::Ready))),
+        async {
+            let _ = stop_rx.await;
+        },
+    ));
+    let second = read_token(&state_dir).await;
+    assert_ne!(second, token, "a restart kept the old token");
+    let host = format!("Host: {listen}\r\n");
+    let (head, _) = exchange(
+        listen,
+        &get(
+            "/api/apps",
+            &format!("{host}Authorization: Bearer {token}\r\n"),
+        ),
+    )
+    .await;
+    assert!(
+        head.starts_with("http/1.1 401"),
+        "the old token still works: {head}"
+    );
+    stop.send(()).unwrap();
+    tokio::time::timeout(TIMEOUT, task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+/// A `POST path` with `headers`, a two-byte JSON body, and
+/// `Connection: close`.
+fn post_to(path: &str, headers: &str) -> String {
+    format!("POST {path} HTTP/1.1\r\n{headers}Content-Length: 2\r\nConnection: close\r\n\r\n{{}}")
 }

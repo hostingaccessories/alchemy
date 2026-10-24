@@ -321,7 +321,14 @@ async fn log_streams_are_capped_across_both_listeners() {
     let uri = "/api/apps/blog/logs?service=web&follow=1&tail=0";
 
     let mut tcp = TcpStream::connect(daemon.listen).await.unwrap();
-    let request = format!("GET {uri} HTTP/1.1\r\nHost: {}\r\n\r\n", daemon.listen);
+    let token = std::fs::read_to_string(alchemy_api::tcp_token_path(
+        &daemon.socket.with_file_name("state"),
+    ))
+    .unwrap();
+    let request = format!(
+        "GET {uri} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {token}\r\n\r\n",
+        daemon.listen
+    );
     tcp.write_all(request.as_bytes()).await.unwrap();
     let mut seen = String::new();
     while !seen.contains("event: following") {
