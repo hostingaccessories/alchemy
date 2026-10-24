@@ -1,5 +1,5 @@
-//! The host's own network as the OS sees it: LAN subnets, routes, and
-//! listening sockets, none of which Docker knows about.
+//! The host's own network as the OS sees it: LAN addresses and subnets,
+//! routes, and listening sockets, none of which Docker knows about.
 //!
 //! Everything is read through a [`HostNetwork`]: [`SystemNetwork`] for this
 //! host, [`FakeNetwork`] in tests. What the OS prints is parsed by pure
@@ -29,7 +29,8 @@ pub use system::SystemNetwork;
 
 use crate::metrics::counts_toward_total;
 
-/// Reads the host's LAN subnets, routes, and listening sockets.
+/// Reads the host's LAN addresses and subnets, routes, and listening
+/// sockets.
 ///
 /// Object safe, so the daemon can hold any implementation as a
 /// [`SharedNetwork`]. Every call reads afresh; nothing is cached.
@@ -38,6 +39,12 @@ pub trait HostNetwork: Send + Sync + fmt::Debug {
     /// `10.0.1.0/24`. Loopback, link-local, and virtual interfaces
     /// (containers, VMs, VPNs) are left out.
     fn lan_subnets(&self) -> BoxFuture<'_, Result<Vec<Ipv4Net>, NetworkError>>;
+
+    /// The host's own IPv4 addresses on the physical interfaces, with the
+    /// subnet each is on: what another device on the LAN reaches it at.
+    /// The same interfaces and addresses count as for
+    /// [`lan_subnets`](Self::lan_subnets).
+    fn lan_addresses(&self) -> BoxFuture<'_, Result<Vec<LanAddress>, NetworkError>>;
 
     /// The IPv4 routes of the main routing table, including the default
     /// route, VPN routes, and those of Docker's own bridges on Linux.
@@ -50,6 +57,17 @@ pub trait HostNetwork: Send + Sync + fmt::Debug {
 
 /// A [`HostNetwork`] shared by the daemon's tasks and routes.
 pub type SharedNetwork = Arc<dyn HostNetwork>;
+
+/// One of the host's own IPv4 addresses on the LAN.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LanAddress {
+    /// The interface it is on, such as `en0` or `eth0`.
+    pub interface: String,
+    /// The address, such as `10.0.1.50`.
+    pub addr: Ipv4Addr,
+    /// The subnet it is on, such as `10.0.1.0/24`.
+    pub subnet: Ipv4Net,
+}
 
 /// One IPv4 route.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -107,30 +125,76 @@ pub enum NetworkError {
     Task(String),
 }
 
-/// The LAN subnets among `addresses`, each an interface name, one of its
-/// addresses, and that address's prefix length.
+/// The LAN addresses among `addresses`, each an interface name, one of
+/// its addresses, and that address's prefix length.
 ///
 /// Only IPv4 addresses on interfaces that [`counts_toward_total`] count.
 /// Loopback, link-local, and unspecified addresses and `/0` prefixes are
-/// left out. The result is sorted, each subnet once.
-pub fn lan_subnets_from<'a>(
+/// left out. The result is sorted by interface, then address, each once.
+pub fn lan_addresses_from<'a>(
     addresses: impl IntoIterator<Item = (&'a str, IpAddr, u8)>,
-) -> Vec<Ipv4Net> {
-    let mut subnets: Vec<Ipv4Net> = addresses
+) -> Vec<LanAddress> {
+    let mut found: Vec<LanAddress> = addresses
         .into_iter()
         .filter(|(name, _, prefix)| *prefix > 0 && counts_toward_total(name))
-        .filter_map(|(_, addr, prefix)| match addr {
+        .filter_map(|(name, addr, prefix)| match addr {
             IpAddr::V4(addr)
                 if !addr.is_loopback() && !addr.is_link_local() && !addr.is_unspecified() =>
             {
-                Ipv4Net::new(addr, prefix).ok()
+                Some(LanAddress {
+                    interface: name.to_owned(),
+                    addr,
+                    subnet: Ipv4Net::new(addr, prefix).ok()?,
+                })
             }
             IpAddr::V4(_) | IpAddr::V6(_) => None,
         })
         .collect();
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// The subnets of `addresses` from [`lan_addresses_from`], sorted, each
+/// once.
+pub fn lan_subnets_from<'a>(
+    addresses: impl IntoIterator<Item = (&'a str, IpAddr, u8)>,
+) -> Vec<Ipv4Net> {
+    let mut subnets: Vec<Ipv4Net> = lan_addresses_from(addresses)
+        .into_iter()
+        .map(|address| address.subnet)
+        .collect();
     subnets.sort_unstable();
     subnets.dedup();
     subnets
+}
+
+/// The address to give other devices for this host: the one on the
+/// interface the default route leaves through, preferring the one whose
+/// subnet holds the gateway, or else the first.
+///
+/// A default route through an interface with no LAN address, such as a
+/// VPN's `utun3`, says nothing about the LAN, so the first address is
+/// used then too.
+pub fn preferred_lan_address(addresses: &[LanAddress], routes: &[Route]) -> Option<Ipv4Addr> {
+    let default = routes
+        .iter()
+        .filter(|route| route.destination.is_default_route())
+        .find(|route| addresses.iter().any(|a| a.interface == route.interface));
+    let on_default =
+        |address: &&LanAddress| default.is_some_and(|route| address.interface == route.interface);
+    let holds_gateway = |address: &&LanAddress| {
+        default
+            .and_then(|route| route.gateway)
+            .is_some_and(|gateway| address.subnet.contains(gateway))
+    };
+    addresses
+        .iter()
+        .filter(on_default)
+        .find(holds_gateway)
+        .or_else(|| addresses.iter().find(on_default))
+        .or_else(|| addresses.first())
+        .map(|address| address.addr)
 }
 
 /// `listeners` with repeats removed, keeping the first of each.
@@ -234,6 +298,106 @@ mod tests {
             );
             let want: Vec<Ipv4Net> = want.iter().map(|s| s.parse().unwrap()).collect();
             assert_eq!(got, want, "{name}");
+        }
+    }
+
+    fn lan(interface: &str, addr: &str, subnet: &str) -> LanAddress {
+        LanAddress {
+            interface: interface.into(),
+            addr: addr.parse().unwrap(),
+            subnet: subnet.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn lan_addresses_keep_the_hosts_own_address() {
+        let got = lan_addresses_from(
+            [
+                ("lo0", "127.0.0.1", 8),
+                ("en0", "10.0.1.50", 24),
+                ("en0", "fe80::1", 64),
+                ("utun3", "100.101.102.103", 32),
+                ("docker0", "172.17.0.1", 16),
+                ("wlan0", "192.168.1.9", 16),
+                ("en0", "10.0.1.50", 24),
+                ("en0", "10.0.1.7", 24),
+                ("en1", "169.254.3.4", 16),
+                ("en2", "10.9.0.5", 0),
+            ]
+            .iter()
+            .map(|(iface, addr, prefix)| (*iface, ip(addr), *prefix)),
+        );
+        assert_eq!(
+            got,
+            [
+                lan("en0", "10.0.1.7", "10.0.1.0/24"),
+                lan("en0", "10.0.1.50", "10.0.1.0/24"),
+                lan("wlan0", "192.168.1.9", "192.168.0.0/16"),
+            ]
+        );
+    }
+
+    #[test]
+    fn preferred_lan_address_follows_the_default_route() {
+        type Case = (
+            &'static str,
+            Vec<LanAddress>,
+            Vec<Route>,
+            Option<&'static str>,
+        );
+        let route = |destination: &str, gateway: Option<&str>, interface: &str| Route {
+            destination: destination.parse().unwrap(),
+            gateway: gateway.map(|g| g.parse().unwrap()),
+            interface: interface.into(),
+        };
+        let wired = lan("en0", "10.0.1.50", "10.0.1.0/24");
+        let wired_alias = lan("en0", "10.0.9.2", "10.0.9.0/24");
+        let wifi = lan("en1", "192.168.1.9", "192.168.1.0/24");
+        let cases: [Case; 6] = [
+            (
+                "the default route's interface",
+                vec![wired.clone(), wifi.clone()],
+                vec![route("0.0.0.0/0", Some("192.168.1.1"), "en1")],
+                Some("192.168.1.9"),
+            ),
+            (
+                "the address whose subnet holds the gateway",
+                vec![wired.clone(), wired_alias.clone()],
+                vec![route("0.0.0.0/0", Some("10.0.9.1"), "en0")],
+                Some("10.0.9.2"),
+            ),
+            (
+                "a default route through a VPN",
+                vec![wired.clone(), wifi.clone()],
+                vec![
+                    route("0.0.0.0/0", None, "utun3"),
+                    route("10.0.1.0/24", None, "en0"),
+                ],
+                Some("10.0.1.50"),
+            ),
+            (
+                "a VPN's default route, then the LAN's",
+                vec![wired.clone(), wifi.clone()],
+                vec![
+                    route("0.0.0.0/0", None, "utun3"),
+                    route("0.0.0.0/0", Some("192.168.1.1"), "en1"),
+                ],
+                Some("192.168.1.9"),
+            ),
+            ("no routes", vec![wifi.clone()], vec![], Some("192.168.1.9")),
+            (
+                "no addresses",
+                vec![],
+                vec![route("0.0.0.0/0", Some("10.0.1.1"), "en0")],
+                None,
+            ),
+        ];
+        for (name, addresses, routes, want) in cases {
+            assert_eq!(
+                preferred_lan_address(&addresses, &routes),
+                want.map(|w| w.parse().unwrap()),
+                "{name}"
+            );
         }
     }
 
