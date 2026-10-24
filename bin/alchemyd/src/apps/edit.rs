@@ -974,7 +974,7 @@ mod tests {
                     &blog,
                     &ComposeConfig {
                         name: "blog".into(),
-                        services: vec![],
+                        ..ComposeConfig::default()
                     },
                 )],
                 ..AppList::default()
@@ -1066,7 +1066,9 @@ mod tests {
             services: vec![ServiceConfig {
                 name: "web".into(),
                 builds: true,
+                ..ServiceConfig::default()
             }],
+            ..ComposeConfig::default()
         }));
         let app = f
             .editor()
@@ -1290,7 +1292,7 @@ mod tests {
 
         f.validator.answer(FakeConfig::Config(ComposeConfig {
             name: "shop".into(),
-            services: vec![],
+            ..ComposeConfig::default()
         }));
         fs::remove_dir(&f.extra).unwrap();
         f.editor()

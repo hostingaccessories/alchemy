@@ -417,8 +417,10 @@ mod tests {
                 .map(|(s, builds)| ServiceConfig {
                     name: (*s).to_owned(),
                     builds: *builds,
+                    ..ServiceConfig::default()
                 })
                 .collect(),
+            ..ComposeConfig::default()
         })
     }
 

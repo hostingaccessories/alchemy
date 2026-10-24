@@ -415,6 +415,7 @@ impl Monitor {
             containers: &containers,
             engine_ready: self.state.engine().state == EngineState::Ready,
         });
+        self.state.set_app_configs(self.outcomes.clone());
         self.state.set_apps(list);
     }
 }
@@ -583,6 +584,10 @@ mod tests {
         assert_eq!(apps.dirs[0].path, HOME);
         assert!(apps.dirs[0].home);
         assert_eq!(h.state.app_settings().home.as_deref(), Some(HOME));
+        match h.state.app_config(Path::new(&blog)) {
+            Some(ConfigOutcome::Ready(config)) => assert_eq!(config.name, "fancy"),
+            other => panic!("expected the cached config, got {other:?}"),
+        }
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(h.config.reads(Path::new(&blog)), 1);
@@ -617,6 +622,7 @@ mod tests {
 
         h.fs.set(HOME, stacks(&[]));
         until(&h.state, "blog gone", |a| a.apps.is_empty()).await;
+        assert_eq!(h.state.app_configs(), BTreeMap::new());
     }
 
     #[tokio::test]

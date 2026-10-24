@@ -203,7 +203,7 @@ impl ComposeValidator for FakeComposeValidator {
             match answer {
                 None => Ok(ComposeConfig {
                     name: dir_name,
-                    services: Vec::new(),
+                    ..ComposeConfig::default()
                 }),
                 Some(FakeConfig::Config(config)) => Ok(config),
                 Some(FakeConfig::Invalid(message)) => Err(ConfigError::Invalid {

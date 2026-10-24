@@ -1,6 +1,8 @@
 //! Live daemon state, written by background tasks such as the engine
 //! monitor and read by both front doors.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alchemy_api::MetricsResponse;
@@ -9,6 +11,7 @@ use alchemy_api::apps::{AppList, AppSettings};
 use alchemy_core::engine::{Containers, EngineState, EngineStatus};
 use tokio::sync::watch;
 
+use crate::apps::ConfigOutcome;
 use crate::logs::LogStreams;
 
 /// The daemon's live state. Cheap to clone: every clone shares the same
@@ -29,6 +32,7 @@ struct Inner {
     containers: watch::Sender<Containers>,
     metrics: watch::Sender<MetricsResponse>,
     apps: watch::Sender<AppList>,
+    app_configs: watch::Sender<BTreeMap<PathBuf, ConfigOutcome>>,
     app_settings: watch::Sender<AppSettings>,
     app_rescans: watch::Sender<u64>,
     app_scans: watch::Sender<u64>,
@@ -50,6 +54,7 @@ impl State {
                     ..MetricsResponse::default()
                 }),
                 apps: watch::Sender::new(AppList::default()),
+                app_configs: watch::Sender::new(BTreeMap::new()),
                 app_settings: watch::Sender::new(AppSettings {
                     home: None,
                     default_home: None,
@@ -147,6 +152,25 @@ impl State {
     /// only notified if it did.
     pub fn set_apps(&self, apps: AppList) -> bool {
         send_if_changed(&self.inner.apps, apps)
+    }
+
+    /// What reading each app's configuration last came to, by app
+    /// folder: the ports and networks Compose declared, without running
+    /// Compose again.
+    pub fn app_configs(&self) -> BTreeMap<PathBuf, ConfigOutcome> {
+        self.inner.app_configs.borrow().clone()
+    }
+
+    /// What reading the configuration of the app in `dir` last came to,
+    /// or `None` if it has not been read.
+    pub fn app_config(&self, dir: &Path) -> Option<ConfigOutcome> {
+        self.inner.app_configs.borrow().get(dir).cloned()
+    }
+
+    /// Replace every app's configuration outcome. Returns whether they
+    /// changed.
+    pub fn set_app_configs(&self, configs: BTreeMap<PathBuf, ConfigOutcome>) -> bool {
+        send_if_changed(&self.inner.app_configs, configs)
     }
 
     /// The app folder settings in effect.
