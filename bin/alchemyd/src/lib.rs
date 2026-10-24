@@ -9,10 +9,12 @@
 //! - a per-user Unix socket ([`socket`]) serving the API alone, used by
 //!   the `alchemy` CLI and `alchemy-helper`.
 //!
-//! It talks to the Docker engine through [`engine`], samples resource
-//! usage through [`metrics`], keeps what it learns in [`State`], and
+//! It talks to the Docker engine through [`engine`], finds the user's
+//! Compose stacks through [`apps`], samples resource usage through
+//! [`metrics`], keeps what it learns in [`State`], and
 //! persists settings and history in a [`store::Store`].
 
+pub mod apps;
 pub mod compose;
 pub mod engine;
 pub mod events;
@@ -35,6 +37,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use tokio::sync::watch;
 
+use crate::apps::AppsDeps;
 use crate::engine::{EngineMonitor, EngineSource, SystemConnector, SystemProbe};
 use crate::metrics::{Collector, MetricsSource, SystemMetrics};
 use crate::store::{SharedStore, SqliteStore};
@@ -55,27 +58,40 @@ pub struct Config {
     pub state_dir: PathBuf,
 }
 
-/// What [`run_with`] runs against: the shared state, the task that keeps
-/// its engine part current, and where metrics are read.
+/// What [`run_with`] runs against: the shared state, the tasks that keep
+/// it current, and where metrics are read.
 #[derive(Debug, Clone)]
 pub struct Deps<E, M = SystemMetrics> {
-    /// State shared by the engine task, the metrics collector, and both
-    /// front doors. Keep a clone to observe or seed it from outside.
+    /// State shared by the background tasks and both front doors. Keep a
+    /// clone to observe or seed it from outside.
     pub state: State,
     /// Keeps the engine status and containers in `state` current.
     pub engine: E,
     /// Where the metrics collector reads the machine and its containers.
     pub metrics: M,
+    /// What the apps task lists folders and reads compose files through.
+    pub apps: AppsDeps,
 }
 
 impl<E> Deps<E> {
     /// Fresh state with `engine` keeping it current, and this machine's
     /// metrics.
+    ///
+    /// The apps task gets the real filesystem but no default home, so it
+    /// searches nothing until the settings name a folder, and a
+    /// [`FakeComposeConfig`](compose::FakeComposeConfig) that knows no
+    /// projects, so `docker compose` never runs. Use [`Self::with_apps`]
+    /// to change either.
     pub fn new(engine: E) -> Self {
         Self {
             state: State::new(),
             engine,
             metrics: SystemMetrics::new(),
+            apps: AppsDeps::new(
+                Arc::new(apps::SystemFs),
+                Arc::new(compose::FakeComposeConfig::new()),
+                None,
+            ),
         }
     }
 }
@@ -87,14 +103,22 @@ impl<E, M> Deps<E, M> {
             state: self.state,
             engine: self.engine,
             metrics,
+            apps: self.apps,
         }
+    }
+
+    /// Use `apps` for the apps task.
+    #[must_use]
+    pub fn with_apps(mut self, apps: AppsDeps) -> Self {
+        self.apps = apps;
+        self
     }
 }
 
 impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
-    /// The real engine monitor for this host.
+    /// The real engine monitor and apps task for this host.
     pub fn system() -> Self {
-        Self::new(EngineMonitor::system())
+        Self::new(EngineMonitor::system()).with_apps(AppsDeps::system())
     }
 }
 
@@ -108,9 +132,11 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::
 ///
 /// The state database in `config.state_dir` is opened, created, or
 /// migrated first; a corrupt or too-new one fails startup before either
-/// listener is bound. The engine task and the metrics collector run
-/// alongside the listeners. An engine that is absent or broken never fails
-/// startup; it only shows up in the engine status.
+/// listener is bound. The engine task, the metrics collector, and the
+/// apps task run alongside the listeners. An engine that is absent or
+/// broken never fails startup; it only shows up in the engine status.
+/// Neither does a missing or unreadable app folder, which shows up in the
+/// app list.
 pub async fn run_with(
     config: Config,
     deps: Deps<impl EngineSource, impl MetricsSource>,
@@ -148,6 +174,12 @@ pub async fn run_with(
     let metrics_task = tokio::spawn(
         Collector::new(deps.metrics, deps.state.clone(), store.clone()).run(shutdown_rx.clone()),
     );
+    let apps_task = tokio::spawn(apps::run(
+        deps.apps,
+        deps.state.clone(),
+        store.clone(),
+        shutdown_rx.clone(),
+    ));
     let socket_task = tokio::spawn(
         axum::serve(
             socket_listener,
@@ -170,11 +202,13 @@ pub async fn run_with(
 
     let engine_result = engine_task.await;
     let metrics_result = metrics_task.await;
+    let apps_result = apps_task.await;
     let socket_result = socket_task.await;
     let http_result = http_task.await;
     drop(socket_file);
     engine_result.context("engine task failed")?;
     metrics_result.context("metrics task failed")?;
+    apps_result.context("apps task failed")?;
     socket_result.context("API socket task failed")??;
     http_result.context("HTTP task failed")??;
     Ok(())

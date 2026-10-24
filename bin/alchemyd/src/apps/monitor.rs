@@ -1,0 +1,553 @@
+//! The task that keeps the app list in [`State`] current.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use alchemy_api::apps::AppProblemKind;
+use alchemy_core::engine::EngineState;
+use alchemy_core::stack::{
+    Discovery, FileInfo, FoundStack, ListedDir, StackDirs, default_stack_home, discover,
+};
+use futures_util::StreamExt as _;
+use futures_util::future::BoxFuture;
+use futures_util::stream::FuturesUnordered;
+use tokio::sync::watch;
+use tokio::time::{Instant, MissedTickBehavior};
+
+use super::assemble::{ConfigOutcome, Inputs, app_list};
+use super::fs::{AppFs, SystemFs};
+use super::settings::{SETTINGS_KEY, StoredDirs, effective};
+use crate::State;
+use crate::compose::{CliComposeConfig, ComposeConfigReader, ComposeProject};
+use crate::engine::{Endpoint, HostEnv};
+use crate::store::SharedStore;
+
+/// How often the app folders are listed again by default.
+///
+/// Listing is cheap: one directory read per folder and a few `lstat`s per
+/// app. Compose only runs for an app whose watched files changed.
+pub const DEFAULT_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many `docker compose config` reads run at once.
+const MAX_READS: usize = 4;
+
+/// How long before an app whose read failed for a reason other than its
+/// files, such as Docker missing, is read again.
+const RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// What the apps task reads the app folders and compose files through.
+#[derive(Debug, Clone)]
+pub struct AppsDeps {
+    /// Lists the app folders.
+    pub fs: Arc<dyn AppFs>,
+    /// Reads each app's resolved configuration.
+    pub config: Arc<dyn ComposeConfigReader>,
+    /// The home used when the settings choose none, usually
+    /// `~/Alchemy/apps`. With neither, no folder is searched.
+    pub default_home: Option<PathBuf>,
+    /// How often to list the folders again.
+    pub scan_interval: Duration,
+}
+
+impl AppsDeps {
+    /// The real filesystem and `docker compose`, with `~/Alchemy/apps` as
+    /// the default home.
+    pub fn system() -> Self {
+        Self::new(
+            Arc::new(SystemFs),
+            Arc::new(CliComposeConfig::system()),
+            default_stack_home(HostEnv::current().home.as_deref()),
+        )
+    }
+
+    /// These effects and default home, listed every
+    /// [`DEFAULT_SCAN_INTERVAL`].
+    pub fn new(
+        fs: Arc<dyn AppFs>,
+        config: Arc<dyn ComposeConfigReader>,
+        default_home: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            fs,
+            config,
+            default_home,
+            scan_interval: DEFAULT_SCAN_INTERVAL,
+        }
+    }
+
+    /// List the folders every `interval` instead.
+    #[must_use]
+    pub fn with_scan_interval(mut self, interval: Duration) -> Self {
+        self.scan_interval = interval;
+        self
+    }
+}
+
+/// A finished read: the stack's directory, the files it was read at, and
+/// what came of it.
+type Read = (PathBuf, BTreeMap<String, FileInfo>, ConfigOutcome);
+
+/// When an app was last read, and at which files.
+#[derive(Debug)]
+struct ReadAt {
+    files: Option<BTreeMap<String, FileInfo>>,
+    at: Instant,
+}
+
+/// Keeps the app list, and the app settings in effect, in [`State`]
+/// current until `shutdown` flips to `true` or its sender is dropped.
+///
+/// It loads the settings from `store` at start and on every
+/// [`State::rescan_apps`]; lists the folders every
+/// [`AppsDeps::scan_interval`], at start, and on a rescan; reads an app's
+/// configuration when it is new, its watched files changed, or a rescan
+/// asks; and rebuilds the list whenever any of that, the containers, or
+/// the engine status changes. It never writes to an app folder, and never
+/// creates one: the home is created when the first app is added.
+///
+/// A read that failed for a reason other than the app's files, such as
+/// Docker not being installed, is retried after a while and whenever the
+/// engine becomes ready. While a changed app is read again, its previous
+/// result stays in the list.
+pub async fn run(
+    deps: AppsDeps,
+    state: State,
+    store: SharedStore,
+    shutdown: watch::Receiver<bool>,
+) {
+    Monitor::new(deps, state, store).run(shutdown).await;
+}
+
+struct Monitor {
+    deps: AppsDeps,
+    state: State,
+    store: SharedStore,
+    dirs: Option<StackDirs>,
+    discovery: Discovery,
+    outcomes: BTreeMap<PathBuf, ConfigOutcome>,
+    read_at: BTreeMap<PathBuf, ReadAt>,
+    reading: BTreeSet<PathBuf>,
+}
+
+impl Monitor {
+    fn new(deps: AppsDeps, state: State, store: SharedStore) -> Self {
+        Self {
+            deps,
+            state,
+            store,
+            dirs: None,
+            discovery: Discovery::default(),
+            outcomes: BTreeMap::new(),
+            read_at: BTreeMap::new(),
+            reading: BTreeSet::new(),
+        }
+    }
+
+    async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
+        let mut containers = self.state.watch_containers();
+        let mut engine = self.state.watch_engine();
+        let mut rescans = self.state.watch_app_rescans();
+        let mut tick = tokio::time::interval(self.deps.scan_interval);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut reads: FuturesUnordered<BoxFuture<'static, Read>> = FuturesUnordered::new();
+        let mut reload = true;
+        loop {
+            let mut scan = false;
+            let mut reread = false;
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stop| *stop) => return,
+                Some(read) = reads.next(), if !reads.is_empty() => self.finish(read),
+                Ok(()) = rescans.changed() => {
+                    rescans.mark_unchanged();
+                    (reload, scan, reread) = (true, true, true);
+                }
+                _ = tick.tick() => scan = true,
+                Ok(()) = engine.changed() => {
+                    if engine.borrow_and_update().state == EngineState::Ready {
+                        self.retry_transient();
+                    }
+                }
+                Ok(()) = containers.changed() => {}
+            }
+            if reload {
+                self.load_settings().await;
+                reload = false;
+            }
+            if scan {
+                self.scan(reread).await;
+            }
+            self.start_reads(&mut reads);
+            self.publish();
+        }
+    }
+
+    async fn load_settings(&mut self) {
+        let stored = match self.store.setting::<StoredDirs>(SETTINGS_KEY).await {
+            Ok(stored) => stored.unwrap_or_default(),
+            Err(error) => {
+                tracing::warn!(error = %error, "app folder settings unreadable; using the defaults");
+                StoredDirs::default()
+            }
+        };
+        let (dirs, settings) = effective(&stored, self.deps.default_home.as_deref());
+        self.state.set_app_settings(settings);
+        self.dirs = dirs;
+    }
+
+    /// List every folder and work out the stacks. With `reread`, every
+    /// app's configuration is read again.
+    async fn scan(&mut self, reread: bool) {
+        let paths: Vec<PathBuf> = self
+            .dirs
+            .iter()
+            .flat_map(StackDirs::all)
+            .map(Path::to_owned)
+            .collect();
+        let fs = self.deps.fs.clone();
+        let listed = tokio::task::spawn_blocking(move || {
+            paths
+                .into_iter()
+                .map(|dir| ListedDir {
+                    listing: fs.list(&dir),
+                    dir,
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        let listed = match listed {
+            Ok(listed) => listed,
+            Err(error) => {
+                tracing::warn!(error = %error, "listing the app folders failed");
+                return;
+            }
+        };
+        self.discovery = discover(&listed);
+        let found: BTreeSet<&Path> = self
+            .discovery
+            .stacks
+            .iter()
+            .map(|s| s.dir.as_path())
+            .collect();
+        self.outcomes.retain(|dir, _| found.contains(dir.as_path()));
+        self.read_at.retain(|dir, _| found.contains(dir.as_path()));
+        if reread {
+            for read in self.read_at.values_mut() {
+                read.files = None;
+            }
+        }
+    }
+
+    fn retry_transient(&mut self) {
+        for (dir, read) in &mut self.read_at {
+            if self
+                .outcomes
+                .get(dir)
+                .is_some_and(ConfigOutcome::is_transient)
+            {
+                read.files = None;
+            }
+        }
+    }
+
+    fn is_stale(&self, stack: &FoundStack) -> bool {
+        let Some(read) = self.read_at.get(&stack.dir) else {
+            return true;
+        };
+        let transient = self
+            .outcomes
+            .get(&stack.dir)
+            .is_some_and(ConfigOutcome::is_transient);
+        read.files.as_ref() != Some(&stack.files) || (transient && read.at.elapsed() >= RETRY_AFTER)
+    }
+
+    fn start_reads(&mut self, reads: &mut FuturesUnordered<BoxFuture<'static, Read>>) {
+        let endpoint = self
+            .state
+            .engine()
+            .endpoint
+            .and_then(|e| Endpoint::parse(&e).ok())
+            .unwrap_or_else(Endpoint::system);
+        let stale: Vec<FoundStack> = self
+            .discovery
+            .stacks
+            .iter()
+            .filter(|stack| !self.reading.contains(&stack.dir) && self.is_stale(stack))
+            .take(MAX_READS.saturating_sub(reads.len()))
+            .cloned()
+            .collect();
+        for stack in stale {
+            self.reading.insert(stack.dir.clone());
+            reads.push(Box::pin(read(
+                self.deps.config.clone(),
+                stack,
+                endpoint.clone(),
+            )));
+        }
+    }
+
+    fn finish(&mut self, (dir, files, outcome): Read) {
+        self.reading.remove(&dir);
+        if !self.discovery.stacks.iter().any(|s| s.dir == dir) {
+            return;
+        }
+        self.read_at.insert(
+            dir.clone(),
+            ReadAt {
+                files: Some(files),
+                at: Instant::now(),
+            },
+        );
+        self.outcomes.insert(dir, outcome);
+    }
+
+    fn publish(&self) {
+        let containers = self.state.containers();
+        let list = app_list(&Inputs {
+            discovery: &self.discovery,
+            home: self.dirs.as_ref().map(StackDirs::home),
+            configs: &self.outcomes,
+            containers: &containers,
+            engine_ready: self.state.engine().state == EngineState::Ready,
+        });
+        self.state.set_apps(list);
+    }
+}
+
+async fn read(config: Arc<dyn ComposeConfigReader>, stack: FoundStack, endpoint: Endpoint) -> Read {
+    let outcome = match ComposeProject::new(&stack.dir) {
+        Ok(project) => {
+            ConfigOutcome::from_result(config.read(&project, &endpoint).await, stack.compose_file)
+        }
+        Err(error) => ConfigOutcome::Failed {
+            kind: AppProblemKind::ComposeUnavailable,
+            message: error.to_string(),
+        },
+    };
+    (stack.dir, stack.files, outcome)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use alchemy_api::apps::{AppList, StackStatus};
+    use alchemy_core::engine::{ContainerState, ContainerStatus, EngineStatus};
+    use alchemy_core::stack::{EntryKind, ListedEntry, Listing};
+
+    use super::*;
+    use crate::apps::FakeFs;
+    use crate::compose::{FakeComposeConfig, FakeConfig};
+    use crate::store::MemoryStore;
+
+    const HOME: &str = "/home/me/Alchemy/apps";
+    const WAIT: Duration = Duration::from_secs(5);
+
+    struct Harness {
+        state: State,
+        store: SharedStore,
+        fs: FakeFs,
+        config: FakeComposeConfig,
+        stop: watch::Sender<bool>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    fn start() -> Harness {
+        let state = State::new();
+        let store: SharedStore = Arc::new(MemoryStore::new());
+        let fs = FakeFs::new();
+        let config = FakeComposeConfig::new();
+        let deps = AppsDeps::new(
+            Arc::new(fs.clone()),
+            Arc::new(config.clone()),
+            Some(HOME.into()),
+        )
+        .with_scan_interval(Duration::from_millis(10));
+        let (stop, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run(deps, state.clone(), store.clone(), stop_rx));
+        Harness {
+            state,
+            store,
+            fs,
+            config,
+            stop,
+            task,
+        }
+    }
+
+    fn stacks(names: &[(&str, u64)]) -> Listing {
+        Listing::Entries(
+            names
+                .iter()
+                .map(|(name, len)| ListedEntry {
+                    name: (*name).into(),
+                    kind: EntryKind::Dir,
+                    files: [(
+                        "compose.yaml".to_owned(),
+                        FileInfo {
+                            kind: EntryKind::File,
+                            modified: None,
+                            len: *len,
+                        },
+                    )]
+                    .into(),
+                })
+                .collect(),
+        )
+    }
+
+    async fn until(state: &State, what: &str, done: impl Fn(&AppList) -> bool) -> AppList {
+        let mut rx = state.watch_apps();
+        let found = tokio::time::timeout(WAIT, rx.wait_for(|apps| done(apps))).await;
+        match found {
+            Ok(Ok(apps)) => apps.clone(),
+            _ => panic!("timed out waiting for {what}: {:?}", state.apps()),
+        }
+    }
+
+    fn running(id: &str, project: &str, service: &str) -> ContainerStatus {
+        let mut c = ContainerStatus::new(id, id, ContainerState::Running);
+        c.project = Some(project.into());
+        c.service = Some(service.into());
+        c
+    }
+
+    fn status_of(apps: &AppList, name: &str) -> Option<StackStatus> {
+        apps.apps
+            .iter()
+            .find(|a| a.name.as_str() == name)
+            .map(|a| a.status)
+    }
+
+    fn resolved(apps: &AppList) -> bool {
+        apps.apps.first().is_some_and(|a| a.project.is_some())
+    }
+
+    #[tokio::test]
+    async fn lists_apps_in_the_default_home_and_reads_each_once() {
+        let h = start();
+        let blog = format!("{HOME}/blog");
+        h.state.set_engine(EngineStatus::new(EngineState::Ready));
+        h.config.project(&blog, "fancy", &["web"]);
+        h.fs.set(HOME, stacks(&[("blog", 1)]));
+
+        let apps = until(&h.state, "blog read", resolved).await;
+        assert_eq!(apps.apps[0].project.as_deref(), Some("fancy"));
+        assert_eq!(apps.apps[0].status, StackStatus::Stopped);
+        assert_eq!(apps.dirs[0].path, HOME);
+        assert!(apps.dirs[0].home);
+        assert_eq!(h.state.app_settings().home.as_deref(), Some(HOME));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(h.config.reads(Path::new(&blog)), 1);
+
+        h.state
+            .update_containers(|c| c.replace_all([running("1", "fancy", "web")]));
+        until(&h.state, "blog running", |a| {
+            status_of(a, "blog") == Some(StackStatus::Running)
+        })
+        .await;
+        assert_eq!(h.config.reads(Path::new(&blog)), 1);
+
+        h.stop.send_replace(true);
+        tokio::time::timeout(WAIT, h.task).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rereads_an_app_when_its_files_change() {
+        let h = start();
+        let blog = format!("{HOME}/blog");
+        h.config.project(&blog, "blog", &["web"]);
+        h.fs.set(HOME, stacks(&[("blog", 1)]));
+        until(&h.state, "blog read", resolved).await;
+
+        h.config.project(&blog, "renamed", &["web"]);
+        h.fs.set(HOME, stacks(&[("blog", 2)]));
+        until(&h.state, "blog reread", |a| {
+            a.apps.first().and_then(|a| a.project.as_deref()) == Some("renamed")
+        })
+        .await;
+        assert_eq!(h.config.reads(Path::new(&blog)), 2);
+
+        h.fs.set(HOME, stacks(&[]));
+        until(&h.state, "blog gone", |a| a.apps.is_empty()).await;
+    }
+
+    #[tokio::test]
+    async fn a_rescan_reloads_settings_and_rereads_every_app() {
+        let h = start();
+        let db = Path::new("/opt/stacks/db");
+        h.config.project(db, "db", &["postgres"]);
+        h.fs.set(HOME, stacks(&[]));
+        h.fs.set("/opt/stacks", stacks(&[("db", 1)]));
+        until(&h.state, "home listed", |a| a.dirs.len() == 1).await;
+
+        h.store
+            .set_setting(
+                SETTINGS_KEY,
+                &StoredDirs {
+                    home: None,
+                    extra: vec!["/opt/stacks".into()],
+                },
+            )
+            .await
+            .unwrap();
+        h.state.rescan_apps();
+        let apps = until(&h.state, "db read", resolved).await;
+        assert_eq!(apps.dirs.len(), 2);
+        assert_eq!(apps.apps[0].root, "/opt/stacks");
+        assert_eq!(h.state.app_settings().extra, ["/opt/stacks"]);
+        assert_eq!(h.config.reads(db), 1);
+
+        h.state.rescan_apps();
+        let deadline = Instant::now() + WAIT;
+        while h.config.reads(db) < 2 {
+            assert!(Instant::now() < deadline, "no reread after a rescan");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_a_read_that_failed_without_the_files_changing() {
+        let h = start();
+        let blog = format!("{HOME}/blog");
+        h.config.set(&blog, FakeConfig::NoDocker);
+        h.fs.set(HOME, stacks(&[("blog", 1)]));
+        until(&h.state, "blog failed", |a| {
+            a.apps.first().is_some_and(|a| !a.problems.is_empty())
+        })
+        .await;
+
+        h.config.project(&blog, "blog", &["web"]);
+        h.state.set_engine(EngineStatus::new(EngineState::Ready));
+        let apps = until(&h.state, "blog read", resolved).await;
+        assert_eq!(apps.apps[0].problems, []);
+    }
+
+    #[tokio::test]
+    async fn searches_nothing_without_a_home() {
+        let state = State::new();
+        let fs = FakeFs::new();
+        fs.set("/", stacks(&[("blog", 1)]));
+        let deps = AppsDeps::new(Arc::new(fs), Arc::new(FakeComposeConfig::new()), None)
+            .with_scan_interval(Duration::from_millis(10));
+        let (stop, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run(
+            deps,
+            state.clone(),
+            Arc::new(MemoryStore::new()),
+            stop_rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(state.apps(), AppList::default());
+        assert_eq!(state.app_settings().home, None);
+        drop(stop);
+        tokio::time::timeout(WAIT, task).await.unwrap().unwrap();
+    }
+}
