@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use alchemy_api::MetricsResponse;
+use alchemy_api::OperationList;
 use alchemy_api::apps::{AppList, AppSettings};
 use alchemy_core::engine::{Containers, EngineState, EngineStatus};
 use tokio::sync::watch;
@@ -28,6 +29,7 @@ struct Inner {
     apps: watch::Sender<AppList>,
     app_settings: watch::Sender<AppSettings>,
     app_rescans: watch::Sender<u64>,
+    operations: watch::Sender<OperationList>,
 }
 
 impl State {
@@ -50,6 +52,7 @@ impl State {
                     extra: Vec::new(),
                 }),
                 app_rescans: watch::Sender::new(0),
+                operations: watch::Sender::new(OperationList::default()),
             }),
         }
     }
@@ -163,6 +166,24 @@ impl State {
     /// Subscribe to [`Self::rescan_apps`] requests.
     pub fn watch_app_rescans(&self) -> watch::Receiver<u64> {
         self.inner.app_rescans.subscribe()
+    }
+
+    /// Every operation held in memory, newest first.
+    pub fn operations(&self) -> OperationList {
+        self.inner.operations.borrow().clone()
+    }
+
+    /// Subscribe to changes to [`Self::operations`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_operations(&self) -> watch::Receiver<OperationList> {
+        self.inner.operations.subscribe()
+    }
+
+    /// Replace the operations held in memory. Returns whether they
+    /// changed; subscribers are only notified if they did.
+    pub fn set_operations(&self, operations: OperationList) -> bool {
+        send_if_changed(&self.inner.operations, operations)
     }
 }
 

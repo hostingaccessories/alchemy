@@ -3,7 +3,9 @@
 //! Routes under `/api` return JSON, except `/api/events`, which streams
 //! [`ApiEvent`]s as server-sent events, and `/api/apps/{name}/logs`,
 //! which streams an app's [`LogEvent`]s. The app routes are described in
-//! [`alchemy_api::apps`]. On the TCP listener ([`router`])
+//! [`alchemy_api::apps`], and the lifecycle operation routes, whose
+//! `/api/operations/{id}/events` streams too, in
+//! [`alchemy_api::operations`]. On the TCP listener ([`router`])
 //! everything else is served from the embedded web UI build with an
 //! `index.html` fallback for client-side routing; on the Unix socket
 //! ([`api_router`]) everything else is a JSON 404.
@@ -19,6 +21,9 @@ use std::time::Duration;
 
 use alchemy_api::apps::{App, AppList, AppSettings, AppSettingsUpdate};
 use alchemy_api::logs::LogEvent;
+use alchemy_api::operations::{
+    Action, ActionRequest, OperationEvent, OperationList, OperationResponse,
+};
 use alchemy_api::{
     ApiEvent, EngineStatus, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, MetricsRange,
     VersionResponse,
@@ -30,8 +35,9 @@ use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::stream::{self, BoxStream};
 use futures_util::{Stream, StreamExt as _};
 use serde::Deserialize;
 use tokio::sync::watch;
@@ -42,11 +48,15 @@ use crate::apps::{self, settings};
 use crate::events::{self, Topic};
 use crate::guard::{self, Refusal, TAURI_ORIGINS};
 use crate::logs::{self, LogQuery, LogsRefusal, SharedLogSource};
+use crate::operations::{CancelError, Operations, StartError};
 use crate::store::SharedStore;
 
 /// How often `/api/events` sends an SSE comment while idle, so proxies and
 /// clients do not give up on a quiet stream.
 pub const KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+/// How many operations `GET /api/operations` returns at most.
+pub const RECENT_OPERATIONS: usize = 50;
 
 #[derive(Debug, Clone)]
 struct Api {
@@ -55,6 +65,13 @@ struct Api {
     topics: Arc<[Topic]>,
     shutdown: watch::Receiver<bool>,
     logs: SharedLogSource,
+    operations: Operations,
+}
+
+impl FromRef<Api> for Operations {
+    fn from_ref(api: &Api) -> Self {
+        api.operations.clone()
+    }
 }
 
 impl FromRef<Api> for State {
@@ -76,18 +93,19 @@ impl FromRef<Api> for SharedStore {
 /// sender is dropped), so open `/api/events` connections do not hold up
 /// graceful shutdown. Only the socket's share of the [`crate::guard`]
 /// checks applies; see [`socket_checks`]. App logs are read through
-/// `logs`.
+/// `logs`, and lifecycle actions run through `operations`.
 pub fn api_router(
     state: State,
     store: SharedStore,
     shutdown: watch::Receiver<bool>,
     logs: SharedLogSource,
+    operations: Operations,
 ) -> Router {
     socket_checks(
         Router::new()
             .nest(
                 alchemy_api::API_PREFIX,
-                api(state, store, events::topics(), shutdown, logs),
+                api(state, store, events::topics(), shutdown, logs, operations),
             )
             .fallback(api_not_found),
     )
@@ -102,8 +120,17 @@ pub fn router(
     listen: IpAddr,
     shutdown: watch::Receiver<bool>,
     logs: SharedLogSource,
+    operations: Operations,
 ) -> Router {
-    router_with_topics(state, store, listen, events::topics(), shutdown, logs)
+    router_with_topics(
+        state,
+        store,
+        listen,
+        events::topics(),
+        shutdown,
+        logs,
+        operations,
+    )
 }
 
 /// [`router`], with `/api/events` publishing `topics` instead of the
@@ -115,12 +142,13 @@ pub fn router_with_topics(
     topics: Vec<Topic>,
     shutdown: watch::Receiver<bool>,
     logs: SharedLogSource,
+    operations: Operations,
 ) -> Router {
     tcp_checks(
         Router::new()
             .nest(
                 alchemy_api::API_PREFIX,
-                api(state, store, topics, shutdown, logs),
+                api(state, store, topics, shutdown, logs, operations),
             )
             .fallback(crate::web::serve),
         listen,
@@ -152,6 +180,7 @@ fn api(
     topics: Vec<Topic>,
     shutdown: watch::Receiver<bool>,
     logs: SharedLogSource,
+    operations: Operations,
 ) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -163,6 +192,12 @@ fn api(
         .route("/apps", get(list_apps))
         .route("/apps/{name}", get(show_app))
         .route("/apps/{name}/logs", get(app_logs))
+        .route("/apps/{name}/actions", post(start_action))
+        .route("/apps/{name}/plan", get(plan_action))
+        .route("/operations", get(list_operations))
+        .route("/operations/{id}", get(show_operation))
+        .route("/operations/{id}/cancel", post(cancel_operation))
+        .route("/operations/{id}/events", get(operation_events))
         .route("/settings/apps", get(app_settings).put(set_app_settings))
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found)
@@ -172,6 +207,7 @@ fn api(
             topics: topics.into(),
             shutdown,
             logs,
+            operations,
         })
 }
 
@@ -400,6 +436,198 @@ fn log_event(event: &LogEvent) -> Result<Event, axum::Error> {
     Event::default().event(event.name()).json_data(event.data())
 }
 
+fn bad_path(rejection: &PathRejection) -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        ErrorCode::BadRequest,
+        &rejection.body_text(),
+    )
+}
+
+fn start_refused(error: &StartError) -> Response {
+    let (status, code) = match error {
+        StartError::AppNotFound { .. } => (StatusCode::NOT_FOUND, ErrorCode::AppNotFound),
+        StartError::Project { .. } => (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal),
+        _ => (StatusCode::CONFLICT, ErrorCode::Conflict),
+    };
+    api_error(status, code, &error.to_string())
+}
+
+fn operation_not_found(id: &str) -> Response {
+    api_error(
+        StatusCode::NOT_FOUND,
+        ErrorCode::OperationNotFound,
+        &format!("no operation has id {id:?}"),
+    )
+}
+
+fn history_unreadable(error: &crate::store::StoreError) -> Response {
+    tracing::warn!(%error, "cannot read operation history");
+    api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorCode::Internal,
+        "cannot read operation history from the state database",
+    )
+}
+
+/// Start an action on an app: 202 with the running operation.
+async fn start_action(
+    extract::State(operations): extract::State<Operations>,
+    name: Result<extract::Path<String>, PathRejection>,
+    body: Bytes,
+) -> Response {
+    let extract::Path(name) = match name {
+        Ok(name) => name,
+        Err(rejection) => return bad_path(&rejection),
+    };
+    let request: ActionRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(err) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::BadRequest,
+                &format!("invalid action: {err}"),
+            );
+        }
+    };
+    match operations.start(&name, request.action, request.force).await {
+        Ok(operation) => {
+            (StatusCode::ACCEPTED, Json(OperationResponse { operation })).into_response()
+        }
+        Err(error) => start_refused(&error),
+    }
+}
+
+/// `?action=up` on `/api/apps/{name}/plan`.
+#[derive(Debug, Deserialize)]
+struct PlanQuery {
+    action: Option<String>,
+}
+
+async fn plan_action(
+    extract::State(operations): extract::State<Operations>,
+    name: Result<extract::Path<String>, PathRejection>,
+    query: Result<Query<PlanQuery>, QueryRejection>,
+) -> Response {
+    let extract::Path(name) = match name {
+        Ok(name) => name,
+        Err(rejection) => return bad_path(&rejection),
+    };
+    let action = match query {
+        Ok(Query(PlanQuery {
+            action: Some(action),
+        })) => action.parse::<Action>(),
+        Ok(Query(PlanQuery { action: None })) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::BadRequest,
+                "missing ?action=",
+            );
+        }
+        Err(rejection) => return bad_query(&rejection),
+    };
+    match action {
+        Ok(action) => match operations.plan(&name, action) {
+            Ok(plan) => Json(plan).into_response(),
+            Err(error) => start_refused(&error),
+        },
+        Err(error) => api_error(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::BadRequest,
+            &error.to_string(),
+        ),
+    }
+}
+
+/// `?app=NAME` on `/api/operations`.
+#[derive(Debug, Deserialize)]
+struct OperationsQuery {
+    app: Option<String>,
+}
+
+async fn list_operations(
+    extract::State(operations): extract::State<Operations>,
+    query: Result<Query<OperationsQuery>, QueryRejection>,
+) -> Response {
+    let query = match query {
+        Ok(Query(query)) => query,
+        Err(rejection) => return bad_query(&rejection),
+    };
+    match operations
+        .recent(query.app.as_deref(), RECENT_OPERATIONS)
+        .await
+    {
+        Ok(operations) => Json(OperationList { operations }).into_response(),
+        Err(error) => history_unreadable(&error),
+    }
+}
+
+async fn show_operation(
+    extract::State(operations): extract::State<Operations>,
+    id: Result<extract::Path<String>, PathRejection>,
+) -> Response {
+    let extract::Path(id) = match id {
+        Ok(id) => id,
+        Err(rejection) => return bad_path(&rejection),
+    };
+    match operations.get(&id).await {
+        Ok(Some(operation)) => Json(operation).into_response(),
+        Ok(None) => operation_not_found(&id),
+        Err(error) => history_unreadable(&error),
+    }
+}
+
+async fn cancel_operation(
+    extract::State(operations): extract::State<Operations>,
+    id: Result<extract::Path<String>, PathRejection>,
+) -> Response {
+    let extract::Path(id) = match id {
+        Ok(id) => id,
+        Err(rejection) => return bad_path(&rejection),
+    };
+    match operations.cancel(&id) {
+        Ok(operation) => {
+            (StatusCode::ACCEPTED, Json(OperationResponse { operation })).into_response()
+        }
+        Err(error @ CancelError::Finished { .. }) => api_error(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            &error.to_string(),
+        ),
+        Err(CancelError::NotFound { .. }) => operation_not_found(&id),
+    }
+}
+
+/// Follow one operation: its events while it is in memory, or, for one
+/// only the store remembers, the operation and `done` at once.
+async fn operation_events(
+    extract::State(operations): extract::State<Operations>,
+    id: Result<extract::Path<String>, PathRejection>,
+) -> Response {
+    let extract::Path(id) = match id {
+        Ok(id) => id,
+        Err(rejection) => return bad_path(&rejection),
+    };
+    let events: BoxStream<'static, OperationEvent> = match operations.follow(&id) {
+        Some(follower) => stream::unfold(follower, |mut follower| async move {
+            follower.next().await.map(|event| (event, follower))
+        })
+        .boxed(),
+        None => match operations.get(&id).await {
+            Ok(Some(operation)) => stream::iter([
+                OperationEvent::Operation(operation.clone()),
+                OperationEvent::Done(operation),
+            ])
+            .boxed(),
+            Ok(None) => return operation_not_found(&id),
+            Err(error) => return history_unreadable(&error),
+        },
+    };
+    Sse::new(events.map(|event| Event::default().event(event.name()).json_data(event.data())))
+        .keep_alive(KeepAlive::new().interval(KEEP_ALIVE))
+        .into_response()
+}
+
 async fn app_settings(extract::State(state): extract::State<State>) -> Json<AppSettings> {
     Json(state.app_settings())
 }
@@ -514,6 +742,19 @@ mod tests {
         std::sync::Arc::new(crate::logs::FakeLogSource::new())
     }
 
+    /// Operations on `state` that run nothing and always succeed.
+    fn ops(state: &State) -> Operations {
+        ops_with(state, crate::compose::FakeComposeRunner::new(), memory())
+    }
+
+    fn ops_with(
+        state: &State,
+        runner: crate::compose::FakeComposeRunner,
+        store: SharedStore,
+    ) -> Operations {
+        Operations::new(Arc::new(runner), state.clone(), store)
+    }
+
     /// The daemon's router with only the engine topic on `/api/events`, so
     /// these tests read engine frames alone as other topics are added.
     fn test_router(state: State) -> (Router, watch::Sender<bool>) {
@@ -523,8 +764,9 @@ mod tests {
     fn test_router_with_logs(state: State, logs: SharedLogSource) -> (Router, watch::Sender<bool>) {
         let (tx, rx) = watch::channel(false);
         let engine = Topic::watch(State::watch_engine, ApiEvent::Engine);
+        let operations = ops(&state);
         (
-            router_with_topics(state, memory(), LISTEN, vec![engine], rx, logs),
+            router_with_topics(state, memory(), LISTEN, vec![engine], rx, logs, operations),
             tx,
         )
     }
@@ -728,6 +970,7 @@ mod tests {
             vec![topic(a_rx), topic(b_rx)],
             stop_rx,
             no_logs(),
+            ops(&State::new()),
         );
         let mut frames = Frames::new(open_events(app, None).await);
 
@@ -862,7 +1105,7 @@ mod tests {
             ("/theme.js", StatusCode::NOT_FOUND),
         ] {
             let (_stop, rx) = watch::channel(false);
-            let resp = api_router(State::new(), memory(), rx, no_logs())
+            let resp = api_router(State::new(), memory(), rx, no_logs(), ops(&State::new()))
                 .oneshot(
                     req(Method::GET, uri)
                         .header(header::ORIGIN, "tauri://localhost")
@@ -1169,7 +1412,7 @@ mod tests {
             origin: None,
             content_type: None,
         };
-        let app = api_router(State::new(), memory(), rx, no_logs());
+        let app = api_router(State::new(), memory(), rx, no_logs(), ops(&State::new()));
         let (status, _, _) = send(app, probe.request("/api/health")).await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -1322,10 +1565,17 @@ data: {"service":"web","container":"blog-web-1","stream":"stdout","time":"2024-0
         if let Some(content_type) = content_type {
             request = request.header(header::CONTENT_TYPE, content_type);
         }
-        let resp = router(state.clone(), store.clone(), LISTEN, rx, no_logs())
-            .oneshot(request.body(Body::from(body.to_owned())).unwrap())
-            .await
-            .unwrap();
+        let resp = router(
+            state.clone(),
+            store.clone(),
+            LISTEN,
+            rx,
+            no_logs(),
+            ops(state),
+        )
+        .oneshot(request.body(Body::from(body.to_owned())).unwrap())
+        .await
+        .unwrap();
         let status = resp.status();
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         (status, serde_json::from_slice(&body).unwrap())
@@ -1443,5 +1693,261 @@ data: {"service":"web","container":"blog-web-1","stream":"stdout","time":"2024-0
                 "{body}"
             );
         }
+    }
+
+    fn ready_with_blog() -> State {
+        let state = State::new();
+        state.set_engine(EngineStatus::new(EngineState::Ready));
+        state.set_apps(app_list());
+        state
+    }
+
+    async fn send_json(
+        app: Router,
+        method: Method,
+        uri: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = req(method.clone(), uri);
+        if method != Method::GET {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+        }
+        let resp = app
+            .oneshot(request.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    fn ops_router(state: &State, operations: &Operations) -> Router {
+        let (_tx, rx) = watch::channel(false);
+        router(
+            state.clone(),
+            memory(),
+            LISTEN,
+            rx,
+            no_logs(),
+            operations.clone(),
+        )
+    }
+
+    #[tokio::test]
+    async fn actions_start_operations_and_refuse_a_busy_app() {
+        use crate::compose::{ComposeAction, FakeComposeRunner, FakeOutcome, FakeScript};
+        let state = ready_with_blog();
+        let runner = FakeComposeRunner::new().with_script(
+            ComposeAction::Up,
+            FakeScript::new().outcome(FakeOutcome::UntilCancelled),
+        );
+        let operations = ops_with(&state, runner, memory());
+        let app = || ops_router(&state, &operations);
+
+        let (status, body) = send_json(
+            app(),
+            Method::POST,
+            "/api/apps/blog/actions",
+            r#"{"action":"up"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["operation"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(body["operation"]["state"], "running");
+        assert_eq!(body["operation"]["app"], "blog");
+
+        let cases = [
+            (
+                r#"{"action":"stop"}"#,
+                "/api/apps/blog/actions",
+                StatusCode::CONFLICT,
+                "conflict",
+            ),
+            (
+                r#"{"action":"up"}"#,
+                "/api/apps/nope/actions",
+                StatusCode::NOT_FOUND,
+                "app_not_found",
+            ),
+            (
+                r#"{"action":"kill"}"#,
+                "/api/apps/blog/actions",
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+            (
+                "",
+                "/api/apps/blog/actions",
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+        ];
+        for (body, uri, want, code) in cases {
+            let (status, got) = send_json(app(), Method::POST, uri, body).await;
+            assert_eq!(status, want, "{uri} {body}");
+            assert_eq!(got["code"], code, "{uri} {body}");
+        }
+
+        let (status, body) =
+            send_json(app(), Method::GET, &format!("/api/operations/{id}"), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], id.as_str());
+        let (status, body) = send_json(app(), Method::GET, "/api/operations?app=blog", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["operations"][0]["id"], id.as_str());
+        let (_, body) = send_json(app(), Method::GET, "/api/operations?app=other", "").await;
+        assert_eq!(body, serde_json::json!({ "operations": [] }));
+        let (status, body) = send_json(app(), Method::GET, "/api/operations/nope", "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "operation_not_found");
+
+        let cancel = format!("/api/operations/{id}/cancel");
+        let (status, _) = send_json(app(), Method::POST, &cancel, "").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let resp = app()
+            .oneshot(
+                req(Method::GET, &format!("/api/operations/{id}/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut frames = Frames::new(resp);
+        let mut last = String::new();
+        while let Some(frame) = frames.next().await {
+            last = frame;
+        }
+        let data = last.strip_prefix("event: done\ndata: ").unwrap();
+        let done: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(done["state"], "cancelled");
+
+        let (status, body) = send_json(app(), Method::POST, &cancel, "").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "conflict");
+        let (status, _) = send_json(app(), Method::POST, "/api/operations/nope/cancel", "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn events_stream_output_then_done() {
+        use crate::compose::{ComposeAction, FakeComposeRunner, FakeScript, Stream};
+        let state = ready_with_blog();
+        let runner = FakeComposeRunner::new().with_script(
+            ComposeAction::Stop,
+            FakeScript::new().line(Stream::Stderr, "stopping"),
+        );
+        let operations = ops_with(&state, runner, memory());
+        let started = operations.start("blog", Action::Stop, false).await.unwrap();
+        let resp = ops_router(&state, &operations)
+            .oneshot(
+                req(
+                    Method::GET,
+                    &format!("/api/operations/{}/events", started.id),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        let mut frames = Frames::new(resp);
+        let mut names = Vec::new();
+        while let Some(frame) = frames.next().await {
+            let name = frame
+                .lines()
+                .next()
+                .unwrap()
+                .trim_start_matches("event: ")
+                .to_owned();
+            if name == "output" {
+                assert!(frame.contains(r#""text":"stopping""#), "{frame}");
+            }
+            names.push(name);
+        }
+        names.dedup();
+        assert_eq!(names.first().map(String::as_str), Some("operation"));
+        assert!(names.contains(&"output".to_owned()), "{names:?}");
+        assert_eq!(names.last().map(String::as_str), Some("done"));
+
+        let (status, body) = send_json(
+            ops_router(&state, &operations),
+            Method::GET,
+            "/api/operations/nope/events",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "operation_not_found");
+    }
+
+    #[tokio::test]
+    async fn plans_show_the_command_lines() {
+        let state = ready_with_blog();
+        let operations = ops(&state);
+        let app = || ops_router(&state, &operations);
+        let (status, body) =
+            send_json(app(), Method::GET, "/api/apps/blog/plan?action=down", "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["action"], "down");
+        assert_eq!(
+            body["steps"][0]["argv"],
+            serde_json::json!([
+                "docker",
+                "compose",
+                "--project-directory",
+                "/srv/apps/blog",
+                "--progress",
+                "json",
+                "down"
+            ])
+        );
+        let cases = [
+            (
+                "/api/apps/blog/plan",
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+            (
+                "/api/apps/blog/plan?action=kill",
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+            (
+                "/api/apps/nope/plan?action=up",
+                StatusCode::NOT_FOUND,
+                "app_not_found",
+            ),
+        ];
+        for (uri, want, code) in cases {
+            let (status, body) = send_json(app(), Method::GET, uri, "").await;
+            assert_eq!(status, want, "{uri}");
+            assert_eq!(body["code"], code, "{uri}");
+        }
+        assert_eq!(operations.recent(None, 10).await.unwrap(), []);
+    }
+
+    #[tokio::test]
+    async fn actions_wait_for_docker() {
+        let state = State::new();
+        state.set_apps(app_list());
+        let operations = ops(&state);
+        let (status, body) = send_json(
+            ops_router(&state, &operations),
+            Method::POST,
+            "/api/apps/blog/actions",
+            r#"{"action":"start"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("Docker isn't running"),
+            "{body}"
+        );
     }
 }

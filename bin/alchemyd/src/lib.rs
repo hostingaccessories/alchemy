@@ -11,9 +11,9 @@
 //!
 //! It talks to the Docker engine through [`engine`], finds the user's
 //! Compose stacks through [`apps`], samples resource usage through
-//! [`metrics`], reads app logs through [`logs`], keeps what it learns in
-//! [`State`], and persists settings, history, and stop [`intent`] in a
-//! [`store::Store`].
+//! [`metrics`], reads app logs through [`logs`], runs lifecycle actions
+//! on apps through [`operations`], keeps what it learns in [`State`], and
+//! persists settings, history, and stop [`intent`] in a [`store::Store`].
 
 pub mod apps;
 pub mod compose;
@@ -24,6 +24,7 @@ pub mod http;
 pub mod intent;
 pub mod logs;
 pub mod metrics;
+pub mod operations;
 mod secure_fs;
 pub mod socket;
 mod state;
@@ -44,6 +45,7 @@ use crate::apps::AppsDeps;
 use crate::engine::{EngineMonitor, EngineSource, SystemConnector, SystemProbe};
 use crate::logs::{SharedLogSource, SystemLogs};
 use crate::metrics::{Collector, MetricsSource, SystemMetrics};
+use crate::operations::{OperationRunner, Operations, SystemRunner};
 use crate::store::{SharedStore, SqliteStore};
 
 /// Default HTTP listen address. Loopback only: the API has no
@@ -77,6 +79,8 @@ pub struct Deps<E, M = SystemMetrics> {
     pub apps: AppsDeps,
     /// Where app logs are read.
     pub logs: SharedLogSource,
+    /// What lifecycle operations run their Compose plans through.
+    pub runner: Arc<dyn OperationRunner>,
 }
 
 impl<E> Deps<E> {
@@ -86,8 +90,11 @@ impl<E> Deps<E> {
     /// The apps task gets the real filesystem but no default home, so it
     /// searches nothing until the settings name a folder, and a
     /// [`FakeComposeConfig`](compose::FakeComposeConfig) that knows no
-    /// projects, so `docker compose` never runs. Use [`Self::with_apps`]
-    /// to change either. Logs are read from the engine.
+    /// projects, so `docker compose` never runs. Logs are read from the
+    /// engine. Operations run on a
+    /// [`FakeComposeRunner`](compose::FakeComposeRunner) that succeeds
+    /// without running anything. Use [`Self::with_apps`] and
+    /// [`Self::with_runner`] to change them.
     pub fn new(engine: E) -> Self {
         Self {
             state: State::new(),
@@ -99,6 +106,7 @@ impl<E> Deps<E> {
                 None,
             ),
             logs: Arc::new(SystemLogs::new()),
+            runner: Arc::new(compose::FakeComposeRunner::new()),
         }
     }
 }
@@ -112,6 +120,7 @@ impl<E, M> Deps<E, M> {
             metrics,
             apps: self.apps,
             logs: self.logs,
+            runner: self.runner,
         }
     }
 
@@ -128,12 +137,22 @@ impl<E, M> Deps<E, M> {
         self.logs = logs;
         self
     }
+
+    /// Run lifecycle operations through `runner`.
+    #[must_use]
+    pub fn with_runner(mut self, runner: Arc<dyn OperationRunner>) -> Self {
+        self.runner = runner;
+        self
+    }
 }
 
 impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
-    /// The real engine monitor and apps task for this host.
+    /// The real engine monitor, apps task, and `docker compose` for this
+    /// host.
     pub fn system() -> Self {
-        Self::new(EngineMonitor::system()).with_apps(AppsDeps::system())
+        Self::new(EngineMonitor::system())
+            .with_apps(AppsDeps::system())
+            .with_runner(Arc::new(SystemRunner::new()))
     }
 }
 
@@ -152,6 +171,10 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::
 /// broken never fails startup; it only shows up in the engine status.
 /// Neither does a missing or unreadable app folder, which shows up in the
 /// app list.
+///
+/// Operations a previous daemon left running are marked interrupted at
+/// startup. On shutdown, running operations are interrupted and stored
+/// before the listeners close.
 pub async fn run_with(
     config: Config,
     deps: Deps<impl EngineSource, impl MetricsSource>,
@@ -175,6 +198,11 @@ pub async fn run_with(
             %error,
             "cannot read stop intents; apps Alchemy stopped may show as stopped outside it"
         ),
+    }
+
+    let operations = Operations::new(deps.runner, deps.state.clone(), store.clone());
+    if let Err(error) = operations.recover().await {
+        tracing::warn!(%error, "cannot tidy the operation history");
     }
 
     let (socket_listener, socket_file) = socket::bind(&config.socket)
@@ -210,6 +238,7 @@ pub async fn run_with(
                 store.clone(),
                 shutdown_rx.clone(),
                 deps.logs.clone(),
+                operations.clone(),
             ),
         )
         .with_graceful_shutdown(stopped(shutdown_rx.clone()))
@@ -224,6 +253,7 @@ pub async fn run_with(
                 config.listen.ip(),
                 shutdown_rx.clone(),
                 deps.logs,
+                operations.clone(),
             ),
         )
         .with_graceful_shutdown(stopped(shutdown_rx))
@@ -232,6 +262,7 @@ pub async fn run_with(
 
     shutdown.await;
     shutdown_tx.send_replace(true);
+    operations.shutdown().await;
 
     let engine_result = engine_task.await;
     let metrics_result = metrics_task.await;
