@@ -467,8 +467,7 @@ export const api = {
   apps: (signal?: AbortSignal) => request<AppList>("GET", "/apps", { signal }),
   app: (name: string, signal?: AbortSignal) =>
     request<App>("GET", `/apps/${encodeURIComponent(name)}`, { signal }),
-  appSettings: (signal?: AbortSignal) =>
-    request<AppSettings>("GET", "/settings/apps", { signal }),
+  appSettings: (signal?: AbortSignal) => request<AppSettings>("GET", "/settings/apps", { signal }),
   setAppSettings: (update: AppSettingsUpdate) =>
     request<AppSettings>("PUT", "/settings/apps", { body: update }),
   subscribe,

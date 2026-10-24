@@ -6,6 +6,7 @@ import {
 } from "@tanstack/react-router";
 
 import { RouteError } from "./components/RouteError.tsx";
+import { appRoute } from "./routes/app.tsx";
 import { appsRoute } from "./routes/apps.tsx";
 import { indexRoute } from "./routes/index.tsx";
 import { machinesRoute } from "./routes/machines.tsx";
@@ -37,6 +38,7 @@ function devRoutes() {
 export const routeTree = rootRoute.addChildren([
   indexRoute,
   appsRoute,
+  appRoute,
   machinesRoute,
   settingsRoute,
   ...devRoutes(),

@@ -23,11 +23,13 @@ beforeEach(() => {
   vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal(
     "fetch",
-    vi.fn(async () => {
+    vi.fn(async (url: string) => {
       if (!daemonUp) {
         throw new TypeError("connection refused");
       }
-      return new Response(JSON.stringify({ version: "9.9.9", api: 1 }), { status: 200 });
+      const body =
+        url === "/api/apps" ? { apps: [], unmanaged: [], dirs: [] } : { version: "9.9.9", api: 1 };
+      return new Response(JSON.stringify(body), { status: 200 });
     }),
   );
 });

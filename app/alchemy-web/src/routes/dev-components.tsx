@@ -2,6 +2,7 @@ import { Boxes, Plus, Trash2 } from "lucide-react";
 import { type ReactNode, useState } from "react";
 
 import { Advanced } from "../components/Advanced.tsx";
+import { AppStatus } from "../components/AppStatus.tsx";
 import { Button } from "../components/Button.tsx";
 import { Code } from "../components/Code.tsx";
 import { ConfirmDialog } from "../components/ConfirmDialog.tsx";
@@ -173,6 +174,15 @@ export function ComponentGallery() {
         >
           Apps you add to Alchemy will show up here.
         </EmptyState>
+      </Section>
+
+      <Section title="AppStatus">
+        <div className="flex flex-wrap gap-4">
+          <AppStatus status="running" />
+          <AppStatus status="partial" />
+          <AppStatus status="stopped" />
+          <AppStatus status="unknown" />
+        </div>
       </Section>
 
       <Section title="Loading">
