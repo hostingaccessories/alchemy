@@ -586,7 +586,8 @@ export type ApiEvent =
   | { event: "engine"; data: EngineStatus }
   | { event: "metrics"; data: MetricsResponse }
   | { event: "apps"; data: AppList }
-  | { event: "operations"; data: OperationList };
+  | { event: "operations"; data: OperationList }
+  | { event: "privileges"; data: PrivilegeList };
 
 /** Every SSE event name the daemon sends. */
 export type ApiEventName = ApiEvent["event"];
@@ -600,6 +601,7 @@ const EVENT_NAMES: { [K in ApiEventName]: K } = {
   metrics: "metrics",
   apps: "apps",
   operations: "operations",
+  privileges: "privileges",
 };
 
 /** The event names {@link subscribe} listens for. Others are ignored. */
@@ -633,6 +635,7 @@ export type ErrorCode =
   | "operation_not_found"
   | "busy"
   | "internal"
+  | "unsupported"
   | "unknown";
 
 /**
@@ -788,6 +791,119 @@ export interface ProxyListener {
   state: ListenerState;
   message: string | null;
   fix: string | null;
+  /**
+   * The privilege that would open it, such as `low_ports` for port 80 refused
+   * for lack of permission on Linux; its state is in {@link PrivilegeList}.
+   * Absent from an older daemon.
+   */
+  privilege?: PrivilegeAction | null;
+}
+
+/**
+ * Mirrors `alchemy_api::privileges::PrivilegeAction`; unknown actions arrive
+ * as `other`. The URL path of `POST /api/machine/privileges/{action}` takes
+ * this name or its kebab-case form (`low-ports`).
+ */
+export type PrivilegeAction = "low_ports" | "firewall" | "system_service" | "other";
+
+/**
+ * Mirrors `alchemy_api::privileges::PrivilegeState`; unknown states arrive as
+ * `other`.
+ *
+ * - `needed`: a system prompt can grant it.
+ * - `needs_restart`: done on disk, in effect once alchemyd restarts; granting
+ *   again restarts it without a prompt.
+ * - `pending`: a prompt is up, or alchemyd is about to restart.
+ * - `needs_terminal`: run {@link Privilege.command} in a terminal.
+ * - `unsupported`: {@link Privilege.message} says why.
+ */
+export type PrivilegeState =
+  | "not_needed"
+  | "needed"
+  | "granted"
+  | "needs_restart"
+  | "pending"
+  | "needs_terminal"
+  | "unsupported"
+  | "other";
+
+/** Mirrors `alchemy_api::privileges::PrivilegeReason`; unknown reasons arrive as `other`. */
+export type PrivilegeReason =
+  | "untrusted_helper"
+  | "no_polkit_agent"
+  | "no_helper"
+  | "not_helper_sibling"
+  | "unmanaged_firewall"
+  | "runs_as_root"
+  | "nosuid_mount"
+  | "no_new_privileges"
+  | "other";
+
+/** Mirrors `alchemy_api::privileges::HelperCommand`: a command that runs `alchemy-helper` as root. */
+export interface HelperCommand {
+  /** What to run, the program first. */
+  argv: string[];
+  /** The same as one shell line, to show and copy. */
+  line: string;
+}
+
+/** Mirrors `alchemy_api::privileges::AttemptResult`; unknown results arrive as `other`. */
+export type AttemptResult = "done" | "cancelled" | "denied" | "needs_terminal" | "failed" | "other";
+
+/** Mirrors `alchemy_api::privileges::PrivilegeAttempt`: how the last grant or undo ended. */
+export interface PrivilegeAttempt {
+  grant: boolean;
+  result: AttemptResult;
+  /** What went wrong, safe to show; `null` when it succeeded. */
+  message: string | null;
+  /** Unix seconds. */
+  at: number;
+}
+
+/** Mirrors `alchemy_api::privileges::Privilege`: one action and where it stands. */
+export interface Privilege {
+  action: PrivilegeAction;
+  state: PrivilegeState;
+  /** Why it needs a terminal or isn't supported. */
+  reason: PrivilegeReason | null;
+  /** The same in a sentence, safe to show. */
+  message: string | null;
+  /** The `sudo alchemy-helper ...` command, when `state` is `needs_terminal`. */
+  command: HelperCommand | null;
+  /** Whether granting or undoing it restarts alchemyd, as low ports do. */
+  restarts: boolean;
+  /** How the last grant or undo ended; a restart of alchemyd forgets it. */
+  last: PrivilegeAttempt | null;
+}
+
+/**
+ * Mirrors `alchemy_api::privileges::PrivilegeList`, returned by
+ * `GET /api/machine/privileges` and sent as the `privileges` event.
+ */
+export interface PrivilegeList {
+  privileges: Privilege[];
+}
+
+/** Mirrors `alchemy_api::privileges::PrivilegeRequest`, the body of `POST /api/machine/privileges/{action}`. */
+export interface PrivilegeRequest {
+  /** `true` to grant, `false` to undo. */
+  grant: boolean;
+}
+
+/** Mirrors `alchemy_api::privileges::ChangeOutcome`; unknown outcomes arrive as `other`. */
+export type ChangeOutcome = "pending" | "restarting" | "needs_terminal" | "unchanged" | "other";
+
+/**
+ * Mirrors `alchemy_api::privileges::PrivilegeChange`. `pending` (202): follow
+ * the `privileges` event until the action leaves `pending`, then read its
+ * `last`. `restarting` (202): alchemyd re-executes itself; reconnect and sign
+ * in again. `needs_terminal`: run `command`, then send the request again.
+ */
+export interface PrivilegeChange {
+  outcome: ChangeOutcome;
+  command: HelperCommand | null;
+  message: string | null;
+  privilege: Privilege;
 }
 
 /** Mirrors `alchemy_api::network::ProxyReport`. */
@@ -1031,6 +1147,12 @@ export const api = {
     request<NetworkSettings>("GET", "/settings/network", { signal }),
   setNetworkSettings: (update: NetworkSettingsUpdate) =>
     request<NetworkSettings>("PUT", "/settings/network", { body: update }),
+  privileges: (signal?: AbortSignal) =>
+    request<PrivilegeList>("GET", "/machine/privileges", { signal }),
+  changePrivilege: (action: PrivilegeAction, body: PrivilegeRequest) =>
+    request<PrivilegeChange>("POST", `/machine/privileges/${encodeURIComponent(action)}`, {
+      body,
+    }),
   cancelOperation: (id: string) =>
     request<OperationResponse>("POST", `/operations/${encodeURIComponent(id)}/cancel`),
   followOperation,
