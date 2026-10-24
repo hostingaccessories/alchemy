@@ -101,6 +101,7 @@ fn generated_man_pages_render() {
             "alchemy-app-update.1",
             "alchemy-app.1",
             "alchemy-completions.1",
+            "alchemy-machine-ports.1",
             "alchemy-machine-stats.1",
             "alchemy-machine.1",
             "alchemy-open.1",

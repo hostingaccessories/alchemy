@@ -1,6 +1,7 @@
 //! `alchemy machine`: the machines Alchemy runs apps on. For now, only
 //! this one.
 
+pub mod ports;
 pub mod stats;
 
 /// Arguments to `alchemy machine`.
@@ -22,4 +23,12 @@ pub enum Verb {
     /// alchemyd runs on, not the VM Docker runs containers in, and an
     /// app's CPU is a share of that VM.
     Stats(stats::Args),
+    /// List every host port in use, reserved by Alchemy, or declared by
+    /// an app, and who holds it.
+    ///
+    /// A port held by a program other than an app shows its process name
+    /// and pid when this machine reveals them. alchemyd can name only its
+    /// own user's processes, so a port a root process holds shows without
+    /// a name, and on some Macs isn't listed.
+    Ports(ports::Args),
 }
