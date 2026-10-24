@@ -19,6 +19,9 @@
 //! keeps its own `alchemy` network through [`subnets`], keeps what it
 //! learns in [`State`], and persists settings, history, and stop
 //! [`intent`] in a [`store::Store`].
+//!
+//! Apps get web addresses from the [`proxy`], on listeners of its own
+//! that never serve the API.
 
 pub mod apps;
 pub mod auth;
@@ -33,6 +36,7 @@ pub mod metrics;
 pub mod network;
 pub mod operations;
 pub mod ports;
+pub mod proxy;
 mod secure_fs;
 pub mod session;
 pub mod socket;
@@ -48,6 +52,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use alchemy_core::route::RouteTable;
 use anyhow::Context as _;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -59,6 +64,7 @@ use crate::metrics::{Collector, MetricsSource, SystemMetrics};
 use crate::network::{FakeNetwork, SharedNetwork, SystemNetwork};
 use crate::operations::{OperationRunner, Operations, SystemRunner};
 use crate::ports::PortRegistry;
+use crate::proxy::{ProxyConfig, ProxyStatus, TcpConnector};
 use crate::session::{Auth, TokenFile};
 use crate::store::{SharedStore, SqliteStore, StateLock};
 use crate::subnets::{FakeDaemonConfig, FakeEngineNetworks, SubnetsDeps};
@@ -332,9 +338,10 @@ pub async fn run_with(
                 &ports,
             ),
         )
-        .with_graceful_shutdown(stopped(shutdown_rx))
+        .with_graceful_shutdown(stopped(shutdown_rx.clone()))
         .into_future(),
     );
+    let (_routes, _proxy_status, proxy_task) = spawn_proxy(listen, shutdown_rx);
 
     shutdown.await;
     shutdown_tx.send_replace(true);
@@ -346,11 +353,13 @@ pub async fn run_with(
     }
     let socket_result = socket_task.await;
     let http_result = http_task.await;
+    let proxy_result = proxy_task.await;
     drop(token_file);
     drop(socket_file);
     for (name, result) in background_results {
         result.with_context(|| format!("{name} task failed"))?;
     }
+    proxy_result.context("proxy task failed")?;
     socket_result.context("API socket task failed")??;
     http_result.context("HTTP task failed")??;
     Ok(())
@@ -424,6 +433,29 @@ fn spawn_background(
             )),
         ),
     ]
+}
+
+/// Start the web address [`proxy`], which never routes to `api`, with an
+/// empty route table, so it binds nothing until routes are sent. Returns
+/// the table's sender, the proxy's status, and its task.
+fn spawn_proxy(
+    api: SocketAddr,
+    shutdown: watch::Receiver<bool>,
+) -> (
+    watch::Sender<RouteTable>,
+    watch::Receiver<ProxyStatus>,
+    JoinHandle<()>,
+) {
+    let (routes_tx, routes_rx) = watch::channel(RouteTable::default());
+    let (status_tx, status_rx) = watch::channel(ProxyStatus::default());
+    let task = tokio::spawn(proxy::run(
+        ProxyConfig::system(api),
+        Arc::new(TcpConnector),
+        routes_rx,
+        status_tx,
+        shutdown,
+    ));
+    (routes_tx, status_rx, task)
 }
 
 fn warn_if_exposed(listen: SocketAddr) {
