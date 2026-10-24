@@ -239,6 +239,14 @@ if [[ "$port_url" != "http://127.0.0.1:${proxy_port}/" ]]; then
   check_echo lan "$port_url" "$lan_host" "${lan_host%:*}"
 fi
 
+log "Checking a forged listener probe never reaches ${app}"
+code="$(curl -sS -o "${tmp}/probe.html" -w '%{http_code}' -H "X-Alchemy-Probe: $(printf '0%.0s' {1..64})" \
+  "http://127.0.0.1:${proxy_port}/cgi-bin/echo")" || die "GET with X-Alchemy-Probe on ${proxy_port} failed"
+[[ "$code" == 404 ]] || die "a forged probe on ${proxy_port} returned ${code}, expected 404"
+if grep -qF "nonce=" "${tmp}/probe.html"; then
+  die "a forged probe on ${proxy_port} reached ${app}"
+fi
+
 # check_host: Host routing on port 80 reaches the app, and an unknown Host
 # gets the proxy's 404, never the API.
 check_host() {

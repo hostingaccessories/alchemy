@@ -734,9 +734,22 @@ sudo setcap cap_net_bind_service=+ep "$(command -v alchemyd)"
 ```
 
 A port 80 that another program holds is tried again every 10 seconds;
-`alchemy machine ports` names the holder. A firewall redirect of port 80,
-which some local development tools install with `pf` on macOS, takes the
-traffic even while alchemyd reports it is listening.
+`alchemy machine ports` names the holder.
+
+Opening a port doesn't prove its traffic arrives: a firewall redirect,
+which some local development tools install with `pf` on macOS, or a
+program on `127.0.0.1:80` that shadows alchemyd's `0.0.0.0:80` takes it
+while the bind succeeds. So before any address is `ready`, alchemyd sends
+each proxy port, 80 and every app port, a `GET` carrying
+`X-Alchemy-Probe` with a random challenge, on loopback and on the LAN
+address. The proxy answers it itself, before routing, with `204` and a
+second random value only alchemyd knows, and never forwards it. Any other
+answer, or none, makes the port `unavailable` ("Another program on this
+computer takes port 80. Your apps still work at their IP:port address."),
+and its addresses drop below the ones that work. Every port is checked
+again every 10 seconds, with new values each time; between checks, a
+request carrying the header gets the proxy's 404. The check is
+`bin/alchemyd/src/proxy/probe.rs`.
 
 The proxy answers 404 for a `Host` or port with no app, 503 when the app
 isn't running, and 502 when it can't connect, each with a short page that
