@@ -51,7 +51,7 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 /// checking, so a burst of container events leads to one check.
 pub const DEFAULT_SETTLE: Duration = Duration::from_secs(2);
 
-/// Reads and creates networks on the engine at an endpoint.
+/// Reads, creates, and joins networks on the engine at an endpoint.
 ///
 /// Object safe, so the daemon can hold any implementation in
 /// [`SubnetsDeps`].
@@ -66,6 +66,15 @@ pub trait EngineNetworks: Send + Sync + fmt::Debug {
         endpoint: &'a str,
         spec: NetworkSpec,
     ) -> BoxFuture<'a, Result<String, SubnetsError>>;
+
+    /// Attach `container` (an ID or name) to `network` (an ID or name).
+    /// Attaching a container that is already attached succeeds.
+    fn connect<'a>(
+        &'a self,
+        endpoint: &'a str,
+        network: &'a str,
+        container: &'a str,
+    ) -> BoxFuture<'a, Result<(), SubnetsError>>;
 }
 
 /// What [`EngineNetworks::read`] reports.
