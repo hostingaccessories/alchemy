@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use alchemy_core::StackName;
 use tokio::process::Command;
 
 use crate::engine::Endpoint;
@@ -75,14 +74,18 @@ impl fmt::Display for ComposeAction {
     }
 }
 
-/// A Compose project on disk: its directory and its project name.
+/// A Compose project on disk, known by its directory.
 ///
 /// The directory is absolute and free of `.` and `..` components, so the
 /// child's working directory never changes what it refers to.
+///
+/// There is no project name: Compose resolves it from the directory, a
+/// `name:` in the compose file, or `COMPOSE_PROJECT_NAME` in the stack's
+/// `.env`, exactly as a hand-run `docker compose` in that directory would,
+/// so both always target the same project.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ComposeProject {
     dir: PathBuf,
-    name: StackName,
 }
 
 /// Why a [`ComposeProject`] directory was rejected.
@@ -104,10 +107,10 @@ pub enum ComposeProjectError {
 }
 
 impl ComposeProject {
-    /// A project named `name` rooted at `dir`.
+    /// The project in `dir`.
     ///
     /// Only the path's shape is checked; whether it exists is up to Compose.
-    pub fn new(dir: impl Into<PathBuf>, name: StackName) -> Result<Self, ComposeProjectError> {
+    pub fn new(dir: impl Into<PathBuf>) -> Result<Self, ComposeProjectError> {
         let dir = dir.into();
         if !dir.is_absolute() {
             return Err(ComposeProjectError::NotAbsolute { dir });
@@ -115,17 +118,12 @@ impl ComposeProject {
         if has_dot_segment(&dir) {
             return Err(ComposeProjectError::NotNormalized { dir });
         }
-        Ok(Self { dir, name })
+        Ok(Self { dir })
     }
 
     /// The project directory.
     pub fn dir(&self) -> &Path {
         &self.dir
-    }
-
-    /// The Compose project name.
-    pub fn name(&self) -> &StackName {
-        &self.name
     }
 }
 
@@ -141,14 +139,12 @@ fn has_dot_segment(dir: &Path) -> bool {
 }
 
 /// The argv after the `docker` binary for `action` on `project`, such as
-/// `compose --project-directory /srv/blog -p blog up --detach`.
+/// `compose --project-directory /srv/blog up --detach`.
 pub fn compose_args(project: &ComposeProject, action: ComposeAction) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "compose".into(),
         "--project-directory".into(),
         project.dir.as_os_str().to_owned(),
-        "-p".into(),
-        project.name.as_str().into(),
     ];
     args.extend(action.args().iter().map(OsString::from));
     args
@@ -337,14 +333,14 @@ impl ComposeRunner for CliComposeRunner {
 mod tests {
     use super::*;
 
-    fn project(dir: &str, name: &str) -> ComposeProject {
-        ComposeProject::new(dir, StackName::new(name).unwrap()).unwrap()
+    fn project(dir: &str) -> ComposeProject {
+        ComposeProject::new(dir).unwrap()
     }
 
     #[test]
     fn builds_argv_for_every_action() {
-        let blog = project("/srv/stacks/blog", "blog");
-        let prefix = "compose --project-directory /srv/stacks/blog -p blog";
+        let blog = project("/srv/stacks/blog");
+        let prefix = "compose --project-directory /srv/stacks/blog";
         let cases = [
             (ComposeAction::Up, "up --detach"),
             (ComposeAction::Down, "down"),
@@ -359,20 +355,20 @@ mod tests {
                 .map(|a| a.into_string().unwrap())
                 .collect();
             assert_eq!(args.join(" "), format!("{prefix} {want}"), "{action}");
-            assert_eq!(args[5], action.as_str());
+            assert_eq!(args[3], action.as_str());
+            assert!(!args.iter().any(|a| a == "-p" || a == "--project-name"));
         }
     }
 
     #[test]
     fn keeps_a_directory_with_spaces_as_one_argument() {
-        let args = compose_args(&project("/srv/my stacks/blog", "blog"), ComposeAction::Stop);
+        let args = compose_args(&project("/srv/my stacks/blog"), ComposeAction::Stop);
         assert_eq!(args[2], OsString::from("/srv/my stacks/blog"));
-        assert_eq!(args.len(), 6);
+        assert_eq!(args.len(), 4);
     }
 
     #[test]
     fn validates_the_project_directory() {
-        let name = StackName::new("blog").unwrap();
         let cases = [
             ("/srv/blog", None),
             ("/srv/blog/", None),
@@ -408,11 +404,10 @@ mod tests {
             ),
         ];
         for (dir, want) in cases {
-            let got = ComposeProject::new(dir, name.clone());
+            let got = ComposeProject::new(dir);
             assert_eq!(got.as_ref().err(), want.as_ref(), "{dir:?}");
             if let Ok(project) = got {
                 assert_eq!(project.dir(), Path::new(dir));
-                assert_eq!(project.name(), &name);
             }
         }
     }

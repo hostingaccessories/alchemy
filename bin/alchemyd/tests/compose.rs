@@ -12,7 +12,6 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use alchemy_core::StackName;
 use alchemyd::compose::{
     CliComposeRunner, ComposeAction, ComposeError, ComposeProject, ComposeRunner,
 };
@@ -70,11 +69,7 @@ exit 0"#,
     );
 
     let endpoint = Endpoint::unix("/run/user/1000/docker.sock").unwrap();
-    let project = ComposeProject::new(
-        dir.path().join("my stacks/blog"),
-        StackName::new("blog").unwrap(),
-    )
-    .unwrap();
+    let project = ComposeProject::new(dir.path().join("my stacks/blog")).unwrap();
     let project_dir = project.dir().display().to_string();
 
     let runner = CliComposeRunner::new(&docker, endpoint.clone()).unwrap();
@@ -84,9 +79,9 @@ exit 0"#,
         std::fs::read_to_string(&log).unwrap(),
         format!(
             "DOCKER_HOST=unix:///run/user/1000/docker.sock\n\
-             [compose]\n[--project-directory]\n[{project_dir}]\n[-p]\n[blog]\n[up]\n[--detach]\n\n\
+             [compose]\n[--project-directory]\n[{project_dir}]\n[up]\n[--detach]\n\n\
              DOCKER_HOST=unix:///run/user/1000/docker.sock\n\
-             [compose]\n[--project-directory]\n[{project_dir}]\n[-p]\n[blog]\n[down]\n\n"
+             [compose]\n[--project-directory]\n[{project_dir}]\n[down]\n\n"
         )
     );
 
@@ -115,35 +110,7 @@ exit 0"#,
         Err(ComposeError::Spawn { .. })
     ));
 
-    CliComposeRunner::new(&env_dump, endpoint.clone())
-        .unwrap()
-        .with_parent_env([
-            ("PATH", "/usr/bin:/bin"),
-            ("HOME", "/home/me"),
-            ("LC_ALL", "C"),
-            ("XDG_RUNTIME_DIR", "/run/user/1000"),
-            ("DOCKER_CONFIG", "/home/me/.docker"),
-            ("AWS_SECRET_ACCESS_KEY", "hunter2"),
-            ("COMPOSE_PROJECT_NAME", "other"),
-            ("DOCKER_HOST", "tcp://elsewhere:2375"),
-            ("DOCKER_CONTEXT", "remote"),
-        ])
-        .run(&project, ComposeAction::Up)
-        .await
-        .unwrap();
-    assert_eq!(
-        child_env_of(&std::fs::read_to_string(&env_log).unwrap()),
-        [
-            "COMPOSE_ANSI=never",
-            "DOCKER_CLI_HINTS=false",
-            "DOCKER_CONFIG=/home/me/.docker",
-            "DOCKER_HOST=unix:///run/user/1000/docker.sock",
-            "HOME=/home/me",
-            "LC_ALL=C",
-            "PATH=/usr/bin:/bin",
-            "XDG_RUNTIME_DIR=/run/user/1000",
-        ]
-    );
+    passes_only_the_allowlisted_environment(&env_dump, &env_log, &endpoint, &project).await;
 
     let started = std::time::Instant::now();
     let timeout = Duration::from_millis(200);
@@ -156,4 +123,41 @@ exit 0"#,
         Err(ComposeError::Timeout { action: ComposeAction::Restart, after }) if after == timeout
     ));
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+async fn passes_only_the_allowlisted_environment(
+    env_dump: &Path,
+    env_log: &Path,
+    endpoint: &Endpoint,
+    project: &ComposeProject,
+) {
+    CliComposeRunner::new(env_dump, endpoint.clone())
+        .unwrap()
+        .with_parent_env([
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/home/me"),
+            ("LC_ALL", "C"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("DOCKER_CONFIG", "/home/me/.docker"),
+            ("AWS_SECRET_ACCESS_KEY", "hunter2"),
+            ("COMPOSE_PROJECT_NAME", "other"),
+            ("DOCKER_HOST", "tcp://elsewhere:2375"),
+            ("DOCKER_CONTEXT", "remote"),
+        ])
+        .run(project, ComposeAction::Up)
+        .await
+        .unwrap();
+    assert_eq!(
+        child_env_of(&std::fs::read_to_string(env_log).unwrap()),
+        [
+            "COMPOSE_ANSI=never",
+            "DOCKER_CLI_HINTS=false",
+            "DOCKER_CONFIG=/home/me/.docker",
+            "DOCKER_HOST=unix:///run/user/1000/docker.sock",
+            "HOME=/home/me",
+            "LC_ALL=C",
+            "PATH=/usr/bin:/bin",
+            "XDG_RUNTIME_DIR=/run/user/1000",
+        ]
+    );
 }
