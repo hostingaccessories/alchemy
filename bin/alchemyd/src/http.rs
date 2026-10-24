@@ -15,9 +15,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alchemy_api::{
-    ApiEvent, EngineStatus, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, VersionResponse,
+    ApiEvent, EngineStatus, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, MetricsRange,
+    VersionResponse,
 };
-use axum::extract::{self, FromRef, Request};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{self, FromRef, Query, Request};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -25,6 +27,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::{Stream, StreamExt as _};
+use serde::Deserialize;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 
@@ -134,6 +137,8 @@ fn api(
         .route("/version", get(version))
         .route("/engine", get(engine))
         .route("/events", get(events))
+        .route("/metrics", get(metrics))
+        .route("/metrics/history", get(metrics_history))
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found)
         .with_state(Api {
@@ -198,6 +203,80 @@ async fn version() -> Json<VersionResponse> {
 
 async fn engine(extract::State(state): extract::State<State>) -> Json<EngineStatus> {
     Json(state.engine())
+}
+
+/// `?project=NAME` on the metrics routes.
+#[derive(Debug, Deserialize)]
+struct MetricsQuery {
+    project: Option<String>,
+}
+
+/// `?range=24h&project=NAME` on `/api/metrics/history`.
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    range: Option<String>,
+    project: Option<String>,
+}
+
+async fn metrics(
+    extract::State(state): extract::State<State>,
+    query: Result<Query<MetricsQuery>, QueryRejection>,
+) -> Response {
+    match query {
+        Ok(Query(query)) => {
+            Json(crate::metrics::current(&state, query.project.as_deref())).into_response()
+        }
+        Err(rejection) => bad_query(&rejection),
+    }
+}
+
+async fn metrics_history(
+    extract::State(store): extract::State<SharedStore>,
+    query: Result<Query<HistoryQuery>, QueryRejection>,
+) -> Response {
+    let query = match query {
+        Ok(Query(query)) => query,
+        Err(rejection) => return bad_query(&rejection),
+    };
+    let range = match query.range.as_deref().map(str::parse::<MetricsRange>) {
+        None => MetricsRange::Hour,
+        Some(Ok(range)) => range,
+        Some(Err(error)) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::BadRequest,
+                &error.to_string(),
+            );
+        }
+    };
+    match crate::metrics::history(&store, range, query.project, unix_now()).await {
+        Ok(history) => Json(history).into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "cannot read metrics history");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "cannot read metrics history from the state database",
+            )
+        }
+    }
+}
+
+/// The wall clock in Unix seconds, for the end of a history range.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+fn bad_query(rejection: &QueryRejection) -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        ErrorCode::BadRequest,
+        &format!("invalid query: {}", rejection.body_text()),
+    )
 }
 
 async fn events(
@@ -359,6 +438,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_report_the_latest_sample_or_one_project() {
+        let (status, body) = get_json("/api/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "at": null, "interval": 60, "containers_in_vm": false,
+                "machine": null, "projects": [], "containers": [],
+            })
+        );
+
+        let state = State::new();
+        let containers: Vec<alchemy_api::ContainerUsage> = ["web", "db"]
+            .map(|project| alchemy_api::ContainerUsage {
+                id: project.into(),
+                name: format!("{project}-1"),
+                project: Some(project.into()),
+                ..Default::default()
+            })
+            .into();
+        state.set_metrics(alchemy_api::MetricsResponse {
+            at: Some(120),
+            interval: 60,
+            containers_in_vm: false,
+            machine: Some(alchemy_api::MachineUsage::default()),
+            projects: alchemy_core::metrics::projects_of(&containers),
+            containers,
+        });
+        let (status, body) = get_json_from(state.clone(), "/api/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["at"], 120);
+        assert_eq!(body["projects"].as_array().unwrap().len(), 2);
+        assert!(body["machine"].is_object());
+
+        let (status, body) = get_json_from(state, "/api/metrics?project=web").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["machine"], serde_json::Value::Null);
+        assert_eq!(body["projects"][0]["name"], "web");
+        assert_eq!(body["containers"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_history_defaults_to_an_hour_and_refuses_unknown_ranges() {
+        let cases = [
+            ("/api/metrics/history", StatusCode::OK, "1h"),
+            ("/api/metrics/history?range=24h", StatusCode::OK, "24h"),
+            (
+                "/api/metrics/history?range=30d&project=web",
+                StatusCode::OK,
+                "30d",
+            ),
+            ("/api/metrics/history?range=2h", StatusCode::BAD_REQUEST, ""),
+            ("/api/metrics/history?range=", StatusCode::BAD_REQUEST, ""),
+        ];
+        for (uri, want, range) in cases {
+            let (status, body) = get_json(uri).await;
+            assert_eq!(status, want, "{uri}");
+            if want == StatusCode::OK {
+                assert_eq!(body["range"], range, "{uri}");
+                assert_eq!(body["points"], serde_json::json!([]), "{uri}");
+            } else {
+                assert_eq!(body["code"], "bad_request", "{uri}");
+                assert!(
+                    body["error"].as_str().unwrap().contains("unknown range"),
+                    "{uri}: {body}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn events_send_engine_on_connect_and_on_change() {
         let state = State::new();
         state.set_engine(EngineStatus::new(EngineState::Starting));
@@ -472,7 +622,14 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_method_on_api_route_is_json_405() {
-        for uri in ["/api/health", "/api/version", "/api/engine", "/api/events"] {
+        for uri in [
+            "/api/health",
+            "/api/version",
+            "/api/engine",
+            "/api/events",
+            "/api/metrics",
+            "/api/metrics/history",
+        ] {
             let (app, _stop) = test_router(State::new());
             let resp = app
                 .oneshot(
