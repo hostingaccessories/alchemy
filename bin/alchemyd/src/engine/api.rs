@@ -124,6 +124,7 @@ impl EngineVersion {
 
 const PROJECT_LABEL: &str = "com.docker.compose.project";
 const SERVICE_LABEL: &str = "com.docker.compose.service";
+const WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
 
 fn engine_version(version: SystemVersion) -> EngineVersion {
     EngineVersion {
@@ -158,6 +159,7 @@ fn container_status(summary: ContainerSummary) -> Option<ContainerStatus> {
     status.image = summary.image.filter(|i| !i.is_empty());
     status.project = labels.remove(PROJECT_LABEL);
     status.service = labels.remove(SERVICE_LABEL);
+    status.working_dir = labels.remove(WORKING_DIR_LABEL);
     status.health = summary
         .health
         .and_then(|h| h.status)
@@ -178,6 +180,7 @@ fn container_event(message: EventMessage) -> Option<ContainerEvent> {
     event.image = attributes.remove("image");
     event.project = attributes.remove(PROJECT_LABEL);
     event.service = attributes.remove(SERVICE_LABEL);
+    event.working_dir = attributes.remove(WORKING_DIR_LABEL);
     Some(event)
 }
 
@@ -369,6 +372,7 @@ mod tests {
             labels: Some(labels(&[
                 (PROJECT_LABEL, "blog"),
                 (SERVICE_LABEL, "db"),
+                (WORKING_DIR_LABEL, "/srv/blog"),
                 ("other", "x"),
             ])),
             health: Some(ContainerSummaryHealth {
@@ -381,6 +385,7 @@ mod tests {
         want.image = Some("postgres:16".into());
         want.project = Some("blog".into());
         want.service = Some("db".into());
+        want.working_dir = Some("/srv/blog".into());
         want.health = Some(Health::Healthy);
         let no_health = ContainerSummary {
             health: Some(ContainerSummaryHealth {
@@ -436,6 +441,7 @@ mod tests {
                     ("image", "postgres:16"),
                     (PROJECT_LABEL, "blog"),
                     (SERVICE_LABEL, "db"),
+                    (WORKING_DIR_LABEL, "/srv/blog"),
                 ])),
             }),
             ..EventMessage::default()
@@ -450,6 +456,7 @@ mod tests {
         start.image = Some("postgres:16".into());
         start.project = Some("blog".into());
         start.service = Some("db".into());
+        start.working_dir = Some("/srv/blog".into());
         let mut healthy = start.clone();
         healthy.action = ContainerAction::Health(Health::Healthy);
         let bare = EventMessage {

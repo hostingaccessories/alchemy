@@ -4,6 +4,8 @@ use std::ffi::OsString;
 use std::fmt;
 use std::str::FromStr;
 
+pub use alchemy_core::stack::ImageSource;
+
 use super::ComposeProject;
 
 /// A lifecycle action on a Compose project.
@@ -123,19 +125,6 @@ impl fmt::Display for ComposeCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
-}
-
-/// Where a stack's images come from, which decides how
-/// [`ComposeAction::Update`] refreshes them.
-///
-/// Whoever reads the compose file decides this; the plan only uses it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum ImageSource {
-    /// Every service names an image to pull.
-    #[default]
-    Registry,
-    /// At least one service has a `build:` section.
-    Build,
 }
 
 /// One `docker compose` run within a [`ComposePlan`].

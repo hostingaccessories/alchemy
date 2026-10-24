@@ -85,6 +85,10 @@ pub struct ContainerStatus {
     /// Compose service, from the `com.docker.compose.service` label.
     #[serde(default)]
     pub service: Option<String>,
+    /// Compose project directory, from the
+    /// `com.docker.compose.project.working_dir` label.
+    #[serde(default)]
+    pub working_dir: Option<String>,
     /// Lifecycle state.
     pub state: ContainerState,
     /// Healthcheck result, if the container has a healthcheck.
@@ -103,6 +107,7 @@ impl ContainerStatus {
             image: None,
             project: None,
             service: None,
+            working_dir: None,
             state,
             health: None,
         }
@@ -205,6 +210,9 @@ pub struct ContainerEvent {
     /// The `com.docker.compose.service` attribute.
     #[serde(default)]
     pub service: Option<String>,
+    /// The `com.docker.compose.project.working_dir` attribute.
+    #[serde(default)]
+    pub working_dir: Option<String>,
 }
 
 impl ContainerEvent {
@@ -217,6 +225,7 @@ impl ContainerEvent {
             image: None,
             project: None,
             service: None,
+            working_dir: None,
         }
     }
 }
@@ -309,6 +318,9 @@ fn merge_attributes(status: &mut ContainerStatus, event: &ContainerEvent) {
     }
     if event.service.is_some() {
         status.service.clone_from(&event.service);
+    }
+    if event.working_dir.is_some() {
+        status.working_dir.clone_from(&event.working_dir);
     }
 }
 
@@ -527,12 +539,14 @@ mod tests {
         create.image = Some("nginx:1".into());
         create.project = Some("web".into());
         create.service = Some("nginx".into());
+        create.working_dir = Some("/srv/web".into());
         assert!(containers.apply(&create));
 
         let mut want = ContainerStatus::new("abc", "web-1", ContainerState::Created);
         want.image = Some("nginx:1".into());
         want.project = Some("web".into());
         want.service = Some("nginx".into());
+        want.working_dir = Some("/srv/web".into());
         assert_eq!(containers.get("abc"), Some(&want));
 
         let mut rename = ContainerEvent::new("abc", ContainerAction::Rename);
@@ -578,6 +592,7 @@ mod tests {
         status.image = Some("nginx:1".into());
         status.project = Some("web".into());
         status.service = Some("nginx".into());
+        status.working_dir = Some("/srv/web".into());
         status.health = Some(Health::Healthy);
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(
@@ -588,6 +603,7 @@ mod tests {
                 "image": "nginx:1",
                 "project": "web",
                 "service": "nginx",
+                "working_dir": "/srv/web",
                 "state": "running",
                 "health": "healthy",
             })
