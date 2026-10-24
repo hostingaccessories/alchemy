@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions, Permissions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use rustix::fs::{FileType, Mode, OFlags, StatVfsMountFlags};
 use rustix::io::Errno;
 
-use crate::system::{CommandOutput, FileInfo, FixedCommand, OpenError, System};
+use crate::system::{CommandOutput, FileInfo, FixedCommand, MAX_READ, OpenError, System};
 
 /// The only `PATH` a [`FixedCommand`] sees. Its program is absolute, so
 /// this matters only for anything that program runs in turn.
@@ -42,6 +42,8 @@ impl System for RealSystem {
         let statvfs = rustix::fs::fstatvfs(file)?;
         Ok(FileInfo {
             regular: FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile,
+            uid: stat.st_uid,
+            mode: permission_bits(stat.st_mode),
             nosuid: statvfs.f_flag.contains(StatVfsMountFlags::NOSUID),
         })
     }
@@ -72,11 +74,28 @@ impl System for RealSystem {
     }
 
     fn read_file(&self, path: &Path) -> io::Result<Option<Vec<u8>>> {
-        match std::fs::read(path) {
-            Ok(contents) => Ok(Some(contents)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+        let fd = match self.open_nofollow(path) {
+            Ok(fd) => fd,
+            Err(OpenError::NotFound) => return Ok(None),
+            Err(OpenError::Symlink) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "is a symlink"));
+            }
+            Err(OpenError::Io(e)) => return Err(e),
+        };
+        if !self.inspect(&fd)?.regular {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "is not a regular file",
+            ));
         }
+        let mut contents = Vec::new();
+        File::from(fd)
+            .take(MAX_READ + 1)
+            .read_to_end(&mut contents)?;
+        if contents.len() as u64 > MAX_READ {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "is too large"));
+        }
+        Ok(Some(contents))
     }
 
     fn write_file(&self, path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
@@ -118,6 +137,13 @@ impl System for RealSystem {
             stderr: output.stderr,
         })
     }
+}
+
+/// The permission bits of `st_mode`, which is a `u32` on Linux and a
+/// `u16` on macOS.
+#[allow(clippy::useless_conversion)]
+fn permission_bits(st_mode: rustix::fs::RawMode) -> u32 {
+    u32::from(st_mode) & 0o7777
 }
 
 /// `ENODATA` on Linux and `ENOATTR` on macOS: the attribute is absent.
@@ -286,6 +312,42 @@ mod tests {
         std::fs::write(&path, b"x").unwrap();
         assert_eq!(sys.read_file(&path).unwrap().as_deref(), Some(&b"x"[..]));
         assert!(sys.read_file(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn read_file_reads_only_small_regular_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"contents").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let limit = usize::try_from(MAX_READ).unwrap();
+        let big = tmp.path().join("big");
+        std::fs::write(&big, vec![b'x'; limit + 1]).unwrap();
+        let fits = tmp.path().join("fits");
+        std::fs::write(&fits, vec![b'x'; limit]).unwrap();
+
+        let sys = RealSystem;
+        assert_eq!(
+            sys.read_file(&file).unwrap().as_deref(),
+            Some(&b"contents"[..])
+        );
+        assert_eq!(sys.read_file(&fits).unwrap().map(|c| c.len()), Some(limit));
+        for bad in [&link, &big] {
+            assert!(sys.read_file(bad).is_err(), "{}", bad.display());
+        }
+    }
+
+    #[test]
+    fn inspect_reports_owner_and_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, Permissions::from_mode(0o640)).unwrap();
+        let sys = RealSystem;
+        let info = sys.inspect(&sys.open_nofollow(&file).unwrap()).unwrap();
+        assert_eq!(info.mode, 0o640);
+        assert_eq!(info.uid, rustix::process::geteuid().as_raw());
     }
 
     #[test]

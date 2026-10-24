@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -39,6 +39,7 @@ pub struct FakeFile {
     xattrs: HashMap<String, Vec<u8>>,
     pub contents: Vec<u8>,
     pub mode: u32,
+    pub uid: u32,
 }
 
 impl FakeFile {
@@ -49,6 +50,7 @@ impl FakeFile {
             xattrs: HashMap::new(),
             contents: Vec::new(),
             mode: 0o755,
+            uid: 0,
         }
     }
 
@@ -79,10 +81,24 @@ impl FakeFile {
         }
     }
 
+    pub fn owned_by(mut self, uid: u32) -> Self {
+        self.uid = uid;
+        self
+    }
+
+    pub fn with_mode(mut self, mode: u32) -> Self {
+        self.mode = mode;
+        self
+    }
+
     pub fn with_xattr(mut self, name: &str, value: &[u8]) -> Self {
         self.xattrs.insert(name.to_owned(), value.to_vec());
         self
     }
+}
+
+fn key(argv: &[&str]) -> Vec<String> {
+    argv.iter().map(|&a| a.to_owned()).collect()
 }
 
 /// An in-memory filesystem and command log.
@@ -93,7 +109,7 @@ pub struct FakeSystem {
     fail: Option<Call>,
     opened: RefCell<Vec<PathBuf>>,
     commands: RefCell<Vec<FixedCommand>>,
-    responses: HashMap<Vec<String>, CommandOutput>,
+    responses: RefCell<HashMap<Vec<String>, VecDeque<CommandOutput>>>,
 }
 
 impl FakeSystem {
@@ -105,13 +121,21 @@ impl FakeSystem {
             fail: None,
             opened: RefCell::default(),
             commands: RefCell::default(),
-            responses: HashMap::new(),
+            responses: RefCell::default(),
         }
     }
 
     /// Make the command `argv` (program first) exit with `code` and print
-    /// `stdout`. Any other command exits 0 with no output.
-    pub fn responding(mut self, argv: &[&str], code: i32, stdout: &str) -> Self {
+    /// `stdout`, replacing any earlier response to it. Any other command
+    /// exits 0 with no output.
+    pub fn responding(self, argv: &[&str], code: i32, stdout: &str) -> Self {
+        self.responses.borrow_mut().remove(&key(argv));
+        self.then_responding(argv, code, stdout)
+    }
+
+    /// Queue another response to `argv` after the ones already set: each
+    /// run takes the next, and the last one repeats.
+    pub fn then_responding(self, argv: &[&str], code: i32, stdout: &str) -> Self {
         let output = CommandOutput {
             code: Some(code),
             stdout: stdout.as_bytes().to_vec(),
@@ -122,7 +146,10 @@ impl FakeSystem {
             },
         };
         self.responses
-            .insert(argv.iter().map(|&a| a.to_owned()).collect(), output);
+            .borrow_mut()
+            .entry(key(argv))
+            .or_default()
+            .push_back(output);
         self
     }
 
@@ -207,6 +234,8 @@ impl System for FakeSystem {
         self.check(Call::Inspect)?;
         self.with_open(file, |f| FileInfo {
             regular: f.kind == Kind::Regular,
+            uid: f.uid,
+            mode: f.mode,
             nosuid: f.nosuid,
         })
     }
@@ -230,7 +259,11 @@ impl System for FakeSystem {
 
     fn read_file(&self, path: &Path) -> io::Result<Option<Vec<u8>>> {
         self.check(Call::ReadFile)?;
-        Ok(self.files.borrow().get(path).map(|f| f.contents.clone()))
+        match self.files.borrow().get(path) {
+            None => Ok(None),
+            Some(f) if f.kind == Kind::Regular => Ok(Some(f.contents.clone())),
+            Some(_) => Err(io::Error::from(io::ErrorKind::InvalidData)),
+        }
     }
 
     fn write_file(&self, path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
@@ -255,14 +288,18 @@ impl System for FakeSystem {
         let argv: Vec<String> = std::iter::once(command.program().to_owned())
             .chain(command.args().iter().cloned())
             .collect();
-        Ok(self
-            .responses
-            .get(&argv)
-            .cloned()
-            .unwrap_or_else(|| CommandOutput {
-                code: Some(0),
-                ..CommandOutput::default()
-            }))
+        let mut responses = self.responses.borrow_mut();
+        let scripted = responses.get_mut(&argv).and_then(|queue| {
+            if queue.len() > 1 {
+                queue.pop_front()
+            } else {
+                queue.front().cloned()
+            }
+        });
+        Ok(scripted.unwrap_or_else(|| CommandOutput {
+            code: Some(0),
+            ..CommandOutput::default()
+        }))
     }
 }
 
@@ -295,5 +332,32 @@ mod tests {
         let sys = FakeSystem::new("/x").failing(Call::Run);
         assert!(sys.run(&command).is_err());
         assert_eq!(sys.commands().len(), 0);
+    }
+
+    #[test]
+    fn read_file_returns_regular_contents() {
+        let sys = FakeSystem::new("/x")
+            .with_file("/etc/a", FakeFile::with_contents("a"))
+            .with_file("/etc/link", FakeFile::symlink());
+        assert_eq!(
+            sys.read_file(Path::new("/etc/a")).unwrap(),
+            Some(b"a".to_vec())
+        );
+        assert_eq!(sys.read_file(Path::new("/etc/b")).unwrap(), None);
+        assert!(sys.read_file(Path::new("/etc/link")).is_err());
+    }
+
+    #[test]
+    fn responses_queue_and_the_last_repeats() {
+        let sys = FakeSystem::new("/x")
+            .responding(&["/bin/x", "a"], 2, "replaced")
+            .responding(&["/bin/x", "a"], 1, "one")
+            .then_responding(&["/bin/x", "a"], 0, "two");
+        let a = FixedCommand::new("/bin/x", vec!["a".into()]).unwrap();
+        let b = FixedCommand::new("/bin/x", vec!["b".into()]).unwrap();
+        let codes: Vec<_> = (0..3).map(|_| sys.run(&a).unwrap().code).collect();
+        assert_eq!(codes, [Some(1), Some(0), Some(0)]);
+        assert_eq!(sys.run(&a).unwrap().stdout, b"two");
+        assert!(sys.run(&b).unwrap().success());
     }
 }

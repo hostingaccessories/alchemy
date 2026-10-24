@@ -3,8 +3,11 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::num::NonZeroU32;
+use std::str::FromStr;
 
 use clap::{Parser, Subcommand};
+
+use crate::firewall::ProxyPorts;
 
 /// Alchemy privileged helper. Run it as root: it performs one operation
 /// and exits.
@@ -52,6 +55,25 @@ pub enum Operation {
         #[arg(long, value_parser = parse_uid)]
         uid: NonZeroU32,
     },
+    /// Open 80/tcp, the proxy port range, and 5353/udp in the firewall.
+    ///
+    /// On Linux this allows the ufw app profile `alchemy` or adds the
+    /// firewalld service `alchemy`, whichever is active. On macOS, when
+    /// the application firewall is on, it allows the alchemyd next to
+    /// this helper. Raw nftables and iptables rules are never edited.
+    OpenFirewall {
+        /// The proxy port range, such as 8100-8999. Must start at 1024 or
+        /// above.
+        #[arg(long, value_name = "START-END", value_parser = ProxyPorts::from_str)]
+        proxy_ports: ProxyPorts,
+    },
+    /// Undo open-firewall: remove Alchemy's ufw profile, firewalld
+    /// service, or macOS application firewall entry.
+    CloseFirewall {
+        /// The proxy port range open-firewall was given.
+        #[arg(long, value_name = "START-END", value_parser = ProxyPorts::from_str)]
+        proxy_ports: ProxyPorts,
+    },
 }
 
 impl Operation {
@@ -64,6 +86,8 @@ impl Operation {
             Self::RevokeLowPorts => "revoke-low-ports",
             Self::InstallService { .. } => "install-service",
             Self::RemoveService { .. } => "remove-service",
+            Self::OpenFirewall { .. } => "open-firewall",
+            Self::CloseFirewall { .. } => "close-firewall",
         }
     }
 }
@@ -159,6 +183,50 @@ mod tests {
                 &["alchemy-helper", "install-service", "--uid", "4294967295"],
                 Operation::InstallService { uid: uid(u32::MAX) },
             ),
+            (
+                &[
+                    "alchemy-helper",
+                    "open-firewall",
+                    "--proxy-ports",
+                    "8100-8999",
+                ],
+                Operation::OpenFirewall {
+                    proxy_ports: ProxyPorts::DEFAULT,
+                },
+            ),
+            (
+                &[
+                    "alchemy-helper",
+                    "close-firewall",
+                    "--proxy-ports",
+                    "8100-8999",
+                ],
+                Operation::CloseFirewall {
+                    proxy_ports: ProxyPorts::DEFAULT,
+                },
+            ),
+            (
+                &[
+                    "alchemy-helper",
+                    "open-firewall",
+                    "--proxy-ports",
+                    "1024-1024",
+                ],
+                Operation::OpenFirewall {
+                    proxy_ports: ProxyPorts::new(1024, 1024).unwrap(),
+                },
+            ),
+            (
+                &[
+                    "alchemy-helper",
+                    "open-firewall",
+                    "--proxy-ports",
+                    "9000-65535",
+                ],
+                Operation::OpenFirewall {
+                    proxy_ports: ProxyPorts::new(9000, 65535).unwrap(),
+                },
+            ),
         ];
         for (argv, want) in cases {
             assert_eq!(parse(argv).unwrap(), want, "{argv:?}");
@@ -213,6 +281,100 @@ mod tests {
     }
 
     #[test]
+    fn rejects_bad_proxy_ports() {
+        let cases: &[&[&str]] = &[
+            &["alchemy-helper", "open-firewall"],
+            &["alchemy-helper", "close-firewall"],
+            &["alchemy-helper", "open-firewall", "--proxy-ports"],
+            &["alchemy-helper", "open-firewall", "--proxy-ports", "22-22"],
+            &[
+                "alchemy-helper",
+                "open-firewall",
+                "--proxy-ports",
+                "1023-8999",
+            ],
+            &[
+                "alchemy-helper",
+                "open-firewall",
+                "--proxy-ports",
+                "8999-8100",
+            ],
+            &["alchemy-helper", "open-firewall", "--proxy-ports", "8100"],
+            &["alchemy-helper", "open-firewall", "--proxy-ports", "8100-"],
+            &["alchemy-helper", "open-firewall", "--proxy-ports", "-8999"],
+            &[
+                "alchemy-helper",
+                "open-firewall",
+                "--proxy-ports",
+                "8100:8999",
+            ],
+            &[
+                "alchemy-helper",
+                "open-firewall",
+                "--proxy-ports",
+                "08100-8999",
+            ],
+            &[
+                "alchemy-helper",
+                "open-firewall",
+                "--proxy-ports",
+                "+8100-8999",
+            ],
+            &[
+                "alchemy-helper",
+                "open-firewall",
+                "--proxy-ports",
+                " 8100-8999",
+            ],
+            &[
+                "alchemy-helper",
+                "open-firewall",
+                "--proxy-ports",
+                "8100-8999\n",
+            ],
+            &[
+                "alchemy-helper",
+                "open-firewall",
+                "--proxy-ports",
+                "8100-65536",
+            ],
+            &[
+                "alchemy-helper",
+                "open-firewall",
+                "--proxy-ports",
+                "8100-8999-9000",
+            ],
+            &[
+                "alchemy-helper",
+                "open-firewall",
+                "--proxy-ports=8100-8999",
+                "x",
+            ],
+            &[
+                "alchemy-helper",
+                "open-firewall",
+                "--proxy-ports",
+                "8100-8999",
+                "--proxy-ports",
+                "8100-8999",
+            ],
+            &["alchemy-helper", "open-firewall", "8100-8999"],
+            &[
+                "alchemy-helper",
+                "open-firewall",
+                "--proxy-ports",
+                "8100-8999",
+                "80",
+            ],
+            &["alchemy-helper", "check", "--proxy-ports", "8100-8999"],
+        ];
+        for argv in cases {
+            let err = parse(*argv).unwrap_err();
+            assert!(err.is_usage(), "{argv:?}");
+        }
+    }
+
+    #[test]
     fn help_and_version_are_not_usage_errors() {
         for flag in ["--help", "-h", "--version", "-V"] {
             let err = parse(["alchemy-helper", flag]).unwrap_err();
@@ -232,12 +394,17 @@ mod tests {
                 "grant-low-ports",
                 "revoke-low-ports",
                 "install-service",
-                "remove-service"
+                "remove-service",
+                "open-firewall",
+                "close-firewall",
             ]
         );
         for name in subcommands {
             let argv: &[&str] = match name {
                 "install-service" | "remove-service" => &["alchemy-helper", name, "--uid", "501"],
+                "open-firewall" | "close-firewall" => {
+                    &["alchemy-helper", name, "--proxy-ports", "8100-8999"]
+                }
                 _ => &["alchemy-helper", name],
             };
             assert_eq!(parse(argv).unwrap().name(), name);

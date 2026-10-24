@@ -37,7 +37,10 @@ pub trait System {
     /// it was there.
     fn remove_xattr(&self, file: &Self::File, name: &str) -> io::Result<bool>;
 
-    /// The contents of `path`, or `None` if nothing exists there.
+    /// The contents of the regular file at `path`, or `None` if nothing
+    /// is there. The final component is not followed, so a symlink is an
+    /// error, as is anything but a regular file or one larger than
+    /// [`MAX_READ`].
     fn read_file(&self, path: &Path) -> io::Result<Option<Vec<u8>>>;
 
     /// Atomically replace `path` with a `root:root` file holding
@@ -70,11 +73,19 @@ pub enum OpenError {
     Io(#[from] io::Error),
 }
 
+/// The largest file [`System::read_file`] reads: the helper only reads
+/// back small configuration files it wrote itself.
+pub const MAX_READ: u64 = 64 * 1024;
+
 /// What [`System::inspect`] reports about an open file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileInfo {
     /// The file is a regular file, not a directory, device, FIFO, or socket.
     pub regular: bool,
+    /// The owner's UID.
+    pub uid: u32,
+    /// The permission bits, such as `0o755`.
+    pub mode: u32,
     /// The file's filesystem is mounted `nosuid`, so the kernel ignores
     /// its setuid bit and file capabilities on exec.
     pub nosuid: bool,

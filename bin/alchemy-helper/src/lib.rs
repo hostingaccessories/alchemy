@@ -21,7 +21,9 @@
 //! crate.
 
 mod cli;
+mod command;
 mod error;
+mod firewall;
 mod low_ports;
 mod real;
 mod service;
@@ -36,6 +38,7 @@ use std::io::Write;
 
 pub use cli::{Operation, ParseError, parse};
 pub use error::{Exit, HelperError};
+pub use firewall::{MIN_PROXY_PORT, ProxyPorts, ProxyPortsError};
 pub use low_ports::{CAPABILITY_XATTR, NET_BIND_SERVICE_EP};
 pub use real::{COMMAND_PATH, RealSystem};
 pub use sibling::DAEMON;
@@ -92,6 +95,8 @@ pub fn run<S: System>(
         Operation::RevokeLowPorts => low_ports::revoke(system, platform),
         Operation::InstallService { uid } => service::install(system, platform, *uid),
         Operation::RemoveService { uid } => service::remove(system, platform, *uid),
+        Operation::OpenFirewall { proxy_ports } => firewall::open(system, platform, *proxy_ports),
+        Operation::CloseFirewall { proxy_ports } => firewall::close(system, platform, *proxy_ports),
     }
 }
 

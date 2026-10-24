@@ -38,7 +38,7 @@ pub(crate) fn open<S: System>(system: &S) -> Result<(PathBuf, S::File, FileInfo)
 }
 
 /// The `alchemyd` in the directory of the helper's canonical executable.
-fn path<S: System>(system: &S) -> Result<PathBuf, HelperError> {
+pub(crate) fn path<S: System>(system: &S) -> Result<PathBuf, HelperError> {
     let exe = system
         .current_exe()
         .map_err(|source| os("resolve", Path::new("alchemy-helper"), source))?;

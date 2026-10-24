@@ -15,8 +15,9 @@
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
+use crate::command::{exec, failed, must};
 use crate::sibling::{self, os};
-use crate::system::{CommandOutput, FixedCommand, OpenError, System};
+use crate::system::{OpenError, System};
 use crate::{HelperError, Outcome, Platform};
 
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
@@ -389,62 +390,9 @@ fn render_plist(uid: NonZeroU32, user: &User, daemon: &Path) -> Result<String, H
     ))
 }
 
-fn command(program: &'static str, args: &[&str]) -> Result<FixedCommand, HelperError> {
-    FixedCommand::new(program, args.iter().map(|&a| a.to_owned()).collect()).ok_or_else(|| {
-        os(
-            "run",
-            Path::new(program),
-            std::io::Error::from(std::io::ErrorKind::InvalidInput),
-        )
-    })
-}
-
-/// Run a fixed command, whatever its exit status.
-fn exec<S: System>(
-    system: &S,
-    program: &'static str,
-    args: &[&str],
-) -> Result<CommandOutput, HelperError> {
-    system
-        .run(&command(program, args)?)
-        .map_err(|source| os("run", Path::new(program), source))
-}
-
 /// Run a fixed command and report whether it exited 0.
 fn query<S: System>(system: &S, program: &'static str, args: &[&str]) -> Result<bool, HelperError> {
     Ok(exec(system, program, args)?.success())
-}
-
-/// Run a fixed command that must exit 0.
-fn must<S: System>(
-    system: &S,
-    program: &'static str,
-    args: &[&str],
-) -> Result<CommandOutput, HelperError> {
-    let output = exec(system, program, args)?;
-    if output.success() {
-        Ok(output)
-    } else {
-        Err(failed(program, args, &output))
-    }
-}
-
-fn failed(program: &str, args: &[&str], output: &CommandOutput) -> HelperError {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    HelperError::CommandFailed {
-        command: std::iter::once(program)
-            .chain(args.iter().copied())
-            .collect::<Vec<_>>()
-            .join(" "),
-        status: output
-            .code
-            .map_or_else(|| "killed by a signal".to_owned(), |c| format!("exit {c}")),
-        stderr: if stderr.is_empty() {
-            "no output".to_owned()
-        } else {
-            stderr
-        },
-    }
 }
 
 #[cfg(test)]

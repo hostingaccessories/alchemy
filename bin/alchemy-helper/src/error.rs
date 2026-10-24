@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::Platform;
+use crate::firewall::ProxyPorts;
 
 /// The process exit statuses `alchemy-helper` uses, from `sysexits.h`.
 /// Each is a contract that alchemyd branches on.
@@ -108,6 +109,36 @@ pub enum HelperError {
         /// What is wrong with it.
         why: &'static str,
     },
+    /// A program the helper would run is not a root-owned regular file
+    /// that only root can write.
+    #[error("{path}: refusing to run it: {why}")]
+    Untrusted {
+        /// The program.
+        path: PathBuf,
+        /// What is wrong with it.
+        why: &'static str,
+    },
+    /// No firewall the helper manages is on, so there is nothing to
+    /// open. Raw nftables and iptables rules are never edited.
+    #[error("{}", no_firewall(*platform, *ports))]
+    NoFirewall {
+        /// Where it was run.
+        platform: Platform,
+        /// The proxy range that was asked for.
+        ports: ProxyPorts,
+    },
+    /// A firewall holds Alchemy's rules but is not running, so they
+    /// cannot be removed safely.
+    #[error(
+        "{path}: {manager} is not running, so its rules for Alchemy cannot be removed; start it \
+         and try again"
+    )]
+    FirewallStopped {
+        /// The firewall, such as `firewalld`.
+        manager: &'static str,
+        /// The file the helper added to it.
+        path: PathBuf,
+    },
     /// A fixed system command exited unsuccessfully.
     #[error("`{command}` failed ({status}): {stderr}")]
     CommandFailed {
@@ -136,9 +167,12 @@ impl HelperError {
         match self {
             Self::Usage(_) => "usage",
             Self::NotRoot => "not_root",
-            Self::UnsupportedPlatform { .. } | Self::Ineffective { .. } => "unsupported",
+            Self::UnsupportedPlatform { .. }
+            | Self::Ineffective { .. }
+            | Self::FirewallStopped { .. } => "unsupported",
             Self::NotFound(_) => "not_found",
-            Self::Refused { .. } | Self::RefusedUser { .. } => "refused",
+            Self::Refused { .. } | Self::RefusedUser { .. } | Self::Untrusted { .. } => "refused",
+            Self::NoFirewall { .. } => "no_firewall",
             Self::NoSuchUser(_) => "no_such_user",
             Self::CommandFailed { .. } => "command_failed",
             Self::Os { .. } => "os_error",
@@ -150,13 +184,30 @@ impl HelperError {
         match self {
             Self::Usage(_) => Exit::Usage,
             Self::NotRoot => Exit::NoPerm,
-            Self::UnsupportedPlatform { .. } | Self::Ineffective { .. } => Exit::Unavailable,
+            Self::UnsupportedPlatform { .. }
+            | Self::Ineffective { .. }
+            | Self::NoFirewall { .. }
+            | Self::FirewallStopped { .. } => Exit::Unavailable,
             Self::NotFound(_) => Exit::NoInput,
-            Self::Refused { .. } | Self::RefusedUser { .. } => Exit::DataErr,
+            Self::Refused { .. } | Self::RefusedUser { .. } | Self::Untrusted { .. } => {
+                Exit::DataErr
+            }
             Self::NoSuchUser(_) => Exit::NoUser,
             Self::CommandFailed { .. } => Exit::Software,
             Self::Os { .. } => Exit::OsErr,
         }
+    }
+}
+
+fn no_firewall(platform: Platform, ports: ProxyPorts) -> String {
+    match platform {
+        Platform::Linux => format!(
+            "neither ufw nor firewalld is active, and Alchemy never edits raw nftables or \
+             iptables rules: if a firewall blocks Alchemy, allow 80/tcp, {}/tcp, and 5353/udp \
+             by hand",
+            ports.firewalld()
+        ),
+        Platform::MacOs => "the macOS application firewall is off, so it blocks nothing".to_owned(),
     }
 }
 
@@ -209,6 +260,30 @@ mod tests {
             ),
             (HelperError::NoSuchUser(1000), "no_such_user", 67),
             (
+                HelperError::Untrusted {
+                    path: path(),
+                    why: "",
+                },
+                "refused",
+                65,
+            ),
+            (
+                HelperError::NoFirewall {
+                    platform: Platform::Linux,
+                    ports: ProxyPorts::DEFAULT,
+                },
+                "no_firewall",
+                69,
+            ),
+            (
+                HelperError::FirewallStopped {
+                    manager: "firewalld",
+                    path: path(),
+                },
+                "unsupported",
+                69,
+            ),
+            (
                 HelperError::CommandFailed {
                     command: String::new(),
                     status: String::new(),
@@ -230,6 +305,29 @@ mod tests {
         for (err, kind, code) in cases {
             assert_eq!(err.kind(), kind, "{err:?}");
             assert_eq!(err.exit().code(), code, "{err:?}");
+        }
+    }
+
+    #[test]
+    fn firewall_messages() {
+        let cases = [
+            (
+                Platform::Linux,
+                "neither ufw nor firewalld is active, and Alchemy never edits raw nftables or \
+                 iptables rules: if a firewall blocks Alchemy, allow 80/tcp, 8100-8999/tcp, and \
+                 5353/udp by hand",
+            ),
+            (
+                Platform::MacOs,
+                "the macOS application firewall is off, so it blocks nothing",
+            ),
+        ];
+        for (platform, want) in cases {
+            let err = HelperError::NoFirewall {
+                platform,
+                ports: ProxyPorts::DEFAULT,
+            };
+            assert_eq!(err.to_string(), want);
         }
     }
 
