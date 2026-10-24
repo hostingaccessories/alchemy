@@ -430,6 +430,32 @@ mod macos {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// Whether `dns-sd -G v4 name` reports `addr` within a few seconds,
+    /// as a resolver that asks mDNSResponder directly would.
+    async fn dns_sd_resolves(name: &str, addr: &str) -> bool {
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
+
+        let mut child = tokio::process::Command::new(DNS_SD)
+            .args(["-G", "v4", name])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let found = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.contains(" Add ") && line.split_whitespace().any(|word| word == addr) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        child.kill().await.unwrap();
+        found
+    }
+
     #[tokio::test]
     #[ignore = "publishes on the LAN through mDNSResponder"]
     async fn dns_sd_announces_resolves_and_withdraws() {
@@ -443,6 +469,11 @@ mod macos {
         wait_state(&mut states, &name, &RecordState::Established).await;
         let found = resolves(&host).await;
         assert!(found.contains(&lan.addr().to_string()), "{found}");
+        assert!(
+            dns_sd_resolves(&host, &lan.addr().to_string()).await,
+            "dns-sd -G v4 {host} did not report {}",
+            lan.addr()
+        );
 
         announcer.withdraw(label(&name)).await.unwrap();
         let mut gone = false;
