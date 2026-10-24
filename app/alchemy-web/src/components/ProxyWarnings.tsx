@@ -7,10 +7,12 @@ import { networkQuery } from "./NetworkWarnings.tsx";
 import { Notice } from "./Notice.tsx";
 
 /**
- * Web address listeners Alchemy can't open: port 80, which serves
- * `http://<app>.localhost`, and each app's own port, with the fix when there
- * is one. Renders nothing when they all work, or when alchemyd is too old to
- * say.
+ * Web address listeners that don't work: port 80, which serves
+ * `http://<app>.localhost` and `http://<app>.local`, and each app's own
+ * port, with the fix when there is one. A listener doesn't work when it
+ * can't be opened or when another program answers its traffic; the
+ * daemon's message says which. Renders nothing when they all work, or when
+ * alchemyd is too old to say.
  */
 export function ProxyWarnings() {
   const network = useQuery(networkQuery);
@@ -29,16 +31,20 @@ export function ProxyWarnings() {
       {listeners.map((listener) => (
         <Notice key={listener.port} tone="warn" title={listenerTitle(listener)}>
           {listener.message !== null && <p>{listener.message}</p>}
-          {listener.fix !== null && <Fix fix={listener.fix} />}
+          {listener.fix !== null && <CommandFix fix={listener.fix} />}
         </Notice>
       ))}
     </div>
   );
 }
 
+/**
+ * What doesn't work, true whether the port couldn't be opened or another
+ * program answers it; the message under it says which.
+ */
 function listenerTitle(listener: ProxyListener): string {
   return listener.app === null
-    ? `Alchemy can't listen on port ${listener.port}`
+    ? `Addresses on port ${listener.port} don't work`
     : `${listener.app}'s address on port ${listener.port} doesn't work`;
 }
 
@@ -46,7 +52,7 @@ function listenerTitle(listener: ProxyListener): string {
  * A fix, with each `command` in it set as code. The first command can be
  * copied, so it pastes cleanly into a terminal.
  */
-function Fix({ fix }: { fix: string }) {
+export function CommandFix({ fix }: { fix: string }) {
   const parts = fix.split("`");
   const command = parts.length > 2 ? parts[1] : undefined;
   return (

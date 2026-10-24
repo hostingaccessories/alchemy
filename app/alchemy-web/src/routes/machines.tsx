@@ -4,6 +4,7 @@ import { useState } from "react";
 
 import { EngineStatusView } from "../components/EngineStatus.tsx";
 import { Loading } from "../components/Loading.tsx";
+import { LocalNames } from "../components/LocalNames.tsx";
 import { NetworkWarnings } from "../components/NetworkWarnings.tsx";
 import { PageHeader } from "../components/PageHeader.tsx";
 import { PortsSection } from "../components/Ports.tsx";
@@ -46,6 +47,7 @@ function MachinesPage() {
         {online && <NetworkWarnings />}
         {online && <ProxyWarnings />}
       </section>
+      {online && <LocalNames />}
       {online && <Usage />}
       {online && <PortsSection />}
     </div>

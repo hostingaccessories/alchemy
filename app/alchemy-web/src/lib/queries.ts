@@ -47,6 +47,15 @@ export const appSettingsQuery = queryOptions({
   queryFn: ({ signal }) => api.appSettings(signal),
 });
 
+/**
+ * `GET /api/settings/network`: whether apps' `.local` names are announced.
+ * Saving replaces this query's data with the daemon's answer.
+ */
+export const networkSettingsQuery = queryOptions({
+  queryKey: ["settings", "network"],
+  queryFn: ({ signal }) => api.networkSettings(signal),
+});
+
 /** A query whose data is one event's payload. */
 export interface LiveQuery<K extends ApiEventName> {
   queryKey: DataTag<QueryKey, ApiEventData<K>, DefaultError>;
