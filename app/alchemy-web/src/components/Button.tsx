@@ -9,6 +9,11 @@ const VARIANTS: Record<ButtonVariant, string> = {
   danger: "bg-error text-surface hover:bg-error/90",
 };
 
+/** A {@link Button}'s classes, for a link that should look like one. */
+export function buttonClass(variant: ButtonVariant = "secondary"): string {
+  return `inline-flex items-center justify-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 ${VARIANTS[variant]}`;
+}
+
 /**
  * A plain button in one of the app's styles. Defaults to `type="button"` so
  * it never submits a form by accident.
@@ -19,11 +24,5 @@ export function Button({
   type = "button",
   ...props
 }: ComponentPropsWithRef<"button"> & { variant?: ButtonVariant }) {
-  return (
-    <button
-      type={type}
-      className={`inline-flex items-center justify-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 ${VARIANTS[variant]} ${className}`}
-      {...props}
-    />
-  );
+  return <button type={type} className={`${buttonClass(variant)} ${className}`} {...props} />;
 }

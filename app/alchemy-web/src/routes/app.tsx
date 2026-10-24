@@ -1,17 +1,21 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, createRoute } from "@tanstack/react-router";
+import { ExternalLink as ExternalLinkIcon } from "lucide-react";
 
 import { Advanced } from "../components/Advanced.tsx";
 import { AppFileEditor } from "../components/AppFileEditor.tsx";
 import { AppLogs } from "../components/AppLogs.tsx";
 import { AppActions } from "../components/AppActions.tsx";
 import { AppStatus, StopReasonStatus } from "../components/AppStatus.tsx";
+import { buttonClass } from "../components/Button.tsx";
 import { ErrorState } from "../components/ErrorState.tsx";
+import { AddressLink } from "../components/ExternalLink.tsx";
 import { Loading } from "../components/Loading.tsx";
 import { Notice } from "../components/Notice.tsx";
 import { PageHeader } from "../components/PageHeader.tsx";
-import type { App, AppService, ImageSource } from "../lib/api.ts";
+import type { App, AppAddress, AppService, ImageSource } from "../lib/api.ts";
 import { useDaemonConnection } from "../lib/live.tsx";
+import { addressUrl } from "../lib/platform.ts";
 import { liveQueries } from "../lib/queries.ts";
 import { serviceStopReason } from "../lib/stopReason.ts";
 import { formatBytes, formatPercent, formatRate, sumMeasured } from "../lib/units.ts";
@@ -44,6 +48,7 @@ function AppPage() {
     <div className="flex max-w-3xl flex-col gap-8">
       <PageHeader title={name}>
         {app && <AppStatus status={app.status} reason={app.stop_reason} />}
+        {app && <OpenApp app={app} />}
       </PageHeader>
       {daemon.kind !== "online" && apps.data === undefined ? (
         <p className="text-muted">This app appears once alchemyd is reachable.</p>
@@ -114,6 +119,12 @@ function AppView({ app }: { app: App }) {
           Where it lives
         </h2>
         <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm">
+          <dt className="text-muted">
+            {(app.addresses?.length ?? 0) > 1 ? "Addresses" : "Address"}
+          </dt>
+          <dd>
+            <Addresses app={app} />
+          </dd>
           <dt className="text-muted">Folder</dt>
           <dd className="break-all">{app.dir}</dd>
           <dt className="text-muted">Compose file</dt>
@@ -155,9 +166,69 @@ function problemTitle(kind: App["problems"][number]["kind"]): string {
       return "One of this app's networks overlaps your network";
     case "port_conflict":
       return "A port this app publishes is already taken";
+    case "route":
+      return "Something is wrong with this app's web address";
     default:
       return "Something is wrong with this app";
   }
+}
+
+/** Opens the app at its best address that answers; nothing while none does. */
+function OpenApp({ app }: { app: App }) {
+  const ready = app.addresses?.find(
+    (address) => address.state === "ready" && addressUrl(address.url) !== null,
+  );
+  if (ready === undefined) {
+    return null;
+  }
+  return (
+    <AddressLink href={ready.url} className={buttonClass("primary")}>
+      <ExternalLinkIcon className="size-4" aria-hidden />
+      Open {app.name}
+    </AddressLink>
+  );
+}
+
+const ADDRESS_STATES: Record<AppAddress["state"], string> = {
+  ready: "Ready",
+  pending: "Not ready yet",
+  not_running: "Not running",
+  unavailable: "Doesn't work",
+  other: "Unknown",
+};
+
+/** Each web address, best first, saying why one doesn't answer. */
+function Addresses({ app }: { app: App }) {
+  const addresses = app.addresses ?? [];
+  if (addresses.length === 0) {
+    return (
+      <span className="text-muted">
+        {app.problems.some((problem) => problem.kind === "route")
+          ? "None. The problem above says why."
+          : "None"}
+      </span>
+    );
+  }
+  return (
+    <ul className="flex flex-col gap-1">
+      {addresses.map((address) => (
+        <li key={address.url} className="flex flex-col">
+          {addressUrl(address.url) === null ? (
+            <span className="break-all">{address.url}</span>
+          ) : (
+            <AddressLink href={address.url} className="break-all text-accent underline">
+              {address.url}
+            </AddressLink>
+          )}
+          {address.state !== "ready" && (
+            <span className="text-muted">
+              {address.message ?? ADDRESS_STATES[address.state] ?? ADDRESS_STATES.other}
+            </span>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
 }
 
 function ServiceRow({ service }: { service: AppService }) {
