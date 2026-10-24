@@ -183,12 +183,8 @@ or `Docker Desktop isn't running at …` when Docker Desktop is installed.
 Docker Desktop or the engine service while the daemon runs shows the
 transitions live.
 
-The engine tests use fakes and run without Docker. One ignored test talks to
-the real engine on this machine:
-
-```sh
-cargo test -p alchemyd --test engine -- --ignored
-```
+The engine tests use fakes and run without Docker; the few that need the
+real engine are listed in [Tests that need Docker](#tests-that-need-docker).
 
 ### Stopped or crashed
 
@@ -448,6 +444,32 @@ cargo test --workspace --locked
 cargo deny check
 pnpm ready   # format, lint, and type checks, web tests, web build
 ```
+
+### Tests that need Docker
+
+Everything in the gate runs without Docker. A few tests talk to the real
+engine on this machine instead, so they are `#[ignore]`d and CI skips them.
+Run them by name with `--ignored`:
+
+```sh
+cargo test -p alchemyd --test engine -- --ignored   # finds and pings the engine
+cargo test -p alchemyd --test escape -- --ignored   # the escape hatch, below
+```
+
+The escape test (`bin/alchemyd/tests/escape.rs`) proves that Alchemy leaves
+apps manageable by hand. It writes two apps into a temporary app home, one
+named after its folder and one with a top-level `name:`, starts alchemyd
+with the real engine monitor, `docker compose config`, and `docker compose`
+runner, and brings both up through `POST /api/apps/NAME/actions`. Then it
+stops the daemon and, in each app's folder, runs `docker compose ps`,
+`stop`, and `up --detach` with no `-p` or `-f`, checking each time that
+they act on the same containers, with the same
+`com.docker.compose.project` label, that Alchemy started. Finally a new
+daemon must see the same containers running, and `down` through it removes
+them. It needs `busybox:1.37`, pulled if missing, and takes a few seconds
+once the image is present. A guard runs `docker compose down` in both
+folders even when an assertion fails, and the temporary directory is
+removed with it.
 
 ## 5. Release smoke test
 
