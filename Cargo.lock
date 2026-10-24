@@ -91,6 +91,7 @@ dependencies = [
  "futures-util",
  "rusqlite",
  "rust-embed",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

@@ -8,12 +8,15 @@
 //! This lives in the daemon rather than `alchemy-core` because the argv is
 //! a detail of the `docker` binary, not of the domain.
 
+mod cli;
 mod env;
+mod lines;
 mod plan;
 mod progress;
 mod project;
 mod runner;
 
+pub use cli::CliComposeRunner;
 pub use env::{ALLOWED_ENV, ALLOWED_ENV_PREFIXES, FIXED_ENV, child_env, is_allowed};
 pub use plan::{
     ComposeAction, ComposeCommand, ComposePlan, ComposeStep, ImageSource, UnknownAction,
@@ -22,4 +25,7 @@ pub use progress::{
     BuildProgress, BuildVertex, ProgressEvent, ResourceProgress, ResourceStatus, parse_progress,
 };
 pub use project::{ComposeProject, ComposeProjectError};
-pub use runner::{CliComposeRunner, ComposeError, ComposeRunner};
+pub use runner::{
+    CancelToken, Canceller, ComposeError, ComposeEvent, ComposeRunner, OutputLine, Stream,
+    cancellation,
+};

@@ -26,6 +26,7 @@ clap               = { workspace = true }
 futures-util       = { workspace = true }
 rust-embed         = { workspace = true }
 rusqlite           = { workspace = true }
+rustix             = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 thiserror          = { workspace = true }

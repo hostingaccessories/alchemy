@@ -1,10 +1,11 @@
 //! Parsing `docker compose --progress json` output.
 //!
-//! Compose writes one JSON object per line on standard error. Most are
-//! resource events (`{"id":"Container blog-web-1","status":"Done",
+//! Compose writes one JSON object per line. Most are resource events on
+//! standard error (`{"id":"Container blog-web-1","status":"Done",
 //! "text":"Started"}`); a run that fails ends with
 //! `{"error":true,"message":"..."}`; and `build` passes `BuildKit`'s own
-//! solve status through (`{"vertexes":[...],"statuses":[...]}`).
+//! solve status through on standard output
+//! (`{"vertexes":[...],"statuses":[...]}`).
 //!
 //! [`parse_progress`] is tolerant: unknown fields are ignored, a field of
 //! the wrong type reads as missing, and anything that is not one of these
