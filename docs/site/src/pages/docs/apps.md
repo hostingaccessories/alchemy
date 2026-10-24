@@ -278,6 +278,65 @@ variables. Everything else is left out on purpose, including every
 variables an app needs in its `.env` file, where both Alchemy and a
 hand-run `docker compose` read them.
 
+## Opening an app
+
+An app that serves a web page gets its own addresses, and **Open** on its
+page uses the best one that works. The page lists them all and says where
+each one works. `alchemy app show NAME` lists them too. For an app named
+`photos`:
+
+| Address                    | Works from                                             |
+| -------------------------- | ------------------------------------------------------ |
+| `http://photos.local`      | Any device on your network, such as your phone         |
+| `http://photos.local:8101` | Any device on your network, when port 80 isn't free    |
+| `http://192.168.1.20:8101` | Any device on your network, by this computer's address |
+| `http://photos.localhost`  | This computer only                                     |
+
+The port, from 8100 to 8999, is the app's own and doesn't change. Alchemy
+works out which service and port to open. When it can't, for example
+because the app has more than one web port, the app's page says what to
+add to the compose file:
+
+```yaml
+x-alchemy:
+  service: web # which service serves the web page
+  port: 8080 # its port inside the container
+  hostname: pics # optional: pics.local instead of photos.local
+```
+
+### Opening apps from your phone
+
+Alchemy announces each app's `.local` name on your network, so phones,
+tablets, and other computers find it with no setup. iPhones, iPads, and
+Macs open `.local` names, Android does from version 12, and so do most
+Linux desktops. The phone has to be on the same Wi-Fi as this computer,
+and not a guest network. If the name doesn't open, turn off any VPN on the
+phone, or use the address with the IP.
+
+- **On a Mac,** if Alchemy asks to find devices on your local network,
+  allow it. If the **Machines** page says the Mac isn't letting Alchemy
+  announce apps, turn on Alchemy (or alchemyd) in System Settings ›
+  Privacy & Security › Local Network.
+- **If another device already uses the name,** the app's page says so and
+  its `.local` address won't work. Pick another name with `hostname:` in
+  `x-alchemy`, as above.
+- **After you stop Alchemy** or turn names off, a phone or Mac may still
+  find the old name for a few minutes.
+- **Addresses without a port need port 80.** On Linux, Alchemy needs
+  permission for it, and `alchemy status` shows the command that grants
+  it. If another program on this computer already takes port 80, the
+  Machines page says so, and Open uses the address with the port instead.
+
+To stop announcing apps, turn off **Announce apps on your network** under
+**Local names** on the **Machines** page, or run:
+
+```sh
+alchemy settings set mdns off   # on to turn it back on
+```
+
+Apps then have no `.local` address; the others keep working. To leave
+just one app out, add `mdns: false` to its `x-alchemy` block.
+
 ## Progress
 
 An action can take a while, so Alchemy shows it as steps in plain words,
