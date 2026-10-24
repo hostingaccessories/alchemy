@@ -5,7 +5,8 @@ use std::io::Write;
 use std::path::Path;
 
 use alchemy_api::{
-    ApiEvent, AppList, EngineStatus, ErrorCode, ErrorResponse, MetricsResponse, VersionResponse,
+    ApiEvent, AppList, EngineStatus, ErrorCode, ErrorResponse, MetricsResponse, OperationList,
+    VersionResponse,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -94,16 +95,25 @@ impl<D: Daemon, W: Write> Context<D, W> {
         decode(&reply.body)
     }
 
+    /// `POST` `body` as JSON to `path` and decode the JSON answer, as
+    /// [`Self::get`] does.
+    pub(crate) async fn post<B: Serialize, T: DeserializeOwned>(
+        &mut self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, ClientError> {
+        let daemon = self.daemon_info().await?.version.clone();
+        let body = serde_json::to_vec(body).map_err(|e| ProtocolError::Http(e.to_string()))?;
+        let reply = self.daemon.request(Method::POST, path, Some(&body)).await?;
+        accept(&reply, &daemon, self.command)?;
+        decode(&reply.body)
+    }
+
     /// Follow [`EVENTS_PATH`]. A refusal comes back as a [`ClientError`].
     pub(crate) async fn events(&mut self) -> Result<Subscription<D::Events>, ClientError> {
-        let daemon = self.daemon_info().await?.version.clone();
-        match self.daemon.events(EVENTS_PATH).await? {
-            Opened::Stream(inner) => Ok(Subscription { inner }),
-            Opened::Refused(reply) => match accept(&reply, &daemon, self.command) {
-                Ok(()) => Err(ClientError::Unexpected(status_text(reply.status))),
-                Err(err) => Err(err),
-            },
-        }
+        self.stream(EVENTS_PATH)
+            .await
+            .map(|inner| Subscription { inner })
     }
 
     /// Follow the event stream at `path`, such as an app's logs, as raw
@@ -154,6 +164,9 @@ pub(crate) fn decode_event(raw: &SseEvent) -> Result<Option<ApiEvent>, ClientErr
             decode::<MetricsResponse>(raw.data.as_bytes()).map(|m| Some(ApiEvent::Metrics(m)))
         }
         "apps" => decode::<AppList>(raw.data.as_bytes()).map(|a| Some(ApiEvent::Apps(a))),
+        "operations" => {
+            decode::<OperationList>(raw.data.as_bytes()).map(|o| Some(ApiEvent::Operations(o)))
+        }
         _ => Ok(None),
     }
 }
@@ -223,6 +236,11 @@ impl<D: Daemon> Context<D, Vec<u8>> {
     /// Everything written to the output so far.
     pub(crate) fn written(&self) -> String {
         String::from_utf8_lossy(self.out.get_ref()).into_owned()
+    }
+
+    /// Everything written as progress, to stderr, so far.
+    pub(crate) fn progress_written(&self) -> String {
+        self.out.progress_written()
     }
 
     /// The daemon client, to inspect what was sent.
@@ -445,6 +463,7 @@ mod tests {
                 ..MetricsResponse::default()
             }),
             ApiEvent::Apps(AppList::default()),
+            ApiEvent::Operations(OperationList::default()),
         ];
         for event in events {
             let raw = SseEvent {

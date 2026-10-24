@@ -4,6 +4,7 @@
 //! Each verb is a module with its own `Args`, `NAME`, and `run`; add one by
 //! adding its module and a [`Verb`] variant.
 
+pub mod action;
 pub mod list;
 pub mod logs;
 pub mod show;
@@ -48,6 +49,65 @@ pub enum Verb {
     /// a share of the whole machine Docker runs on, or of its VM with Docker
     /// Desktop, so an app's containers add up to the machine's figure.
     Stats(stats::Args),
+
+    /// Create and start an app's containers, downloading or building its
+    /// images first if they are missing.
+    ///
+    /// Progress goes to stderr and the result to stdout; with --json, each
+    /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
+    /// carries on with it.
+    Up(action::Args),
+
+    /// Stop and remove an app's containers and networks. Its volumes and
+    /// files are kept.
+    ///
+    /// Asks first; pass --yes to skip the question. Progress goes to stderr
+    /// and the result to stdout; with --json, each event is one line on
+    /// stdout. Ctrl-C stops watching, but alchemyd carries on with it.
+    Down(action::Args),
+
+    /// Start an app's existing containers.
+    ///
+    /// Progress goes to stderr and the result to stdout; with --json, each
+    /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
+    /// carries on with it.
+    Start(action::Args),
+
+    /// Stop an app's containers without removing them.
+    ///
+    /// Progress goes to stderr and the result to stdout; with --json, each
+    /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
+    /// carries on with it.
+    Stop(action::Args),
+
+    /// Restart an app's containers.
+    ///
+    /// Progress goes to stderr and the result to stdout; with --json, each
+    /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
+    /// carries on with it.
+    Restart(action::Args),
+
+    /// Download the latest images for an app, without restarting it.
+    ///
+    /// Progress goes to stderr and the result to stdout; with --json, each
+    /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
+    /// carries on with it.
+    Pull(action::Args),
+
+    /// Build the images of an app's services that have a build section.
+    ///
+    /// Progress goes to stderr and the result to stdout; with --json, each
+    /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
+    /// carries on with it.
+    Build(action::Args),
+
+    /// Download or rebuild an app's images, then recreate the containers
+    /// that changed. There is no rollback.
+    ///
+    /// Progress goes to stderr and the result to stdout; with --json, each
+    /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
+    /// carries on with it.
+    Update(action::Args),
 }
 
 /// Parse an app name as Compose would accept it, in the CLI's words.

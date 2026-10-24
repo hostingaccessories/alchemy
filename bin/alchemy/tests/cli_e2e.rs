@@ -49,6 +49,14 @@ struct Daemon {
 
 impl Daemon {
     async fn start(engine: EngineStatus) -> Self {
+        Self::start_with(engine, |deps| deps).await
+    }
+
+    /// [`Self::start`], with `deps` changed by `change` first.
+    async fn start_with(
+        engine: EngineStatus,
+        change: impl FnOnce(Deps<FixedEngine>) -> Deps<FixedEngine>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("alchemyd.sock");
         let config = Config {
@@ -56,7 +64,7 @@ impl Daemon {
             socket: socket.clone(),
             state_dir: dir.path().join("state"),
         };
-        let deps = Deps::new(FixedEngine(engine.clone()));
+        let deps = change(Deps::new(FixedEngine(engine.clone())));
         let state = deps.state.clone();
         let (stop, stop_rx) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
@@ -942,4 +950,150 @@ async fn app_logs_print_the_tail_and_follow_new_lines() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+/// A daemon whose home holds the app `blog`, which Compose reads as
+/// project `blog`, with operations on `runner`.
+async fn daemon_with_blog(
+    runner: alchemyd::compose::FakeComposeRunner,
+) -> (Daemon, tempfile::TempDir) {
+    use std::sync::Arc;
+
+    use alchemyd::apps::{AppsDeps, SystemFs};
+    use alchemyd::compose::FakeComposeConfig;
+
+    let apps = tempfile::tempdir().unwrap();
+    let home = apps.path().canonicalize().unwrap();
+    std::fs::create_dir(home.join("blog")).unwrap();
+    std::fs::write(
+        home.join("blog/compose.yaml"),
+        "services:\n  web:\n    image: nginx\n",
+    )
+    .unwrap();
+    let config = FakeComposeConfig::new();
+    config.project(home.join("blog"), "blog", &["web"]);
+    let daemon = Daemon::start_with(EngineStatus::new(EngineState::Ready), |deps| {
+        deps.with_apps(
+            AppsDeps::new(Arc::new(SystemFs), Arc::new(config), Some(home))
+                .with_scan_interval(Duration::from_millis(20)),
+        )
+        .with_runner(Arc::new(runner))
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let out = run_args(&daemon.socket, &["--json", "app", "show", "blog"]).await;
+        if out.is_ok_and(|out| out.contains(r#""project":"blog""#)) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "blog never read");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    (daemon, apps)
+}
+
+async fn run_args_prompted(
+    socket: &Path,
+    args: &[&str],
+    prompt: &mut FakePrompt,
+) -> Result<String, ClientError> {
+    let mut command_line = vec!["alchemy", "--socket", socket.to_str().unwrap()];
+    command_line.extend_from_slice(args);
+    run_prompted(Cli::try_parse_from(command_line).unwrap(), prompt).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lifecycle_actions_run_in_the_daemon_and_follow_to_the_end() {
+    use alchemyd::compose::{ComposeAction, FakeComposeRunner, FakeOutcome, FakeScript, Stream};
+
+    let runner = FakeComposeRunner::new()
+        .with_script(
+            ComposeAction::Up,
+            FakeScript::new().line(
+                Stream::Stderr,
+                r#"{"id":"Container blog-web-1","status":"Done","text":"Started"}"#,
+            ),
+        )
+        .with_script(
+            ComposeAction::Pull,
+            FakeScript::new().outcome(FakeOutcome::Fail {
+                code: 1,
+                message: "pull access denied".into(),
+            }),
+        );
+    let (daemon, apps) = daemon_with_blog(runner.clone()).await;
+    let socket = daemon.socket.clone();
+
+    let out = run_args(&socket, &["app", "up", "blog"]).await.unwrap();
+    assert_eq!(out, "blog is up\n");
+
+    let out = run_args(&socket, &["--json", "app", "up", "blog"])
+        .await
+        .unwrap();
+    let events: Vec<serde_json::Value> = out
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.first().unwrap()["event"], "operation");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event"] == "output" && e["data"]["text"] == "Container blog-web-1 Started"),
+        "{out}"
+    );
+    assert_eq!(events.last().unwrap()["event"], "done");
+    assert_eq!(events.last().unwrap()["data"]["state"], "succeeded");
+
+    let err = run_args(&socket, &["app", "pull", "blog"])
+        .await
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert_eq!(err.kind(), "operation_failed");
+    assert_eq!(err.to_string(), "pull blog failed: pull access denied");
+
+    let runs = runner.runs().len();
+    let out = run_args(&socket, &["app", "update", "blog", "--dry-run"])
+        .await
+        .unwrap();
+    let blog = apps.path().canonicalize().unwrap().join("blog");
+    assert_eq!(
+        out,
+        format!(
+            "would run: docker compose --project-directory {0} --progress json pull\n\
+             would run: docker compose --project-directory {0} --progress json up --detach\n",
+            blog.display()
+        )
+    );
+
+    let err = run_args_prompted(&socket, &["app", "down", "blog"], &mut FakePrompt::no_tty())
+        .await
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 3);
+    let mut prompt = FakePrompt::tty([false]);
+    let err = run_args_prompted(&socket, &["app", "down", "blog"], &mut prompt)
+        .await
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 3);
+    assert_eq!(
+        runner.runs().len(),
+        runs,
+        "a refused down or a dry run runs nothing"
+    );
+    let out = run_args_prompted(
+        &socket,
+        &["app", "down", "blog"],
+        &mut FakePrompt::tty([true]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, "blog is down\n");
+    assert_eq!(runner.runs().last().unwrap().action(), ComposeAction::Down);
+
+    let err = run_args(&socket, &["app", "start", "nope"])
+        .await
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert_eq!(err.to_string(), "alchemyd: no app is named \"nope\"");
+
+    daemon.stop().await;
 }

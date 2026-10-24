@@ -17,6 +17,7 @@ use std::ffi::OsStr;
 use std::io::Write;
 use std::path::PathBuf;
 
+use alchemy_api::operations::Action;
 use clap::{Parser, Subcommand};
 
 use crate::commands::{app, completions, generate_man, machine, settings, status, version};
@@ -112,13 +113,6 @@ pub async fn run<W: Write>(cli: Cli, out: &mut W, color: Color) -> Result<(), Cl
 }
 
 /// [`run`], asking for confirmation on `prompt` instead of the terminal.
-#[cfg_attr(
-    not(feature = "test-command"),
-    expect(
-        unused_variables,
-        reason = "no destructive command exists outside tests until M4"
-    )
-)]
 pub async fn run_with<W: Write, P: Prompt>(
     cli: Cli,
     out: &mut W,
@@ -155,6 +149,38 @@ pub async fn run_with<W: Write, P: Prompt>(
             app::Verb::Stats(args) => {
                 let mut context = context(out, app::stats::NAME)?;
                 app::stats::run(&mut context, args).await
+            }
+            app::Verb::Up(args) => {
+                let mut context = context(out, app::action::name(Action::Up))?;
+                app::action::run(&mut context, prompt, Action::Up, args).await
+            }
+            app::Verb::Down(args) => {
+                let mut context = context(out, app::action::name(Action::Down))?;
+                app::action::run(&mut context, prompt, Action::Down, args).await
+            }
+            app::Verb::Start(args) => {
+                let mut context = context(out, app::action::name(Action::Start))?;
+                app::action::run(&mut context, prompt, Action::Start, args).await
+            }
+            app::Verb::Stop(args) => {
+                let mut context = context(out, app::action::name(Action::Stop))?;
+                app::action::run(&mut context, prompt, Action::Stop, args).await
+            }
+            app::Verb::Restart(args) => {
+                let mut context = context(out, app::action::name(Action::Restart))?;
+                app::action::run(&mut context, prompt, Action::Restart, args).await
+            }
+            app::Verb::Pull(args) => {
+                let mut context = context(out, app::action::name(Action::Pull))?;
+                app::action::run(&mut context, prompt, Action::Pull, args).await
+            }
+            app::Verb::Build(args) => {
+                let mut context = context(out, app::action::name(Action::Build))?;
+                app::action::run(&mut context, prompt, Action::Build, args).await
+            }
+            app::Verb::Update(args) => {
+                let mut context = context(out, app::action::name(Action::Update))?;
+                app::action::run(&mut context, prompt, Action::Update, args).await
             }
         },
         Command::Machine(args) => match args.command {

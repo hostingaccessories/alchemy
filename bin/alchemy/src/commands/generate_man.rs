@@ -97,10 +97,18 @@ mod tests {
         assert_eq!(
             names,
             [
+                "alchemy-app-build.1",
+                "alchemy-app-down.1",
                 "alchemy-app-list.1",
                 "alchemy-app-logs.1",
+                "alchemy-app-pull.1",
+                "alchemy-app-restart.1",
                 "alchemy-app-show.1",
+                "alchemy-app-start.1",
                 "alchemy-app-stats.1",
+                "alchemy-app-stop.1",
+                "alchemy-app-up.1",
+                "alchemy-app-update.1",
                 "alchemy-app.1",
                 "alchemy-completions.1",
                 "alchemy-machine-stats.1",
