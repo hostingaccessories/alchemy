@@ -5,15 +5,21 @@
 //! everything else is served from the embedded web UI build with an
 //! `index.html` fallback for client-side routing; on the Unix socket
 //! ([`api_router`]) everything else is a JSON 404.
+//!
+//! Both routers apply the request checks in [`crate::guard`] before any
+//! route sees a request, so a route added under `/api` is covered by
+//! nesting it, with nothing to opt into.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use alchemy_api::{
     ApiEvent, EngineStatus, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, VersionResponse,
 };
-use axum::extract::{self, FromRef};
+use axum::extract::{self, FromRef, Request};
 use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -24,10 +30,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::State;
 use crate::events::{self, Topic};
-
-/// Origins the Tauri shell serves its bundled UI from (macOS and Linux
-/// respectively). The browser UI is same-origin and needs no CORS.
-const TAURI_ORIGINS: [&str; 2] = ["tauri://localhost", "http://tauri.localhost"];
+use crate::guard::{self, Refusal, TAURI_ORIGINS};
 
 /// How often `/api/events` sends an SSE comment while idle, so proxies and
 /// clients do not give up on a quiet stream.
@@ -51,33 +54,58 @@ impl FromRef<Api> for State {
 /// This is what the per-user Unix socket serves. Anything outside `/api`
 /// is a JSON 404. Event streams end once `shutdown` becomes `true` (or its
 /// sender is dropped), so open `/api/events` connections do not hold up
-/// graceful shutdown.
+/// graceful shutdown. Only the socket's share of the [`crate::guard`]
+/// checks applies; see [`socket_checks`].
 pub fn api_router(state: State, shutdown: watch::Receiver<bool>) -> Router {
-    Router::new()
-        .nest(
-            alchemy_api::API_PREFIX,
-            api(state, events::topics(), shutdown),
-        )
-        .fallback(api_not_found)
+    socket_checks(
+        Router::new()
+            .nest(
+                alchemy_api::API_PREFIX,
+                api(state, events::topics(), shutdown),
+            )
+            .fallback(api_not_found),
+    )
 }
 
-/// Build the full router for the TCP listener: the [`api_router`] routes,
-/// CORS for the desktop shell, and the web UI.
-pub fn router(state: State, shutdown: watch::Receiver<bool>) -> Router {
-    router_with_topics(state, events::topics(), shutdown)
+/// Build the full router for the TCP listener bound to `listen`: the
+/// [`api_router`] routes, CORS for the desktop shell, the web UI, and every
+/// [`crate::guard`] check.
+pub fn router(state: State, listen: IpAddr, shutdown: watch::Receiver<bool>) -> Router {
+    router_with_topics(state, listen, events::topics(), shutdown)
 }
 
 /// [`router`], with `/api/events` publishing `topics` instead of the
 /// daemon's own [`events::topics`].
 pub fn router_with_topics(
     state: State,
+    listen: IpAddr,
     topics: Vec<Topic>,
     shutdown: watch::Receiver<bool>,
 ) -> Router {
-    Router::new()
-        .nest(alchemy_api::API_PREFIX, api(state, topics, shutdown))
-        .fallback(crate::web::serve)
+    tcp_checks(
+        Router::new()
+            .nest(alchemy_api::API_PREFIX, api(state, topics, shutdown))
+            .fallback(crate::web::serve),
+        listen,
+    )
+}
+
+/// Wrap `routes` the way the TCP listener bound to `listen` serves them.
+///
+/// The `Host` check is outermost, so it covers CORS preflights too. The
+/// origin and content-type checks sit inside CORS, so a refusal sent to the
+/// desktop shell still carries the headers it needs to read the error.
+pub fn tcp_checks(routes: Router, listen: IpAddr) -> Router {
+    routes
+        .layer(middleware::from_fn(require_browser_safe))
         .layer(cors())
+        .layer(middleware::from_fn_with_state(listen, require_host))
+}
+
+/// Wrap `routes` the way the Unix socket serves them: the content-type
+/// check alone, since no browser can reach the socket.
+pub fn socket_checks(routes: Router) -> Router {
+    routes.layer(middleware::from_fn(require_json))
 }
 
 /// The routes under `/api`, shared by [`api_router`] and [`router`].
@@ -94,6 +122,38 @@ fn api(state: State, topics: Vec<Topic>, shutdown: watch::Receiver<bool>) -> Rou
             topics: topics.into(),
             shutdown,
         })
+}
+
+async fn require_host(
+    extract::State(listen): extract::State<IpAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    match guard::check_host(req.headers(), listen) {
+        Ok(()) => next.run(req).await,
+        Err(refusal) => refuse(refusal),
+    }
+}
+
+async fn require_browser_safe(req: Request, next: Next) -> Response {
+    match guard::check_origin(req.method(), req.headers())
+        .and_then(|()| guard::check_content_type(req.method(), req.headers()))
+    {
+        Ok(()) => next.run(req).await,
+        Err(refusal) => refuse(refusal),
+    }
+}
+
+async fn require_json(req: Request, next: Next) -> Response {
+    match guard::check_content_type(req.method(), req.headers()) {
+        Ok(()) => next.run(req).await,
+        Err(refusal) => refuse(refusal),
+    }
+}
+
+fn refuse(refusal: Refusal) -> Response {
+    tracing::debug!(?refusal, "refused request");
+    api_error(refusal.status(), refusal.code(), refusal.message())
 }
 
 fn cors() -> CorsLayer {
@@ -163,14 +223,27 @@ mod tests {
     use alchemy_api::EngineState;
     use axum::body::{Body, BodyDataStream, to_bytes};
     use axum::http::Request;
+    use axum::http::request::Builder;
+    use axum::routing::post;
     use tower::ServiceExt as _;
+
+    const LISTEN: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    const HOST: &str = "127.0.0.1:7240";
+
+    /// A request as a same-origin browser page sends it.
+    fn req(method: Method, uri: &str) -> Builder {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, HOST)
+    }
 
     /// The daemon's router with only the engine topic on `/api/events`, so
     /// these tests read engine frames alone as other topics are added.
     fn test_router(state: State) -> (Router, watch::Sender<bool>) {
         let (tx, rx) = watch::channel(false);
         let engine = Topic::watch(State::watch_engine, ApiEvent::Engine);
-        (router_with_topics(state, vec![engine], rx), tx)
+        (router_with_topics(state, LISTEN, vec![engine], rx), tx)
     }
 
     async fn get_json(uri: &str) -> (StatusCode, serde_json::Value) {
@@ -180,7 +253,7 @@ mod tests {
     async fn get_json_from(state: State, uri: &str) -> (StatusCode, serde_json::Value) {
         let (app, _tx) = test_router(state);
         let resp = app
-            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .oneshot(req(Method::GET, uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
         let status = resp.status();
@@ -224,7 +297,7 @@ mod tests {
     }
 
     async fn open_events(app: Router, origin: Option<&str>) -> Response {
-        let mut req = Request::get("/api/events");
+        let mut req = req(Method::GET, "/api/events");
         if let Some(origin) = origin {
             req = req.header(header::ORIGIN, origin);
         }
@@ -294,7 +367,12 @@ mod tests {
         let (a, a_rx) = watch::channel(EngineState::Starting);
         let (b, b_rx) = watch::channel(EngineState::Ready);
         let (stop, stop_rx) = watch::channel(false);
-        let app = router_with_topics(State::new(), vec![topic(a_rx), topic(b_rx)], stop_rx);
+        let app = router_with_topics(
+            State::new(),
+            LISTEN,
+            vec![topic(a_rx), topic(b_rx)],
+            stop_rx,
+        );
         let mut frames = Frames::new(open_events(app, None).await);
 
         let mut initial = [
@@ -369,7 +447,12 @@ mod tests {
         for uri in ["/api/health", "/api/version", "/api/engine", "/api/events"] {
             let (app, _stop) = test_router(State::new());
             let resp = app
-                .oneshot(Request::post(uri).body(Body::empty()).unwrap())
+                .oneshot(
+                    req(Method::POST, uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{uri}");
@@ -391,7 +474,7 @@ mod tests {
     async fn root_serves_ui_or_reports_it_unbuilt() {
         let (app, _stop) = test_router(State::new());
         let resp = app
-            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .oneshot(req(Method::GET, "/").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert!(
@@ -418,7 +501,7 @@ mod tests {
             let (_stop, rx) = watch::channel(false);
             let resp = api_router(State::new(), rx)
                 .oneshot(
-                    Request::get(uri)
+                    req(Method::GET, uri)
                         .header(header::ORIGIN, "tauri://localhost")
                         .body(Body::empty())
                         .unwrap(),
@@ -454,7 +537,7 @@ mod tests {
                 let (app, _stop) = test_router(State::new());
                 let resp = app
                     .oneshot(
-                        Request::get(uri)
+                        req(Method::GET, uri)
                             .header(header::ORIGIN, origin)
                             .body(Body::empty())
                             .unwrap(),
@@ -465,5 +548,266 @@ mod tests {
                 assert_eq!(got.is_some(), allowed, "{origin} {uri}");
             }
         }
+    }
+
+    /// A stand-in for the first mutating route, until M4 adds real ones.
+    fn things() -> Router {
+        Router::new().route("/api/things", post(|| async { StatusCode::NO_CONTENT }))
+    }
+
+    /// A `POST`-style request with only the headers that are `Some`.
+    struct Probe<'a> {
+        method: Method,
+        host: Option<&'a str>,
+        origin: Option<&'a str>,
+        content_type: Option<&'a str>,
+    }
+
+    impl Probe<'_> {
+        fn post(
+            host: Option<&'static str>,
+            origin: Option<&'static str>,
+            content_type: Option<&'static str>,
+        ) -> Probe<'static> {
+            Probe {
+                method: Method::POST,
+                host,
+                origin,
+                content_type,
+            }
+        }
+
+        fn request(&self, uri: &str) -> Request<Body> {
+            let mut builder = Request::builder().method(self.method.clone()).uri(uri);
+            for (name, value) in [
+                (header::HOST, self.host),
+                (header::ORIGIN, self.origin),
+                (header::CONTENT_TYPE, self.content_type),
+            ] {
+                if let Some(value) = value {
+                    builder = builder.header(name, value);
+                }
+            }
+            builder.body(Body::from("{}")).unwrap()
+        }
+    }
+
+    async fn send(app: Router, request: Request<Body>) -> (StatusCode, Option<String>, Vec<u8>) {
+        let resp = app.oneshot(request).await.unwrap();
+        let status = resp.status();
+        let acao = resp
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .map(|v| v.to_str().unwrap().to_owned());
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, acao, body.to_vec())
+    }
+
+    fn error_code(body: &[u8]) -> serde_json::Value {
+        serde_json::from_slice::<serde_json::Value>(body).unwrap()["code"].clone()
+    }
+
+    const JSON: Option<&str> = Some("application/json");
+
+    #[tokio::test]
+    async fn tcp_checks_guard_mutating_routes() {
+        let forbidden = Some(StatusCode::FORBIDDEN);
+        let unsupported = Some(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let cases = [
+            (
+                "same-origin",
+                Some(HOST),
+                Some("http://127.0.0.1:7240"),
+                JSON,
+                None,
+            ),
+            ("no origin", Some(HOST), None, JSON, None),
+            ("tauri", Some(HOST), Some("tauri://localhost"), JSON, None),
+            (
+                "tauri linux",
+                Some(HOST),
+                Some("http://tauri.localhost"),
+                JSON,
+                None,
+            ),
+            (
+                "vite dev proxy",
+                Some("localhost:5173"),
+                Some("http://localhost:5173"),
+                Some("application/json; charset=utf-8"),
+                None,
+            ),
+            (
+                "cross-origin form",
+                Some(HOST),
+                Some("https://evil.example"),
+                Some("application/x-www-form-urlencoded"),
+                forbidden,
+            ),
+            (
+                "cross-origin text/plain",
+                Some(HOST),
+                Some("https://evil.example"),
+                Some("text/plain"),
+                forbidden,
+            ),
+            (
+                "cross-origin JSON",
+                Some(HOST),
+                Some("https://evil.example"),
+                JSON,
+                forbidden,
+            ),
+            ("opaque origin", Some(HOST), Some("null"), JSON, forbidden),
+            (
+                "text/plain",
+                Some(HOST),
+                None,
+                Some("text/plain"),
+                unsupported,
+            ),
+            (
+                "same-origin text/plain",
+                Some(HOST),
+                Some("http://127.0.0.1:7240"),
+                Some("text/plain"),
+                unsupported,
+            ),
+            ("no content type", Some(HOST), None, None, unsupported),
+            (
+                "rebinding host",
+                Some("evil.example:7240"),
+                Some("http://evil.example:7240"),
+                JSON,
+                forbidden,
+            ),
+            ("no host", None, None, JSON, forbidden),
+        ];
+        for (name, host, origin, content_type, refused) in cases {
+            let probe = Probe::post(host, origin, content_type);
+            let app = tcp_checks(things(), LISTEN);
+            let (status, _, body) = send(app, probe.request("/api/things")).await;
+            match refused {
+                None => assert_eq!(status, StatusCode::NO_CONTENT, "{name}"),
+                Some(want) => {
+                    assert_eq!(status, want, "{name}");
+                    let code = if want == StatusCode::FORBIDDEN {
+                        "forbidden"
+                    } else {
+                        "unsupported_media_type"
+                    };
+                    assert_eq!(error_code(&body), code, "{name}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn host_check_covers_every_request() {
+        for (method, uri) in [
+            (Method::GET, "/api/health"),
+            (Method::GET, "/api/events"),
+            (Method::GET, "/"),
+            (Method::OPTIONS, "/api/health"),
+        ] {
+            let probe = Probe {
+                method: method.clone(),
+                host: Some("evil.example:7240"),
+                origin: Some("tauri://localhost"),
+                content_type: None,
+            };
+            let (app, _stop) = test_router(State::new());
+            let (status, acao, body) = send(app, probe.request(uri)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+            assert_eq!(acao, None, "{method} {uri}");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({ "error": Refusal::Host.message(), "code": "forbidden" }),
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tauri_preflight_passes_and_refusals_stay_readable() {
+        let preflight = req(Method::OPTIONS, "/api/things")
+            .header(header::ORIGIN, "tauri://localhost")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+            .body(Body::empty())
+            .unwrap();
+        let (status, acao, _) = send(tcp_checks(things(), LISTEN), preflight).await;
+        assert!(status.is_success(), "{status}");
+        assert_eq!(acao.as_deref(), Some("tauri://localhost"));
+
+        let probe = Probe::post(Some(HOST), Some("tauri://localhost"), Some("text/plain"));
+        let app = tcp_checks(things(), LISTEN);
+        let (status, acao, body) = send(app, probe.request("/api/things")).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(acao.as_deref(), Some("tauri://localhost"));
+        assert_eq!(error_code(&body), "unsupported_media_type");
+    }
+
+    #[tokio::test]
+    async fn tcp_checks_accept_the_configured_listen_address() {
+        let lan = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 5));
+        for (host, origin, want) in [
+            (
+                "192.168.1.5:7240",
+                "http://192.168.1.5:7240",
+                StatusCode::NO_CONTENT,
+            ),
+            (
+                "localhost:7240",
+                "http://localhost:7240",
+                StatusCode::NO_CONTENT,
+            ),
+            (
+                "10.0.0.9:7240",
+                "http://10.0.0.9:7240",
+                StatusCode::FORBIDDEN,
+            ),
+            ("nas.lan:7240", "http://nas.lan:7240", StatusCode::FORBIDDEN),
+        ] {
+            let probe = Probe::post(Some(host), Some(origin), JSON);
+            let app = tcp_checks(things(), lan);
+            let (status, _, _) = send(app, probe.request("/api/things")).await;
+            assert_eq!(status, want, "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_checks_content_type_only() {
+        let unsupported = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+        for (host, origin, content_type, want) in [
+            (Some("alchemyd"), None, JSON, StatusCode::NO_CONTENT),
+            (None, None, JSON, StatusCode::NO_CONTENT),
+            (
+                Some("evil.example"),
+                Some("https://evil.example"),
+                JSON,
+                StatusCode::NO_CONTENT,
+            ),
+            (Some("alchemyd"), None, Some("text/plain"), unsupported),
+            (Some("alchemyd"), None, None, unsupported),
+        ] {
+            let probe = Probe::post(host, origin, content_type);
+            let (status, _, _) = send(socket_checks(things()), probe.request("/api/things")).await;
+            assert_eq!(status, want, "{host:?} {origin:?} {content_type:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn api_router_answers_the_cli_host() {
+        let (_stop, rx) = watch::channel(false);
+        let probe = Probe {
+            method: Method::GET,
+            host: Some("alchemyd"),
+            origin: None,
+            content_type: None,
+        };
+        let app = api_router(State::new(), rx);
+        let (status, _, _) = send(app, probe.request("/api/health")).await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

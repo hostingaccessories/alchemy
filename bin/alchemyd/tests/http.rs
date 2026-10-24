@@ -1,5 +1,6 @@
 //! HTTP front door wiring: `run_with` serving `/api/events` over a real TCP
-//! listener to a client on the Tauri origin.
+//! listener to a client on the Tauri origin, and refusing requests other
+//! web pages could send.
 
 #![allow(
     clippy::unwrap_used,
@@ -138,4 +139,112 @@ async fn events_stream_reaches_the_tauri_origin_and_ends_on_shutdown() {
         raw.closed().await,
         "event stream stayed open after shutdown"
     );
+}
+
+/// Send `request` as written, then read the whole response, lowercasing
+/// the head.
+async fn exchange(addr: SocketAddr, request: &str) -> (String, String) {
+    let mut stream = connect(addr).await;
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut seen = String::new();
+    tokio::time::timeout(TIMEOUT, stream.read_to_string(&mut seen))
+        .await
+        .unwrap()
+        .unwrap();
+    let (head, body) = seen.split_once("\r\n\r\n").unwrap();
+    (head.to_ascii_lowercase(), body.to_owned())
+}
+
+/// A `POST /api/health` with `headers`, a two-byte body, and
+/// `Connection: close`. No mutating route exists yet; one that passes the
+/// checks reaches the router and gets its 405.
+fn post(headers: &str) -> String {
+    format!(
+        "POST /api/health HTTP/1.1\r\n{headers}Content-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+    )
+}
+
+fn code(body: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(body).unwrap()["code"].clone()
+}
+
+#[tokio::test]
+async fn tcp_listener_refuses_rebinding_cross_origin_and_non_json_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let listen = free_port();
+    let config = alchemyd::Config {
+        listen,
+        socket: dir.path().join("alchemyd.sock"),
+    };
+    let deps = Deps::new(FixedEngine(EngineStatus::new(EngineState::Ready)));
+    let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let daemon = tokio::spawn(alchemyd::run_with(config, deps, async {
+        let _ = stop_rx.await;
+    }));
+    let host = format!("Host: {listen}\r\n");
+    let same_origin = format!("{host}Origin: http://{listen}\r\n");
+
+    let cases = [
+        (
+            "rebinding host",
+            "GET /api/health HTTP/1.1\r\nHost: evil.example:7240\r\nConnection: close\r\n\r\n"
+                .to_owned(),
+            "403",
+            "forbidden",
+        ),
+        (
+            "cross-origin form post",
+            post(&format!(
+                "{host}Origin: https://evil.example\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n"
+            )),
+            "403",
+            "forbidden",
+        ),
+        (
+            "text/plain post",
+            post(&format!("{same_origin}Content-Type: text/plain\r\n")),
+            "415",
+            "unsupported_media_type",
+        ),
+        (
+            "same-origin json post",
+            post(&format!("{same_origin}Content-Type: application/json\r\n")),
+            "405",
+            "method_not_allowed",
+        ),
+        (
+            "tauri json post",
+            post(&format!(
+                "{host}Origin: tauri://localhost\r\nContent-Type: application/json\r\n"
+            )),
+            "405",
+            "method_not_allowed",
+        ),
+        (
+            "localhost get",
+            "GET /api/nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_owned(),
+            "404",
+            "not_found",
+        ),
+    ];
+    for (name, request, status, want) in cases {
+        let (head, body) = exchange(listen, &request).await;
+        assert!(
+            head.starts_with(&format!("http/1.1 {status}")),
+            "{name}: {head}"
+        );
+        assert!(
+            head.contains("content-type: application/json"),
+            "{name}: {head}"
+        );
+        assert_eq!(code(&body), want, "{name}");
+    }
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(TIMEOUT, daemon)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }

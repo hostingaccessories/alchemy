@@ -3,8 +3,9 @@
 //! `alchemyd` is the single source of truth. It serves the same HTTP API
 //! ([`http`]) through two front doors over the same state:
 //!
-//! - a TCP listener, which adds the embedded web UI and CORS for the
-//!   Tauri shell, used by browsers and the shell, and
+//! - a TCP listener, which adds the embedded web UI, CORS for the Tauri
+//!   shell, and the [`guard`] checks against other web pages, used by
+//!   browsers and the shell, and
 //! - a per-user Unix socket ([`socket`]) serving the API alone, used by
 //!   the `alchemy` CLI and `alchemy-helper`.
 //!
@@ -14,6 +15,7 @@
 pub mod compose;
 pub mod engine;
 pub mod events;
+pub mod guard;
 pub mod http;
 mod secure_fs;
 pub mod socket;
@@ -118,9 +120,12 @@ pub async fn run_with(
         .into_future(),
     );
     let http_task = tokio::spawn(
-        axum::serve(http_listener, http::router(deps.state, shutdown_rx.clone()))
-            .with_graceful_shutdown(stopped(shutdown_rx))
-            .into_future(),
+        axum::serve(
+            http_listener,
+            http::router(deps.state, config.listen.ip(), shutdown_rx.clone()),
+        )
+        .with_graceful_shutdown(stopped(shutdown_rx))
+        .into_future(),
     );
 
     shutdown.await;
