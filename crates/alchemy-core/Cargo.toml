@@ -1,6 +1,6 @@
 [package]
 name                   = "alchemy-core"
-description            = "Pure domain model for Alchemy: stacks, the Docker engine, and their invariants. No I/O."
+description            = "Pure domain model for Alchemy: stacks, the Docker engine, resource usage, and their invariants. No I/O."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

@@ -5,6 +5,7 @@
 //! in as plain values.
 
 pub mod engine;
+pub mod metrics;
 mod stack;
 
 pub use stack::{StackName, StackNameError};
