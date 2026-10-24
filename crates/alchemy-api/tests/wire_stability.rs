@@ -902,7 +902,6 @@ fn operations_event() {
     );
 }
 
-
 #[test]
 fn new_app() {
     use alchemy_api::apps::files::NewApp;

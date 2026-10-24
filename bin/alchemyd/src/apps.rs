@@ -12,6 +12,9 @@
 //!   [`AppList`] clients see.
 //! - [`run`] ties them together for the daemon's lifetime, and the
 //!   settings in [`settings`] say which folders to look in.
+//! - [`AppEditor`] creates apps and edits their compose file and `.env`,
+//!   staged and validated with Compose, writing only through [`AppDisk`]
+//!   ([`SystemDisk`] in the daemon).
 //!
 //! Code that acts on an app, such as running a lifecycle action, finds it
 //! with [`find`] in [`State::apps`](crate::State::apps) and gets its
@@ -19,11 +22,15 @@
 //! `project` are what Compose resolved.
 
 mod assemble;
+mod disk;
+mod edit;
 mod fs;
 mod monitor;
 pub mod settings;
 
 pub use assemble::{ConfigOutcome, Inputs, app_list};
+pub use disk::{AppDisk, FileRead, ReadOutcome, SystemDisk};
+pub use edit::{AppEditor, EditError, content_hash};
 pub use fs::{AppFs, FakeFs, SystemFs};
 pub use monitor::{AppsDeps, DEFAULT_SCAN_INTERVAL, run};
 

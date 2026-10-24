@@ -13,6 +13,12 @@
 //! Both routers apply the request checks in [`crate::guard`] before any
 //! route sees a request, so a route added under `/api` is covered by
 //! nesting it, with nothing to opt into.
+//!
+//! Creating apps and editing their files needs an [`AppEditor`], which
+//! [`with_editor`] adds to either router; without one those routes answer
+//! 503.
+
+mod app_files;
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -36,7 +42,7 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use futures_util::stream::{self, BoxStream};
 use futures_util::{Stream, StreamExt as _};
 use serde::Deserialize;
@@ -44,7 +50,7 @@ use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 
 use crate::State;
-use crate::apps::{self, settings};
+use crate::apps::{self, AppEditor, settings};
 use crate::events::{self, Topic};
 use crate::guard::{self, Refusal, TAURI_ORIGINS};
 use crate::logs::{self, LogQuery, LogsRefusal, SharedLogSource};
@@ -167,6 +173,11 @@ pub fn tcp_checks(routes: Router, listen: IpAddr) -> Router {
         .layer(middleware::from_fn_with_state(listen, require_host))
 }
 
+/// Give `router`'s app file routes `editor` to create and edit apps with.
+pub fn with_editor(router: Router, editor: Arc<AppEditor>) -> Router {
+    router.layer(Extension(editor))
+}
+
 /// Wrap `routes` the way the Unix socket serves them: the content-type
 /// check alone, since no browser can reach the socket.
 pub fn socket_checks(routes: Router) -> Router {
@@ -189,7 +200,12 @@ fn api(
         .route("/events", get(events))
         .route("/metrics", get(metrics))
         .route("/metrics/history", get(metrics_history))
-        .route("/apps", get(list_apps))
+        .route(
+            "/apps",
+            get(list_apps)
+                .post(app_files::create)
+                .layer(app_files::body_limit()),
+        )
         .route("/apps/{name}", get(show_app))
         .route("/apps/{name}/logs", get(app_logs))
         .route("/apps/{name}/actions", post(start_action))
@@ -198,6 +214,12 @@ fn api(
         .route("/operations/{id}", get(show_operation))
         .route("/operations/{id}/cancel", post(cancel_operation))
         .route("/operations/{id}/events", get(operation_events))
+        .route(
+            "/apps/{name}/files/{file}",
+            get(app_files::read)
+                .put(app_files::write)
+                .layer(app_files::body_limit()),
+        )
         .route("/settings/apps", get(app_settings).put(set_app_settings))
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found)

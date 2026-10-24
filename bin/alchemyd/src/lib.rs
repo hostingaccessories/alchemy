@@ -41,7 +41,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use tokio::sync::watch;
 
-use crate::apps::AppsDeps;
+use crate::apps::{AppEditor, AppsDeps};
 use crate::engine::{EngineMonitor, EngineSource, SystemConnector, SystemProbe};
 use crate::logs::{SharedLogSource, SystemLogs};
 use crate::metrics::{Collector, MetricsSource, SystemMetrics};
@@ -81,6 +81,8 @@ pub struct Deps<E, M = SystemMetrics> {
     pub logs: SharedLogSource,
     /// What lifecycle operations run their Compose plans through.
     pub runner: Arc<dyn OperationRunner>,
+    /// Creates apps and edits their files for the API.
+    pub editor: Arc<AppEditor>,
 }
 
 impl<E> Deps<E> {
@@ -93,8 +95,11 @@ impl<E> Deps<E> {
     /// projects, so `docker compose` never runs. Logs are read from the
     /// engine. Operations run on a
     /// [`FakeComposeRunner`](compose::FakeComposeRunner) that succeeds
-    /// without running anything. Use [`Self::with_apps`] and
-    /// [`Self::with_runner`] to change them.
+    /// without running anything. The editor writes to the real
+    /// filesystem but validates with a
+    /// [`FakeComposeValidator`](compose::FakeComposeValidator) that
+    /// accepts everything. Use [`Self::with_apps`],
+    /// [`Self::with_runner`], and [`Self::with_editor`] to change them.
     pub fn new(engine: E) -> Self {
         Self {
             state: State::new(),
@@ -107,6 +112,10 @@ impl<E> Deps<E> {
             ),
             logs: Arc::new(SystemLogs::new()),
             runner: Arc::new(compose::FakeComposeRunner::new()),
+            editor: Arc::new(AppEditor::new(
+                Arc::new(apps::SystemDisk),
+                Arc::new(compose::FakeComposeValidator::new()),
+            )),
         }
     }
 }
@@ -121,6 +130,7 @@ impl<E, M> Deps<E, M> {
             apps: self.apps,
             logs: self.logs,
             runner: self.runner,
+            editor: self.editor,
         }
     }
 
@@ -144,6 +154,13 @@ impl<E, M> Deps<E, M> {
         self.runner = runner;
         self
     }
+
+    /// Use `editor` to create apps and edit their files.
+    #[must_use]
+    pub fn with_editor(mut self, editor: AppEditor) -> Self {
+        self.editor = Arc::new(editor);
+        self
+    }
 }
 
 impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
@@ -153,6 +170,7 @@ impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
         Self::new(EngineMonitor::system())
             .with_apps(AppsDeps::system())
             .with_runner(Arc::new(SystemRunner::new()))
+            .with_editor(AppEditor::system())
     }
 }
 
@@ -233,12 +251,15 @@ pub async fn run_with(
     let socket_task = tokio::spawn(
         axum::serve(
             socket_listener,
-            http::api_router(
-                deps.state.clone(),
-                store.clone(),
-                shutdown_rx.clone(),
-                deps.logs.clone(),
-                operations.clone(),
+            http::with_editor(
+                http::api_router(
+                    deps.state.clone(),
+                    store.clone(),
+                    shutdown_rx.clone(),
+                    deps.logs.clone(),
+                    operations.clone(),
+                ),
+                deps.editor.clone(),
             ),
         )
         .with_graceful_shutdown(stopped(shutdown_rx.clone()))
@@ -247,13 +268,16 @@ pub async fn run_with(
     let http_task = tokio::spawn(
         axum::serve(
             http_listener,
-            http::router(
-                deps.state,
-                store,
-                config.listen.ip(),
-                shutdown_rx.clone(),
-                deps.logs,
-                operations.clone(),
+            http::with_editor(
+                http::router(
+                    deps.state,
+                    store,
+                    config.listen.ip(),
+                    shutdown_rx.clone(),
+                    deps.logs,
+                    operations.clone(),
+                ),
+                deps.editor,
             ),
         )
         .with_graceful_shutdown(stopped(shutdown_rx))
