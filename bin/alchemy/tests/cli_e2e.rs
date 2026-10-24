@@ -195,13 +195,17 @@ fn daemon_line(socket: &Path) -> String {
 async fn status_reports_the_daemon_and_docker() {
     let daemon = Daemon::start(ready_desktop()).await;
     let out = run(cli(&daemon.socket, false, false)).await.unwrap();
+    let lines: Vec<&str> = out.lines().collect();
     assert_eq!(
-        out,
-        format!(
-            "{}\nDocker ready: Desktop 4.34.2, Engine 27.3.1, Compose v2.29.7\n",
-            daemon_line(&daemon.socket)
-        )
+        lines[..2],
+        [
+            daemon_line(&daemon.socket).as_str(),
+            "Docker ready: Desktop 4.34.2, Engine 27.3.1, Compose v2.29.7"
+        ],
+        "{out}"
     );
+    assert!(lines[2].starts_with("Local names (mDNS): "), "{out}");
+    assert_eq!(lines.len(), 3, "{out}");
 
     daemon
         .state
@@ -247,13 +251,16 @@ async fn status_explains_networks_that_overlap_the_lan() {
         .unwrap();
 
     let out = run(cli(&daemon.socket, false, false)).await.unwrap();
-    let lines: Vec<&str> = out.lines().collect();
+    let lines: Vec<&str> = out
+        .lines()
+        .skip_while(|line| !line.starts_with("Warning: "))
+        .collect();
     assert_eq!(
-        lines[2],
+        lines[0],
         "Warning: Docker's address pool 192.168.0.0/16 overlaps your local network 192.168.0.0/16, so a new network may be given addresses that hide devices on it."
     );
     assert_eq!(
-        lines[3],
+        lines[1],
         "  Fix: In Docker Desktop, open Settings, then Docker Engine, add these settings to the JSON there, and select Apply & restart:"
     );
     assert!(out.contains("\"default-address-pools\""), "{out}");
