@@ -248,7 +248,13 @@ export interface AppService {
 }
 
 /** Mirrors `alchemy_api::apps::AppProblemKind`; unknown kinds arrive as `other`. */
-export type AppProblemKind = "compose_error" | "compose_unavailable" | "shared_project" | "other";
+export type AppProblemKind =
+  | "compose_error"
+  | "compose_unavailable"
+  | "shared_project"
+  | "network_overlap"
+  | "port_conflict"
+  | "other";
 
 /** Mirrors `alchemy_api::apps::AppProblem`. `message` is safe to show as is. */
 export interface AppProblem {
@@ -587,6 +593,77 @@ export interface ErrorResponse {
 }
 
 /** An HTTP method {@link request} sends. */
+/** Mirrors `alchemy_api::network::AddressPool`: `base` is CIDR text, `size` a prefix length. */
+export interface AddressPool {
+  base: string;
+  size: number;
+}
+
+/** Mirrors `alchemy_api::network::PoolsSource`; unknown sources arrive as `unknown`. */
+export type PoolsSource = "engine" | "daemon_json" | "defaults" | "unknown";
+
+/** Mirrors `alchemy_api::network::DockerNetwork`. Subnets are CIDR text. */
+export interface DockerNetwork {
+  name: string;
+  driver: string | null;
+  subnets: string[];
+  project: string | null;
+  /** Whether Alchemy created it. */
+  managed: boolean;
+}
+
+/** Mirrors `alchemy_api::network::AlchemyNetworkState`; unknown states arrive as `other`. */
+export type AlchemyNetworkState = "pending" | "ready" | "overlapping" | "unavailable" | "other";
+
+/** Mirrors `alchemy_api::network::AlchemyNetwork`: Alchemy's own shared network. */
+export interface AlchemyNetwork {
+  name: string;
+  state: AlchemyNetworkState;
+  subnet: string | null;
+}
+
+/** Mirrors `alchemy_api::network::NetworkWarningKind`; unknown kinds arrive as `other`. */
+export type NetworkWarningKind =
+  | "bridge_overlap"
+  | "pool_overlap"
+  | "network_overlap"
+  | "alchemy_network_overlap"
+  | "no_free_subnet"
+  | "create_failed"
+  | "host_unreadable"
+  | "engine_unreadable"
+  | "other";
+
+/**
+ * Mirrors `alchemy_api::network::NetworkWarning`. `message` and `fix` are
+ * safe to show as is; `fix` may span lines, such as a `daemon.json` fragment.
+ */
+export interface NetworkWarning {
+  kind: NetworkWarningKind;
+  message: string;
+  fix: string | null;
+  subnet: string | null;
+  host: "lan" | "route" | null;
+  host_subnet: string | null;
+  network: string | null;
+}
+
+/**
+ * Mirrors `alchemy_api::network::NetworkReport`, returned by `GET /api/network`.
+ * Subnets are CIDR text. Docker's side is empty while `engine_ready` is false.
+ */
+export interface NetworkReport {
+  engine_ready: boolean;
+  lan: string[];
+  routes: string[];
+  bridge: string | null;
+  pools: AddressPool[];
+  pools_source: PoolsSource;
+  networks: DockerNetwork[];
+  alchemy: AlchemyNetwork;
+  warnings: NetworkWarning[];
+}
+
 export type Method = "GET" | "POST" | "PUT" | "DELETE";
 
 /** `ApiError.status` when no response arrived at all. */
@@ -804,6 +881,7 @@ export const api = {
   startAction: (name: string, body: ActionRequest) =>
     request<OperationResponse>("POST", `/apps/${encodeURIComponent(name)}/actions`, { body }),
   operations: (signal?: AbortSignal) => request<OperationList>("GET", "/operations", { signal }),
+  network: (signal?: AbortSignal) => request<NetworkReport>("GET", "/network", { signal }),
   cancelOperation: (id: string) =>
     request<OperationResponse>("POST", `/operations/${encodeURIComponent(id)}/cancel`),
   followOperation,

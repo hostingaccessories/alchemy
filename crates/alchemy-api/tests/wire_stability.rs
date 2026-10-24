@@ -1194,3 +1194,123 @@ fn session_response() {
     let future: SessionResponse = serde_json::from_str(r#"{"auth":"passkey"}"#).unwrap();
     assert_eq!(future.auth, SessionAuth::Unknown);
 }
+
+#[test]
+fn network_problem_kinds() {
+    for (kind, want) in [
+        (AppProblemKind::NetworkOverlap, r#""network_overlap""#),
+        (AppProblemKind::PortConflict, r#""port_conflict""#),
+    ] {
+        assert_wire(&kind, want);
+    }
+}
+
+fn net(cidr: &str) -> alchemy_api::network::Ipv4Net {
+    cidr.parse().unwrap()
+}
+
+#[test]
+fn network_report() {
+    use alchemy_api::network::{
+        AddressPool, AlchemyNetwork, AlchemyNetworkState, DockerNetwork, HostSide, NetworkReport,
+        NetworkWarning, NetworkWarningKind, PoolsSource,
+    };
+    let report = NetworkReport {
+        engine_ready: true,
+        lan: vec![net("192.168.0.0/16")],
+        routes: vec![net("100.64.0.0/10")],
+        bridge: Some(net("172.17.0.0/16")),
+        pools: vec![AddressPool::new(net("192.168.0.0/16"), 20).unwrap()],
+        pools_source: PoolsSource::Defaults,
+        networks: vec![DockerNetwork {
+            name: "alchemy".into(),
+            driver: Some("bridge".into()),
+            subnets: vec![net("172.18.0.0/24")],
+            project: None,
+            managed: true,
+        }],
+        alchemy: AlchemyNetwork {
+            name: "alchemy".into(),
+            state: AlchemyNetworkState::Ready,
+            subnet: Some(net("172.18.0.0/24")),
+        },
+        warnings: vec![NetworkWarning {
+            kind: NetworkWarningKind::PoolOverlap,
+            message: "m".into(),
+            fix: Some("f".into()),
+            subnet: Some(net("192.168.0.0/16")),
+            host: Some(HostSide::Lan),
+            host_subnet: Some(net("192.168.0.0/16")),
+            network: None,
+        }],
+    };
+    assert_wire(
+        &report,
+        concat!(
+            r#"{"engine_ready":true,"lan":["192.168.0.0/16"],"routes":["100.64.0.0/10"],"#,
+            r#""bridge":"172.17.0.0/16","pools":[{"base":"192.168.0.0/16","size":20}],"#,
+            r#""pools_source":"defaults","networks":[{"name":"alchemy","driver":"bridge","#,
+            r#""subnets":["172.18.0.0/24"],"project":null,"managed":true}],"#,
+            r#""alchemy":{"name":"alchemy","state":"ready","subnet":"172.18.0.0/24"},"#,
+            r#""warnings":[{"kind":"pool_overlap","message":"m","fix":"f","#,
+            r#""subnet":"192.168.0.0/16","host":"lan","host_subnet":"192.168.0.0/16","#,
+            r#""network":null}]}"#,
+        ),
+    );
+    assert_wire(
+        &NetworkReport::default(),
+        concat!(
+            r#"{"engine_ready":false,"lan":[],"routes":[],"bridge":null,"pools":[],"#,
+            r#""pools_source":"unknown","networks":[],"#,
+            r#""alchemy":{"name":"alchemy","state":"pending","subnet":null},"warnings":[]}"#,
+        ),
+    );
+}
+
+#[test]
+fn network_enums() {
+    use alchemy_api::network::{AlchemyNetworkState, HostSide, NetworkWarningKind, PoolsSource};
+    for (source, want) in [
+        (PoolsSource::Engine, r#""engine""#),
+        (PoolsSource::DaemonJson, r#""daemon_json""#),
+        (PoolsSource::Defaults, r#""defaults""#),
+        (PoolsSource::Unknown, r#""unknown""#),
+    ] {
+        assert_wire(&source, want);
+    }
+    for (state, want) in [
+        (AlchemyNetworkState::Pending, r#""pending""#),
+        (AlchemyNetworkState::Ready, r#""ready""#),
+        (AlchemyNetworkState::Overlapping, r#""overlapping""#),
+        (AlchemyNetworkState::Unavailable, r#""unavailable""#),
+        (AlchemyNetworkState::Other, r#""other""#),
+    ] {
+        assert_wire(&state, want);
+    }
+    for (kind, want) in [
+        (NetworkWarningKind::BridgeOverlap, r#""bridge_overlap""#),
+        (NetworkWarningKind::PoolOverlap, r#""pool_overlap""#),
+        (NetworkWarningKind::NetworkOverlap, r#""network_overlap""#),
+        (
+            NetworkWarningKind::AlchemyNetworkOverlap,
+            r#""alchemy_network_overlap""#,
+        ),
+        (NetworkWarningKind::NoFreeSubnet, r#""no_free_subnet""#),
+        (NetworkWarningKind::CreateFailed, r#""create_failed""#),
+        (NetworkWarningKind::HostUnreadable, r#""host_unreadable""#),
+        (
+            NetworkWarningKind::EngineUnreadable,
+            r#""engine_unreadable""#,
+        ),
+        (NetworkWarningKind::Other, r#""other""#),
+    ] {
+        assert_wire(&kind, want);
+    }
+    for (host, want) in [(HostSide::Lan, r#""lan""#), (HostSide::Route, r#""route""#)] {
+        assert_wire(&host, want);
+    }
+    let future: NetworkWarningKind = serde_json::from_str(r#""ipv6_overlap""#).unwrap();
+    assert_eq!(future, NetworkWarningKind::Other);
+    let future: PoolsSource = serde_json::from_str(r#""etcd""#).unwrap();
+    assert_eq!(future, PoolsSource::Unknown);
+}

@@ -14,7 +14,8 @@
 //! `GET /api/events` streams [`ApiEvent`]s. The app routes and their
 //! types are in [`apps`], an app's log stream in [`logs`], the
 //! lifecycle operation routes in [`operations`], signing in to the TCP
-//! listener in [`session`], and the port registry in [`ports`].
+//! listener in [`session`], the port registry in [`ports`], and
+//! `GET /api/network` in [`network`].
 //!
 //! The default build is pure. Enable the `socket` feature for the daemon
 //! socket path shared by `alchemyd` and its local clients, and the
@@ -32,6 +33,7 @@ use serde::{Deserialize, Serialize, Serializer};
 
 pub mod apps;
 pub mod logs;
+pub mod network;
 pub mod operations;
 pub mod ports;
 pub mod session;

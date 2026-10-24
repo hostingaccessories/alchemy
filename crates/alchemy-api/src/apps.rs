@@ -113,6 +113,11 @@ pub enum AppProblemKind {
     /// Another app resolves to the same Compose project, so both see the
     /// same containers.
     SharedProject,
+    /// One of the app's networks overlaps the LAN or a route, so its
+    /// containers can't reach the devices or addresses behind it.
+    NetworkOverlap,
+    /// A port the app publishes is already in use or reserved.
+    PortConflict,
     /// A kind this build does not know.
     #[serde(other)]
     Other,
