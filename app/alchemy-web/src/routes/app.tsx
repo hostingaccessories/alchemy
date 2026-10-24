@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, createRoute } from "@tanstack/react-router";
 
 import { Advanced } from "../components/Advanced.tsx";
+import { AppFileEditor } from "../components/AppFileEditor.tsx";
 import { AppLogs } from "../components/AppLogs.tsx";
 import { AppActions } from "../components/AppActions.tsx";
 import { AppStatus, StopReasonStatus } from "../components/AppStatus.tsx";
@@ -107,6 +108,7 @@ function AppView({ app }: { app: App }) {
       </section>
       {app.project !== null && <AppUsage project={app.project} />}
       <AppLogs app={app} />
+      <AppFileEditor app={app} />
       <section aria-labelledby="details" className="flex flex-col gap-3">
         <h2 id="details" className="text-base font-semibold">
           Where it lives

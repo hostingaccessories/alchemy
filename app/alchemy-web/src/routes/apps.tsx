@@ -1,8 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, createRoute } from "@tanstack/react-router";
-import { Boxes, ChevronRight } from "lucide-react";
+import { Boxes, ChevronRight, Plus } from "lucide-react";
+import { useState } from "react";
+
+import { AddApp } from "../components/AddApp.tsx";
 
 import { AppStatus } from "../components/AppStatus.tsx";
+import { Button } from "../components/Button.tsx";
 import { EmptyState } from "../components/EmptyState.tsx";
 import { ErrorState } from "../components/ErrorState.tsx";
 import { Loading } from "../components/Loading.tsx";
@@ -23,10 +27,20 @@ export const appsRoute = createRoute({
 function AppsPage() {
   const daemon = useDaemonConnection();
   const apps = useQuery({ ...liveQueries.apps, enabled: daemon.kind === "online" });
+  const [adding, setAdding] = useState(false);
+  const dirs = apps.data?.dirs.filter((dir) => dir.home || dir.state === "ok") ?? [];
 
   return (
     <div className="flex max-w-3xl flex-col gap-8">
-      <PageHeader title="Apps" />
+      <PageHeader title="Apps">
+        {apps.data !== undefined && !adding && dirs.some((dir) => dir.home) && (
+          <Button variant="primary" onClick={() => setAdding(true)}>
+            <Plus className="size-4" aria-hidden />
+            Add app
+          </Button>
+        )}
+      </PageHeader>
+      {adding && <AddApp dirs={dirs} onCancel={() => setAdding(false)} />}
       {daemon.kind !== "online" && apps.data === undefined ? (
         <p className="text-muted">Your apps appear once alchemyd is reachable.</p>
       ) : apps.isError ? (
