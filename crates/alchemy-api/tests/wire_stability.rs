@@ -14,9 +14,10 @@ use alchemy_api::apps::{
     StackName, StackStatus, UnmanagedApp,
 };
 use alchemy_api::{
-    API_VERSION, ApiEvent, ContainerUsage, EngineFlavor, EngineState, EngineStatus, ErrorCode,
-    ErrorResponse, HealthResponse, HealthStatus, MachineUsage, MetricsHistory, MetricsPoint,
-    MetricsRange, MetricsResponse, ProjectUsage, VersionResponse,
+    API_VERSION, ApiEvent, ContainerStatus, ContainerUsage, EngineFlavor, EngineState,
+    EngineStatus, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, MachineUsage,
+    MetricsHistory, MetricsPoint, MetricsRange, MetricsResponse, ProjectUsage, StopReason,
+    VersionResponse,
 };
 
 fn assert_wire<T>(value: &T, json: &str)
@@ -121,6 +122,85 @@ fn engine_status() {
             r#""endpoint":null}"#,
         ),
     );
+}
+
+#[test]
+fn container_status() {
+    let mut status = ContainerStatus::new("abc", "blog-web-1", ContainerState::Exited);
+    status.image = Some("nginx:1".into());
+    status.project = Some("blog".into());
+    status.service = Some("web".into());
+    status.health = Some(Health::Unhealthy);
+    status.stop_reason = StopReason::Crashed {
+        exit_code: Some(137),
+        oom: true,
+    };
+    assert_wire(
+        &status,
+        concat!(
+            r#"{"id":"abc","name":"blog-web-1","image":"nginx:1","project":"blog","#,
+            r#""service":"web","state":"exited","health":"unhealthy","#,
+            r#""stop_reason":{"kind":"crashed","exit_code":137,"oom":true}}"#,
+        ),
+    );
+    let older: ContainerStatus =
+        serde_json::from_str(r#"{"id":"abc","name":"web","state":"running"}"#).unwrap();
+    assert_eq!(
+        older.stop_reason,
+        StopReason::Unknown,
+        "a daemon without it"
+    );
+}
+
+#[test]
+fn stop_reasons() {
+    let reasons = [
+        (StopReason::Running, r#"{"kind":"running"}"#),
+        (StopReason::Paused, r#"{"kind":"paused"}"#),
+        (StopReason::NotStarted, r#"{"kind":"not_started"}"#),
+        (
+            StopReason::StoppedByAlchemy,
+            r#"{"kind":"stopped_by_alchemy"}"#,
+        ),
+        (StopReason::StoppedOutside, r#"{"kind":"stopped_outside"}"#),
+        (
+            StopReason::Crashed {
+                exit_code: None,
+                oom: false,
+            },
+            r#"{"kind":"crashed","exit_code":null,"oom":false}"#,
+        ),
+        (
+            StopReason::CrashLooping {
+                exit_code: Some(1),
+                oom: false,
+            },
+            r#"{"kind":"crash_looping","exit_code":1,"oom":false}"#,
+        ),
+        (StopReason::Finished, r#"{"kind":"finished"}"#),
+        (StopReason::Unknown, r#"{"kind":"unknown"}"#),
+    ];
+    for (reason, want) in reasons {
+        assert_wire(&reason, want);
+    }
+    let future: StopReason = serde_json::from_str(r#"{"kind":"from_the_future"}"#).unwrap();
+    assert_eq!(future, StopReason::Unknown);
+}
+
+#[test]
+fn container_states() {
+    let states = [
+        (ContainerState::Created, r#""created""#),
+        (ContainerState::Running, r#""running""#),
+        (ContainerState::Paused, r#""paused""#),
+        (ContainerState::Restarting, r#""restarting""#),
+        (ContainerState::Removing, r#""removing""#),
+        (ContainerState::Exited, r#""exited""#),
+        (ContainerState::Dead, r#""dead""#),
+    ];
+    for (state, want) in states {
+        assert_wire(&state, want);
+    }
 }
 
 #[test]

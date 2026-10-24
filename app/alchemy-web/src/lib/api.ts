@@ -33,6 +33,47 @@ export interface EngineStatus {
   endpoint: string | null;
 }
 
+/** Mirrors `alchemy_api::ContainerState`, Docker's lifecycle state. */
+export type ContainerState =
+  | "created"
+  | "running"
+  | "paused"
+  | "restarting"
+  | "removing"
+  | "exited"
+  | "dead";
+
+/** Mirrors `alchemy_api::Health`. Containers without a healthcheck have `null`. */
+export type Health = "starting" | "healthy" | "unhealthy";
+
+/**
+ * Mirrors `alchemy_api::StopReason`: why a container is or is not running.
+ * `unknown` is also what a kind this build does not know means.
+ */
+export type StopReason =
+  | { kind: "running" }
+  | { kind: "paused" }
+  | { kind: "not_started" }
+  | { kind: "stopped_by_alchemy" }
+  | { kind: "stopped_outside" }
+  | { kind: "crashed"; exit_code: number | null; oom: boolean }
+  | { kind: "crash_looping"; exit_code: number | null; oom: boolean }
+  | { kind: "finished" }
+  | { kind: "unknown" };
+
+/** Mirrors `alchemy_api::ContainerStatus`. */
+export interface ContainerStatus {
+  id: string;
+  name: string;
+  image: string | null;
+  project: string | null;
+  service: string | null;
+  state: ContainerState;
+  health: Health | null;
+  /** Absent from a daemon older than stop reasons; treat as `unknown`. */
+  stop_reason?: StopReason;
+}
+
 /**
  * Mirrors `alchemy_api::MachineUsage`. CPU is a percentage of the whole
  * machine, rates are bytes per second, and sizes are bytes. `null` means not

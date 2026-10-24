@@ -6,6 +6,8 @@
 //!
 //! `GET /api/engine` returns an [`EngineStatus`], re-exported from
 //! `alchemy-core` so the wire type and the domain type cannot drift.
+//! [`ContainerStatus`] and its [`StopReason`] are re-exported the same way
+//! for routes that show containers.
 //! `GET /api/metrics` returns a [`MetricsResponse`] and
 //! `GET /api/metrics/history` a [`MetricsHistory`], built from the
 //! resource-usage types in `alchemy_core::metrics`.
@@ -15,7 +17,9 @@
 //! The default build is pure. Enable the `socket` feature for the daemon
 //! socket path shared by `alchemyd` and its local clients.
 
-pub use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
+pub use alchemy_core::engine::{
+    ContainerStatus, EngineFlavor, EngineState, EngineStatus, StopReason,
+};
 pub use alchemy_core::metrics::{
     ContainerUsage, MachineUsage, MetricsPoint, MetricsRange, ProjectUsage,
 };
