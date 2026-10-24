@@ -83,6 +83,9 @@ pub fn failure_message(error: &ComposeError) -> String {
         ComposeError::RelativeBinary { .. } => {
             "alchemyd couldn't find the docker command".to_owned()
         }
+        ComposeError::MissingDir { dir } => {
+            format!("the app's folder {} no longer exists", dir.display())
+        }
         ComposeError::Spawn { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
             "Docker isn't installed, or alchemyd can't find the docker command".to_owned()
         }
@@ -275,6 +278,12 @@ mod tests {
             (
                 failed(None, ""),
                 "docker compose pull was stopped by a signal",
+            ),
+            (
+                ComposeError::MissingDir {
+                    dir: "/srv/blog".into(),
+                },
+                "the app's folder /srv/blog no longer exists",
             ),
             (
                 ComposeError::Spawn {

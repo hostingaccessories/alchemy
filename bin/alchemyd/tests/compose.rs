@@ -36,6 +36,7 @@ fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
 struct Stubs {
     dir: tempfile::TempDir,
     argv_log: PathBuf,
+    cwd_log: PathBuf,
     env_log: PathBuf,
     fails_pull_log: PathBuf,
     go: PathBuf,
@@ -53,6 +54,7 @@ impl Stubs {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let argv_log = dir.path().join("argv.log");
+        let cwd_log = dir.path().join("cwd.log");
         let env_log = dir.path().join("env.log");
         let fails_pull_log = dir.path().join("fails-pull.log");
         let go = dir.path().join("go");
@@ -61,11 +63,13 @@ impl Stubs {
             "docker",
             &format!(
                 r#"{{ printf '[%s]' "$@"; echo; }} >> '{}'
+pwd -P >> '{}'
 read -r line && echo "stdin was open" >&2 && exit 9
 echo '{STARTED}' >&2
 echo "done $6"
 exit 0"#,
-                argv_log.display()
+                argv_log.display(),
+                cwd_log.display()
             ),
         );
         let env_dump = write_script(
@@ -113,9 +117,11 @@ wait",
             "trap 'echo ignoring >&2' INT\necho ready >&2\nwhile :; do sleep 1; done",
         );
         let slow = write_script(dir.path(), "slow", "exec sleep 10");
+        std::fs::create_dir_all(dir.path().join("my stacks/blog")).unwrap();
         Self {
             dir,
             argv_log,
+            cwd_log,
             env_log,
             fails_pull_log,
             go,
@@ -239,6 +245,14 @@ async fn runs_every_action_with_fixed_argv(stubs: &Stubs) {
         }
     }
     assert_eq!(std::fs::read_to_string(&stubs.argv_log).unwrap(), want_log);
+    let real_dir = project.dir().canonicalize().unwrap();
+    let cwd_log = std::fs::read_to_string(&stubs.cwd_log).unwrap();
+    let cwds: Vec<&str> = cwd_log.lines().collect();
+    assert_eq!(cwds.len(), want_log.lines().count());
+    assert!(
+        cwds.iter().all(|cwd| Path::new(cwd) == real_dir),
+        "{cwds:?}"
+    );
 }
 
 /// A step of the `docker` stub: started, one line on each stream in either
@@ -309,6 +323,17 @@ async fn reports_failures(stubs: &Stubs) {
         run_all(&missing, &stubs.plan(ComposeAction::Start)).await.1,
         Err(ComposeError::Spawn { .. })
     ));
+
+    let gone = stubs.dir.path().join("gone");
+    let plan = ComposePlan::new(
+        &ComposeProject::new(&gone).unwrap(),
+        ComposeAction::Start,
+        ImageSource::Registry,
+    );
+    match run_all(&runner(&stubs.docker), &plan).await.1 {
+        Err(ComposeError::MissingDir { dir }) => assert_eq!(dir, gone),
+        other => panic!("expected a missing directory, got {other:?}"),
+    }
 }
 
 /// The variables in `env` output, sorted, without the ones `/bin/sh` sets

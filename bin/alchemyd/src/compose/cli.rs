@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
@@ -126,7 +127,7 @@ impl CliComposeRunner {
     }
 
     fn command(&self, step: &ComposeStep) -> Command {
-        docker_command(&self.binary, step.args(), &self.env)
+        docker_command(&self.binary, step.dir(), step.args(), &self.env)
     }
 
     async fn run_step(
@@ -138,13 +139,15 @@ impl CliComposeRunner {
         cancel: &mut CancelToken,
         deadline: Instant,
     ) -> Result<(), ComposeError> {
-        let mut child = self
-            .command(step)
-            .spawn()
-            .map_err(|source| ComposeError::Spawn {
-                binary: self.binary.clone(),
-                source,
-            })?;
+        let mut child = self.command(step).spawn().map_err(|source| {
+            match spawn_failure(step.dir(), source) {
+                Ok(dir) => ComposeError::MissingDir { dir },
+                Err(source) => ComposeError::Spawn {
+                    binary: self.binary.clone(),
+                    source,
+                },
+            }
+        })?;
         let group = process_group(&child);
         let stdout = pump(child.stdout.take(), Stream::Stdout, index, events);
         let stderr = pump(child.stderr.take(), Stream::Stderr, index, events);
@@ -272,17 +275,22 @@ fn check(
     }
 }
 
-/// `binary` with `args` and exactly `env`, stdin closed, stdout and stderr
-/// piped, leading its own process group, and killed if dropped. No shell
-/// is involved.
+/// `binary` with `args` and exactly `env`, run in `dir`, stdin closed,
+/// stdout and stderr piped, leading its own process group, and killed if
+/// dropped. No shell is involved. Compose resolves relative `COMPOSE_FILE`
+/// entries against its working directory, not `--project-directory`, so
+/// `dir` must be the project's directory for a hand-run `docker compose`
+/// in that folder to see the same files.
 pub(super) fn docker_command(
     binary: &Path,
+    dir: &Path,
     args: &[OsString],
     env: &BTreeMap<OsString, OsString>,
 ) -> Command {
     let mut command = Command::new(binary);
     command
         .args(args)
+        .current_dir(dir)
         .env_clear()
         .envs(env)
         .stdin(Stdio::null())
@@ -291,6 +299,18 @@ pub(super) fn docker_command(
         .process_group(0)
         .kill_on_drop(true);
     command
+}
+
+/// Tells a [`docker_command`] that failed to start because `dir` is gone
+/// (`Ok` with the directory) from any other failure (`Err`, unchanged). A
+/// missing working directory and a missing binary both surface as
+/// `NotFound`, and only the first is the app's fault.
+pub(super) fn spawn_failure(dir: &Path, source: io::Error) -> Result<PathBuf, io::Error> {
+    if source.kind() == io::ErrorKind::NotFound && !dir.is_dir() {
+        Ok(dir.to_path_buf())
+    } else {
+        Err(source)
+    }
 }
 
 /// The process group a spawned [`docker_command`] leads.

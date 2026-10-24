@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde::de::IgnoredAny;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
-use super::cli::{docker_command, process_group, signal};
+use super::cli::{docker_command, process_group, signal, spawn_failure};
 use super::runner::tail;
 use super::{ComposeProject, ImageSource, child_env};
 use crate::engine::{
@@ -122,6 +122,12 @@ pub enum ConfigError {
     /// No `docker` binary was found.
     #[error("the docker command wasn't found")]
     NoDocker,
+    /// The project's directory is gone, so Compose could not run in it.
+    #[error("the project directory {} doesn't exist", dir.display())]
+    MissingDir {
+        /// The directory Compose should have run in.
+        dir: PathBuf,
+    },
     /// The binary could not be started.
     #[error("failed to run {}", binary.display())]
     Spawn {
@@ -243,21 +249,25 @@ impl CliComposeConfig {
         self
     }
 
-    /// Run `docker` with `args`, which end in `config --format json`, and
-    /// parse what it prints.
+    /// Run `docker` in `dir` with `args`, which end in
+    /// `config --format json`, and parse what it prints.
     pub(super) async fn run(
         &self,
+        dir: &Path,
         args: &[OsString],
         endpoint: &Endpoint,
     ) -> Result<ComposeConfig, ConfigError> {
         let binary =
             find_docker_binary(&SystemProbe, &self.binaries).ok_or(ConfigError::NoDocker)?;
         let env = child_env(self.parent_env.iter().cloned(), endpoint.docker_host());
-        let mut child = docker_command(&binary, args, &env)
+        let mut child = docker_command(&binary, dir, args, &env)
             .spawn()
-            .map_err(|source| ConfigError::Spawn {
-                binary: binary.clone(),
-                source,
+            .map_err(|source| match spawn_failure(dir, source) {
+                Ok(dir) => ConfigError::MissingDir { dir },
+                Err(source) => ConfigError::Spawn {
+                    binary: binary.clone(),
+                    source,
+                },
             })?;
         let group = process_group(&child);
         let stdout = read_capped(child.stdout.take(), MAX_CONFIG + 1);
@@ -293,7 +303,10 @@ impl ComposeConfigReader for CliComposeConfig {
         project: &'a ComposeProject,
         endpoint: &'a Endpoint,
     ) -> BoxFuture<'a, Result<ComposeConfig, ConfigError>> {
-        Box::pin(async move { self.run(&config_args(project), endpoint).await })
+        Box::pin(async move {
+            self.run(project.dir(), &config_args(project), endpoint)
+                .await
+        })
     }
 }
 
