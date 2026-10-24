@@ -1,4 +1,5 @@
-import { apiBase } from "./platform.ts";
+import { apiBase, authHeaders, forgetDaemonToken, isTauri } from "./platform.ts";
+import { CLOSED, type EventStream, openEventStream } from "./stream.ts";
 
 /** Mirrors `alchemy_api::HealthResponse`. */
 export interface HealthResponse {
@@ -533,12 +534,24 @@ export const NO_RESPONSE = 0;
  */
 export class ApiError extends Error {
   readonly status: number;
+  /** The daemon's {@link ErrorCode}, or `null` when it sent none. */
+  readonly code: ErrorCode | null;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code: ErrorCode | null = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
   }
+}
+
+/**
+ * Whether `error` is alchemyd refusing a request that isn't signed in: a
+ * browser that hasn't been through `alchemy open`, or a shell without the
+ * daemon's current token.
+ */
+export function isSignedOut(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 401 && error.code === "unauthorized";
 }
 
 /** Options for {@link request}. */
@@ -552,25 +565,27 @@ function isAbort(err: unknown): boolean {
   return err instanceof DOMException && err.name === "AbortError";
 }
 
-/** The daemon's {@link ErrorResponse} text, or a generic line for any other body. */
-async function errorMessage(res: Response): Promise<string> {
+/** The error in `res`: the daemon's {@link ErrorResponse}, or a generic line for any other body. */
+async function responseError(res: Response): Promise<ApiError> {
   let body: unknown;
   try {
     body = await res.json();
   } catch {
     body = null;
   }
-  const error = (body as Partial<ErrorResponse> | null)?.error;
-  return typeof error === "string" && error !== ""
-    ? error
-    : `alchemyd answered with HTTP ${res.status}`;
+  const { error, code } = (body ?? {}) as Partial<ErrorResponse>;
+  const message =
+    typeof error === "string" && error !== "" ? error : `alchemyd answered with HTTP ${res.status}`;
+  return new ApiError(res.status, message, typeof code === "string" ? code : null);
 }
 
 /**
  * Send one request to `/api{path}` and return the JSON response, or
  * `undefined` for `204 No Content`. `body`, when given, is sent as JSON.
  * Every method but `GET` declares `content-type: application/json`, body or
- * not, because alchemyd refuses a mutating request without it (415).
+ * not, because alchemyd refuses a mutating request without it (415). In the
+ * desktop shell it also sends the daemon's token, and after a 401 reads the
+ * token again and retries once, since alchemyd makes a new one each start.
  * Rejects with an {@link ApiError} for every failure except an abort, which
  * rejects with the `AbortError` unchanged.
  */
@@ -579,24 +594,32 @@ export async function request<T>(
   path: string,
   { body, signal }: RequestOptions = {},
 ): Promise<T> {
-  const init: RequestInit = { method, signal };
-  if (method !== "GET") {
-    init.headers = { "content-type": "application/json" };
-  }
-  if (body !== undefined) {
-    init.body = JSON.stringify(body);
-  }
+  const send = async (): Promise<Response> => {
+    const headers: Record<string, string> = await authHeaders();
+    if (method !== "GET") {
+      headers["content-type"] = "application/json";
+    }
+    const init: RequestInit = { method, signal, headers };
+    if (body !== undefined) {
+      init.body = JSON.stringify(body);
+    }
+    return fetch(`${apiBase()}/api${path}`, init);
+  };
 
   let res: Response;
   try {
-    res = await fetch(`${apiBase()}/api${path}`, init);
+    res = await send();
+    if (res.status === 401 && isTauri()) {
+      forgetDaemonToken();
+      res = await send();
+    }
   } catch (err) {
     if (isAbort(err)) throw err;
     throw new ApiError(NO_RESPONSE, "alchemyd is not reachable");
   }
 
   if (!res.ok) {
-    throw new ApiError(res.status, await errorMessage(res));
+    throw await responseError(res);
   }
   if (res.status === 204) {
     return undefined as T;
@@ -616,9 +639,6 @@ export async function request<T>(
  */
 export const RESUBSCRIBE_DELAY_MS = 2000;
 
-/** `EventSource.CLOSED`: the browser will not reconnect on its own. */
-const EVENT_SOURCE_CLOSED = 2;
-
 /**
  * Open `GET /api/events` and call `onEvent` for every event. The first
  * `engine` event carries the current status, so no separate fetch is needed.
@@ -633,17 +653,17 @@ export function subscribe(
 ): () => void {
   let closed = false;
   let retry: ReturnType<typeof setTimeout> | undefined;
-  let source: EventSource;
+  let source: EventStream;
 
   const open = () => {
     retry = undefined;
-    const current = new EventSource(`${apiBase()}/api/events`);
+    const current = openEventStream(`${apiBase()}/api/events`);
     source = current;
     for (const name of API_EVENT_NAMES) {
-      current.addEventListener(name, (message: MessageEvent<string>) => {
+      current.addEventListener(name, (message) => {
         let data: unknown;
         try {
-          data = JSON.parse(message.data);
+          data = JSON.parse((message as MessageEvent<string>).data);
         } catch {
           return;
         }
@@ -653,7 +673,7 @@ export function subscribe(
     current.addEventListener("open", () => options.onOpen?.());
     current.addEventListener("error", () => {
       options.onError?.();
-      if (!closed && retry === undefined && current.readyState === EVENT_SOURCE_CLOSED) {
+      if (!closed && retry === undefined && current.readyState === CLOSED) {
         retry = setTimeout(open, RESUBSCRIBE_DELAY_MS);
       }
     });
@@ -675,12 +695,12 @@ export function subscribe(
  * Returns a function that closes the stream.
  */
 export function followOperation(id: string, onEvent: (event: OperationEvent) => void): () => void {
-  const source = new EventSource(`${apiBase()}/api/operations/${encodeURIComponent(id)}/events`);
+  const source = openEventStream(`${apiBase()}/api/operations/${encodeURIComponent(id)}/events`);
   for (const name of OPERATION_EVENT_NAMES) {
-    source.addEventListener(name, (message: MessageEvent<string>) => {
+    source.addEventListener(name, (message) => {
       let data: unknown;
       try {
-        data = JSON.parse(message.data);
+        data = JSON.parse((message as MessageEvent<string>).data);
       } catch {
         return;
       }
@@ -696,6 +716,7 @@ export function followOperation(id: string, onEvent: (event: OperationEvent) => 
 export const api = {
   health: (signal?: AbortSignal) => request<HealthResponse>("GET", "/health", { signal }),
   version: (signal?: AbortSignal) => request<VersionResponse>("GET", "/version", { signal }),
+  session: (signal?: AbortSignal) => request<SessionResponse>("GET", "/session", { signal }),
   engine: (signal?: AbortSignal) => request<EngineStatus>("GET", "/engine", { signal }),
   metrics: (signal?: AbortSignal, filter?: MetricsFilter) => {
     const query = new URLSearchParams(filter).toString();

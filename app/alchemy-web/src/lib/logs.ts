@@ -1,5 +1,6 @@
 import type { LogEvent } from "./api.ts";
 import { apiBase } from "./platform.ts";
+import { CLOSED, openEventStream } from "./stream.ts";
 
 /** What to read of an app's logs. */
 export interface LogsQuery {
@@ -36,9 +37,6 @@ export function logsPath(app: string, query: LogsQuery): string {
 
 const EVENT_NAMES: readonly LogEvent["event"][] = ["log", "following", "done"];
 
-/** `EventSource.CLOSED`. */
-const CLOSED = 2;
-
 /**
  * Open `GET /api/apps/{app}/logs` and pass each event to `handlers`. The
  * stream is closed after `done`, so the browser doesn't reconnect to a
@@ -47,12 +45,12 @@ const CLOSED = 2;
  * Returns a function that closes the stream.
  */
 export function openLogs(app: string, query: LogsQuery, handlers: LogsHandlers): () => void {
-  const source = new EventSource(`${apiBase()}/api${logsPath(app, query)}`);
+  const source = openEventStream(`${apiBase()}/api${logsPath(app, query)}`);
   for (const name of EVENT_NAMES) {
-    source.addEventListener(name, (message: MessageEvent<string>) => {
+    source.addEventListener(name, (message) => {
       let data: unknown;
       try {
-        data = JSON.parse(message.data);
+        data = JSON.parse((message as MessageEvent<string>).data);
       } catch {
         return;
       }

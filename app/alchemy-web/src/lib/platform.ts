@@ -15,6 +15,46 @@ export function apiBase(): string {
   return isTauri() && !import.meta.env.DEV ? DEFAULT_DAEMON_URL : "";
 }
 
+let token: Promise<string | null> | null = null;
+
+/**
+ * alchemyd's TCP token, which the desktop shell reads from the file alchemyd
+ * writes at each start (the `daemon_token` command). The shell's UI is served
+ * from its own origin, so the browser's sign-in cookie never reaches it and
+ * every request carries the token instead. `null` in a browser, or when the
+ * shell can't read it. Kept until {@link forgetDaemonToken}; a failed read is
+ * not kept, so the next call tries again.
+ */
+export function daemonToken(): Promise<string | null> {
+  if (!isTauri()) {
+    return Promise.resolve(null);
+  }
+  if (token === null) {
+    const read = import("@tauri-apps/api/core")
+      .then(({ invoke }) => invoke<string>("daemon_token"))
+      .catch(() => {
+        if (token === read) token = null;
+        return null;
+      });
+    token = read;
+  }
+  return token;
+}
+
+/** Drop the kept token, after a 401 says alchemyd has restarted with a new one. */
+export function forgetDaemonToken(): void {
+  token = null;
+}
+
+/**
+ * Headers that sign a request to alchemyd's API in: `Authorization: Bearer`
+ * in the desktop shell, nothing in a browser, which sends its cookie.
+ */
+export async function authHeaders(): Promise<Record<string, string>> {
+  const value = await daemonToken();
+  return value === null ? {} : { authorization: `Bearer ${value}` };
+}
+
 /**
  * `url` parsed, if Alchemy may open it outside the app; otherwise `null`.
  * Only `https:` passes, matching the desktop shell's opener scope.

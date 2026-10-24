@@ -30,6 +30,26 @@ describe("summarizeError", () => {
       },
     ],
     [
+      "a browser that isn't signed in",
+      new ApiError(401, "not signed in", "unauthorized"),
+      "Couldn't load your apps",
+      {
+        title: "You're signed out of alchemyd",
+        message: "Run `alchemy open` in a terminal on this machine to sign in, then try again.",
+        detail: "HTTP 401: not signed in",
+      },
+    ],
+    [
+      "a 401 without the unauthorized code",
+      new ApiError(401, "who are you"),
+      "Couldn't load your apps",
+      {
+        title: "Couldn't load your apps",
+        message: "who are you",
+        detail: "HTTP 401: who are you",
+      },
+    ],
+    [
       "a daemon error without a title",
       new ApiError(404, "no app named nextcloud"),
       undefined,
@@ -63,6 +83,20 @@ describe("summarizeError", () => {
 
   it.each(cases)("summarizes %s", (_name, error, title, expected) => {
     expect(summarizeError(error, title)).toEqual(expected);
+  });
+
+  it("says the desktop shell couldn't sign in, since it has nothing to run", () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    try {
+      expect(summarizeError(new ApiError(401, "not signed in", "unauthorized"))).toEqual({
+        title: "You're signed out of alchemyd",
+        message:
+          "Alchemy couldn't sign in to alchemyd. Check that alchemyd is running as you, then try again.",
+        detail: "HTTP 401: not signed in",
+      });
+    } finally {
+      delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    }
   });
 });
 

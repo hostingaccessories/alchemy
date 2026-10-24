@@ -18,6 +18,12 @@ export default defineConfig({
        * and alchemyd treats mutating requests as same-origin.
        */
       "/api": { target: daemon, changeOrigin: false },
+      /**
+       * Sign-in links from `alchemy open --url-base http://localhost:5173`.
+       * The session cookie alchemyd sets is then this origin's, and the
+       * browser sends it with every `/api` request the proxy passes on.
+       */
+      "/login": { target: daemon, changeOrigin: false },
     },
   },
   test: {

@@ -20,6 +20,18 @@ export const versionQuery = queryOptions({
 });
 
 /**
+ * `GET /api/session`: whether this page is signed in to alchemyd. It fails
+ * with a 401 `unauthorized` (`isSignedOut`) until the browser has been
+ * through `alchemy open`, or while the shell lacks the daemon's token. Rerun
+ * with the version probe whenever the event stream drops.
+ */
+export const sessionQuery = queryOptions({
+  queryKey: ["session"],
+  queryFn: ({ signal }) => api.session(signal),
+  retry: false,
+});
+
+/**
  * `GET /api/settings/apps`: the app folders in effect. Saving them replaces
  * this query's data with the daemon's answer.
  */

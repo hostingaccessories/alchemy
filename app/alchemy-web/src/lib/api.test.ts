@@ -10,9 +10,17 @@ import {
   type OperationEvent,
   api,
   followOperation,
+  isSignedOut,
   request,
   subscribe,
 } from "./api.ts";
+import { forgetDaemonToken } from "./platform.ts";
+
+const tauri = vi.hoisted(() => ({
+  invoke: vi.fn(async (_command: string): Promise<string> => ""),
+}));
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: tauri.invoke }));
 
 const ready: EngineStatus = {
   state: "ready",
@@ -49,7 +57,11 @@ describe("request", () => {
     const fetch = vi.fn(async () => new Response(JSON.stringify(ready)));
     vi.stubGlobal("fetch", fetch);
     await expect(api.engine()).resolves.toEqual(ready);
-    expect(fetch).toHaveBeenCalledWith("/api/engine", { method: "GET", signal: undefined });
+    expect(fetch).toHaveBeenCalledWith("/api/engine", {
+      method: "GET",
+      signal: undefined,
+      headers: {},
+    });
   });
 
   it("narrows metrics to an app by folder name or to a project", async () => {
@@ -148,6 +160,99 @@ describe("request", () => {
       throw abort;
     });
     expect(await rejection(request("GET", "/engine"))).toBe(abort);
+  });
+
+  it("keeps the daemon's error code and tells a sign-in refusal apart", async () => {
+    const answer = (status: number, body: unknown) => async () =>
+      new Response(JSON.stringify(body), { status });
+    vi.stubGlobal(
+      "fetch",
+      answer(401, { error: "not signed in: run `alchemy open`", code: "unauthorized" }),
+    );
+    const signedOut = await rejection(request("GET", "/apps"));
+    expect(signedOut).toMatchObject({ status: 401, code: "unauthorized" });
+    expect(isSignedOut(signedOut)).toBe(true);
+
+    vi.stubGlobal("fetch", answer(403, { error: "cross-site request refused", code: "forbidden" }));
+    const forbidden = await rejection(request("GET", "/apps"));
+    expect(forbidden).toMatchObject({ status: 403, code: "forbidden" });
+    expect(isSignedOut(forbidden)).toBe(false);
+
+    vi.stubGlobal("fetch", answer(401, { error: "who are you" }));
+    const noCode = await rejection(request("GET", "/apps"));
+    expect(noCode).toMatchObject({ status: 401, code: null });
+    expect(isSignedOut(noCode)).toBe(false);
+    expect(isSignedOut(new Error("x"))).toBe(false);
+  });
+
+  it("sends no credential from a browser, which has its cookie", async () => {
+    const fetch = vi.fn(async (_url: string, _init: RequestInit) => new Response("{}"));
+    vi.stubGlobal("fetch", fetch);
+    await request("POST", "/apps", { body: {} });
+    expect(fetch.mock.calls[0]?.[1].headers).toEqual({ "content-type": "application/json" });
+    expect(tauri.invoke).not.toHaveBeenCalled();
+  });
+});
+
+describe("request in the desktop shell", () => {
+  beforeEach(() => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    forgetDaemonToken();
+  });
+
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    forgetDaemonToken();
+    tauri.invoke.mockReset();
+  });
+
+  it("sends the daemon's token as a bearer token, read once", async () => {
+    tauri.invoke.mockResolvedValue("a".repeat(64));
+    const fetch = vi.fn(async (_url: string, _init: RequestInit) => new Response("{}"));
+    vi.stubGlobal("fetch", fetch);
+    await request("GET", "/apps");
+    await request("PUT", "/settings/apps", { body: {} });
+    expect(fetch.mock.calls.map(([, init]) => init.headers)).toEqual([
+      { authorization: `Bearer ${"a".repeat(64)}` },
+      { authorization: `Bearer ${"a".repeat(64)}`, "content-type": "application/json" },
+    ]);
+    expect(tauri.invoke).toHaveBeenCalledTimes(1);
+    expect(tauri.invoke).toHaveBeenCalledWith("daemon_token");
+  });
+
+  it("reads the token again after a 401 and retries once", async () => {
+    tauri.invoke.mockResolvedValueOnce("old").mockResolvedValue("new");
+    const unauthorized = () =>
+      new Response(JSON.stringify({ error: "not signed in", code: "unauthorized" }), {
+        status: 401,
+      });
+    const fetch = vi.fn(async (_url: string, init: RequestInit) =>
+      (init.headers as Record<string, string>).authorization === "Bearer new"
+        ? new Response(JSON.stringify(ready))
+        : unauthorized(),
+    );
+    vi.stubGlobal("fetch", fetch);
+    await expect(api.engine()).resolves.toEqual(ready);
+    expect(fetch).toHaveBeenCalledTimes(2);
+
+    tauri.invoke.mockReset();
+    tauri.invoke.mockResolvedValue("still wrong");
+    forgetDaemonToken();
+    const err = await rejection(api.engine());
+    expect(isSignedOut(err)).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it("sends no credential when the token can't be read, and tries again next time", async () => {
+    tauri.invoke.mockRejectedValueOnce("no token file").mockResolvedValue("b".repeat(64));
+    const fetch = vi.fn(async (_url: string, _init: RequestInit) => new Response("{}"));
+    vi.stubGlobal("fetch", fetch);
+    await request("GET", "/apps");
+    await request("GET", "/apps");
+    expect(fetch.mock.calls.map(([, init]) => init.headers)).toEqual([
+      {},
+      { authorization: `Bearer ${"b".repeat(64)}` },
+    ]);
   });
 });
 
