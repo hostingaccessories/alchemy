@@ -5,7 +5,8 @@
 //! which streams an app's [`LogEvent`]s. The app routes are described in
 //! [`alchemy_api::apps`], and the lifecycle operation routes, whose
 //! `/api/operations/{id}/events` streams too, in
-//! [`alchemy_api::operations`]. On the TCP listener ([`router`])
+//! [`alchemy_api::operations`]. `/api/network` returns the latest
+//! [`NetworkReport`]. On the TCP listener ([`router`])
 //! everything else is served from the embedded web UI build with an
 //! `index.html` fallback for client-side routing; on the Unix socket
 //! ([`api_router`]) everything else is a JSON 404.
@@ -32,6 +33,7 @@ use std::time::Duration;
 
 use alchemy_api::apps::{App, AppList, AppSettings, AppSettingsUpdate};
 use alchemy_api::logs::LogEvent;
+use alchemy_api::network::NetworkReport;
 use alchemy_api::operations::{
     Action, ActionRequest, OperationEvent, OperationList, OperationResponse,
 };
@@ -283,6 +285,7 @@ fn api(
         )
         .route("/settings/apps", get(app_settings).put(set_app_settings))
         .route("/ports", get(ports::list))
+        .route("/network", get(network))
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found)
         .with_state(Api {
@@ -474,6 +477,10 @@ async fn version() -> Json<VersionResponse> {
 
 async fn engine(extract::State(state): extract::State<State>) -> Json<EngineStatus> {
     Json(state.engine())
+}
+
+async fn network(extract::State(state): extract::State<State>) -> Json<NetworkReport> {
+    Json(state.network())
 }
 
 /// `?app=NAME` or `?project=NAME` on the metrics routes.
@@ -1160,6 +1167,27 @@ mod tests {
         let (status, body) = get_json_from(state, "/api/engine").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::to_value(&ready).unwrap());
+    }
+
+    #[tokio::test]
+    async fn network_reports_the_latest_check() {
+        let (status, body) = get_json("/api/network").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::to_value(alchemy_api::network::NetworkReport::default()).unwrap()
+        );
+
+        let state = State::new();
+        let report = alchemy_api::network::NetworkReport {
+            engine_ready: true,
+            lan: vec!["10.0.1.0/24".parse().unwrap()],
+            ..alchemy_api::network::NetworkReport::default()
+        };
+        state.set_network(report.clone());
+        let (status, body) = get_json_from(state, "/api/network").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::to_value(&report).unwrap());
     }
 
     #[tokio::test]
@@ -2043,6 +2071,8 @@ mod tests {
                 StatusCode::UNAUTHORIZED,
             ),
             (Method::GET, "/api/events", None, StatusCode::UNAUTHORIZED),
+            (Method::GET, "/api/network", None, StatusCode::UNAUTHORIZED),
+            (Method::GET, "/api/network", token.clone(), StatusCode::OK),
             (Method::GET, "/api/session", None, StatusCode::UNAUTHORIZED),
             (Method::POST, "/api/health", None, StatusCode::UNAUTHORIZED),
             (Method::GET, "/api/nope", None, StatusCode::UNAUTHORIZED),

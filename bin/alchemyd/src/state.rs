@@ -8,6 +8,7 @@ use std::sync::Arc;
 use alchemy_api::MetricsResponse;
 use alchemy_api::OperationList;
 use alchemy_api::apps::{AppList, AppSettings};
+use alchemy_api::network::NetworkReport;
 use alchemy_core::engine::{Containers, EngineState, EngineStatus};
 use tokio::sync::watch;
 
@@ -37,6 +38,7 @@ struct Inner {
     app_rescans: watch::Sender<u64>,
     app_scans: watch::Sender<u64>,
     operations: watch::Sender<OperationList>,
+    network: watch::Sender<NetworkReport>,
     log_streams: LogStreams,
 }
 
@@ -63,6 +65,7 @@ impl State {
                 app_rescans: watch::Sender::new(0),
                 app_scans: watch::Sender::new(0),
                 operations: watch::Sender::new(OperationList::default()),
+                network: watch::Sender::new(NetworkReport::default()),
                 log_streams: LogStreams::default(),
             }),
         }
@@ -243,6 +246,24 @@ impl State {
     /// changed; subscribers are only notified if they did.
     pub fn set_operations(&self, operations: OperationList) -> bool {
         send_if_changed(&self.inner.operations, operations)
+    }
+
+    /// The latest check of Docker's networks against the host's.
+    pub fn network(&self) -> NetworkReport {
+        self.inner.network.borrow().clone()
+    }
+
+    /// Subscribe to changes to [`Self::network`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_network(&self) -> watch::Receiver<NetworkReport> {
+        self.inner.network.subscribe()
+    }
+
+    /// Replace the network check. Returns whether it changed; subscribers
+    /// are only notified if it did.
+    pub fn set_network(&self, network: NetworkReport) -> bool {
+        send_if_changed(&self.inner.network, network)
     }
 
     /// The log streams open on either listener, held to

@@ -10,8 +10,10 @@ use alchemy_api::apps::{
     App, AppContainer, AppDir, AppDirState, AppList, AppProblem, AppProblemKind, AppService,
     SkipReason as WireSkip, SkippedApp, UnmanagedApp,
 };
+use alchemy_api::network::NetworkReport;
 use alchemy_core::StackNameError;
 use alchemy_core::engine::{ContainerStatus, Containers, Intent, StopReason, summarize};
+use alchemy_core::network::{Ipv4Net, NetworkSubnet, NetworkSurvey, Subject, pick_subnet};
 use alchemy_core::stack::{
     DirReport, DirState, Discovery, FoundStack, ServiceRun, SkipReason, Skipped, StackStatus,
     stack_status,
@@ -76,6 +78,9 @@ pub struct Inputs<'a> {
     pub containers: &'a Containers,
     /// Whether the engine is ready, so the containers are current.
     pub engine_ready: bool,
+    /// The latest check of Docker's networks against the host's, to flag
+    /// app networks that overlap the LAN or a route.
+    pub network: &'a NetworkReport,
 }
 
 /// The app list for `inputs`.
@@ -149,6 +154,8 @@ fn app(
             );
             app.project = Some(config.name.clone());
             app.images = Some(config.images());
+            app.problems
+                .extend(network_overlaps(config, inputs.network));
         }
         Some(ConfigOutcome::Failed { kind, message }) => app.problems.push(AppProblem {
             kind: *kind,
@@ -229,6 +236,79 @@ fn reason(
         .take(counted)
         .flat_map(|service| service.containers.iter().map(|c| c.stop_reason));
     summarize(reasons, intent)
+}
+
+/// A problem for each overlap between one of `config`'s networks, by the
+/// subnets its compose file sets or Docker gave it, and the LAN or a route
+/// in `network`.
+fn network_overlaps(config: &ComposeConfig, network: &NetworkReport) -> Vec<AppProblem> {
+    let subnets: Vec<NetworkSubnet> = config
+        .networks
+        .iter()
+        .flat_map(|declared| {
+            let live = network
+                .networks
+                .iter()
+                .filter(|n| n.name == declared.name)
+                .flat_map(|n| n.subnets.iter().copied());
+            let subnets: BTreeSet<Ipv4Net> = declared.subnets.iter().copied().chain(live).collect();
+            subnets.into_iter().map(|subnet| NetworkSubnet {
+                name: declared.name.clone(),
+                subnet,
+            })
+        })
+        .collect();
+    if subnets.is_empty() {
+        return Vec::new();
+    }
+    let survey = NetworkSurvey {
+        lan: network.lan.clone(),
+        routes: network.routes.clone(),
+        networks: subnets,
+        ..NetworkSurvey::default()
+    };
+    survey
+        .collisions()
+        .into_iter()
+        .map(|collision| {
+            let declared = config.networks.iter().any(|n| {
+                matches!(&collision.subject, Subject::Network { name } if *name == n.name)
+                    && n.subnets.contains(&collision.subnet)
+            });
+            let fix = if declared {
+                match pick_subnet(&taken(network)) {
+                    Some(free) => format!(
+                        "Change its subnet in the compose file to one that doesn't overlap, such as {free}."
+                    ),
+                    None => "Change its subnet in the compose file to one that doesn't overlap."
+                        .to_owned(),
+                }
+            } else {
+                "Take the app down and start it again so Docker gives the network a new subnet. If Docker's address pools overlap your network too, fix them first: see Machines or `alchemy status`.".to_owned()
+            };
+            AppProblem {
+                kind: AppProblemKind::NetworkOverlap,
+                message: format!("{collision} {fix}"),
+            }
+        })
+        .collect()
+}
+
+/// Every subnet in use: the LAN, routes, the bridge, and Docker's networks.
+fn taken(network: &NetworkReport) -> Vec<Ipv4Net> {
+    network
+        .lan
+        .iter()
+        .chain(&network.routes)
+        .chain(&network.bridge)
+        .copied()
+        .chain(
+            network
+                .networks
+                .iter()
+                .flat_map(|n| n.subnets.iter().copied()),
+        )
+        .collect()
 }
 
 fn mark_shared_projects(apps: &mut [App]) {
@@ -449,6 +529,7 @@ mod tests {
             configs,
             containers,
             engine_ready,
+            network: &NetworkReport::default(),
         })
     }
 
@@ -814,6 +895,114 @@ mod tests {
                 vec![],
             ]
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn app_networks_overlapping_the_lan_are_flagged() {
+        use alchemy_api::network::DockerNetwork;
+
+        use crate::compose::NetworkConfig;
+
+        let n = |s: &str| -> Ipv4Net { s.parse().unwrap() };
+        let found = discovery(&[("/srv/apps", &["blog"])]);
+        let with_networks = |networks: Vec<NetworkConfig>| -> BTreeMap<PathBuf, ConfigOutcome> {
+            let ConfigOutcome::Ready(mut config) = config("blog", &[("web", false)]) else {
+                unreachable!()
+            };
+            config.networks = networks;
+            [(
+                PathBuf::from("/srv/apps/blog"),
+                ConfigOutcome::Ready(config),
+            )]
+            .into()
+        };
+        let default_net = |subnets: &[&str]| NetworkConfig {
+            key: "default".into(),
+            name: "blog_default".into(),
+            external: false,
+            subnets: subnets.iter().map(|s| n(s)).collect(),
+        };
+        let report = |lan: &str, routes: &[&str], live: &[(&str, &str)]| NetworkReport {
+            engine_ready: true,
+            lan: vec![n(lan)],
+            routes: routes.iter().map(|r| n(r)).collect(),
+            bridge: Some(n("172.17.0.0/16")),
+            networks: live
+                .iter()
+                .map(|(name, subnet)| DockerNetwork {
+                    name: (*name).into(),
+                    driver: Some("bridge".into()),
+                    subnets: vec![n(subnet)],
+                    project: Some("blog".into()),
+                    managed: false,
+                })
+                .collect(),
+            ..NetworkReport::default()
+        };
+        let cases: [(&str, Vec<NetworkConfig>, NetworkReport, Vec<&str>); 5] = [
+            (
+                "Docker gave it a clear subnet",
+                vec![default_net(&[])],
+                report("10.0.1.0/24", &[], &[("blog_default", "172.18.0.0/16")]),
+                vec![],
+            ),
+            (
+                "Docker gave it a subnet on the LAN",
+                vec![default_net(&[])],
+                report("192.168.0.0/16", &[], &[("blog_default", "192.168.0.0/20")]),
+                vec![
+                    "Docker network blog_default (192.168.0.0/20) overlaps your local network 192.168.0.0/16, so its containers can't reach devices on it. Take the app down and start it again so Docker gives the network a new subnet. If Docker's address pools overlap your network too, fix them first: see Machines or `alchemy status`.",
+                ],
+            ),
+            (
+                "the compose file sets a subnet on the LAN",
+                vec![default_net(&["10.0.1.0/24"])],
+                report("10.0.1.0/24", &[], &[]),
+                vec![
+                    "Docker network blog_default (10.0.1.0/24) overlaps your local network 10.0.1.0/24, so its containers can't reach devices on it. Change its subnet in the compose file to one that doesn't overlap, such as 172.18.0.0/24.",
+                ],
+            ),
+            (
+                "the compose file sets a subnet behind a VPN route",
+                vec![default_net(&["10.8.0.0/24"])],
+                report(
+                    "192.168.1.0/24",
+                    &["10.8.0.0/16"],
+                    &[("blog_default", "10.8.0.0/24")],
+                ),
+                vec![
+                    "Docker network blog_default (10.8.0.0/24) overlaps the route to 10.8.0.0/16, so its containers can't reach addresses behind it. Change its subnet in the compose file to one that doesn't overlap, such as 172.18.0.0/24.",
+                ],
+            ),
+            (
+                "another app's network on the LAN is not this app's problem",
+                vec![default_net(&[])],
+                report("192.168.0.0/16", &[], &[("wiki_default", "192.168.0.0/20")]),
+                vec![],
+            ),
+        ];
+        for (name, networks, network, want) in cases {
+            let configs = with_networks(networks);
+            let got = app_list(&Inputs {
+                discovery: &found,
+                home: Some(Path::new("/srv/apps")),
+                configs: &configs,
+                containers: &Containers::new(),
+                engine_ready: true,
+                network: &network,
+            });
+            let problems: Vec<(AppProblemKind, &str)> = got.apps[0]
+                .problems
+                .iter()
+                .map(|p| (p.kind, p.message.as_str()))
+                .collect();
+            let want: Vec<(AppProblemKind, &str)> = want
+                .into_iter()
+                .map(|m| (AppProblemKind::NetworkOverlap, m))
+                .collect();
+            assert_eq!(problems, want, "{name}");
+        }
     }
 
     #[test]
