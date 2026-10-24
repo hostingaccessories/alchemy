@@ -84,11 +84,16 @@ fn generated_man_pages_render() {
     assert_eq!(
         names,
         [
+            "alchemy-app-list.1",
+            "alchemy-app-show.1",
             "alchemy-app-stats.1",
             "alchemy-app.1",
             "alchemy-completions.1",
             "alchemy-machine-stats.1",
             "alchemy-machine.1",
+            "alchemy-settings-set.1",
+            "alchemy-settings-show.1",
+            "alchemy-settings.1",
             "alchemy-status.1",
             "alchemy-version.1",
             "alchemy.1"
@@ -111,6 +116,8 @@ fn generated_man_pages_render() {
     assert!(top.contains("alchemy-status(1)"), "{top}");
     assert!(top.contains("alchemy-completions(1)"), "{top}");
     assert!(top.contains("alchemy-version(1)"), "{top}");
+    assert!(top.contains("alchemy-app(1)"), "{top}");
+    assert!(top.contains("alchemy-settings(1)"), "{top}");
 }
 
 /// Render `page` with the first renderer installed: `man -l` where it

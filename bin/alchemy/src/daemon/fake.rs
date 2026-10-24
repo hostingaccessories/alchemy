@@ -36,12 +36,13 @@ enum Script {
 }
 
 /// Answers requests from a script, in order, and records every request as
-/// `METHOD path`. A request that does not match the next scripted one
-/// panics.
+/// `METHOD path`, and every body sent. A request that does not match the
+/// next scripted one panics.
 #[derive(Default)]
 pub(crate) struct FakeDaemon {
     script: VecDeque<(String, Script)>,
     requests: Vec<String>,
+    bodies: Vec<String>,
 }
 
 impl FakeDaemon {
@@ -117,6 +118,11 @@ impl FakeDaemon {
         &self.requests
     }
 
+    /// Every request body received so far, in order, as text.
+    pub(crate) fn bodies(&self) -> &[String] {
+        &self.bodies
+    }
+
     fn push(mut self, method: &Method, path: &str, script: Script) -> Self {
         self.script.push_back((format!("{method} {path}"), script));
         self
@@ -144,7 +150,11 @@ impl Daemon for FakeDaemon {
         &mut self,
         method: Method,
         path: &str,
+        body: Option<&[u8]>,
     ) -> impl Future<Output = Result<Reply, ClientError>> {
+        if let Some(body) = body {
+            self.bodies.push(String::from_utf8_lossy(body).into_owned());
+        }
         ready(match self.next(&method, path) {
             Script::One(reply) => reply,
             Script::Events(_) => panic!("{method} {path} is scripted as events"),

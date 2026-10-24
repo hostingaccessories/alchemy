@@ -30,9 +30,17 @@ pub(crate) trait Daemon {
     /// Where this client reaches the daemon.
     fn socket(&self) -> &Path;
 
-    /// Send `method` to `path`, such as `/api/engine`, with no body, and
-    /// return the status and the whole body.
-    async fn request(&mut self, method: Method, path: &str) -> Result<Reply, ClientError>;
+    /// Send `method` to `path`, such as `/api/engine`, with `body` as its
+    /// JSON body if given, and return the status and the whole body.
+    ///
+    /// Every method but `GET` declares `Content-Type: application/json`,
+    /// body or not, as alchemyd requires.
+    async fn request(
+        &mut self,
+        method: Method,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<Reply, ClientError>;
 
     /// `GET` the server-sent event stream at `path`. A status other than
     /// success comes back as [`Opened::Refused`] with its body.

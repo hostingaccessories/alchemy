@@ -9,6 +9,7 @@ pub mod generate_man;
 pub mod machine;
 #[cfg(feature = "test-command")]
 pub mod safety_probe;
+pub mod settings;
 pub mod status;
 mod usage;
 pub mod version;

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{app, completions, generate_man, machine, status, version};
+use crate::commands::{app, completions, generate_man, machine, settings, status, version};
 use crate::context::Context;
 use crate::daemon::HttpDaemon;
 use crate::output::Output;
@@ -72,12 +72,17 @@ pub enum Command {
     /// whether Docker is ready.
     Status(commands::status::Args),
 
-    /// Work with apps: the Compose projects Alchemy runs.
+    /// Work with apps: the Compose projects Alchemy runs, found in the app
+    /// folders.
     App(commands::app::Args),
 
     /// Work with the machines Alchemy runs apps on. For now, only this
     /// one.
     Machine(commands::machine::Args),
+
+    /// Show and change alchemyd's settings, such as where it looks for
+    /// apps.
+    Settings(commands::settings::Args),
 
     /// Show the versions of alchemy and alchemyd, and the protocol each
     /// speaks.
@@ -138,6 +143,12 @@ pub async fn run_with<W: Write, P: Prompt>(
         Command::Status(args) => status::run(&mut context(out, status::NAME)?, args).await,
         Command::Version(args) => version::run(&mut context(out, version::NAME)?, args).await,
         Command::App(args) => match args.command {
+            app::Verb::List(args) => {
+                app::list::run(&mut context(out, app::list::NAME)?, args).await
+            }
+            app::Verb::Show(args) => {
+                app::show::run(&mut context(out, app::show::NAME)?, args).await
+            }
             app::Verb::Stats(args) => {
                 let mut context = context(out, app::stats::NAME)?;
                 app::stats::run(&mut context, args).await
@@ -147,6 +158,14 @@ pub async fn run_with<W: Write, P: Prompt>(
             machine::Verb::Stats(args) => {
                 let mut context = context(out, machine::stats::NAME)?;
                 machine::stats::run(&mut context, args).await
+            }
+        },
+        Command::Settings(args) => match args.command {
+            settings::Verb::Show(args) => {
+                settings::show::run(&mut context(out, settings::show::NAME)?, args).await
+            }
+            settings::Verb::Set(args) => {
+                settings::set::run(&mut context(out, settings::set::NAME)?, args).await
             }
         },
         Command::Completions(args) => completions::run(out, &args),

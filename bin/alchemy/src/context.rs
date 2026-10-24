@@ -7,6 +7,7 @@ use std::path::Path;
 use alchemy_api::{
     ApiEvent, AppList, EngineStatus, ErrorCode, ErrorResponse, MetricsResponse, VersionResponse,
 };
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::daemon::{Daemon, DaemonInfo, EventStream, Method, Opened, Reply};
@@ -74,7 +75,21 @@ impl<D: Daemon, W: Write> Context<D, W> {
     /// error status comes back as a [`ClientError`].
     pub(crate) async fn get<T: DeserializeOwned>(&mut self, path: &str) -> Result<T, ClientError> {
         let daemon = self.daemon_info().await?.version.clone();
-        let reply = self.daemon.request(Method::GET, path).await?;
+        let reply = self.daemon.request(Method::GET, path, None).await?;
+        accept(&reply, &daemon, self.command)?;
+        decode(&reply.body)
+    }
+
+    /// `PUT` `body` as JSON to `path` and decode the JSON answer, as
+    /// [`Self::get`] does.
+    pub(crate) async fn put<B: Serialize, T: DeserializeOwned>(
+        &mut self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, ClientError> {
+        let daemon = self.daemon_info().await?.version.clone();
+        let body = serde_json::to_vec(body).map_err(|e| ProtocolError::Http(e.to_string()))?;
+        let reply = self.daemon.request(Method::PUT, path, Some(&body)).await?;
         accept(&reply, &daemon, self.command)?;
         decode(&reply.body)
     }
@@ -125,7 +140,7 @@ pub(crate) fn decode_event(raw: &SseEvent) -> Result<Option<ApiEvent>, ClientErr
 }
 
 async fn handshake<D: Daemon>(daemon: &mut D) -> Result<DaemonInfo, ClientError> {
-    let reply = daemon.request(Method::GET, VERSION_PATH).await?;
+    let reply = daemon.request(Method::GET, VERSION_PATH, None).await?;
     if !is_success(reply.status) {
         let err = error_reply(&reply)?;
         return Err(ClientError::Daemon(err.error));

@@ -722,3 +722,74 @@ async fn failures_are_reported_on_stderr_as_text_or_json() {
         );
     }
 }
+
+/// Run `alchemy` with `args` against `socket`, as the binary parses them.
+async fn run_args(socket: &Path, args: &[&str]) -> Result<String, ClientError> {
+    let mut command_line = vec!["alchemy", "--socket", socket.to_str().unwrap()];
+    command_line.extend_from_slice(args);
+    run(Cli::try_parse_from(command_line).unwrap()).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn apps_are_found_in_the_folder_the_settings_name() {
+    let daemon = Daemon::start(EngineStatus::new(EngineState::Ready)).await;
+    let apps = tempfile::tempdir().unwrap();
+    let home = apps.path().canonicalize().unwrap();
+    std::fs::create_dir(home.join("blog")).unwrap();
+    std::fs::write(home.join("blog/compose.yaml"), "services: {}\n").unwrap();
+    let home_str = home.to_str().unwrap();
+
+    let out = run_args(&daemon.socket, &["settings", "show"])
+        .await
+        .unwrap();
+    assert_eq!(out, "App home:           none\nOther app folders:  none\n");
+    let out = run_args(&daemon.socket, &["settings", "set", "app-home", home_str])
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        format!("App home:           {home_str}\nOther app folders:  none\n")
+    );
+
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let list = loop {
+        let out = run_args(&daemon.socket, &["--json", "app", "list"])
+            .await
+            .unwrap();
+        let list: alchemy_api::AppList = serde_json::from_str(out.trim_end()).unwrap();
+        if !list.apps.is_empty() {
+            break list;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{out}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(list.apps[0].name.as_str(), "blog");
+    assert_eq!(list.apps[0].dir, home.join("blog").to_str().unwrap());
+
+    let out = run_args(&daemon.socket, &["app", "list"]).await.unwrap();
+    assert!(
+        out.starts_with("NAME  STATUS   SERVICES  FOLDER\nblog  unknown  -"),
+        "{out}"
+    );
+    let out = run_args(&daemon.socket, &["app", "show", "blog", "--json"])
+        .await
+        .unwrap();
+    let app: alchemy_api::apps::App = serde_json::from_str(out.trim_end()).unwrap();
+    assert_eq!(app.name.as_str(), "blog");
+
+    let err = run_args(&daemon.socket, &["app", "show", "nope"])
+        .await
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert_eq!(err.to_string(), "alchemyd: no app is named \"nope\"");
+    let err = run_args(
+        &daemon.socket,
+        &["settings", "set", "app-folders", "relative"],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert!(err.to_string().contains("not a full path"), "{err}");
+
+    daemon.stop().await;
+}

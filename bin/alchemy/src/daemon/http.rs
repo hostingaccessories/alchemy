@@ -6,7 +6,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use http_body_util::{BodyExt as _, Empty, Limited};
+use http_body_util::{BodyExt as _, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::client::conn::http1;
 use hyper::{Request, Response, header};
@@ -39,7 +39,12 @@ impl HttpDaemon {
         Self { socket }
     }
 
-    async fn send(&self, method: Method, path: &str) -> Result<Response<Incoming>, ClientError> {
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<Response<Incoming>, ClientError> {
         let stream = UnixStream::connect(&self.socket).await.map_err(|e| {
             ClientError::DaemonUnreachable(format!("{}: {e}", self.socket.display()))
         })?;
@@ -49,11 +54,14 @@ impl HttpDaemon {
         tokio::spawn(async move {
             let _ = conn.await;
         });
-        let req = Request::builder()
+        let mut req = Request::builder().uri(path).header(header::HOST, HOST);
+        if method != Method::GET {
+            req = req.header(header::CONTENT_TYPE, "application/json");
+        }
+        let body = Full::new(Bytes::copy_from_slice(body.unwrap_or_default()));
+        let req = req
             .method(method)
-            .uri(path)
-            .header(header::HOST, HOST)
-            .body(Empty::<Bytes>::new())
+            .body(body)
             .map_err(|e| ProtocolError::Http(e.to_string()))?;
         sender.send_request(req).await.map_err(|e| from_hyper(&e))
     }
@@ -66,9 +74,14 @@ impl Daemon for HttpDaemon {
         &self.socket
     }
 
-    async fn request(&mut self, method: Method, path: &str) -> Result<Reply, ClientError> {
+    async fn request(
+        &mut self,
+        method: Method,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<Reply, ClientError> {
         with_timeout(&self.socket, async {
-            let resp = self.send(method, path).await?;
+            let resp = self.send(method, path, body).await?;
             reply(resp).await
         })
         .await
@@ -76,7 +89,7 @@ impl Daemon for HttpDaemon {
 
     async fn events(&mut self, path: &str) -> Result<Opened<HttpEvents>, ClientError> {
         with_timeout(&self.socket, async {
-            let resp = self.send(Method::GET, path).await?;
+            let resp = self.send(Method::GET, path, None).await?;
             if !resp.status().is_success() {
                 return reply(resp).await.map(Opened::Refused);
             }
@@ -297,11 +310,45 @@ mod tests {
             ("/nope", 404, ""),
         ];
         for (path, status, body) in cases {
-            let reply = daemon.request(Method::GET, path).await.unwrap();
+            let reply = daemon.request(Method::GET, path, None).await.unwrap();
             assert_eq!(reply.status, status, "{path}");
             assert_eq!(String::from_utf8(reply.body).unwrap(), body, "{path}");
         }
         assert_eq!(daemon.socket(), server.socket);
+    }
+
+    #[tokio::test]
+    async fn mutating_requests_send_json_with_their_body() {
+        use axum::http::HeaderMap;
+        let echo = |method: &'static str| {
+            move |headers: HeaderMap, body: String| async move {
+                let content_type = headers
+                    .get(header::CONTENT_TYPE)
+                    .map_or("none", |v| v.to_str().unwrap())
+                    .to_owned();
+                format!("{method} {content_type} {body}")
+            }
+        };
+        let app = Router::new().route("/api/thing", get(echo("GET")).put(echo("PUT")));
+        let server = serve(app);
+        let mut daemon = HttpDaemon::new(server.socket.clone());
+        let cases = [
+            (Method::GET, None, "GET none "),
+            (
+                Method::PUT,
+                Some(&b"{\"a\":1}"[..]),
+                "PUT application/json {\"a\":1}",
+            ),
+            (Method::PUT, None, "PUT application/json "),
+        ];
+        for (method, body, want) in cases {
+            let reply = daemon
+                .request(method.clone(), "/api/thing", body)
+                .await
+                .unwrap();
+            assert_eq!(reply.status, 200, "{method}");
+            assert_eq!(String::from_utf8(reply.body).unwrap(), want, "{method}");
+        }
     }
 
     #[tokio::test]
@@ -348,7 +395,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut missing = HttpDaemon::new(tmp.path().join("nope.sock"));
         let err = missing
-            .request(Method::GET, "/api/version")
+            .request(Method::GET, "/api/version", None)
             .await
             .unwrap_err();
         assert!(matches!(err, ClientError::DaemonUnreachable(_)), "{err:?}");
@@ -357,7 +404,7 @@ mod tests {
 
         let silent = raw(b"");
         let err = HttpDaemon::new(silent.socket.clone())
-            .request(Method::GET, "/api/version")
+            .request(Method::GET, "/api/version", None)
             .await
             .unwrap_err();
         assert!(matches!(err, ClientError::ConnectionClosed), "{err:?}");
@@ -365,7 +412,7 @@ mod tests {
 
         let framed = raw(b"\x00\x00\x00\x02{}");
         let err = HttpDaemon::new(framed.socket.clone())
-            .request(Method::GET, "/api/version")
+            .request(Method::GET, "/api/version", None)
             .await
             .unwrap_err();
         assert!(
@@ -390,7 +437,7 @@ mod tests {
         });
         let mut daemon = HttpDaemon::new(socket);
         let err = daemon
-            .request(Method::GET, "/api/version")
+            .request(Method::GET, "/api/version", None)
             .await
             .unwrap_err();
         assert!(
