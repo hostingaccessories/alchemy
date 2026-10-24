@@ -104,6 +104,18 @@ export interface PortClaim {
   source: PortSource;
 }
 
+/**
+ * Mirrors `alchemy_api::ports::PortConflict`: a port an app wants that
+ * something else holds, from {@link ActionPlan.conflicts}.
+ */
+export interface PortConflict {
+  service: string;
+  wanted: PublishedPort;
+  claim: PortClaim;
+  /** A plain sentence naming the port and its holder. */
+  message: string;
+}
+
 /** Mirrors `alchemy_api::ports::PortList`, from `GET /api/ports`. */
 export interface PortList {
   ports: PortClaim[];
@@ -476,8 +488,28 @@ export interface Operation {
 /** Mirrors `alchemy_api::operations::ActionRequest`, the body of `POST /api/apps/{name}/actions`. */
 export interface ActionRequest {
   action: Action;
-  /** Go ahead even though another app shares this app's Compose project. */
+  /**
+   * Go ahead even though another app shares this app's Compose project, or
+   * a host port the app publishes is taken.
+   */
   force?: boolean;
+}
+
+/** Mirrors `alchemy_api::operations::PlannedStep`. */
+export interface PlannedStep {
+  command: StepCommand;
+  label: string;
+  /** The whole command line, starting with `docker`. */
+  argv: string[];
+}
+
+/** Mirrors `alchemy_api::operations::ActionPlan`, from `GET /api/apps/{name}/plan?action=ACTION`. */
+export interface ActionPlan {
+  app: string;
+  action: Action;
+  steps: PlannedStep[];
+  /** Ports that refuse the action unless forced. Absent when there are none. */
+  conflicts?: PortConflict[];
 }
 
 /** Mirrors `alchemy_api::operations::OperationResponse`. */
@@ -880,6 +912,12 @@ export const api = {
     request<AppSettings>("PUT", "/settings/apps", { body: update }),
   startAction: (name: string, body: ActionRequest) =>
     request<OperationResponse>("POST", `/apps/${encodeURIComponent(name)}/actions`, { body }),
+  actionPlan: (name: string, action: Action, signal?: AbortSignal) =>
+    request<ActionPlan>(
+      "GET",
+      `/apps/${encodeURIComponent(name)}/plan?action=${encodeURIComponent(action)}`,
+      { signal },
+    ),
   operations: (signal?: AbortSignal) => request<OperationList>("GET", "/operations", { signal }),
   network: (signal?: AbortSignal) => request<NetworkReport>("GET", "/network", { signal }),
   cancelOperation: (id: string) =>

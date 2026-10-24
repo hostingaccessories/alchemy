@@ -2,7 +2,7 @@ import { act, cleanup, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import type { App, AppList, Operation, OperationList } from "../lib/api.ts";
+import type { ActionPlan, App, AppList, Operation, OperationList } from "../lib/api.ts";
 import { FakeEventSource, renderAt } from "../test/render.tsx";
 
 const blog: App = {
@@ -43,6 +43,7 @@ function update(overrides: Partial<Operation> = {}): Operation {
 }
 
 let operations: OperationList = { operations: [] };
+let plan: ActionPlan | null = null;
 let actionReply: { status: number; body: unknown } = {
   status: 202,
   body: { operation: update() },
@@ -51,6 +52,7 @@ const calls: { url: string; method: string; body: unknown }[] = [];
 
 beforeEach(() => {
   operations = { operations: [] };
+  plan = null;
   actionReply = { status: 202, body: { operation: update() } };
   calls.length = 0;
   FakeEventSource.instances = [];
@@ -69,6 +71,9 @@ beforeEach(() => {
       if (url === "/api/metrics") return new Response(JSON.stringify({ projects: [] }));
       if (url === "/api/apps/blog/actions") {
         return new Response(JSON.stringify(actionReply.body), { status: actionReply.status });
+      }
+      if (url.startsWith("/api/apps/blog/plan?") && plan) {
+        return new Response(JSON.stringify(plan));
       }
       if (url === "/api/operations/op1/cancel") {
         return new Response(JSON.stringify({ operation: update() }), { status: 202 });
@@ -199,6 +204,63 @@ describe("App actions", () => {
     await user.click(await screen.findByRole("button", { name: "Restart" }));
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText(/blog is busy/)).toBeTruthy();
+  });
+
+  it("offers to start anyway when the app's ports are taken", async () => {
+    const user = userEvent.setup();
+    const taken = "Port 8080/tcp for service web is in use by service web of app wiki.";
+    actionReply = {
+      status: 409,
+      body: {
+        error: `${taken} Free that port, or force start to start blog anyway.`,
+        code: "conflict",
+      },
+    };
+    const port = { protocol: "tcp", host_ip: null, published: "8080", target: null } as const;
+    plan = {
+      app: "blog",
+      action: "start",
+      steps: [],
+      conflicts: [
+        {
+          service: "web",
+          wanted: port,
+          claim: { port, holder: { kind: "app", app: "wiki", service: "web" }, source: "live" },
+          message: taken,
+        },
+      ],
+    };
+    await renderAt("/apps/blog");
+    await user.click(await screen.findByRole("button", { name: "Start" }));
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText(/in use by service web of app wiki/)).toBeTruthy();
+    expect(calls.some((call) => call.url === "/api/apps/blog/plan?action=start")).toBe(true);
+
+    actionReply = { status: 202, body: { operation: update({ action: "start" }) } };
+    await user.click(await within(alert).findByRole("button", { name: "Advanced" }));
+    await user.click(within(alert).getByRole("button", { name: "Start anyway" }));
+    expect(posts()).toEqual([
+      { url: "/api/apps/blog/actions", method: "POST", body: { action: "start" } },
+      { url: "/api/apps/blog/actions", method: "POST", body: { action: "start", force: true } },
+    ]);
+    expect(await screen.findByText("Starting blog…")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("offers no override when the refusal isn't about ports", async () => {
+    const user = userEvent.setup();
+    actionReply = {
+      status: 409,
+      body: { error: "blog is busy with another operation (op0)", code: "conflict" },
+    };
+    plan = { app: "blog", action: "restart", steps: [] };
+    await renderAt("/apps/blog");
+    await user.click(await screen.findByRole("button", { name: "Restart" }));
+    const alert = await screen.findByRole("alert");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(within(alert).queryByRole("button", { name: "Advanced" })).toBeNull();
   });
 
   it("waits for Compose to read the app", async () => {
