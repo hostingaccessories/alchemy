@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod network;
 pub mod operation;
 pub mod ports;
+pub mod privilege;
 pub mod route;
 pub mod stack;
 
