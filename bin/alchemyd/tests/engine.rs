@@ -803,6 +803,7 @@ async fn run_daemon_until(deps: Deps<impl EngineSource>, pred: impl FnMut(&Engin
     let config = alchemyd::Config {
         listen: "127.0.0.1:0".parse().unwrap(),
         socket: dir.path().join("alchemyd.sock"),
+        state_dir: dir.path().join("state"),
     };
     let state = deps.state.clone();
     let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();

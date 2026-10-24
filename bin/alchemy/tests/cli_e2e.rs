@@ -54,6 +54,7 @@ impl Daemon {
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             socket: socket.clone(),
+            state_dir: dir.path().join("state"),
         };
         let deps = Deps::new(FixedEngine(engine.clone()));
         let state = deps.state.clone();

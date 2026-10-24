@@ -20,6 +20,10 @@ struct Cli {
     /// Path of the API socket for the CLI. Defaults to the per-user runtime dir.
     #[arg(long, env = alchemy_api::SOCKET_ENV)]
     socket: Option<PathBuf>,
+
+    /// Directory for the state database. Defaults to the per-user state dir.
+    #[arg(long, env = alchemyd::store::STATE_DIR_ENV)]
+    state_dir: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -32,9 +36,18 @@ fn main() -> ExitCode {
         )
         .init();
 
+    let Some(state_dir) = cli.state_dir.or_else(alchemyd::store::default_state_dir) else {
+        tracing::error!(
+            "cannot find a state directory: set HOME, or pass --state-dir or {}",
+            alchemyd::store::STATE_DIR_ENV
+        );
+        return ExitCode::FAILURE;
+    };
+
     let config = alchemyd::Config {
         listen: cli.listen,
         socket: cli.socket.unwrap_or_else(alchemy_api::default_socket_path),
+        state_dir,
     };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()

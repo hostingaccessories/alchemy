@@ -9,8 +9,9 @@
 //! - a per-user Unix socket ([`socket`]) serving the API alone, used by
 //!   the `alchemy` CLI and `alchemy-helper`.
 //!
-//! It talks to the Docker engine through [`engine`], and keeps what it
-//! learns in [`State`].
+//! It talks to the Docker engine through [`engine`], keeps what it
+//! learns in [`State`], and persists settings and history in a
+//! [`store::Store`].
 
 pub mod compose;
 pub mod engine;
@@ -20,6 +21,7 @@ pub mod http;
 mod secure_fs;
 pub mod socket;
 mod state;
+pub mod store;
 mod web;
 
 pub use state::State;
@@ -27,11 +29,13 @@ pub use state::State;
 use std::future::{Future, IntoFuture as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use tokio::sync::watch;
 
 use crate::engine::{EngineMonitor, EngineSource, SystemConnector, SystemProbe};
+use crate::store::{SharedStore, SqliteStore};
 
 /// Default HTTP listen address. Loopback only: the API has no
 /// authentication yet.
@@ -44,6 +48,9 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Path of the per-user Unix socket the API is served on.
     pub socket: PathBuf,
+    /// Directory holding the state database, usually
+    /// [`store::default_state_dir`].
+    pub state_dir: PathBuf,
 }
 
 /// What [`run_with`] runs against: the shared state and the task that
@@ -82,8 +89,11 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::
 
 /// [`run`] with injected dependencies, such as a fake engine in tests.
 ///
-/// The engine task runs alongside the listeners. An engine that is absent
-/// or broken never fails startup; it only shows up in the engine status.
+/// The state database in `config.state_dir` is opened, created, or
+/// migrated first; a corrupt or too-new one fails startup before either
+/// listener is bound. The engine task runs alongside the listeners. An
+/// engine that is absent or broken never fails startup; it only shows up
+/// in the engine status.
 pub async fn run_with(
     config: Config,
     deps: Deps<impl EngineSource>,
@@ -96,6 +106,12 @@ pub async fn run_with(
         );
     }
 
+    let sqlite = SqliteStore::open(&config.state_dir)
+        .await
+        .context("opening the state database")?;
+    let db = sqlite.path().to_owned();
+    let store: SharedStore = Arc::new(sqlite);
+
     let (socket_listener, socket_file) = socket::bind(&config.socket)
         .with_context(|| format!("binding API socket {}", config.socket.display()))?;
     let http_listener = tokio::net::TcpListener::bind(config.listen)
@@ -106,6 +122,7 @@ pub async fn run_with(
         version = alchemy_core::VERSION,
         http = %config.listen,
         socket = %config.socket.display(),
+        state = %db.display(),
         "alchemyd listening"
     );
 
@@ -114,7 +131,7 @@ pub async fn run_with(
     let socket_task = tokio::spawn(
         axum::serve(
             socket_listener,
-            http::api_router(deps.state.clone(), shutdown_rx.clone()),
+            http::api_router(deps.state.clone(), store.clone(), shutdown_rx.clone()),
         )
         .with_graceful_shutdown(stopped(shutdown_rx.clone()))
         .into_future(),
@@ -122,7 +139,7 @@ pub async fn run_with(
     let http_task = tokio::spawn(
         axum::serve(
             http_listener,
-            http::router(deps.state, config.listen.ip(), shutdown_rx.clone()),
+            http::router(deps.state, store, config.listen.ip(), shutdown_rx.clone()),
         )
         .with_graceful_shutdown(stopped(shutdown_rx))
         .into_future(),

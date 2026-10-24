@@ -31,6 +31,7 @@ use tower_http::cors::CorsLayer;
 use crate::State;
 use crate::events::{self, Topic};
 use crate::guard::{self, Refusal, TAURI_ORIGINS};
+use crate::store::SharedStore;
 
 /// How often `/api/events` sends an SSE comment while idle, so proxies and
 /// clients do not give up on a quiet stream.
@@ -39,6 +40,7 @@ pub const KEEP_ALIVE: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone)]
 struct Api {
     state: State,
+    store: SharedStore,
     topics: Arc<[Topic]>,
     shutdown: watch::Receiver<bool>,
 }
@@ -49,6 +51,12 @@ impl FromRef<Api> for State {
     }
 }
 
+impl FromRef<Api> for SharedStore {
+    fn from_ref(api: &Api) -> Self {
+        api.store.clone()
+    }
+}
+
 /// Build the API router: `/api` routes only, with no web UI and no CORS.
 ///
 /// This is what the per-user Unix socket serves. Anything outside `/api`
@@ -56,12 +64,12 @@ impl FromRef<Api> for State {
 /// sender is dropped), so open `/api/events` connections do not hold up
 /// graceful shutdown. Only the socket's share of the [`crate::guard`]
 /// checks applies; see [`socket_checks`].
-pub fn api_router(state: State, shutdown: watch::Receiver<bool>) -> Router {
+pub fn api_router(state: State, store: SharedStore, shutdown: watch::Receiver<bool>) -> Router {
     socket_checks(
         Router::new()
             .nest(
                 alchemy_api::API_PREFIX,
-                api(state, events::topics(), shutdown),
+                api(state, store, events::topics(), shutdown),
             )
             .fallback(api_not_found),
     )
@@ -70,21 +78,27 @@ pub fn api_router(state: State, shutdown: watch::Receiver<bool>) -> Router {
 /// Build the full router for the TCP listener bound to `listen`: the
 /// [`api_router`] routes, CORS for the desktop shell, the web UI, and every
 /// [`crate::guard`] check.
-pub fn router(state: State, listen: IpAddr, shutdown: watch::Receiver<bool>) -> Router {
-    router_with_topics(state, listen, events::topics(), shutdown)
+pub fn router(
+    state: State,
+    store: SharedStore,
+    listen: IpAddr,
+    shutdown: watch::Receiver<bool>,
+) -> Router {
+    router_with_topics(state, store, listen, events::topics(), shutdown)
 }
 
 /// [`router`], with `/api/events` publishing `topics` instead of the
 /// daemon's own [`events::topics`].
 pub fn router_with_topics(
     state: State,
+    store: SharedStore,
     listen: IpAddr,
     topics: Vec<Topic>,
     shutdown: watch::Receiver<bool>,
 ) -> Router {
     tcp_checks(
         Router::new()
-            .nest(alchemy_api::API_PREFIX, api(state, topics, shutdown))
+            .nest(alchemy_api::API_PREFIX, api(state, store, topics, shutdown))
             .fallback(crate::web::serve),
         listen,
     )
@@ -109,7 +123,12 @@ pub fn socket_checks(routes: Router) -> Router {
 }
 
 /// The routes under `/api`, shared by [`api_router`] and [`router`].
-fn api(state: State, topics: Vec<Topic>, shutdown: watch::Receiver<bool>) -> Router {
+fn api(
+    state: State,
+    store: SharedStore,
+    topics: Vec<Topic>,
+    shutdown: watch::Receiver<bool>,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
@@ -119,6 +138,7 @@ fn api(state: State, topics: Vec<Topic>, shutdown: watch::Receiver<bool>) -> Rou
         .fallback(api_not_found)
         .with_state(Api {
             state,
+            store,
             topics: topics.into(),
             shutdown,
         })
@@ -238,12 +258,19 @@ mod tests {
             .header(header::HOST, HOST)
     }
 
+    fn memory() -> SharedStore {
+        std::sync::Arc::new(crate::store::MemoryStore::new())
+    }
+
     /// The daemon's router with only the engine topic on `/api/events`, so
     /// these tests read engine frames alone as other topics are added.
     fn test_router(state: State) -> (Router, watch::Sender<bool>) {
         let (tx, rx) = watch::channel(false);
         let engine = Topic::watch(State::watch_engine, ApiEvent::Engine);
-        (router_with_topics(state, LISTEN, vec![engine], rx), tx)
+        (
+            router_with_topics(state, memory(), LISTEN, vec![engine], rx),
+            tx,
+        )
     }
 
     async fn get_json(uri: &str) -> (StatusCode, serde_json::Value) {
@@ -369,6 +396,7 @@ mod tests {
         let (stop, stop_rx) = watch::channel(false);
         let app = router_with_topics(
             State::new(),
+            memory(),
             LISTEN,
             vec![topic(a_rx), topic(b_rx)],
             stop_rx,
@@ -499,7 +527,7 @@ mod tests {
             ("/theme.js", StatusCode::NOT_FOUND),
         ] {
             let (_stop, rx) = watch::channel(false);
-            let resp = api_router(State::new(), rx)
+            let resp = api_router(State::new(), memory(), rx)
                 .oneshot(
                     req(Method::GET, uri)
                         .header(header::ORIGIN, "tauri://localhost")
@@ -806,7 +834,7 @@ mod tests {
             origin: None,
             content_type: None,
         };
-        let app = api_router(State::new(), rx);
+        let app = api_router(State::new(), memory(), rx);
         let (status, _, _) = send(app, probe.request("/api/health")).await;
         assert_eq!(status, StatusCode::OK);
     }

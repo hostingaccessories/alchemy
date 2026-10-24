@@ -92,6 +92,7 @@ async fn events_stream_reaches_the_tauri_origin_and_ends_on_shutdown() {
     let config = alchemyd::Config {
         listen,
         socket: dir.path().join("alchemyd.sock"),
+        state_dir: dir.path().join("state"),
     };
     let deps = Deps::new(FixedEngine(EngineStatus::new(EngineState::Ready)));
     let state = deps.state.clone();
@@ -175,6 +176,7 @@ async fn tcp_listener_refuses_rebinding_cross_origin_and_non_json_requests() {
     let config = alchemyd::Config {
         listen,
         socket: dir.path().join("alchemyd.sock"),
+        state_dir: dir.path().join("state"),
     };
     let deps = Deps::new(FixedEngine(EngineStatus::new(EngineState::Ready)));
     let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();

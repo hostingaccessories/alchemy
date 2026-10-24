@@ -26,6 +26,8 @@ clap               = { workspace = true }
 futures-util       = { workspace = true }
 rust-embed         = { workspace = true }
 rusqlite           = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
 thiserror          = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync", "io-util", "process", "time"] }
 tower-http         = { workspace = true }
@@ -33,7 +35,6 @@ tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 tempfile   = { workspace = true }
 tokio      = { workspace = true, features = ["test-util"] }
 tower      = { workspace = true }
