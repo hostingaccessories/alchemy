@@ -193,7 +193,18 @@ fn daemon_line(socket: &Path) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn status_reports_the_daemon_and_docker() {
-    let daemon = Daemon::start(ready_desktop()).await;
+    use std::sync::Arc;
+
+    use alchemyd::network::{FakeNetwork, LanAddress};
+
+    let host = FakeNetwork::new();
+    host.set_lan_addresses(vec![LanAddress {
+        interface: "en0".into(),
+        addr: "192.168.1.20".parse().unwrap(),
+        subnet: "192.168.1.0/24".parse().unwrap(),
+    }]);
+    let daemon =
+        Daemon::start_with(ready_desktop(), |deps| deps.with_network(Arc::new(host))).await;
     let out = run(cli(&daemon.socket, false, false)).await.unwrap();
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(
