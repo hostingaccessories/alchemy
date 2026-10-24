@@ -102,6 +102,26 @@ impl FakeDaemon {
         )
     }
 
+    /// Open the event stream at `path`, send `items`, then end it.
+    pub(crate) fn stream(
+        self,
+        path: &str,
+        items: impl IntoIterator<Item = Result<SseEvent, ClientError>>,
+    ) -> Self {
+        let items = items.into_iter().collect();
+        self.push(
+            &Method::GET,
+            path,
+            Script::Events(Ok(Opened::Stream(items))),
+        )
+    }
+
+    /// Refuse the event stream at `path` with `status` and the raw `body`.
+    pub(crate) fn refuse_stream(self, path: &str, status: u16, body: Vec<u8>) -> Self {
+        let refused = Opened::Refused(Reply { status, body });
+        self.push(&Method::GET, path, Script::Events(Ok(refused)))
+    }
+
     /// Refuse the event stream with `status` and the raw `body`.
     pub(crate) fn refuse_events(self, status: u16, body: Vec<u8>) -> Self {
         let refused = Opened::Refused(Reply { status, body });

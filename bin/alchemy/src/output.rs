@@ -52,10 +52,6 @@ impl<W: Write> Output<W> {
     }
 
     /// Whether results may use ANSI styling. Never with `--json`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no command styles its output yet")
-    )]
     pub(crate) fn color(&self) -> bool {
         self.color == Color::On && !self.json
     }

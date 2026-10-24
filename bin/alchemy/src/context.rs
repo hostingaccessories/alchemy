@@ -105,6 +105,25 @@ impl<D: Daemon, W: Write> Context<D, W> {
             },
         }
     }
+
+    /// Follow the event stream at `path`, such as an app's logs, as raw
+    /// events. A refusal comes back as a [`ClientError`], as with
+    /// [`Self::get`].
+    pub(crate) async fn stream(&mut self, path: &str) -> Result<D::Events, ClientError> {
+        let daemon = self.daemon_info().await?.version.clone();
+        match self.daemon.events(path).await? {
+            Opened::Stream(inner) => Ok(inner),
+            Opened::Refused(reply) => match accept(&reply, &daemon, self.command) {
+                Ok(()) => Err(ClientError::Unexpected(status_text(reply.status))),
+                Err(err) => Err(err),
+            },
+        }
+    }
+}
+
+/// Decode the JSON `data` of a raw event as `T`.
+pub(crate) fn decode_data<T: DeserializeOwned>(raw: &SseEvent) -> Result<T, ClientError> {
+    decode(raw.data.as_bytes())
 }
 
 /// The events from [`Context::events`], decoded.

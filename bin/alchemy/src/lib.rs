@@ -149,6 +149,9 @@ pub async fn run_with<W: Write, P: Prompt>(
             app::Verb::Show(args) => {
                 app::show::run(&mut context(out, app::show::NAME)?, args).await
             }
+            app::Verb::Logs(args) => {
+                app::logs::run(&mut context(out, app::logs::NAME)?, args).await
+            }
             app::Verb::Stats(args) => {
                 let mut context = context(out, app::stats::NAME)?;
                 app::stats::run(&mut context, args).await

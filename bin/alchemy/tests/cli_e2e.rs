@@ -793,3 +793,153 @@ async fn apps_are_found_in_the_folder_the_settings_name() {
 
     daemon.stop().await;
 }
+
+/// A daemon serving the app `blog`, whose service `web` runs the
+/// container `w1`, with logs from a fake source.
+struct BlogDaemon {
+    _dir: tempfile::TempDir,
+    socket: PathBuf,
+    logs: alchemyd::logs::FakeLogSource,
+    stop: oneshot::Sender<()>,
+    task: JoinHandle<Result<(), String>>,
+}
+
+async fn start_blog() -> BlogDaemon {
+    use alchemy_core::engine::{ContainerState, ContainerStatus};
+    use alchemyd::apps::{AppsDeps, SystemFs};
+    use alchemyd::compose::FakeComposeConfig;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let blog = root.join("apps/blog");
+    std::fs::create_dir_all(&blog).unwrap();
+    std::fs::write(blog.join("compose.yaml"), "services: {}\n").unwrap();
+    let compose = FakeComposeConfig::new();
+    compose.project(blog.clone(), "blog", &["web"]);
+    let logs = alchemyd::logs::FakeLogSource::new();
+    let mut engine = EngineStatus::new(EngineState::Ready);
+    engine.endpoint = Some("unix:///fake/docker.sock".into());
+    let deps = Deps::new(FixedEngine(engine))
+        .with_apps(
+            AppsDeps::new(
+                std::sync::Arc::new(SystemFs),
+                std::sync::Arc::new(compose),
+                Some(root.join("apps")),
+            )
+            .with_scan_interval(Duration::from_millis(50)),
+        )
+        .with_logs(std::sync::Arc::new(logs.clone()));
+    let state = deps.state.clone();
+    let socket = root.join("alchemyd.sock");
+    let config = Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        socket: socket.clone(),
+        state_dir: root.join("state"),
+    };
+    let (stop, stop_rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        alchemyd::run_with(config, deps, async {
+            let _ = stop_rx.await;
+        })
+        .await
+        .map_err(|e| format!("{e:#}"))
+    });
+    let mut web = ContainerStatus::new("w1", "blog-web-1", ContainerState::Running);
+    web.project = Some("blog".into());
+    web.service = Some("web".into());
+    state.update_containers(|c| c.replace_all([web]));
+    let mut apps = state.watch_apps();
+    tokio::time::timeout(
+        DEADLINE,
+        apps.wait_for(|list| {
+            list.apps
+                .first()
+                .is_some_and(|app| app.services.iter().any(|s| !s.containers.is_empty()))
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    BlogDaemon {
+        _dir: dir,
+        socket,
+        logs,
+        stop,
+        task,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn app_logs_print_the_tail_and_follow_new_lines() {
+    use alchemy_api::logs::LogStream;
+
+    let BlogDaemon {
+        _dir,
+        socket,
+        logs,
+        stop,
+        task,
+    } = start_blog().await;
+    logs.write(
+        "w1",
+        LogStream::Stdout,
+        "2024-05-06T07:08:09.000000000Z",
+        "started",
+    );
+
+    let out = run_args(&socket, &["app", "logs", "blog"]).await.unwrap();
+    assert_eq!(out, "web | started\n");
+    let out = run_args(
+        &socket,
+        &["--json", "app", "logs", "blog", "web", "--tail", "1"],
+    )
+    .await
+    .unwrap();
+    let line: alchemy_api::logs::LogLine = serde_json::from_str(out.trim_end()).unwrap();
+    assert_eq!(line.line, "started");
+    let err = run_args(&socket, &["app", "logs", "blog", "db"])
+        .await
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert_eq!(
+        err.to_string(),
+        "alchemyd: the app blog has no service named \"db\""
+    );
+
+    let cli = Cli::try_parse_from([
+        "alchemy",
+        "--socket",
+        socket.to_str().unwrap(),
+        "app",
+        "logs",
+        "blog",
+        "-f",
+        "--tail",
+        "0",
+    ])
+    .unwrap();
+    let mut follow = Watch::start(cli);
+    tokio::time::timeout(DEADLINE, async {
+        while logs.followers("w1") == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    logs.write(
+        "w1",
+        LogStream::Stderr,
+        "2024-05-06T07:08:10.000000000Z",
+        "new line",
+    );
+    assert_eq!(follow.line().await, "web | new line");
+
+    stop.send(()).unwrap();
+    let err = follow.finish().await.unwrap_err();
+    assert_eq!(err.exit_code(), 69, "{err}");
+    tokio::time::timeout(DEADLINE, task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}

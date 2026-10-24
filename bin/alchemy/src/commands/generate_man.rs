@@ -98,6 +98,7 @@ mod tests {
             names,
             [
                 "alchemy-app-list.1",
+                "alchemy-app-logs.1",
                 "alchemy-app-show.1",
                 "alchemy-app-stats.1",
                 "alchemy-app.1",

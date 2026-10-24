@@ -5,6 +5,7 @@
 //! adding its module and a [`Verb`] variant.
 
 pub mod list;
+pub mod logs;
 pub mod show;
 pub mod stats;
 
@@ -29,6 +30,16 @@ pub enum Verb {
     /// Show one app: its folder, Compose project, services, and anything
     /// wrong with it.
     Show(show::Args),
+
+    /// Print an app's logs, or one service's, as `service | line`.
+    ///
+    /// Starts with the last 200 lines across the app's containers, in the
+    /// order they were written. With --follow, keeps printing new lines as
+    /// they arrive, including from containers that restart or are
+    /// recreated, until interrupted. Control characters in a line, such as
+    /// terminal escapes, are shown as ^[ and the like. With --json, prints
+    /// one JSON object per line.
+    Logs(logs::Args),
 
     /// Show an app's CPU, memory, and network use, in total and per
     /// container.
