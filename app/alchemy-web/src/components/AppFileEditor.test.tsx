@@ -49,6 +49,9 @@ beforeEach(() => {
         }
         return new Response(JSON.stringify(onDisk));
       }
+      if (url === "/api/operations") {
+        return new Response(JSON.stringify({ operations: [] }));
+      }
       if (url === "/api/metrics") {
         return new Response(JSON.stringify({ projects: [] }));
       }

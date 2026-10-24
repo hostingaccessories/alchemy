@@ -46,6 +46,9 @@ beforeEach(() => {
       if (url === "/api/apps") {
         return new Response(JSON.stringify(apps));
       }
+      if (url === "/api/operations") {
+        return new Response(JSON.stringify({ operations: [] }));
+      }
       if (url === "/api/metrics") {
         return new Response(JSON.stringify({ projects: [] }));
       }
