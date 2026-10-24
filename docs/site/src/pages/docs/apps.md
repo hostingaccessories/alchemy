@@ -166,7 +166,8 @@ On the **Apps** page, choose **Add app**. Give it a name (lowercase
 letters, digits, `-`, and `_`; it becomes the folder's name), pick the app
 folder if you have more than one, paste the compose file, and optionally a
 `.env` under **Environment file (.env)**. **Create app** opens the new
-app's page. From the CLI:
+app's page; **Create and start** also starts it, and the page shows its
+progress. From the CLI:
 
 ```sh
 alchemy app create blog                          # copies ./compose.yaml
@@ -174,13 +175,17 @@ alchemy app create blog --file ~/blog.yaml --env-file ~/blog.env
 cat compose.yaml | alchemy app create blog --file -
 alchemy app create blog --folder /opt/stacks     # an app folder other than the home
 alchemy app create blog --dry-run                # only check it with Compose
+alchemy app create blog --start                  # create it, then start it
 ```
 
 The app gets a new folder, `HOME/NAME` or `FOLDER/NAME`, holding
 `compose.yaml` and, if you gave one, `.env`. The home is created the first
 time an app goes in it. `--folder` must be one of your app folders.
-Creating an app doesn't start it; use **Create and start** (`alchemy app up
-NAME`) when you're ready.
+Creating an app doesn't start it unless you ask: **Create and start** on
+the form or `--start` in the CLI starts it once Alchemy has read the new
+files, as **More actions › Create and start** (`alchemy app up NAME`)
+would. If it can't be started, for example because Docker isn't running,
+the app is still created and Alchemy says why it didn't start.
 
 Alchemy never replaces a folder, since it may hold data: if the folder
 already exists, even empty, or another app already has the name, the app
@@ -189,12 +194,13 @@ isn't created.
 ### Editing an app's files
 
 Each app's page has an **Edit** section with its compose file and its
-`.env`. Change one and choose **Save**; **Undo changes** puts back what was
-loaded. From the CLI:
+`.env`. Change one and choose **Save**, or **Save and start** to bring the
+app up with it; **Undo changes** puts back what was loaded. From the CLI:
 
 ```sh
 alchemy app edit blog         # the compose file
 alchemy app edit blog --env   # the .env
+alchemy app edit blog --start # save, then start it with the change
 ```
 
 `alchemy app edit` opens a private copy in `$VISUAL` or `$EDITOR` (`vi` if
@@ -215,8 +221,11 @@ the question, `--dry-run` saves nothing).
   the first one it lists, and Compose checks it together with the rest. That
   first file must sit in the app's folder, and `COMPOSE_FILE` can't use
   `$VARIABLES`; otherwise edit the files by hand.
-- **Saving doesn't restart anything.** Run **Update** or **Create and
-  start** to apply the change.
+- **Saving doesn't restart anything** unless you ask. **Save and start**
+  (`alchemy app edit --start`) saves, then brings the app up with the
+  change once Alchemy has read it, as **Create and start** would; if it
+  can't start the app, the file stays saved and Alchemy says why.
+  Otherwise run **Update** or **Create and start** to apply the change.
 - Each file can be up to 256 KiB of text. Apps whose folder or file is a
   symlink can't be edited from Alchemy.
 

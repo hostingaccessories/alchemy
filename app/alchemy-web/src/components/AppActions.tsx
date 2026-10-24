@@ -6,11 +6,10 @@ import {
   ApiError,
   type App,
   type Operation,
-  type OperationList,
   type OutputLine,
   api,
 } from "../lib/api.ts";
-import { liveQueries } from "../lib/queries.ts";
+import { liveQueries, showOperation } from "../lib/queries.ts";
 import { Advanced } from "./Advanced.tsx";
 import { Button } from "./Button.tsx";
 import { ConfirmDialog } from "./ConfirmDialog.tsx";
@@ -73,11 +72,7 @@ export function AppActions({ app }: { app: App }) {
   const start = useMutation({
     mutationFn: (action: Action) => api.startAction(app.name, { action }),
     onMutate: () => setError(null),
-    onSuccess: ({ operation }) => {
-      client.setQueryData<OperationList>(liveQueries.operations.queryKey, (list) => ({
-        operations: [operation, ...(list?.operations ?? []).filter((op) => op.id !== operation.id)],
-      }));
-    },
+    onSuccess: ({ operation }) => showOperation(client, operation),
     onError: (err) => setError(err instanceof ApiError ? err.message : "Something went wrong."),
   });
 
