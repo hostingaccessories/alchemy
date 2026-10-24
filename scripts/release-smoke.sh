@@ -134,6 +134,15 @@ history="$(curl -fsS --unix-socket "$socket" 'http://localhost/api/metrics/histo
 "${bin}/alchemy" --socket "$socket" machine stats | grep -q '^Memory ' \
   || fail "alchemy machine stats did not show memory"
 
+log "Checking operations on the socket"
+operations="$(curl -fsS --unix-socket "$socket" http://localhost/api/operations)" \
+  || fail "GET /api/operations on ${socket} failed"
+[[ "$operations" == '{"operations":[]}' ]] || fail "unexpected operations: ${operations}"
+refused="$(curl -sS --unix-socket "$socket" -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Content-Type: application/json' -d '{"action":"up"}' \
+  http://localhost/api/apps/smoke-missing/actions)"
+[[ "$refused" == 404 ]] || fail "an action on a missing app answered ${refused}, not 404"
+
 log "Checking embedded web UI"
 index="$(curl -fsS "${base}/")" || fail "GET / failed (web UI not embedded?)"
 [[ "$index" == *'id="root"'* ]] || fail "GET / did not return the web UI"

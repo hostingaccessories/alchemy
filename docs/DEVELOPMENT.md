@@ -330,6 +330,51 @@ is in `alchemy_core::logs`, the reading in `bin/alchemyd/src/logs/`.
 curl -N --unix-socket /run/user/1000/alchemy/alchemyd.sock 'http://alchemyd/api/apps/blog/logs?service=web&follow=true'
 ```
 
+### Lifecycle actions
+
+`POST /api/apps/NAME/actions` with `{"action":"up"}` (or `down`, `start`,
+`stop`, `restart`, `pull`, `build`, `update`; `"force":true` acts on an
+app that shares its Compose project with another) starts an operation
+and answers 202 with it. Update pulls, then runs `up --detach`; for an
+app that builds, the pull skips buildable services and a `build --pull`
+runs between them. One operation runs per app at a time: a second action
+is 409 `conflict`, as is one before Compose has read the app or while
+Docker isn't running. Before Compose runs, the operation records the stop
+intent (`up` for an update; nothing for `pull` and `build`), and leaves it
+when it fails.
+
+`GET /api/operations/ID/events` streams the operation as server-sent
+events: `operation` first and on every step change, `output` for each line
+of output (from its first kept line, so a late follower misses nothing
+still held), then `done`. Each step has a plain-words `label` and a
+one-line `message`, such as "2 of 3 images downloaded". The daemon keeps
+the newest 5000 output lines per operation, and finished operations in
+memory for an hour (at most 100); `GET /api/operations[?app=NAME]` lists
+recent ones, newest first, from the state database too, which keeps the
+latest 1000. The `operations` event carries the ones in memory.
+`POST /api/operations/ID/cancel` stops one. Shutdown interrupts running
+operations and stores them as `interrupted`; ones a crashed daemon left
+running are marked so at the next start. `GET /api/apps/NAME/plan?action=down`
+returns the command lines an action would run, changing nothing.
+
+`alchemy app up|down|start|stop|restart|pull|build|update NAME` starts
+one and follows it: each step on stderr as it starts or fails, the result
+on stdout, and with `--json` every event as one line on stdout. `down`
+asks first (`--yes` skips the question, and without a terminal it refuses
+with exit 3); `--dry-run` prints the plan. A failed, cancelled, or
+interrupted operation exits 1 with kind `operation_failed`. Ctrl-C stops
+following, but the operation keeps running in the daemon. The app page
+has the same actions, with Down, Pull, and Build under More actions. The
+pure model is `alchemy_core::operation`, the manager
+`bin/alchemyd/src/operations/`.
+
+```sh
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock -X POST \
+  -H 'Content-Type: application/json' -d '{"action":"restart"}' \
+  http://alchemyd/api/apps/blog/actions
+curl -N --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/operations/ID/events
+```
+
 ### Web UI in debug vs release
 
 The daemon serves `app/alchemy-web/dist`. Debug builds read it from disk, so
@@ -366,6 +411,8 @@ checks:
 - `/api/events` streams an `engine` event to the Tauri origin;
 - `/api/metrics` reports the machine, `/api/metrics/history` has a
   stored point, and `alchemy machine stats` prints them;
+- `/api/operations` answers, and an action on an app that doesn't exist
+  is refused with 404;
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
 - `alchemy-helper` refuses to run without root;
@@ -657,7 +704,7 @@ message. `kind` is a contract.
 | Exit | When                                                    | `kind`                                                                   |
 | ---- | ------------------------------------------------------- | ------------------------------------------------------------------------ |
 | 0    | It did what was asked                                   |                                                                          |
-| 1    | It failed, for example alchemyd refused it              | `daemon`, `runtime`                                                      |
+| 1    | It failed, for example alchemyd refused it              | `daemon`, `runtime`, `operation_failed`                                  |
 | 2    | The command line or daemon target is invalid            | `usage`, `remote_daemon`, `invalid_target`                               |
 | 3    | Confirmation was declined, or needed without a terminal | `declined`, `confirmation_required`                                      |
 | 69   | alchemyd is unreachable or went away                    | `daemon_unreachable`, `disconnected`                                     |
@@ -707,12 +754,12 @@ pub(crate) async fn run<D: Daemon, W: Write, P: Prompt>(
 }
 ```
 
-Its arm in `run_with` passes `prompt`. The first such command must delete
-the `expect(unused_variables)` on `run_with`, which stands in until one
-exists. alchemyd has no plan request yet: the first destructive command
-adds one to `alchemy-api`, along with its JSON shape. The hidden
-`safety-probe` command in `src/commands/safety_probe.rs` shows the flow,
-and its JSON isn't a contract.
+Its arm in `run_with` passes `prompt`. alchemyd's plan request for
+lifecycle actions is `GET /api/apps/NAME/plan?action=ACTION`, an
+`ActionPlan` in `alchemy-api`; `src/commands/app/action.rs` shows the
+whole flow, and a new destructive command adds its own plan route. The
+hidden `safety-probe` command in `src/commands/safety_probe.rs` is the
+smallest example, and its JSON isn't a contract.
 
 ### Help, completions, and man pages
 
