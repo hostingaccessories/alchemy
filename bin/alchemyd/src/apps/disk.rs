@@ -83,6 +83,11 @@ pub trait AppDisk: Send + Sync + fmt::Debug {
 
     /// Remove the staging directory `dir` and everything in it.
     fn remove_staging(&self, dir: &Path) -> io::Result<()>;
+
+    /// Remove the directory `dir` if it is empty, and never anything in
+    /// it. Anything but a real directory at `dir`, such as a symlink to
+    /// one, fails with [`io::ErrorKind::NotADirectory`] and is left alone.
+    fn remove_empty_dir(&self, dir: &Path) -> io::Result<()>;
 }
 
 /// [`AppDisk`] over the real filesystem.
@@ -201,6 +206,13 @@ impl AppDisk for SystemDisk {
 
     fn remove_staging(&self, dir: &Path) -> io::Result<()> {
         fs::remove_dir_all(dir)
+    }
+
+    fn remove_empty_dir(&self, dir: &Path) -> io::Result<()> {
+        if self.kind(dir)? != Some(EntryKind::Dir) {
+            return Err(io::ErrorKind::NotADirectory.into());
+        }
+        fs::remove_dir(dir)
     }
 }
 
@@ -337,6 +349,33 @@ mod tests {
         assert_eq!(mode(&staging.join("blog")), 0o755);
         SystemDisk.remove_staging(&staging).unwrap();
         assert!(!staging.exists());
+    }
+
+    #[test]
+    fn removes_only_empty_real_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let empty = root.path().join("empty");
+        let full = root.path().join("full");
+        fs::create_dir(&empty).unwrap();
+        fs::create_dir(&full).unwrap();
+        fs::write(full.join("data"), "keep").unwrap();
+        fs::write(root.path().join("file"), "keep").unwrap();
+        symlink(&empty, root.path().join("link")).unwrap();
+        let cases = [
+            ("full", Some(io::ErrorKind::DirectoryNotEmpty)),
+            ("file", Some(io::ErrorKind::NotADirectory)),
+            ("link", Some(io::ErrorKind::NotADirectory)),
+            ("missing", Some(io::ErrorKind::NotADirectory)),
+            ("empty", None),
+        ];
+        for (name, want) in cases {
+            let got = SystemDisk.remove_empty_dir(&root.path().join(name));
+            assert_eq!(got.err().map(|e| e.kind()), want, "{name}");
+        }
+        assert!(!empty.exists());
+        assert!(full.join("data").exists());
+        assert!(root.path().join("file").exists());
+        assert!(fs::symlink_metadata(root.path().join("link")).is_ok());
     }
 
     #[test]
