@@ -30,6 +30,7 @@ use alchemy_core::route::{EngineFacts, ExposedPort, HostOs};
 use alchemyd::apps::{AppsDeps, SystemFs};
 use alchemyd::compose::{ComposeConfig, FakeComposeConfig, FakeConfig, ServiceConfig};
 use alchemyd::engine::{DockerNetwork, EngineSource};
+use alchemyd::network::{FakeNetwork, LanAddress};
 use alchemyd::proxy::{FakeAnswer, FakeConnector, FakeProbe};
 use alchemyd::routing::ProxyDeps;
 use alchemyd::subnets::{FakeDaemonConfig, FakeEngineNetworks, SubnetsDeps};
@@ -198,6 +199,18 @@ impl Daemon {
         networks: FakeEngineNetworks,
         proxy: ProxyDeps,
     ) -> Self {
+        Self::start_on(dir, engine, apps, networks, proxy, FakeNetwork::new()).await
+    }
+
+    /// [`Self::start`] on a host whose LAN `host` describes.
+    async fn start_on(
+        dir: tempfile::TempDir,
+        engine: Engine,
+        apps: (PathBuf, FakeComposeConfig),
+        networks: FakeEngineNetworks,
+        proxy: ProxyDeps,
+        host: FakeNetwork,
+    ) -> Self {
         let socket = dir.path().join("alchemyd.sock");
         let listen = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -213,6 +226,7 @@ impl Daemon {
                 Arc::new(networks),
                 Arc::new(FakeDaemonConfig::new()),
             ))
+            .with_network(Arc::new(host))
             .with_proxy(proxy);
         let state = deps.state.clone();
         let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -254,6 +268,22 @@ impl Daemon {
         .unwrap_or_else(|_| panic!("{name} never got there: {:?}", find(&self.state.apps())))
         .unwrap();
         find(&self.state.apps()).unwrap()
+    }
+
+    /// `GET /api/network`, once `done` holds for it.
+    async fn report_where(&self, done: impl Fn(&NetworkReport) -> bool) -> NetworkReport {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let report: NetworkReport = get_socket(&self.socket, "/api/network").await;
+            if done(&report) {
+                return report;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the network report never got there: {report:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     async fn stop(self) {
@@ -732,8 +762,19 @@ async fn routes_local_names_while_mdns_is_on_except_for_apps_that_opt_out() {
     host_answers(host_port, "notes.local", "404").await;
     let body = host_answers(host_port, "notes.localhost", "200").await;
     assert_eq!(body, "notes notes.localhost");
-    let report: NetworkReport = get_socket(&daemon.socket, "/api/network").await;
-    assert_eq!(report.mdns.state, MdnsState::Starting);
+    let report = daemon
+        .report_where(|r| r.mdns.state != MdnsState::Starting)
+        .await;
+    assert_eq!(report.mdns.state, MdnsState::Unavailable, "no LAN address");
+    assert!(
+        report
+            .mdns
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("can't find this computer's address")),
+        "{:?}",
+        report.mdns
+    );
 
     let settings: NetworkSettings =
         put_socket(&daemon.socket, "/api/settings/network", r#"{"mdns":false}"#).await;
@@ -756,6 +797,334 @@ async fn routes_local_names_while_mdns_is_on_except_for_apps_that_opt_out() {
         .await;
     let body = host_answers(host_port, "wiki.local", "200").await;
     assert_eq!(body, "wiki wiki.local");
+
+    daemon.stop().await;
+}
+
+fn lan_address(interface: &str, addr: [u8; 4]) -> LanAddress {
+    LanAddress {
+        interface: interface.into(),
+        addr: Ipv4Addr::from(addr),
+        subnet: format!("{}.{}.{}.0/24", addr[0], addr[1], addr[2])
+            .parse()
+            .unwrap(),
+    }
+}
+
+async fn eventually(what: &str, ok: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while !ok() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A free port whose next port is free too, below the ephemeral range
+/// on Linux and macOS, so the Host listener's port `0` never lands on
+/// either.
+fn free_pair() -> u16 {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let start = 20_000 + u16::try_from(seed % 5_000).unwrap() * 2;
+    (start..30_000)
+        .step_by(2)
+        .find(|&port| {
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+                && std::net::TcpListener::bind(("127.0.0.1", port + 1)).is_ok()
+        })
+        .unwrap()
+}
+
+/// `wiki`, and `notes`, which opts out of `.local`, routed on two ports
+/// of their own, on a Mac whose LAN address `host` gives, announcing
+/// through `proxy`.
+async fn local_names_daemon(host: FakeNetwork, proxy: ProxyDeps) -> Daemon {
+    use alchemy_core::route::{XAlchemy, XAlchemyBlock};
+
+    let wiki_app = fake_app("wiki").await;
+    let notes_app = fake_app("notes").await;
+    let connector = FakeConnector::new();
+    connector.redirect(wiki_app, wiki_app);
+    connector.redirect(notes_app, notes_app);
+    let port = free_pair();
+    let dir = tempdir();
+    let (home, config) = apps_home(
+        dir.path(),
+        vec![
+            (
+                "wiki",
+                vec![service("app", &[], vec![tcp(wiki_app.port(), 3000)])],
+            ),
+            (
+                "notes",
+                vec![service("app", &[], vec![tcp(notes_app.port(), 3000)])],
+            ),
+        ],
+    );
+    config.set(
+        home.join("notes"),
+        FakeConfig::Config(ComposeConfig {
+            name: "notes".into(),
+            services: vec![service("app", &[], vec![tcp(notes_app.port(), 3000)])],
+            x_alchemy: Some(XAlchemyBlock::Read(XAlchemy {
+                mdns: false,
+                ..XAlchemy::default()
+            })),
+            ..ComposeConfig::default()
+        }),
+    );
+    let mut wiki = running("wiki-app-1", "wiki", "app");
+    wiki.ports = vec![tcp(wiki_app.port(), 3000)];
+    let mut notes = running("notes-app-1", "notes", "app");
+    notes.ports = vec![tcp(notes_app.port(), 3000)];
+    Daemon::start_on(
+        dir,
+        Engine {
+            facts: EngineFacts {
+                host_os: HostOs::MacOs,
+                flavor: Some(EngineFlavor::DockerDesktop),
+                rootless: false,
+            },
+            containers: vec![wiki, notes],
+        },
+        (home, config),
+        FakeEngineNetworks::new(),
+        proxy
+            .with_connector(Arc::new(connector))
+            .with_range(PortRange::new(port, port.saturating_add(1)).unwrap())
+            .with_host_listen(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .with_interval(Duration::from_millis(50)),
+        host,
+    )
+    .await
+}
+
+/// The state of `app`'s address at `url`, if it has one.
+fn state_of(app: &App, url: &str) -> Option<AddressState> {
+    app.addresses.iter().find(|a| a.url == url).map(|a| a.state)
+}
+
+fn local_urls(app: &App) -> Vec<String> {
+    app.addresses
+        .iter()
+        .filter(|a| a.url.contains(".local/") || a.url.contains(".local:"))
+        .map(|a| a.url.clone())
+        .collect()
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread")]
+async fn announces_local_names_and_follows_the_lan_the_setting_and_conflicts() {
+    use alchemy_api::network::{MdnsBackend, MdnsState, NetworkSettings};
+    use alchemy_core::route::HostLabel;
+    use alchemyd::mdns::{Backend, FakeAnnouncer, FakeCall, RecordState};
+
+    let host = FakeNetwork::new();
+    host.set_lan_addresses(vec![lan_address("en0", [192, 168, 1, 20])]);
+    let announcer = FakeAnnouncer::new(Backend::DnsSd);
+    let daemon = local_names_daemon(
+        host.clone(),
+        ProxyDeps::loopback().with_announcer(Arc::new(announcer.clone())),
+    )
+    .await;
+    let wiki_label = HostLabel::new("wiki").unwrap();
+
+    let wiki = daemon
+        .app_where("wiki", |app| {
+            app.addresses.len() == 4
+                && app.addresses.first().is_some_and(|a| {
+                    a.url.starts_with("http://wiki.local:") && a.state == AddressState::Ready
+                })
+        })
+        .await;
+    let first = &wiki.addresses[0];
+    assert_eq!(first.kind, AddressKind::Host, "{wiki:?}");
+    let host_port: u16 = first
+        .url
+        .strip_prefix("http://wiki.local:")
+        .and_then(|rest| rest.strip_suffix('/'))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let local = format!("http://wiki.local:{host_port}/");
+    let wiki_port: u16 = wiki
+        .addresses
+        .iter()
+        .find_map(|a| {
+            a.url
+                .strip_prefix("http://127.0.0.1:")
+                .and_then(|r| r.strip_suffix('/'))
+        })
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        local_urls(&wiki),
+        [local.clone(), format!("http://wiki.local:{wiki_port}/")]
+    );
+    eventually("the service to name the verified Host port", || {
+        announcer.published().first().map(|r| r.port) == Some(host_port)
+    })
+    .await;
+    let published = announcer.published();
+    assert_eq!(published.len(), 1, "notes opts out: {published:?}");
+    assert_eq!(published[0].name, "wiki.local");
+    assert_eq!(published[0].interface, "en0");
+    assert_eq!(published[0].addr, Ipv4Addr::new(192, 168, 1, 20));
+    let notes = daemon
+        .app_where("notes", |app| !app.addresses.is_empty())
+        .await;
+    assert_eq!(local_urls(&notes), Vec::<String>::new());
+    let report = daemon
+        .report_where(|r| r.mdns.state == MdnsState::Announcing)
+        .await;
+    assert_eq!(report.mdns.backend, Some(MdnsBackend::DnsSd));
+    assert_eq!(report.mdns.message, None);
+
+    announcer.set_state(&wiki_label, RecordState::Registering);
+    let wiki = daemon
+        .app_where("wiki", |app| {
+            state_of(app, &local) == Some(AddressState::Pending)
+        })
+        .await;
+    let pending = wiki.addresses.iter().find(|a| a.url == local).unwrap();
+    assert_eq!(
+        pending.message.as_deref(),
+        Some("Alchemy is announcing wiki.local on your network.")
+    );
+    assert_eq!(
+        wiki.addresses[0].url,
+        format!("http://127.0.0.1:{wiki_port}/"),
+        "{wiki:#?}"
+    );
+    announcer.set_state(&wiki_label, RecordState::Established);
+    daemon
+        .app_where("wiki", |app| state_of(app, &local) == Some(AddressState::Ready))
+        .await;
+
+    announcer.take(&wiki_label);
+    let wiki = daemon
+        .app_where("wiki", |app| !app.problems.is_empty())
+        .await;
+    assert_eq!(wiki.problems[0].kind, AppProblemKind::Route);
+    assert_eq!(
+        wiki.problems[0].message,
+        "Another device on your network uses wiki.local. Set a hostname in x-alchemy."
+    );
+    for url in local_urls(&wiki) {
+        assert_eq!(
+            state_of(&wiki, &url),
+            Some(AddressState::Unavailable),
+            "{url}"
+        );
+    }
+    assert_eq!(
+        wiki.addresses[0].url,
+        format!("http://127.0.0.1:{wiki_port}/")
+    );
+    assert_eq!(wiki.addresses[0].state, AddressState::Ready);
+    let report: NetworkReport = get_socket(&daemon.socket, "/api/network").await;
+    assert_eq!(
+        report.mdns.state,
+        MdnsState::Announcing,
+        "a conflict is the app's problem"
+    );
+
+    announcer.release(&wiki_label);
+    host.set_lan_addresses(vec![lan_address("en1", [10, 0, 0, 7])]);
+    let wiki = daemon
+        .app_where("wiki", |app| {
+            app.problems.is_empty() && state_of(app, &local) == Some(AddressState::Ready)
+        })
+        .await;
+    assert_eq!(wiki.addresses[0].url, local, "{wiki:?}");
+    assert!(
+        !announcer
+            .calls()
+            .contains(&FakeCall::Withdraw(wiki_label.clone())),
+        "a new address replaces the old one in a single announce"
+    );
+    let published = announcer.published();
+    assert_eq!(published.len(), 1);
+    assert_eq!(
+        (published[0].interface.as_str(), published[0].addr),
+        ("en1", Ipv4Addr::new(10, 0, 0, 7))
+    );
+
+    let _: NetworkSettings =
+        put_socket(&daemon.socket, "/api/settings/network", r#"{"mdns":false}"#).await;
+    let wiki = daemon
+        .app_where("wiki", |app| {
+            !app.addresses.is_empty() && local_urls(app).is_empty()
+        })
+        .await;
+    assert!(wiki.problems.is_empty());
+    let report = daemon.report_where(|r| r.mdns.state == MdnsState::Off).await;
+    assert_eq!(report.mdns.backend, None);
+    eventually("wiki.local to be withdrawn", || {
+        announcer.published().is_empty()
+    })
+    .await;
+    assert!(
+        announcer
+            .calls()
+            .contains(&FakeCall::Withdraw(wiki_label.clone()))
+    );
+
+    let _: NetworkSettings =
+        put_socket(&daemon.socket, "/api/settings/network", r#"{"mdns":true}"#).await;
+    daemon
+        .app_where("wiki", |app| state_of(app, &local) == Some(AddressState::Ready))
+        .await;
+    assert_eq!(announcer.published().len(), 1);
+
+    daemon.stop().await;
+    assert_eq!(announcer.calls().last(), Some(&FakeCall::Shutdown));
+    assert_eq!(announcer.published(), []);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_responder_that_cannot_start_leaves_ip_port_addresses_working() {
+    use alchemy_api::network::{MdnsBackend, MdnsState};
+    use alchemyd::mdns::{AnnounceError, Backend, Responder};
+
+    let host = FakeNetwork::new();
+    host.set_lan_addresses(vec![lan_address("eth0", [192, 168, 1, 20])]);
+    let daemon = local_names_daemon(
+        host,
+        ProxyDeps::loopback().with_responder(Responder::Failed(AnnounceError::Responder {
+            backend: Backend::Builtin,
+            message: "cannot open port 5353".into(),
+        })),
+    )
+    .await;
+
+    let report = daemon
+        .report_where(|r| r.mdns.state == MdnsState::Unavailable)
+        .await;
+    assert_eq!(report.mdns.backend, Some(MdnsBackend::BuiltIn));
+    assert_eq!(
+        report.mdns.message.as_deref(),
+        Some(
+            "Alchemy can't start announcing app names on your network (built-in failed: cannot open port 5353). Your apps still work at their IP:port address."
+        )
+    );
+    assert!(report.mdns.fix.is_some());
+    let wiki = daemon
+        .app_where("wiki", |app| {
+            app.addresses.first().is_some_and(|a| {
+                a.url.starts_with("http://127.0.0.1:") && a.state == AddressState::Ready
+            })
+        })
+        .await;
+    for url in local_urls(&wiki) {
+        assert_eq!(state_of(&wiki, &url), Some(AddressState::Pending), "{url}");
+    }
 
     daemon.stop().await;
 }

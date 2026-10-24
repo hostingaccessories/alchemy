@@ -24,8 +24,9 @@ use alchemy_core::route::{
 };
 
 use crate::apps::ConfigOutcome;
+use crate::mdns::Wanted;
 use crate::network::LanAddress;
-use crate::proxy::{BindError, Listen, ListenerStatus, ProbeResult, ProxyStatus};
+use crate::proxy::{BindError, HOST_PORT, Listen, ListenerStatus, ProbeResult, ProxyStatus};
 
 /// What the routing task last decided, kept in
 /// [`State`](crate::State) for the apps task and `GET /api/network`.
@@ -106,6 +107,32 @@ pub fn mdns_problem(problem: &MdnsProblem) -> AppProblem {
     AppProblem {
         kind: AppProblemKind::Route,
         message: problem.kind.to_string(),
+    }
+}
+
+/// What to hand the mDNS task: the names `inputs` say are desired,
+/// pointing at `lan`, each with the port its `_http._tcp` service should
+/// carry. That is the Host listener's port once its check reached the
+/// proxy, since `http://<name>.local/` works then, else the app's own
+/// port, which `http://<name>.local:<port>/` uses.
+pub fn mdns_wanted(inputs: &RoutingInputs<'_>, lan: Option<&LanIpv4>) -> Wanted {
+    let verified_host = match (&inputs.status.host, inputs.checks.get(&Listen::Host)) {
+        (ListenerStatus::Listening(addr), Some(ListenerCheck::Ours)) => Some(addr.port()),
+        _ => None,
+    };
+    let fallback = inputs.addressing.host_port.unwrap_or(HOST_PORT);
+    let names = inputs.mdns.desired.clone();
+    let ports = names
+        .iter()
+        .map(|a| {
+            let own = inputs.plan.table.get(&a.app).and_then(|r| r.listen_port);
+            (a.label.clone(), verified_host.or(own).unwrap_or(fallback))
+        })
+        .collect();
+    Wanted {
+        lan: lan.cloned(),
+        names,
+        ports,
     }
 }
 
@@ -1671,6 +1698,81 @@ mod tests {
             .collect();
         assert_eq!(urls, ["http://127.0.0.1:8100/", "http://blog.localhost/"]);
         assert!(got.apps["wiki"].problems.is_empty(), "no name, no conflict");
+    }
+
+    #[test]
+    fn wanted_names_carry_port_80_only_once_it_reaches_the_proxy() {
+        let (apps, configs, containers) = world();
+        let reserved = BTreeMap::from([("blog".to_owned(), 8100), ("wiki".to_owned(), 8101)]);
+        let inputs = route_inputs(&apps, &configs, &containers, &reserved);
+        let plan = plan_routes(
+            &inputs,
+            &RouteOptions {
+                reachability: Reachability::ContainerIp,
+                suffixes: suffixes(true),
+            },
+        );
+        let want = alchemy_core::mdns::desired(&alchemy_core::mdns::MdnsInputs {
+            enabled: true,
+            routes: &plan.table,
+            lan: Some(&lan()),
+        });
+        let everything = ProxyStatus {
+            host: listening(80),
+            ports: BTreeMap::from([(8100, listening(8100)), (8101, listening(8101))]),
+        };
+        let refused = ProxyStatus {
+            host: ListenerStatus::Unavailable(bind_error(80, io::ErrorKind::PermissionDenied)),
+            ..everything.clone()
+        };
+        let foreign = BTreeMap::from([(Listen::Host, ListenerCheck::Foreign(at("127.0.0.1:80")))]);
+        let cases = [
+            ("port 80 verified", &everything, ours(&everything), [80, 80]),
+            (
+                "port 80 not checked yet",
+                &everything,
+                BTreeMap::new(),
+                [8100, 8101],
+            ),
+            (
+                "port 80 answered by another program",
+                &everything,
+                foreign,
+                [8100, 8101],
+            ),
+            ("port 80 refused", &refused, ours(&refused), [8100, 8101]),
+        ];
+        let status = MdnsStatus::default();
+        for (name, proxy, checks, ports) in cases {
+            let got = mdns_wanted(
+                &RoutingInputs {
+                    plan: &plan,
+                    inputs: &inputs,
+                    reachability: Reachability::ContainerIp,
+                    unreserved: &BTreeMap::new(),
+                    range: PortRange::new(8100, 8999).unwrap(),
+                    status: proxy,
+                    checks: &checks,
+                    addressing: Addressing {
+                        host_port: Some(80),
+                        app_host: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+                    },
+                    mdns: MdnsRouting {
+                        enabled: true,
+                        desired: &want,
+                        status: &status,
+                    },
+                },
+                Some(&lan()),
+            );
+            assert_eq!(got.lan, Some(lan()), "{name}");
+            assert_eq!(got.names, want, "{name}");
+            assert_eq!(
+                got.ports,
+                BTreeMap::from([(label("blog"), ports[0]), (label("wiki"), ports[1])]),
+                "{name}"
+            );
+        }
     }
 
     #[test]

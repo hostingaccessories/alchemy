@@ -469,7 +469,8 @@ fn spawn_background(
 }
 
 /// Start the web address [`proxy`] as `deps` says, never routing to
-/// `api`, and the [`routing`] task that feeds it routes, each with its
+/// `api`, the [`routing`] task that feeds it routes, and the [`mdns`]
+/// task that announces the `.local` names routing picks, each with its
 /// name. The proxy starts with an empty route table, so it binds nothing
 /// until routes arrive. Routing attaches containers through `routing.0`,
 /// reads the LAN address through `routing.1`, and reserves ports through
@@ -480,9 +481,17 @@ fn spawn_proxy(
     routing: (Arc<dyn EngineNetworks>, SharedNetwork, &PortRegistry),
     state: &State,
     shutdown: &watch::Receiver<bool>,
-) -> [(&'static str, JoinHandle<()>); 2] {
+) -> [(&'static str, JoinHandle<()>); 3] {
     let (engine, network, ports) = routing;
     let (routes_tx, routes_rx) = watch::channel(RouteTable::default());
+    let (names_tx, names_rx) = watch::channel(None);
+    let mdns = tokio::spawn(mdns::run(
+        deps.responder.clone(),
+        names_rx,
+        state.clone(),
+        deps.interval,
+        shutdown.clone(),
+    ));
     let (status_tx, status_rx) = watch::channel(ProxyStatus::default());
     let (probe_tx, probe_rx) = watch::channel(None);
     let proxy = tokio::spawn(proxy::run(
@@ -495,6 +504,7 @@ fn spawn_proxy(
     ));
     let handle = ProxyHandle {
         routes: routes_tx,
+        names: names_tx,
         status: status_rx,
         probe: probe_tx,
     };
@@ -507,7 +517,7 @@ fn spawn_proxy(
         handle,
         shutdown.clone(),
     ));
-    [("routing", routing), ("proxy", proxy)]
+    [("routing", routing), ("proxy", proxy), ("mdns", mdns)]
 }
 
 fn warn_if_exposed(listen: SocketAddr) {

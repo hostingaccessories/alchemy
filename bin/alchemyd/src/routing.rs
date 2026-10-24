@@ -22,7 +22,11 @@
 //! `x-alchemy: { mdns: false }`. Each name [`desired`] for the LAN
 //! address gets `.local` addresses, as far as the announcer's
 //! [`MdnsStatus`] in [`State`] says it has got, and a name another device
-//! answers for is an app problem.
+//! answers for is an app problem. The names, with the port each one's
+//! service carries, go to the [`mdns`](crate::mdns) task as [`Wanted`]
+//! on [`ProxyHandle::names`], so it and the addresses agree on one LAN
+//! read and one plan. The LAN address is read again every
+//! [`ProxyDeps::interval`], so a new one re-announces every name.
 //!
 //! A proxy listener another program held is tried again every
 //! [`ProxyDeps::interval`].
@@ -61,6 +65,7 @@ pub use plan::{AppRouting, MdnsStatus, Routing};
 
 use self::plan::{Addressing, ListenerCheck, MdnsRouting, RoutingInputs};
 use crate::State;
+use crate::mdns::{FakeAnnouncer, Responder, SharedAnnouncer, Wanted};
 use crate::network::{SharedNetwork, preferred_lan_address};
 use crate::ports::PortRegistry;
 use crate::proxy::probe::classify;
@@ -98,12 +103,15 @@ pub struct ProxyDeps {
     pub range: PortRange,
     /// How often [`run`] checks when nothing prompts it.
     pub interval: Duration,
+    /// What announces apps' `.local` names.
+    pub responder: Responder,
 }
 
 impl ProxyDeps {
     /// This machine's proxy: Host routing on port 80 and app ports on
     /// every IPv4 address, from [`DEFAULT_RANGE`], connecting and
-    /// checking listeners over TCP.
+    /// checking listeners over TCP, with `.local` names announced by this
+    /// host's responder.
     pub fn system() -> Self {
         Self {
             connector: Arc::new(TcpConnector),
@@ -115,12 +123,14 @@ impl ProxyDeps {
             app_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             range: default_range(),
             interval: DEFAULT_INTERVAL,
+            responder: Responder::System,
         }
     }
 
     /// A proxy for tests: app ports on loopback only, no Host listener,
     /// and a [`FakeConnector`] that reaches nothing until told to. Its
-    /// listeners are checked for real, over loopback.
+    /// listeners are checked for real, over loopback, and `.local` names
+    /// go to a [`FakeAnnouncer`].
     pub fn loopback() -> Self {
         Self {
             connector: Arc::new(FakeConnector::new()),
@@ -129,7 +139,21 @@ impl ProxyDeps {
             app_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             range: default_range(),
             interval: DEFAULT_INTERVAL,
+            responder: Responder::Given(Arc::new(FakeAnnouncer::default())),
         }
+    }
+
+    /// Announce `.local` names through `announcer` instead.
+    #[must_use]
+    pub fn with_announcer(self, announcer: SharedAnnouncer) -> Self {
+        self.with_responder(Responder::Given(announcer))
+    }
+
+    /// Get the announcer from `responder` instead.
+    #[must_use]
+    pub fn with_responder(mut self, responder: Responder) -> Self {
+        self.responder = responder;
+        self
     }
 
     /// Connect to apps through `connector` instead.
@@ -181,12 +205,14 @@ fn default_range() -> PortRange {
     PortRange::new(DEFAULT_RANGE.0, DEFAULT_RANGE.1).unwrap_or(PortRange::ALL)
 }
 
-/// The proxy's side of [`run`]: where to send the route table, and what
-/// the proxy is listening on.
+/// Where [`run`] sends what it decides, and what the proxy is listening
+/// on.
 #[derive(Debug)]
 pub struct ProxyHandle {
     /// The route table the proxy serves.
     pub routes: watch::Sender<RouteTable>,
+    /// The `.local` names the mDNS task announces, once planned.
+    pub names: watch::Sender<Option<Wanted>>,
     /// What the proxy is listening on.
     pub status: watch::Receiver<ProxyStatus>,
     /// The marker the proxy answers probes with, set only while a round
@@ -326,6 +352,10 @@ impl Router {
             self.state.set_routing(Routing {
                 mdns: plan::mdns_report(settings.mdns, &mdns.report),
                 ..Routing::default()
+            });
+            self.send_names(Wanted {
+                lan: self.lan_ipv4.clone(),
+                ..Wanted::default()
             });
             return;
         };
@@ -517,7 +547,7 @@ impl Router {
             .iter()
             .map(|(app, (why, _))| (app.clone(), why.clone()))
             .collect();
-        self.state.set_routing(plan::routing(&RoutingInputs {
+        let inputs = RoutingInputs {
             plan,
             inputs,
             reachability: reach,
@@ -527,29 +557,53 @@ impl Router {
             checks: &checks,
             addressing: self.addressing,
             mdns,
-        }));
+        };
+        self.state.set_routing(plan::routing(&inputs));
+        self.send_names(plan::mdns_wanted(&inputs, self.lan_ipv4.as_ref()));
+    }
+
+    /// Hand the mDNS task `wanted`, waking it only when it changed.
+    fn send_names(&self, wanted: Wanted) {
+        self.proxy.names.send_if_modified(|current| {
+            if current.as_ref() == Some(&wanted) {
+                false
+            } else {
+                *current = Some(wanted);
+                true
+            }
+        });
     }
 
     /// Read the LAN address again, mark every listener due a check, and
     /// nudge the proxy to retry any listener another program held. One
     /// refused for lack of permission stays refused until the daemon
     /// restarts, so it waits for the next route change.
+    ///
+    /// `.local` names always follow the LAN address. App port URLs and
+    /// listener checks use it only when app ports listen on every
+    /// address.
     async fn on_tick(&mut self) {
         self.recheck = true;
+        let (addresses, routes) = tokio::join!(self.host.lan_addresses(), self.host.routes());
+        let (lan, lan_ipv4) = match (addresses, routes) {
+            (Ok(addresses), Ok(routes)) => {
+                let lan = preferred_lan_address(&addresses, &routes);
+                (lan, plan::lan_ipv4(&addresses, lan))
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                tracing::debug!(%error, "cannot read the LAN address");
+                (None, None)
+            }
+        };
+        if self.lan_ipv4 != lan_ipv4 {
+            tracing::info!(
+                lan = ?lan_ipv4.as_ref().map(|l| (l.interface().to_owned(), l.addr())),
+                "LAN address changed"
+            );
+        }
+        self.lan_ipv4 = lan_ipv4;
         if self.deps.app_ip.is_unspecified() {
-            let (addresses, routes) = tokio::join!(self.host.lan_addresses(), self.host.routes());
-            let (lan, lan_ipv4) = match (addresses, routes) {
-                (Ok(addresses), Ok(routes)) => {
-                    let lan = preferred_lan_address(&addresses, &routes);
-                    (lan, plan::lan_ipv4(&addresses, lan))
-                }
-                (Err(error), _) | (_, Err(error)) => {
-                    tracing::debug!(%error, "cannot read the LAN address");
-                    (None, None)
-                }
-            };
             self.lan = lan;
-            self.lan_ipv4 = lan_ipv4;
             self.addressing.app_host = IpAddr::V4(lan.unwrap_or(Ipv4Addr::LOCALHOST));
         }
         let retry = {

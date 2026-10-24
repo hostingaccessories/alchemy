@@ -15,23 +15,33 @@
 //! Each backend reports what became of every name it publishes, a
 //! conflict with another device included, as [`RecordStates`] on a watch
 //! channel. Tests use [`FakeAnnouncer`].
+//!
+//! [`run`] drives one announcer for the daemon: routing hands it the
+//! [`Wanted`] names, it makes the calls [`plan`] works out, and it
+//! reports what came of them to [`State`](crate::State) as an
+//! [`MdnsStatus`](crate::routing::MdnsStatus).
 
 pub mod avahi;
 pub mod builtin;
 pub mod dnssd;
 mod fake;
+pub mod plan;
+mod task;
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
+use alchemy_api::network::MdnsBackend;
 use alchemy_core::mdns::Announcement;
 use alchemy_core::route::HostLabel;
 use futures_util::future::BoxFuture;
 use tokio::sync::watch;
 
 pub use fake::{FakeAnnouncer, FakeCall};
+pub use plan::Wanted;
+pub use task::run;
 
 /// The DNS-SD service type the `dns-sd` and built-in backends carry with
 /// each name, since neither can publish an A record alone.
@@ -56,6 +66,15 @@ impl Backend {
             Self::DnsSd => "dns-sd",
             Self::Avahi => "avahi",
             Self::Builtin => "built-in",
+        }
+    }
+
+    /// The name `GET /api/network` reports this backend by.
+    pub fn api(self) -> MdnsBackend {
+        match self {
+            Self::DnsSd => MdnsBackend::DnsSd,
+            Self::Avahi => MdnsBackend::Avahi,
+            Self::Builtin => MdnsBackend::BuiltIn,
         }
     }
 }
@@ -208,6 +227,29 @@ pub async fn system() -> Result<SharedAnnouncer, AnnounceError> {
         }
     }
     Ok(Arc::new(builtin::BuiltinAnnouncer::new()?))
+}
+
+/// Where [`run`] gets its announcer.
+#[derive(Debug, Clone)]
+pub enum Responder {
+    /// This host's, from [`system`], started when the task starts.
+    System,
+    /// This one, such as a [`FakeAnnouncer`].
+    Given(SharedAnnouncer),
+    /// None, since starting one failed with this error, as [`system`]
+    /// can.
+    Failed(AnnounceError),
+}
+
+impl Responder {
+    /// The announcer.
+    pub async fn start(self) -> Result<SharedAnnouncer, AnnounceError> {
+        match self {
+            Self::System => system().await,
+            Self::Given(announcer) => Ok(announcer),
+            Self::Failed(error) => Err(error),
+        }
+    }
 }
 
 /// The published names and their states, shared by a backend's tasks.
