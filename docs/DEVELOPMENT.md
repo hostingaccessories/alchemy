@@ -53,8 +53,8 @@ Daemon settings, as flags or environment variables:
 
 The state directory is `$XDG_STATE_HOME/alchemy` (else
 `~/.local/state/alchemy`) on Linux and `~/Library/Application Support/Alchemy`
-on macOS. It holds `alchemy.db`, the daemon's SQLite database of settings
-and history. The directory is `0700` and the database `0600`. A
+on macOS. It holds `alchemy.db`, the daemon's SQLite database of the app
+folder settings, operation and metrics history, and stop intents. The directory is `0700` and the database `0600`. A
 database that is corrupt, or was written by a newer alchemyd, stops startup
 with a message saying so; move it aside to start fresh. Point
 `--state-dir` at a temporary directory to run a throwaway daemon. The schema
@@ -121,8 +121,8 @@ alchemy completions fish > ~/.config/fish/completions/alchemy.fish
 
 ### Remote daemon over SSH
 
-Until then, reach a daemon on another machine by forwarding its socket over
-SSH, as the user that runs alchemyd there, and pointing `--socket` at the
+Until remote daemons have authentication, reach one on another machine by
+forwarding its socket over SSH, as the user that runs alchemyd there, and pointing `--socket` at the
 local end. `alchemy status` on the server prints the remote path.
 
 ```sh
@@ -186,73 +186,11 @@ transitions live.
 The engine tests use fakes and run without Docker; the few that need the
 real engine are listed in [Tests that need Docker](#tests-that-need-docker).
 
-### Stopped or crashed
-
-Every container, and every app, carries a `stop_reason`: running,
-stopped by Alchemy, stopped outside Alchemy, crashed (with its exit code
-and whether it ran out of memory), keeps crashing, or finished. The pure
-rules live in `alchemy_core::engine::stop`. They read the container's
-events (`docker stop` sends `kill`, `die`, then `stop`; an out-of-memory
-kill sends `oom` then `die`; a process killed from the host sends only
-`die`) and the last action Alchemy recorded for its Compose project
-(`bin/alchemyd/src/intent.rs`), which is stored so it survives a restart.
-Containers already stopped when the daemon connects are inspected once
-for their exit code. A one-off job that exits 0 doesn't make its app
-partly running.
-
-To see each case, run an app and then:
-
-```sh
-docker compose stop web               # Stopped outside Alchemy
-docker kill --signal=KILL blog-web-1  # Stopped outside Alchemy
-sudo kill -9 "$(docker inspect -f '{{.State.Pid}}' blog-web-1)"  # Crashed (exit code 137), Linux
-```
-
-### Metrics
-
-The daemon samples this machine and every running container a minute
-after the last sample (the first right at startup, the second 10 seconds
-later), whether or not anyone is looking. Machine figures come from
-`sysinfo`, plus `/proc/stat` for raw CPU ticks on Linux; on macOS they
-are the Mac's own, not the VM Docker Desktop runs containers in, and the
-API, CLI, and UI say so. Container figures come from one-shot Engine API
-stats, at most 4 at a time with a 5 second timeout each. CPU is a share
-of the whole machine (or of Docker's VM), so an app's containers add up to
-the machine's figure. A figure that could not be measured is `null`,
-never 0.
-
-History is stored in the state database in five tiers, each rolled up
-from the one below and kept a little longer than its range:
-
-| Range | Point every | Kept for |
-| ----- | ----------- | -------- |
-| `1h`  | 1 minute    | 2 hours  |
-| `12h` | 10 minutes  | 13 hours |
-| `24h` | 20 minutes  | 25 hours |
-| `7d`  | 2 hours     | 8 days   |
-| `30d` | 8 hours     | 31 days  |
-
-A bucket is built once it closes, and only if the tier below has at least
-half its points, so a stretch the daemon was stopped for stays a gap; it
-catches up on restart. The pure logic lives in `alchemy_core::metrics`,
-the collector in `bin/alchemyd/src/metrics/`.
-
-`GET /api/metrics` is the latest sample, also sent as the `metrics`
-event; `GET /api/metrics/history?range=24h` is one tier's points. Both
-take `project=NAME` for one Compose project's figures. `alchemy machine
-stats` and `alchemy app stats NAME` print them, and the Machines page
-charts them. An app's figures are its Compose project's, the `project`
-in its entry from `/api/apps`.
-
-```sh
-curl --unix-socket /run/user/1000/alchemy/alchemyd.sock 'http://alchemyd/api/metrics/history?range=24h&project=blog'
-```
-
 ### Apps
 
 An app is a folder holding a compose file inside one of the app folders.
 The home, `~/Alchemy/apps` unless chosen otherwise, is searched first and
-is where new apps will go; other folders, such as an existing `/opt/stacks`,
+is where new apps go; other folders, such as an existing `/opt/stacks`,
 are searched after it in order. Both are settings in the state database,
 changed with `PUT /api/settings/apps`, `alchemy settings set app-home
 PATH|default`, `alchemy settings set app-folders [PATH]...`, or the
@@ -281,7 +219,8 @@ The daemon lists the folders every 5 seconds and runs `docker compose
 --project-directory DIR config --format json` for an app only when it is
 new or its compose file, overrides, or `.env` changed (by size and
 modification time), at most 4 at a time, to learn the project name Compose
-resolves (folder name, `name:`, or `COMPOSE_PROJECT_NAME`) and whether any
+resolves (folder name, `name:`, or `COMPOSE_PROJECT_NAME` in the app's
+`.env`) and whether any
 service builds. Saving the settings lists and reads everything again at
 once. Containers are matched to apps by their
 `com.docker.compose.project` label; Compose projects that match no app are
@@ -358,29 +297,6 @@ curl --unix-socket /run/user/1000/alchemy/alchemyd.sock -X POST \
   http://alchemyd/api/apps
 ```
 
-### Logs
-
-`GET /api/apps/NAME/logs` streams an app's logs as server-sent events,
-read from the Engine API, never a `docker compose logs` process. The
-containers are the app's, as `/api/apps` lists them; `service=web`
-limits them to one service (400 `bad_request` for one the app doesn't
-have). It sends the last `tail` lines (200 by default, at most 5000)
-across the containers in the order Docker timestamped them, as one `log`
-event each, then `done`. With `follow=true` it sends `following` instead
-of `done` and then each new line as it arrives, until the client leaves:
-a container that stops is picked up again, without repeating a line, when
-it starts, and one Compose creates later is followed from its first line.
-A `done` with an `error` means the logs couldn't be read; a stream that
-ends without `done` was cut off. Lines over 8 KiB are cut and end in `…`,
-and bytes that aren't UTF-8 become U+FFFD. `alchemy app logs NAME
-[SERVICE] [-f] [--tail N]` prints `service | line` (NDJSON with
-`--json`), and the app page has a Logs section. The pure line handling
-is in `alchemy_core::logs`, the reading in `bin/alchemyd/src/logs/`.
-
-```sh
-curl -N --unix-socket /run/user/1000/alchemy/alchemyd.sock 'http://alchemyd/api/apps/blog/logs?service=web&follow=true'
-```
-
 ### Lifecycle actions
 
 `POST /api/apps/NAME/actions` with `{"action":"up"}` (or `down`, `start`,
@@ -393,6 +309,15 @@ is 409 `conflict`, as is one before Compose has read the app or while
 Docker isn't running. Before Compose runs, the operation records the stop
 intent (`up` for an update; nothing for `pull` and `build`), and leaves it
 when it fails.
+
+Every `docker compose` the daemon runs, for actions, reads, and
+validation, is `docker compose --project-directory DIR ...` with no `-p`,
+so Compose resolves the project as it would by hand (only validation adds
+`-f` for its staged file). Its environment is an allowlist
+(`bin/alchemyd/src/compose/env.rs`): `PATH`, `HOME`, the locale, `TMPDIR`,
+`DOCKER_CONFIG`, and a few more pass through, with `DOCKER_HOST` set to
+the engine the daemon found; `COMPOSE_*`, the other `DOCKER_*` variables,
+proxies, and `SSH_AUTH_SOCK` never do.
 
 `GET /api/operations/ID/events` streams the operation as server-sent
 events: `operation` first and on every step change, `output` for each line
@@ -426,6 +351,91 @@ curl --unix-socket /run/user/1000/alchemy/alchemyd.sock -X POST \
 curl -N --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/operations/ID/events
 ```
 
+### Logs
+
+`GET /api/apps/NAME/logs` streams an app's logs as server-sent events,
+read from the Engine API, never a `docker compose logs` process. The
+containers are the app's, as `/api/apps` lists them; `service=web`
+limits them to one service (400 `bad_request` for one the app doesn't
+have). It sends the last `tail` lines (200 by default, at most 5000)
+across the containers in the order Docker timestamped them, as one `log`
+event each, then `done`. With `follow=true` it sends `following` instead
+of `done` and then each new line as it arrives, until the client leaves:
+a container that stops is picked up again, without repeating a line, when
+it starts, and one Compose creates later is followed from its first line.
+A `done` with an `error` means the logs couldn't be read; a stream that
+ends without `done` was cut off. Lines over 8 KiB are cut and end in `…`,
+and bytes that aren't UTF-8 become U+FFFD. `alchemy app logs NAME
+[SERVICE] [-f] [--tail N]` prints `service | line` (NDJSON with
+`--json`), and the app page has a Logs section. The pure line handling
+is in `alchemy_core::logs`, the reading in `bin/alchemyd/src/logs/`.
+
+```sh
+curl -N --unix-socket /run/user/1000/alchemy/alchemyd.sock 'http://alchemyd/api/apps/blog/logs?service=web&follow=true'
+```
+
+### Stopped or crashed
+
+Every container, and every app, carries a `stop_reason`: running,
+stopped by Alchemy, stopped outside Alchemy, crashed (with its exit code
+and whether it ran out of memory), keeps crashing, or finished. The pure
+rules live in `alchemy_core::engine::stop`. They read the container's
+events (`docker stop` sends `kill`, `die`, then `stop`; an out-of-memory
+kill sends `oom` then `die`; a process killed from the host sends only
+`die`) and the last action Alchemy recorded for its Compose project
+(`bin/alchemyd/src/intent.rs`), which is stored so it survives a restart.
+Containers already stopped when the daemon connects are inspected once
+for their exit code. A one-off job that exits 0 doesn't make its app
+partly running.
+
+To see each case, run an app and then:
+
+```sh
+docker compose stop web               # Stopped outside Alchemy
+docker kill --signal=KILL blog-web-1  # Stopped outside Alchemy
+sudo kill -9 "$(docker inspect -f '{{.State.Pid}}' blog-web-1)"  # Crashed (exit code 137), Linux
+```
+
+### Metrics
+
+The daemon samples this machine and every running container a minute
+after the last sample (the first right at startup, the second 10 seconds
+later), whether or not anyone is looking. Machine figures come from
+`sysinfo`, plus `/proc/stat` for raw CPU ticks on Linux; on macOS they
+are the Mac's own, not the VM Docker Desktop runs containers in, and the
+API, CLI, and UI say so. Container figures come from one-shot Engine API
+stats, at most 4 at a time with a 5 second timeout each. CPU is a share
+of the whole machine (or of Docker's VM), so an app's containers add up to
+the machine's figure. A figure that could not be measured is `null`,
+never 0.
+
+History is stored in the state database in five tiers, each rolled up
+from the one below and kept a little longer than its range:
+
+| Range | Point every | Kept for |
+| ----- | ----------- | -------- |
+| `1h`  | 1 minute    | 2 hours  |
+| `12h` | 10 minutes  | 13 hours |
+| `24h` | 20 minutes  | 25 hours |
+| `7d`  | 2 hours     | 8 days   |
+| `30d` | 8 hours     | 31 days  |
+
+A bucket is built once it closes, and only if the tier below has at least
+half its points, so a stretch the daemon was stopped for stays a gap; it
+catches up on restart. The pure logic lives in `alchemy_core::metrics`,
+the collector in `bin/alchemyd/src/metrics/`.
+
+`GET /api/metrics` is the latest sample, also sent as the `metrics`
+event; `GET /api/metrics/history?range=24h` is one tier's points. Both
+take `project=NAME` for one Compose project's figures. `alchemy machine
+stats` and `alchemy app stats NAME` print them, and the Machines page
+charts them. An app's figures are its Compose project's, the `project`
+in its entry from `/api/apps`.
+
+```sh
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock 'http://alchemyd/api/metrics/history?range=24h&project=blog'
+```
+
 ### Web UI in debug vs release
 
 The daemon serves `app/alchemy-web/dist`. Debug builds read it from disk, so
@@ -457,10 +467,11 @@ cargo test -p alchemyd --test escape -- --ignored   # the escape hatch, below
 ```
 
 The escape test (`bin/alchemyd/tests/escape.rs`) proves that Alchemy leaves
-apps manageable by hand. It writes two apps into a temporary app home, one
-named after its folder and one with a top-level `name:`, starts alchemyd
-with the real engine monitor, `docker compose config`, and `docker compose`
-runner, and brings both up through `POST /api/apps/NAME/actions`. Then it
+apps manageable by hand. It starts alchemyd on a temporary app home with
+the real engine monitor, `docker compose config`, app editor, and
+`docker compose` runner. One app is written by hand and named after its
+folder; the other is created through `POST /api/apps` with a top-level
+`name:`. It brings both up through `POST /api/apps/NAME/actions`. Then it
 stops the daemon and, in each app's folder, runs `docker compose ps`,
 `stop`, and `up --detach` with no `-p` or `-f`, checking each time that
 they act on the same containers, with the same
@@ -634,7 +645,8 @@ route in `alchemy-api` and `alchemyd` if it needs data the daemon doesn't
 serve yet ([Talking to alchemyd](#talking-to-alchemyd)). Usage
 errors, `--json` errors, exit codes, `--daemon` and `--socket`, the version
 handshake, ctrl-c, help, completions, and man pages already apply to every
-command; nothing else needs wiring. The examples add `alchemy app list`;
+command; nothing else needs wiring. The examples walk through a simplified `alchemy app list` (the real one,
+in `src/commands/app/list.rs`, has no `--all`);
 paths are relative to `bin/alchemy/`.
 
 ### Naming
@@ -896,3 +908,50 @@ Finally, run [the gate](#4-the-gate). It builds `alchemy` with the
 ```sh
 cargo clippy -p alchemy --lib --bins --locked -- -D warnings
 ```
+
+## 9. Adding an app action
+
+An app action runs through every layer, but most of them are tables that
+the compiler walks you through. The examples add a `pause` action; paths
+are from the repository root.
+
+1. **The model** (`crates/alchemy-core/src/operation.rs`). Add the variant
+   to `Action`, `Action::ALL`, and `as_str`, and a `StepCommand` if it
+   runs a `docker compose` subcommand no other action does. Give each new
+   step a label in `step_label`, decide in `intent_action` what stop
+   intent it records (`None` if it leaves containers alone, as `pull`
+   does), and, for a new `StepCommand`, its verb in the progress message
+   in `operation/track.rs` ("1 of 2 containers paused"). `Action` is
+   exhaustive, so `cargo build` lists every match that needs an arm. Each
+   of these functions is table-tested in its module; add the rows.
+2. **The plan** (`bin/alchemyd/src/compose/plan.rs`). Add its steps to
+   `ComposePlan::new`, with any flags, and a row to `plans_every_action`.
+   Steps run in order, and an operation stops at the first that fails.
+3. **The wire** (`crates/alchemy-api`). `Action` and `StepCommand` are
+   re-exported there, so a new variant is a contract addition: add its
+   rows to the action and step tests in `tests/wire_stability.rs`, and
+   the name to `Action` (and `StepCommand`) in
+   `app/alchemy-web/src/lib/api.ts`. No `API_VERSION` bump: an older
+   daemon refuses the unknown action with 400.
+4. **The CLI** (`bin/alchemy`). Add a `Verb` variant taking
+   `action::Args` in `src/commands/app.rs`, whose doc comment is its help;
+   its arm in `run_with` in `src/lib.rs`; and its name, progress word, and
+   result in the matches in `src/commands/app/action.rs`. If it removes
+   anything, make it ask first, as `down` does there. Add
+   `alchemy-app-pause.1` to the man page lists, as in
+   [Help, completions, and man pages](#help-completions-and-man-pages).
+5. **The web UI** (`app/alchemy-web/src/components/AppActions.tsx`). Add
+   its words to `BUTTONS`, `RUNNING`, and `DONE` (`tsc` fails until all
+   three have it), and its button to `PRIMARY` or under More actions; a
+   destructive one goes in a `ConfirmDialog`. Cover it in
+   `src/routes/app-actions.test.tsx`.
+6. **The docs.** Add it to [Lifecycle actions](#lifecycle-actions) and to
+   the user guide's action table in `docs/site/src/pages/docs/apps.md`.
+
+Nothing else needs wiring: the route, the one-operation-per-app rule,
+progress, history, cancel, and the `operations` event apply to every
+action. `bin/alchemyd/tests/operations.rs` runs actions end to end
+against a `FakeComposeRunner` scripted per action with `with_script`;
+add a case there when the action's steps or intent are new. Then run
+[the gate](#4-the-gate), and the escape test if it changes what Compose
+runs.
