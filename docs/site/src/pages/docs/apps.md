@@ -276,7 +276,9 @@ such as "Downloading images" with "2 of 3 images downloaded" under it.
 - **CLI:** each step is printed on stderr as it starts or fails, and the
   result on stdout. `--json` prints every event as one line on stdout. The
   command exits 1 if the action fails or is cancelled. Ctrl-C stops
-  watching, but the action keeps running in alchemyd.
+  watching, but the action keeps running in alchemyd. `alchemy app cancel
+  NAME` stops it, as does `alchemy app cancel` with the operation id the
+  action printed when it started.
 
 Cancelling interrupts `docker compose` as Ctrl-C would, and kills it if it
 doesn't stop soon after, so an app can be left part way through, the same

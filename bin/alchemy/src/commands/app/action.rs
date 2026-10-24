@@ -5,7 +5,7 @@
 //! follows `/api/operations/{id}/events`: each step as it starts or fails
 //! goes to stderr, and the result to stdout. With `--json`, every event is
 //! one line on stdout instead. Ctrl-C stops following; the operation keeps
-//! running in alchemyd.
+//! running in alchemyd until `alchemy app cancel NAME` stops it.
 
 use std::io::Write;
 
@@ -146,14 +146,14 @@ fn decode(raw: &SseEvent) -> Result<Option<OperationEvent>, ClientError> {
         .map_err(|e| ProtocolError::Decode(e).into())
 }
 
-/// The first progress line: what started, and that Ctrl-C leaves it
-/// running.
+/// The first progress line: what started, that Ctrl-C leaves it running,
+/// and how to stop it.
 pub(crate) fn started_line(op: &Operation) -> String {
     format!(
-        "{} {} (operation {}). Ctrl-C stops watching; alchemyd keeps going.",
+        "{} {app} (operation {}). Ctrl-C stops watching; alchemyd keeps going until `alchemy app cancel {app}`.",
         doing(op.action),
-        op.app,
-        op.id
+        op.id,
+        app = op.app,
     )
 }
 
@@ -505,7 +505,7 @@ mod tests {
         assert_eq!(ctx.written(), "updated blog\n");
         assert_eq!(
             ctx.progress_written(),
-            "Updating blog (operation op1). Ctrl-C stops watching; alchemyd keeps going.\n\
+            "Updating blog (operation op1). Ctrl-C stops watching; alchemyd keeps going until `alchemy app cancel blog`.\n\
              Downloading updates…\n"
         );
         assert_eq!(

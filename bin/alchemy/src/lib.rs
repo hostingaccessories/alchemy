@@ -203,6 +203,9 @@ pub async fn run_with<W: Write, P: Prompt>(
                 let mut context = context(out, app::action::name(Action::Update))?;
                 app::action::run(&mut context, prompt, Action::Update, args).await
             }
+            app::Verb::Cancel(args) => {
+                app::cancel::run(&mut context(out, app::cancel::NAME)?, args).await
+            }
         },
         Command::Machine(args) => match args.command {
             machine::Verb::Stats(args) => {

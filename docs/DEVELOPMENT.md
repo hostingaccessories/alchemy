@@ -418,7 +418,11 @@ on stdout, and with `--json` every event as one line on stdout. `down`
 asks first (`--yes` skips the question, and without a terminal it refuses
 with exit 3); `--dry-run` prints the plan. A failed, cancelled, or
 interrupted operation exits 1 with kind `operation_failed`. Ctrl-C stops
-following, but the operation keeps running in the daemon. The app page
+following, but the operation keeps running in the daemon.
+`alchemy app cancel NAME|ID` cancels the app's running operation (found
+with `?app=NAME`), or, for anything that is not an app name or is a name
+with no operations, the operation with that id; with nothing running it
+exits 1 with kind `nothing_to_cancel`. The app page
 has the same actions, with Down, Pull, and Build under More actions. The
 pure model is `alchemy_core::operation`, the manager
 `bin/alchemyd/src/operations/`.
@@ -885,16 +889,16 @@ The message says what failed, then why, in lower case without a final full
 stop or the `alchemy: ` prefix. The hint is the next step, kept out of the
 message. `kind` is a contract.
 
-| Exit | When                                                    | `kind`                                                                   |
-| ---- | ------------------------------------------------------- | ------------------------------------------------------------------------ |
-| 0    | It did what was asked                                   |                                                                          |
-| 1    | It failed, for example alchemyd refused it              | `daemon`, `runtime`, `operation_failed`, `editor`, `file`                |
-| 2    | The command line or daemon target is invalid            | `usage`, `remote_daemon`, `invalid_target`                               |
-| 3    | Confirmation was declined, or needed without a terminal | `declined`, `confirmation_required`                                      |
-| 69   | alchemyd is unreachable or went away                    | `daemon_unreachable`, `disconnected`                                     |
-| 74   | Writing the output failed                               | `output`                                                                 |
-| 76   | alchemy and alchemyd don't speak the same protocol      | `daemon_too_old`, `protocol`, `unexpected_response`, `connection_closed` |
-| 130  | Interrupted with ctrl-c                                 | `interrupted`                                                            |
+| Exit | When                                                    | `kind`                                                                         |
+| ---- | ------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| 0    | It did what was asked                                   |                                                                                |
+| 1    | It failed, for example alchemyd refused it              | `daemon`, `runtime`, `operation_failed`, `nothing_to_cancel`, `editor`, `file` |
+| 2    | The command line or daemon target is invalid            | `usage`, `remote_daemon`, `invalid_target`                                     |
+| 3    | Confirmation was declined, or needed without a terminal | `declined`, `confirmation_required`                                            |
+| 69   | alchemyd is unreachable or went away                    | `daemon_unreachable`, `disconnected`                                           |
+| 74   | Writing the output failed                               | `output`                                                                       |
+| 76   | alchemy and alchemyd don't speak the same protocol      | `daemon_too_old`, `protocol`, `unexpected_response`, `connection_closed`       |
+| 130  | Interrupted with ctrl-c                                 | `interrupted`                                                                  |
 
 Ctrl-c and a closed stdout (`| head`) only set the exit code. Most commands
 need no new error. Add a `ClientError` variant only when a script would

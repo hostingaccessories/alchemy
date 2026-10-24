@@ -5,6 +5,7 @@
 //! adding its module and a [`Verb`] variant.
 
 pub mod action;
+pub mod cancel;
 pub mod create;
 pub mod edit;
 pub mod list;
@@ -57,7 +58,7 @@ pub enum Verb {
     ///
     /// Progress goes to stderr and the result to stdout; with --json, each
     /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
-    /// carries on with it.
+    /// carries on with it; `alchemy app cancel NAME` stops it.
     Up(action::Args),
 
     /// Stop and remove an app's containers and networks. Its volumes and
@@ -65,42 +66,43 @@ pub enum Verb {
     ///
     /// Asks first; pass --yes to skip the question. Progress goes to stderr
     /// and the result to stdout; with --json, each event is one line on
-    /// stdout. Ctrl-C stops watching, but alchemyd carries on with it.
+    /// stdout. Ctrl-C stops watching, but alchemyd carries on with it;
+    /// `alchemy app cancel NAME` stops it.
     Down(action::Args),
 
     /// Start an app's existing containers.
     ///
     /// Progress goes to stderr and the result to stdout; with --json, each
     /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
-    /// carries on with it.
+    /// carries on with it; `alchemy app cancel NAME` stops it.
     Start(action::Args),
 
     /// Stop an app's containers without removing them.
     ///
     /// Progress goes to stderr and the result to stdout; with --json, each
     /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
-    /// carries on with it.
+    /// carries on with it; `alchemy app cancel NAME` stops it.
     Stop(action::Args),
 
     /// Restart an app's containers.
     ///
     /// Progress goes to stderr and the result to stdout; with --json, each
     /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
-    /// carries on with it.
+    /// carries on with it; `alchemy app cancel NAME` stops it.
     Restart(action::Args),
 
     /// Download the latest images for an app, without restarting it.
     ///
     /// Progress goes to stderr and the result to stdout; with --json, each
     /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
-    /// carries on with it.
+    /// carries on with it; `alchemy app cancel NAME` stops it.
     Pull(action::Args),
 
     /// Build the images of an app's services that have a build section.
     ///
     /// Progress goes to stderr and the result to stdout; with --json, each
     /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
-    /// carries on with it.
+    /// carries on with it; `alchemy app cancel NAME` stops it.
     Build(action::Args),
 
     /// Download or rebuild an app's images, then recreate the containers
@@ -108,8 +110,17 @@ pub enum Verb {
     ///
     /// Progress goes to stderr and the result to stdout; with --json, each
     /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
-    /// carries on with it.
+    /// carries on with it; `alchemy app cancel NAME` stops it.
     Update(action::Args),
+
+    /// Cancel an app's running operation, or the operation with the given
+    /// id.
+    ///
+    /// alchemyd interrupts the running step as Ctrl-C would interrupt
+    /// `docker compose`, and the operation ends as cancelled. Prints what
+    /// is being cancelled; with --json, the operation as one line. Exits 1
+    /// when nothing is running.
+    Cancel(cancel::Args),
 
     /// Create an app from a compose file, validated by Compose first.
     ///
