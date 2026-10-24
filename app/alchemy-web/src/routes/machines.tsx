@@ -55,8 +55,13 @@ function Usage() {
     queryFn: ({ signal }) => api.metricsHistory(range, undefined, signal),
     refetchInterval: HISTORY_REFRESH_MS,
   });
+  const apps = useQuery(liveQueries.apps);
   const sampled = metrics.data && metrics.data.at !== null ? metrics.data : null;
   const now = sampled?.at ?? Date.now() / 1000;
+  const appFor = (project: string) => {
+    const matches = apps.data?.apps.filter((app) => app.project === project) ?? [];
+    return matches.length === 1 ? matches[0]?.name : undefined;
+  };
 
   return (
     <>
@@ -90,7 +95,13 @@ function Usage() {
           <h2 id="app-usage" className="text-base font-semibold">
             Apps on this machine
           </h2>
-          <AppUsageTable metrics={sampled} history={history.data} range={range} now={now} />
+          <AppUsageTable
+            metrics={sampled}
+            history={history.data}
+            range={range}
+            now={now}
+            appFor={appFor}
+          />
         </section>
       )}
     </>

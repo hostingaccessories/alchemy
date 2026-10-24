@@ -52,6 +52,23 @@ describe("request", () => {
     expect(fetch).toHaveBeenCalledWith("/api/engine", { method: "GET", signal: undefined });
   });
 
+  it("narrows metrics to an app by folder name or to a project", async () => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({})));
+    vi.stubGlobal("fetch", fetch);
+    await api.metrics();
+    await api.metrics(undefined, { app: "my blog" });
+    await api.metricsHistory("24h");
+    await api.metricsHistory("24h", { app: "blog" });
+    await api.metricsHistory("1h", { project: "my-blog" });
+    expect(fetch.mock.calls.map((call: unknown[]) => call[0])).toEqual([
+      "/api/metrics",
+      "/api/metrics?app=my+blog",
+      "/api/metrics/history?range=24h",
+      "/api/metrics/history?range=24h&app=blog",
+      "/api/metrics/history?range=1h&project=my-blog",
+    ]);
+  });
+
   it.each(["POST", "PUT", "DELETE"] as const)("sends %s with a JSON body", async (method) => {
     const fetch = vi.fn(async () => new Response(JSON.stringify({ ok: true })));
     vi.stubGlobal("fetch", fetch);

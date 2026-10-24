@@ -1,3 +1,4 @@
+import { Link } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 
 import type {
@@ -142,18 +143,21 @@ export function MachineUsageView({
 
 /**
  * Each running app's latest CPU and memory, with its CPU charted over the
- * chosen range. An app is a Compose project.
+ * chosen range. A row is a Compose project; one that `appFor` names an app
+ * for links to that app's page.
  */
 export function AppUsageTable({
   metrics,
   history,
   range,
   now,
+  appFor = () => undefined,
 }: {
   metrics: MetricsResponse;
   history: MetricsHistory | undefined;
   range: MetricsRange;
   now: number;
+  appFor?: (project: string) => string | undefined;
 }) {
   if (metrics.projects.length === 0) {
     return <p className="text-muted">No apps are running.</p>;
@@ -177,7 +181,7 @@ export function AppUsageTable({
         {metrics.projects.map((app) => (
           <tr key={app.name} className="border-t border-border">
             <td className="py-1.5 pr-3 font-medium">
-              {app.name}
+              <AppName project={app.name} app={appFor(app.name)} />
               <span className="ml-2 text-muted">
                 {app.containers} {app.containers === 1 ? "container" : "containers"}
               </span>
@@ -201,6 +205,18 @@ export function AppUsageTable({
         ))}
       </tbody>
     </table>
+  );
+}
+
+/** A project's name, linking to its app's page when it has one. */
+function AppName({ project, app }: { project: string; app: string | undefined }) {
+  if (app === undefined) {
+    return <>{project}</>;
+  }
+  return (
+    <Link to="/apps/$name" params={{ name: app }} className="text-accent hover:underline">
+      {project}
+    </Link>
   );
 }
 

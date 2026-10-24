@@ -148,9 +148,17 @@ export interface MetricsPoint {
 export interface MetricsHistory {
   range: MetricsRange;
   step: number;
+  /** The project asked for or the asked-for app's, `null` for the machine or an unread app. */
   project: string | null;
   points: MetricsPoint[];
 }
+
+/**
+ * Narrows `/api/metrics` and `/api/metrics/history` to one app, by its
+ * folder name, or to one Compose project. An unknown app is a 404
+ * `app_not_found`; an app Compose hasn't read yet has no figures.
+ */
+export type MetricsFilter = { app: string } | { project: string };
 
 /**
  * Mirrors `alchemy_api::apps::StackStatus`. A status a newer daemon sends
@@ -672,10 +680,14 @@ export const api = {
   health: (signal?: AbortSignal) => request<HealthResponse>("GET", "/health", { signal }),
   version: (signal?: AbortSignal) => request<VersionResponse>("GET", "/version", { signal }),
   engine: (signal?: AbortSignal) => request<EngineStatus>("GET", "/engine", { signal }),
-  metrics: (signal?: AbortSignal) => request<MetricsResponse>("GET", "/metrics", { signal }),
-  metricsHistory: (range: MetricsRange, project?: string, signal?: AbortSignal) => {
-    const query = new URLSearchParams({ range });
-    if (project !== undefined) query.set("project", project);
+  metrics: (signal?: AbortSignal, filter?: MetricsFilter) => {
+    const query = new URLSearchParams(filter).toString();
+    return request<MetricsResponse>("GET", query === "" ? "/metrics" : `/metrics?${query}`, {
+      signal,
+    });
+  },
+  metricsHistory: (range: MetricsRange, filter?: MetricsFilter, signal?: AbortSignal) => {
+    const query = new URLSearchParams({ range, ...filter });
     return request<MetricsHistory>("GET", `/metrics/history?${query.toString()}`, { signal });
   },
   apps: (signal?: AbortSignal) => request<AppList>("GET", "/apps", { signal }),

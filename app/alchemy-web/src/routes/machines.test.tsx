@@ -1,7 +1,7 @@
 import { act, cleanup, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import type { EngineStatus, MetricsHistory, MetricsResponse } from "../lib/api.ts";
+import type { App, AppList, EngineStatus, MetricsHistory, MetricsResponse } from "../lib/api.ts";
 import { FakeEventSource, renderAt } from "../test/render.tsx";
 
 const ready: EngineStatus = {
@@ -120,7 +120,7 @@ beforeEach(() => {
           status: 404,
         });
       }
-      if (url === "/api/engine" || url === "/api/metrics") {
+      if (url === "/api/engine" || url === "/api/metrics" || url === "/api/apps") {
         return new Promise<Response>(() => {});
       }
       if (url.startsWith("/api/metrics/history?")) {
@@ -315,6 +315,35 @@ describe("Machines", () => {
     expect(within(row).getByText("3.5%")).toBeTruthy();
     expect(within(row).getByText("300.0 MiB")).toBeTruthy();
     expect(within(row).getByRole("img", { name: "blog CPU over the last 24 hours" })).toBeTruthy();
+  });
+
+  it("links a project to the app it belongs to, even under another name", async () => {
+    await renderOnline();
+    const app: App = {
+      name: "journal",
+      status: "running",
+      dir: "/home/me/Alchemy/apps/journal",
+      root: "/home/me/Alchemy/apps",
+      compose_file: "compose.yaml",
+      project: "blog",
+      images: "registry",
+      services: [],
+      problems: [],
+      stop_reason: { kind: "running" },
+    };
+    const apps: AppList = { apps: [app], unmanaged: [], dirs: [] };
+    await act(async () => {
+      source().emit("apps", JSON.stringify(apps));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const other = { ...sample.projects[0]!, name: "legacy" };
+    await sendMetrics({ ...sample, projects: [...sample.projects, other] });
+
+    const table = screen.getByRole("region", { name: "Apps on this machine" });
+    const link = within(table).getByRole("link", { name: "blog" });
+    expect(link.getAttribute("href")).toBe("/apps/journal");
+    const legacy = within(table).getByRole("row", { name: /legacy/ });
+    expect(within(legacy).queryByRole("link")).toBeNull();
   });
 
   it("says when the figures are the host's, not Docker's VM", async () => {
