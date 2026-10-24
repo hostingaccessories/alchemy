@@ -125,7 +125,7 @@ export function AppActions({ app }: { app: App }) {
             description={
               <p>
                 Its containers and networks are removed. Its data volumes and files are kept, and
-                Start brings it back.
+                Create and start brings it back.
               </p>
             }
             confirmLabel="Take down"
