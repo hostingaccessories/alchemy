@@ -25,6 +25,7 @@ bollard            = { workspace = true }
 clap               = { workspace = true }
 futures-util       = { workspace = true }
 rust-embed         = { workspace = true }
+rusqlite           = { workspace = true }
 thiserror          = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync", "io-util", "process", "time"] }
 tower-http         = { workspace = true }
