@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::stop::{InspectedExit, Intent, StopReason, Trail, stop_reason};
+
 /// A container's lifecycle state, as Docker names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,6 +98,13 @@ pub struct ContainerStatus {
     /// Only meaningful while the container is running.
     #[serde(default)]
     pub health: Option<Health>,
+    /// Why it is or is not running. [`Containers`] keeps this current
+    /// from the container's events and its project's [`Intent`].
+    #[serde(default)]
+    pub stop_reason: StopReason,
+    /// The history `stop_reason` is decided from. Not on the wire.
+    #[serde(skip)]
+    trail: Trail,
 }
 
 impl ContainerStatus {
@@ -110,7 +119,25 @@ impl ContainerStatus {
             working_dir: None,
             state,
             health: None,
+            stop_reason: stop_reason(state, &Trail::default(), None),
+            trail: Trail::default(),
         }
+    }
+
+    /// The history its [`stop_reason`](Self::stop_reason) is decided from.
+    pub fn trail(&self) -> &Trail {
+        &self.trail
+    }
+
+    fn classify(&mut self, intent: Option<&Intent>) {
+        self.stop_reason = stop_reason(self.state, &self.trail, intent);
+    }
+
+    fn same_view(&self, other: &Self) -> bool {
+        Self {
+            trail: other.trail,
+            ..self.clone()
+        } == *other
     }
 }
 
@@ -213,6 +240,15 @@ pub struct ContainerEvent {
     /// The `com.docker.compose.project.working_dir` attribute.
     #[serde(default)]
     pub working_dir: Option<String>,
+    /// When it happened, in Unix milliseconds.
+    #[serde(default)]
+    pub at: Option<i64>,
+    /// The `exitCode` attribute of a `die` event.
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    /// The `signal` attribute of a `kill` event.
+    #[serde(default)]
+    pub signal: Option<i32>,
 }
 
 impl ContainerEvent {
@@ -226,6 +262,9 @@ impl ContainerEvent {
             project: None,
             service: None,
             working_dir: None,
+            at: None,
+            exit_code: None,
+            signal: None,
         }
     }
 }
@@ -235,9 +274,14 @@ impl ContainerEvent {
 /// Seed it with [`Containers::replace_all`] from a full listing, then keep
 /// it current with [`Containers::apply`] for each event. Iteration order
 /// is by ID, so output is deterministic.
+///
+/// It also holds the last [`Intent`] Alchemy recorded for each Compose
+/// project, set with [`Containers::set_intent`], and keeps every
+/// container's [`ContainerStatus::stop_reason`] current with both.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Containers {
     by_id: BTreeMap<String, ContainerStatus>,
+    intents: BTreeMap<String, Intent>,
 }
 
 impl Containers {
@@ -246,16 +290,81 @@ impl Containers {
         Self::default()
     }
 
-    /// Replace everything with a fresh listing. Returns whether anything
-    /// changed.
+    /// Replace every container with a fresh listing. Returns whether
+    /// anything changed.
+    ///
+    /// A listing carries no history, so a container already known keeps
+    /// its trail. Intents are kept.
     pub fn replace_all(&mut self, containers: impl IntoIterator<Item = ContainerStatus>) -> bool {
-        let next: BTreeMap<_, _> = containers.into_iter().map(|c| (c.id.clone(), c)).collect();
+        let next: BTreeMap<_, _> = containers
+            .into_iter()
+            .map(|mut c| {
+                if let Some(known) = self.by_id.get(&c.id) {
+                    c.trail = known.trail;
+                }
+                c.classify(intent_for(&self.intents, &c));
+                (c.id.clone(), c)
+            })
+            .collect();
         let changed = next != self.by_id;
         self.by_id = next;
         changed
     }
 
-    /// Apply one event. Returns whether anything changed.
+    /// Record what Alchemy asked of Compose project `project`, replacing
+    /// any earlier intent. Returns whether any container's reason changed.
+    pub fn set_intent(&mut self, project: &str, intent: Intent) -> bool {
+        self.intents.insert(project.to_owned(), intent);
+        self.by_id
+            .values_mut()
+            .filter(|c| c.project.as_deref() == Some(project))
+            .fold(false, |changed, c| {
+                let before = c.stop_reason;
+                c.classify(Some(&intent));
+                let this = c.stop_reason != before;
+                changed || this
+            })
+    }
+
+    /// The last intent recorded for `project`.
+    pub fn intent(&self, project: &str) -> Option<&Intent> {
+        self.intents.get(project)
+    }
+
+    /// Stopped Compose containers whose last exit is unknown, because they
+    /// stopped before the daemon was watching. Inspect them and pass each
+    /// result to [`Containers::record_inspect`].
+    pub fn needs_inspect(&self) -> Vec<String> {
+        self.by_id
+            .values()
+            .filter(|c| {
+                c.project.is_some()
+                    && matches!(c.state, ContainerState::Exited | ContainerState::Dead)
+                    && !c.trail.knows_exit()
+            })
+            .map(|c| c.id.clone())
+            .collect()
+    }
+
+    /// Fill in the last exit of container `id` from an inspect. Ignored
+    /// if the container is gone, or its events have reported an exit
+    /// since. Returns whether anything changed.
+    pub fn record_inspect(&mut self, id: &str, inspected: InspectedExit) -> bool {
+        let Some(container) = self.by_id.get_mut(id) else {
+            return false;
+        };
+        if container.trail.knows_exit() {
+            return false;
+        }
+        let before = container.stop_reason;
+        container.trail = Trail::from_inspect(inspected);
+        container.classify(intent_for(&self.intents, container));
+        container.stop_reason != before
+    }
+
+    /// Apply one event. Returns whether anything a client sees changed;
+    /// an event that only adds to a container's trail, such as `kill`, is
+    /// recorded without counting as a change.
     ///
     /// An event for an unknown container adds it when the action implies
     /// a state (such as `start` or `die`), so a missed `create` heals.
@@ -278,11 +387,14 @@ impl Containers {
         };
         merge_attributes(&mut next, event);
         transition(&mut next, event.action);
+        next.trail.record(event);
+        next.classify(intent_for(&self.intents, &next));
         if current == Some(&next) {
             return false;
         }
+        let visible = current.is_none_or(|c| !c.same_view(&next));
         self.by_id.insert(next.id.clone(), next);
-        true
+        visible
     }
 
     /// The container with this ID.
@@ -304,6 +416,13 @@ impl Containers {
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
+}
+
+fn intent_for<'a>(
+    intents: &'a BTreeMap<String, Intent>,
+    container: &ContainerStatus,
+) -> Option<&'a Intent> {
+    container.project.as_deref().and_then(|p| intents.get(p))
 }
 
 fn merge_attributes(status: &mut ContainerStatus, event: &ContainerEvent) {
@@ -500,8 +619,10 @@ mod tests {
             let mut containers = Containers::new();
             containers.replace_all([start.clone()]);
             let changed = containers.apply(&ContainerEvent::new("a", action));
-            assert_eq!(containers.get("a"), want.as_ref(), "{action:?}");
-            assert_eq!(changed, want.as_ref() != Some(&start), "{action:?}");
+            let view = |c: &ContainerStatus| (c.state, c.health);
+            let got = containers.get("a").map(view);
+            assert_eq!(got, want.as_ref().map(view), "{action:?}");
+            assert_eq!(changed, got != Some(view(&start)), "{action:?}");
         }
     }
 
@@ -558,6 +679,7 @@ mod tests {
         assert!(!containers.apply(&rename));
         assert!(containers.apply(&ContainerEvent::new("abc", ContainerAction::Start)));
         want.state = ContainerState::Running;
+        want.stop_reason = StopReason::Running;
         assert_eq!(containers.get("abc"), Some(&want));
     }
 
@@ -606,6 +728,7 @@ mod tests {
                 "working_dir": "/srv/web",
                 "state": "running",
                 "health": "healthy",
+                "stop_reason": { "kind": "running" },
             })
         );
         assert_eq!(
@@ -630,5 +753,103 @@ mod tests {
                 action
             );
         }
+    }
+
+    fn in_project(mut status: ContainerStatus, project: &str) -> ContainerStatus {
+        status.project = Some(project.into());
+        status
+    }
+
+    fn event(action: ContainerAction, at_ms: i64) -> ContainerEvent {
+        let mut event = ContainerEvent::new("a", action);
+        event.at = Some(at_ms);
+        event
+    }
+
+    fn reason(containers: &Containers, id: &str) -> StopReason {
+        containers.get(id).unwrap().stop_reason
+    }
+
+    #[test]
+    fn events_and_intents_decide_the_stop_reason() {
+        use crate::engine::{Intent, IntentAction};
+        let mut containers = Containers::new();
+        containers.replace_all([
+            in_project(running("a"), "blog"),
+            in_project(running("b"), "shop"),
+        ]);
+        assert_eq!(reason(&containers, "a"), StopReason::Running);
+
+        let mut kill = event(ContainerAction::Kill, 2_000);
+        kill.signal = Some(15);
+        assert!(
+            !containers.apply(&kill),
+            "a kill alone changes nothing visible"
+        );
+        let mut die = event(ContainerAction::Die, 2_100);
+        die.exit_code = Some(0);
+        assert!(containers.apply(&die));
+        assert_eq!(reason(&containers, "a"), StopReason::StoppedOutside);
+
+        assert!(containers.set_intent("blog", Intent::new(IntentAction::Stop, 1_900)));
+        assert_eq!(reason(&containers, "a"), StopReason::StoppedByAlchemy);
+        assert_eq!(reason(&containers, "b"), StopReason::Running);
+        assert!(!containers.set_intent("shop", Intent::new(IntentAction::Down, 1_900)));
+
+        containers.replace_all([in_project(
+            ContainerStatus::new("a", "a", ContainerState::Exited),
+            "blog",
+        )]);
+        assert_eq!(
+            reason(&containers, "a"),
+            StopReason::StoppedByAlchemy,
+            "a relisting keeps the trail and the intent"
+        );
+        assert_eq!(
+            containers.intent("blog"),
+            Some(&Intent::new(IntentAction::Stop, 1_900))
+        );
+
+        assert!(containers.set_intent("blog", Intent::new(IntentAction::Start, 3_000)));
+        assert_eq!(reason(&containers, "a"), StopReason::StoppedOutside);
+    }
+
+    #[test]
+    fn stopped_containers_without_history_are_inspected() {
+        let exited = |id: &str| ContainerStatus::new(id, id, ContainerState::Exited);
+        let mut containers = Containers::new();
+        containers.replace_all([
+            in_project(exited("a"), "blog"),
+            in_project(running("b"), "blog"),
+            exited("c"),
+            in_project(ContainerStatus::new("d", "d", ContainerState::Dead), "blog"),
+        ]);
+        assert_eq!(containers.needs_inspect(), ["a", "d"]);
+        assert_eq!(reason(&containers, "a"), StopReason::Unknown);
+
+        let inspected = InspectedExit {
+            exit_code: Some(1),
+            ..InspectedExit::default()
+        };
+        assert!(containers.record_inspect("a", inspected));
+        assert_eq!(
+            reason(&containers, "a"),
+            StopReason::Crashed {
+                exit_code: Some(1),
+                oom: false
+            }
+        );
+        assert_eq!(containers.needs_inspect(), ["d"]);
+        assert!(!containers.record_inspect("a", InspectedExit::default()));
+        assert!(!containers.record_inspect("gone", inspected));
+
+        let mut die = ContainerEvent::new("d", ContainerAction::Die);
+        die.exit_code = Some(0);
+        containers.apply(&die);
+        assert!(
+            !containers.record_inspect("d", inspected),
+            "an inspect never overrides an event"
+        );
+        assert_eq!(reason(&containers, "d"), StopReason::Finished);
     }
 }
