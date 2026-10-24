@@ -120,7 +120,7 @@ struct Daemon {
     socket: PathBuf,
     state_dir: PathBuf,
     stop: oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<anyhow::Result<alchemyd::Stopped>>,
 }
 
 async fn start(root: &Path, runner: FakeComposeRunner) -> Daemon {

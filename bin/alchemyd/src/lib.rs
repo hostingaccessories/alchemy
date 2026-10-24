@@ -23,6 +23,12 @@
 //! Apps get web addresses from the [`proxy`], on listeners of its own
 //! that never serve the API, with the routes [`routing`] plans for it,
 //! and their `.local` names are announced to the LAN through [`mdns`].
+//!
+//! What needs root, such as port 80 on Linux, is granted through
+//! `alchemy-helper` behind a system prompt by [`privileges`]. A change
+//! that only takes effect at exec makes [`run`] return
+//! [`Stopped::Restart`], and `main` re-executes the daemon with
+//! [`restart::exec_self`].
 
 pub mod apps;
 pub mod auth;
@@ -38,7 +44,9 @@ pub mod metrics;
 pub mod network;
 pub mod operations;
 pub mod ports;
+pub mod privileges;
 pub mod proxy;
+pub mod restart;
 pub mod routing;
 mod secure_fs;
 pub mod session;
@@ -55,6 +63,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use alchemy_core::privilege::ProxyPorts;
 use alchemy_core::route::RouteTable;
 use anyhow::Context as _;
 use tokio::sync::watch;
@@ -67,6 +76,7 @@ use crate::metrics::{Collector, MetricsSource, SystemMetrics};
 use crate::network::{FakeNetwork, SharedNetwork, SystemNetwork};
 use crate::operations::{OperationRunner, Operations, SystemRunner};
 use crate::ports::PortRegistry;
+use crate::privileges::{PrivilegeDeps, Privileges};
 use crate::proxy::ProxyStatus;
 use crate::routing::{ProxyDeps, ProxyHandle};
 use crate::session::{Auth, TokenFile};
@@ -116,6 +126,19 @@ pub struct Deps<E, M = SystemMetrics> {
     pub subnets: SubnetsDeps,
     /// Where the web address proxy listens and how it reaches apps.
     pub proxy: ProxyDeps,
+    /// Where the privileges' facts are read and how the helper is run as
+    /// root.
+    pub privileges: PrivilegeDeps,
+}
+
+/// Why [`run`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// The shutdown future resolved.
+    Shutdown,
+    /// A privilege change takes effect only when alchemyd starts again,
+    /// so the caller should re-execute it with [`restart::exec_self`].
+    Restart,
 }
 
 impl<E> Deps<E> {
@@ -136,10 +159,11 @@ impl<E> Deps<E> {
     /// [`FakeNetwork`] with nothing on it, and Docker's networks are a
     /// [`FakeEngineNetworks`] with none and no `daemon.json`. The proxy
     /// is [`ProxyDeps::loopback`]: app ports on loopback, no Host
-    /// listener, and a connector that reaches nothing. Use
+    /// listener, and a connector that reaches nothing. Privileges are
+    /// [`PrivilegeDeps::fake`]. Use
     /// [`Self::with_apps`], [`Self::with_runner`], [`Self::with_editor`],
-    /// [`Self::with_network`], [`Self::with_subnets`], and
-    /// [`Self::with_proxy`] to change them.
+    /// [`Self::with_network`], [`Self::with_subnets`],
+    /// [`Self::with_proxy`], and [`Self::with_privileges`] to change them.
     pub fn new(engine: E) -> Self {
         Self {
             state: State::new(),
@@ -162,6 +186,7 @@ impl<E> Deps<E> {
                 Arc::new(FakeDaemonConfig::new()),
             ),
             proxy: ProxyDeps::loopback(),
+            privileges: PrivilegeDeps::fake(),
         }
     }
 }
@@ -180,6 +205,7 @@ impl<E, M> Deps<E, M> {
             network: self.network,
             subnets: self.subnets,
             proxy: self.proxy,
+            privileges: self.privileges,
         }
     }
 
@@ -231,6 +257,13 @@ impl<E, M> Deps<E, M> {
         self.proxy = proxy;
         self
     }
+
+    /// Read and change privileges through `privileges`.
+    #[must_use]
+    pub fn with_privileges(mut self, privileges: PrivilegeDeps) -> Self {
+        self.privileges = privileges;
+        self
+    }
 }
 
 impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
@@ -244,12 +277,13 @@ impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
             .with_network(Arc::new(SystemNetwork::new()))
             .with_subnets(SubnetsDeps::system())
             .with_proxy(ProxyDeps::system())
+            .with_privileges(PrivilegeDeps::system())
     }
 }
 
-/// Bind both listeners and serve until `shutdown` resolves, monitoring
-/// this host's Docker engine.
-pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
+/// Bind both listeners and serve until `shutdown` resolves or a privilege
+/// change asks for a restart, monitoring this host's Docker engine.
+pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::Result<Stopped> {
     run_with(config, Deps::system(), shutdown).await
 }
 
@@ -275,11 +309,14 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::
 /// Operations a previous daemon left running are marked interrupted at
 /// startup. On shutdown, running operations are interrupted and stored
 /// before the listeners close.
+///
+/// A privilege change that takes effect only at exec shuts the daemon
+/// down the same way, and it returns [`Stopped::Restart`].
 pub async fn run_with(
     config: Config,
     deps: Deps<impl EngineSource, impl MetricsSource>,
     shutdown: impl Future<Output = ()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Stopped> {
     warn_if_exposed(config.listen);
     let (_state_lock, sqlite) = open_state(&config.state_dir).await?;
     let db = sqlite.path().to_owned();
@@ -308,6 +345,8 @@ pub async fn run_with(
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (privileges, privileges_task) =
+        spawn_privileges(deps.privileges, &deps.state, deps.proxy.range, &shutdown_rx);
     let mut background = Vec::from(spawn_proxy(
         deps.proxy,
         listen,
@@ -324,60 +363,75 @@ pub async fn run_with(
         &store,
         &shutdown_rx,
     ));
-    let socket_task = tokio::spawn(
-        axum::serve(
-            socket_listener,
-            with_handlers(
-                http::api_router(
-                    deps.state.clone(),
-                    store.clone(),
-                    shutdown_rx.clone(),
-                    deps.logs.clone(),
-                    operations.clone(),
-                    auth.clone(),
-                ),
-                &deps.editor,
-                &ports,
+    background.push(privileges_task);
+    let socket_task = serve(
+        socket_listener,
+        with_handlers(
+            http::api_router(
+                deps.state.clone(),
+                store.clone(),
+                shutdown_rx.clone(),
+                deps.logs.clone(),
+                operations.clone(),
+                auth.clone(),
             ),
-        )
-        .with_graceful_shutdown(stopped(shutdown_rx.clone()))
-        .into_future(),
+            &deps.editor,
+            &ports,
+            &privileges,
+        ),
+        &shutdown_rx,
     );
-    let http_task = tokio::spawn(
-        axum::serve(
-            http_listener,
-            with_handlers(
-                http::router(
-                    deps.state,
-                    store,
-                    http::Tcp {
-                        listen: listen.ip(),
-                        auth,
-                    },
-                    shutdown_rx.clone(),
-                    deps.logs,
-                    operations.clone(),
-                ),
-                &deps.editor,
-                &ports,
+    let http_task = serve(
+        http_listener,
+        with_handlers(
+            http::router(
+                deps.state,
+                store,
+                http::Tcp {
+                    listen: listen.ip(),
+                    auth,
+                },
+                shutdown_rx.clone(),
+                deps.logs,
+                operations.clone(),
             ),
-        )
-        .with_graceful_shutdown(stopped(shutdown_rx.clone()))
-        .into_future(),
+            &deps.editor,
+            &ports,
+            &privileges,
+        ),
+        &shutdown_rx,
     );
 
-    shutdown.await;
+    let why = tokio::select! {
+        () = shutdown => Stopped::Shutdown,
+        () = privileges.restarting() => Stopped::Restart,
+    };
     shutdown_tx.send_replace(true);
     operations.shutdown().await;
+    drain(
+        background,
+        [socket_task, http_task],
+        (token_file, socket_file),
+    )
+    .await?;
+    Ok(why)
+}
 
+/// Wait for every task to end, then remove the token and socket files in
+/// `files`, and report the first task that failed.
+async fn drain<S>(
+    background: Vec<(&'static str, JoinHandle<()>)>,
+    servers: [JoinHandle<std::io::Result<()>>; 2],
+    files: (TokenFile, S),
+) -> anyhow::Result<()> {
     let mut background_results = Vec::with_capacity(background.len());
     for (name, task) in background {
         background_results.push((name, task.await));
     }
+    let [socket_task, http_task] = servers;
     let socket_result = socket_task.await;
     let http_result = http_task.await;
-    drop(token_file);
-    drop(socket_file);
+    drop(files);
     for (name, result) in background_results {
         result.with_context(|| format!("{name} task failed"))?;
     }
@@ -413,13 +467,54 @@ async fn recovered_operations(
     operations
 }
 
-/// Give `router` the app editor and the port registry its routes use.
+/// The daemon's [`Privileges`], read through `deps` with the firewall
+/// opening the proxy's `range`, and the task that keeps them current in
+/// `state`, with its name.
+fn spawn_privileges(
+    deps: PrivilegeDeps,
+    state: &State,
+    range: alchemy_core::ports::PortRange,
+    shutdown: &watch::Receiver<bool>,
+) -> (Privileges, (&'static str, JoinHandle<()>)) {
+    let privileges = Privileges::new(
+        deps,
+        state.clone(),
+        ProxyPorts::try_from(range).unwrap_or_default(),
+    );
+    let task = tokio::spawn(privileges.clone().run(shutdown.clone()));
+    (privileges, ("privileges", task))
+}
+
+/// Serve `router` on `listener` until `shutdown` becomes `true`, letting
+/// requests in flight finish.
+fn serve<L>(
+    listener: L,
+    router: axum::Router,
+    shutdown: &watch::Receiver<bool>,
+) -> JoinHandle<std::io::Result<()>>
+where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+{
+    tokio::spawn(
+        axum::serve(listener, router)
+            .with_graceful_shutdown(stopped(shutdown.clone()))
+            .into_future(),
+    )
+}
+
+/// Give `router` the app editor, the port registry, and the privileges
+/// its routes use.
 fn with_handlers(
     router: axum::Router,
     editor: &Arc<AppEditor>,
     ports: &PortRegistry,
+    privileges: &Privileges,
 ) -> axum::Router {
-    http::with_ports(http::with_editor(router, editor.clone()), ports.clone())
+    http::with_privileges(
+        http::with_ports(http::with_editor(router, editor.clone()), ports.clone()),
+        privileges.clone(),
+    )
 }
 
 /// Start the tasks that keep `state` current, each with its name: the

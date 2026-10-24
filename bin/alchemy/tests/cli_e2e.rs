@@ -44,7 +44,7 @@ struct Daemon {
     socket: PathBuf,
     state: State,
     stop: oneshot::Sender<()>,
-    task: JoinHandle<Result<(), String>>,
+    task: JoinHandle<Result<alchemyd::Stopped, String>>,
 }
 
 impl Daemon {
@@ -1081,7 +1081,7 @@ struct BlogDaemon {
     socket: PathBuf,
     logs: alchemyd::logs::FakeLogSource,
     stop: oneshot::Sender<()>,
-    task: JoinHandle<Result<(), String>>,
+    task: JoinHandle<Result<alchemyd::Stopped, String>>,
 }
 
 async fn start_blog() -> BlogDaemon {

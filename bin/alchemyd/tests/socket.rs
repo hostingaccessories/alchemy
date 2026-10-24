@@ -38,7 +38,7 @@ struct Daemon {
     socket: PathBuf,
     state: State,
     stop: oneshot::Sender<()>,
-    task: JoinHandle<anyhow::Result<()>>,
+    task: JoinHandle<anyhow::Result<alchemyd::Stopped>>,
     _dir: tempfile::TempDir,
 }
 

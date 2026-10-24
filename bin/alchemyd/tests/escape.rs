@@ -227,7 +227,7 @@ async fn act(socket: &Path, name: &str, action: &str) {
 struct Daemon {
     socket: PathBuf,
     stop: oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<anyhow::Result<alchemyd::Stopped>>,
 }
 
 /// alchemyd with the real engine monitor, `docker compose config`, app
