@@ -643,3 +643,53 @@ fn app_settings() {
         }
     );
 }
+
+#[test]
+fn log_events() {
+    use alchemy_api::logs::{LogEvent, LogLine, LogStream, LogsDone, LogsFollowing};
+    let line = LogLine {
+        service: "web".into(),
+        container: "blog-web-1".into(),
+        stream: LogStream::Stderr,
+        time: Some("2024-05-06T07:08:09.123456789Z".into()),
+        line: "GET / 200".into(),
+    };
+    assert_wire(
+        &line,
+        r#"{"service":"web","container":"blog-web-1","stream":"stderr","time":"2024-05-06T07:08:09.123456789Z","line":"GET / 200"}"#,
+    );
+    assert_wire(
+        &LogLine {
+            stream: LogStream::Stdout,
+            time: None,
+            ..line.clone()
+        },
+        r#"{"service":"web","container":"blog-web-1","stream":"stdout","time":null,"line":"GET / 200"}"#,
+    );
+    assert_eq!(
+        serde_json::from_str::<LogStream>(r#""console""#).unwrap(),
+        LogStream::Other
+    );
+    assert_wire(&LogsFollowing {}, "{}");
+    assert_wire(&LogsDone { error: None }, r#"{"error":null}"#);
+    assert_wire(
+        &LogsDone {
+            error: Some("Docker isn't running".into()),
+        },
+        r#"{"error":"Docker isn't running"}"#,
+    );
+
+    let cases = [
+        (LogEvent::Log(line.clone()), "log"),
+        (LogEvent::Following(LogsFollowing {}), "following"),
+        (LogEvent::Done(LogsDone::default()), "done"),
+    ];
+    for (event, name) in cases {
+        assert_eq!(event.name(), name);
+        let data = serde_json::to_value(event.data()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            serde_json::json!({ "event": name, "data": data })
+        );
+    }
+}

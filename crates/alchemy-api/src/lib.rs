@@ -12,7 +12,7 @@
 //! `GET /api/metrics/history` a [`MetricsHistory`], built from the
 //! resource-usage types in `alchemy_core::metrics`.
 //! `GET /api/events` streams [`ApiEvent`]s. The app routes and their
-//! types are in [`apps`].
+//! types are in [`apps`], and an app's log stream in [`logs`].
 //!
 //! The default build is pure. Enable the `socket` feature for the daemon
 //! socket path shared by `alchemyd` and its local clients.
@@ -26,6 +26,7 @@ pub use alchemy_core::metrics::{
 use serde::{Deserialize, Serialize, Serializer};
 
 pub mod apps;
+pub mod logs;
 #[cfg(feature = "socket")]
 mod socket;
 
