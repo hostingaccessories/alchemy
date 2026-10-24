@@ -286,7 +286,9 @@ impl AppEditor {
                 target.clone(),
                 name.clone(),
             );
-            blocking(move || begin_create(&*disk, &root, is_home, &target, &name)).await??
+            let dry_run = new.dry_run;
+            blocking(move || begin_create(&*disk, &root, is_home, dry_run, &target, &name))
+                .await??
         };
         let staged_app = staging.join(name.as_str());
         let result = self
@@ -603,11 +605,14 @@ fn exists(target: &Path) -> EditError {
 }
 
 /// Check where a new app goes, creating the home if this is its first
-/// app, and make its staging folder.
+/// app, and make its staging folder. A dry run never creates the home: it
+/// stages in the system's temporary folder instead, which a new app's lone
+/// folder cannot tell apart.
 fn begin_create(
     disk: &dyn AppDisk,
     root: &Path,
     is_home: bool,
+    dry_run: bool,
     target: &Path,
     name: &StackName,
 ) -> Result<PathBuf, EditError> {
@@ -617,8 +622,10 @@ fn begin_create(
             path.display()
         )))
     };
+    let mut staging_root = root.to_owned();
     match look(root)? {
         Some(EntryKind::Dir | EntryKind::Link | EntryKind::LinkToDir) => {}
+        None if is_home && dry_run => staging_root = std::env::temp_dir(),
         None if is_home => disk.create_dirs(root).map_err(EditError::io(format!(
             "Alchemy couldn't create {}",
             root.display()
@@ -639,10 +646,10 @@ fn begin_create(
     if look(target)?.is_some() {
         return Err(exists(target));
     }
-    disk.make_staging(root, &staging_prefix(name))
+    disk.make_staging(&staging_root, &staging_prefix(name))
         .map_err(EditError::io(format!(
             "Alchemy couldn't make a temporary folder in {}",
-            root.display()
+            staging_root.display()
         )))
 }
 
@@ -872,6 +879,10 @@ mod tests {
         fs::remove_dir_all(&f.home).unwrap();
         f.state.set_apps(AppList::default());
         let editor = f.editor();
+        let mut dry = new("blog", None);
+        dry.dry_run = true;
+        editor.create(&f.state, dry).await.unwrap();
+        assert!(!f.home.exists(), "a dry run created the home");
         editor.create(&f.state, new("blog", None)).await.unwrap();
         assert!(f.home.join("blog/compose.yaml").is_file());
 
