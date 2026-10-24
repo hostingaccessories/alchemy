@@ -33,19 +33,6 @@ export interface EngineStatus {
   endpoint: string | null;
 }
 
-/** Mirrors `alchemy_api::ContainerState`, Docker's lifecycle state. */
-export type ContainerState =
-  | "created"
-  | "running"
-  | "paused"
-  | "restarting"
-  | "removing"
-  | "exited"
-  | "dead";
-
-/** Mirrors `alchemy_api::Health`. Containers without a healthcheck have `null`. */
-export type Health = "starting" | "healthy" | "unhealthy";
-
 /**
  * Mirrors `alchemy_api::StopReason`: why a container is or is not running.
  * `unknown` is also what a kind this build does not know means.
@@ -192,6 +179,8 @@ export interface AppContainer {
   image: string | null;
   state: ContainerState;
   health: Health | null;
+  /** Absent from a daemon older than stop reasons; treat as `unknown`. */
+  stop_reason?: StopReason;
 }
 
 /** Mirrors `alchemy_api::apps::AppService`. */
@@ -224,6 +213,8 @@ export interface App {
   images: ImageSource | null;
   services: AppService[];
   problems: AppProblem[];
+  /** The most pressing of its containers' reasons. Absent from an older daemon. */
+  stop_reason?: StopReason;
 }
 
 /** Mirrors `alchemy_api::apps::UnmanagedApp`. */

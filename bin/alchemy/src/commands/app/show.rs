@@ -4,7 +4,7 @@ use std::io::Write;
 
 use alchemy_api::apps::{App, Health, ImageSource};
 
-use super::{columns, is_running, path_segment, status_word};
+use super::{app_status, columns, path_segment, service_status};
 use crate::context::Context;
 use crate::daemon::Daemon;
 use crate::error::ClientError;
@@ -43,7 +43,11 @@ pub(crate) fn show_lines(app: &App, json: bool) -> Vec<String> {
         Some(ImageSource::Registry) => "downloaded",
         None => "unknown",
     };
-    let mut lines = vec![format!("{}: {}", app.name, status_word(app.status))];
+    let mut lines = vec![format!(
+        "{}: {}",
+        app.name,
+        app_status(app.status, app.stop_reason)
+    )];
     lines.extend(columns(&[
         vec!["Folder:".into(), app.dir.clone()],
         vec!["Compose file:".into(), app.compose_file.clone()],
@@ -71,12 +75,7 @@ pub(crate) fn show_lines(app: &App, json: bool) -> Vec<String> {
                     .collect();
                 vec![
                     service.name.clone(),
-                    if is_running(service) {
-                        "running"
-                    } else {
-                        "stopped"
-                    }
-                    .into(),
+                    service_status(service),
                     containers.join(", "),
                 ]
             })
@@ -122,6 +121,25 @@ mod tests {
                 "  web  stopped  blog-web-1",
             ]
         );
+    }
+
+    #[test]
+    fn says_why_services_are_not_running() {
+        use alchemy_api::apps::StopReason;
+        let mut app = blog();
+        let crashed = StopReason::Crashed {
+            exit_code: Some(137),
+            oom: true,
+        };
+        app.stop_reason = crashed;
+        app.services[1].containers[0].stop_reason = crashed;
+        let lines = show_lines(&app, false);
+        assert_eq!(lines[0], "blog: partly running, crashed (out of memory)");
+        assert_eq!(lines[7], "  web  crashed (out of memory)  blog-web-1");
+        app.services[1].containers[0].stop_reason = StopReason::Finished;
+        assert_eq!(show_lines(&app, false)[7], "  web  finished  blog-web-1");
+        app.services[1].containers.clear();
+        assert_eq!(show_lines(&app, false)[7], "  web  not running");
     }
 
     #[test]

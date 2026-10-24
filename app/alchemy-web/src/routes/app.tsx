@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, createRoute } from "@tanstack/react-router";
 
 import { Advanced } from "../components/Advanced.tsx";
-import { AppStatus } from "../components/AppStatus.tsx";
+import { AppStatus, StopReasonStatus } from "../components/AppStatus.tsx";
 import { ErrorState } from "../components/ErrorState.tsx";
 import { Loading } from "../components/Loading.tsx";
 import { Notice } from "../components/Notice.tsx";
@@ -10,6 +10,7 @@ import { PageHeader } from "../components/PageHeader.tsx";
 import type { App, AppService, ImageSource } from "../lib/api.ts";
 import { useDaemonConnection } from "../lib/live.tsx";
 import { liveQueries } from "../lib/queries.ts";
+import { serviceStopReason } from "../lib/stopReason.ts";
 import { formatBytes, formatPercent, formatRate, sumMeasured } from "../lib/units.ts";
 import { rootRoute } from "./root.tsx";
 
@@ -37,7 +38,9 @@ function AppPage() {
 
   return (
     <div className="flex max-w-3xl flex-col gap-8">
-      <PageHeader title={name}>{app && <AppStatus status={app.status} />}</PageHeader>
+      <PageHeader title={name}>
+        {app && <AppStatus status={app.status} reason={app.stop_reason} />}
+      </PageHeader>
       {daemon.kind !== "online" && apps.data === undefined ? (
         <p className="text-muted">This app appears once alchemyd is reachable.</p>
       ) : apps.isError ? (
@@ -147,13 +150,12 @@ function problemTitle(kind: App["problems"][number]["kind"]): string {
 }
 
 function ServiceRow({ service }: { service: AppService }) {
-  const running = service.containers.some((c) => c.state === "running");
   const health = service.containers.find((c) => c.health !== null)?.health;
   return (
     <li className="flex items-center gap-4 rounded-lg border border-border bg-surface-raised px-4 py-2">
       <span className="min-w-0 flex-1 font-medium">{service.name}</span>
       {health === "unhealthy" && <span className="text-sm text-error">Unhealthy</span>}
-      <AppStatus status={running ? "running" : "stopped"} />
+      <StopReasonStatus reason={serviceStopReason(service)} />
     </li>
   );
 }

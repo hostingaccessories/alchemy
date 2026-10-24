@@ -149,6 +149,19 @@ describe("Apps", () => {
     expect(within(rows[0]!).getByText("Partly running")).toBeTruthy();
     expect(within(rows[0]!).getByText("/home/me/Alchemy/apps/blog")).toBeTruthy();
     expect(within(rows[1]!).getByText("Status unknown")).toBeTruthy();
+    cleanup();
+    apps = {
+      ...full,
+      apps: [
+        {
+          ...blog,
+          status: "stopped",
+          stop_reason: { kind: "crash_looping", exit_code: 1, oom: false },
+        },
+      ],
+    };
+    await renderAt("/apps");
+    expect(await screen.findByText("Stopped, keeps crashing (exit code 1)")).toBeTruthy();
     expect(
       within(rows[1]!).getByText("Compose can't read compose.yaml: yaml: line 4: oops"),
     ).toBeTruthy();
@@ -184,11 +197,51 @@ describe("App", () => {
     expect(within(header).getByText("Partly running")).toBeTruthy();
     const services = screen.getByRole("heading", { name: "Services" }).parentElement!;
     const rows = within(services).getAllByRole("listitem");
-    expect(rows.map((row) => row.textContent)).toEqual(["dbRunning", "webStopped"]);
+    expect(rows.map((row) => row.textContent)).toEqual(["dbRunning", "webNot running"]);
     expect(screen.getByText("/home/me/Alchemy/apps/blog")).toBeTruthy();
     expect(screen.getByText("compose.yaml")).toBeTruthy();
     expect(screen.getByText("Downloaded")).toBeTruthy();
     expect(await screen.findByText("12.5%")).toBeTruthy();
+  });
+
+  it("says why an app and its services aren't running", async () => {
+    const oom = { kind: "crashed" as const, exit_code: 137, oom: true };
+    const container = (
+      id: string,
+      state: "running" | "exited",
+      stop_reason: App["stop_reason"],
+    ) => ({
+      id,
+      name: `blog-${id}`,
+      image: null,
+      state,
+      health: null,
+      stop_reason,
+    });
+    apps = {
+      ...full,
+      apps: [
+        {
+          ...blog,
+          stop_reason: oom,
+          services: [
+            { name: "db", containers: [container("db", "exited", oom)] },
+            { name: "migrate", containers: [container("migrate", "exited", { kind: "finished" })] },
+            { name: "web", containers: [container("web", "running", { kind: "running" })] },
+          ],
+        },
+      ],
+    };
+    await renderAt("/apps/blog");
+    const header = screen.getByRole("banner");
+    expect(await within(header).findByText("Partly running, crashed (out of memory)")).toBeTruthy();
+    const services = screen.getByRole("heading", { name: "Services" }).parentElement!;
+    const rows = within(services).getAllByRole("listitem");
+    expect(rows.map((row) => row.textContent)).toEqual([
+      "dbCrashed (out of memory)",
+      "migrateFinished",
+      "webRunning",
+    ]);
   });
 
   it("puts problems first", async () => {

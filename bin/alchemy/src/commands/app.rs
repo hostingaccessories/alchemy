@@ -8,7 +8,7 @@ pub mod list;
 pub mod show;
 pub mod stats;
 
-use alchemy_api::apps::{AppService, ContainerState, StackStatus};
+use alchemy_api::apps::{AppService, ContainerState, StackStatus, StopReason};
 use alchemy_core::StackName;
 
 /// Arguments to `alchemy app`.
@@ -52,6 +52,47 @@ pub(crate) fn status_word(status: StackStatus) -> &'static str {
         StackStatus::Stopped => "stopped",
         _ => "unknown",
     }
+}
+
+/// An app's status in words, with why it is not running when that is a
+/// problem or was done outside Alchemy, such as `stopped, keeps crashing`.
+/// Plain stops and finished jobs need no explaining.
+pub(crate) fn app_status(status: StackStatus, reason: StopReason) -> String {
+    let word = status_word(status);
+    match (status, reason) {
+        (StackStatus::Stopped, StopReason::StoppedOutside) => "stopped outside Alchemy".to_owned(),
+        (StackStatus::Running | StackStatus::Unknown, _) => word.to_owned(),
+        (_, reason) if reason.is_problem() || reason == StopReason::StoppedOutside => {
+            format!("{word}, {}", reason_words(reason))
+        }
+        _ => word.to_owned(),
+    }
+}
+
+/// A service's state in words: `running`, or why it is not, such as
+/// `crashed (exit code 1)` or `finished`. A crash in any of its containers
+/// comes first.
+pub(crate) fn service_status(service: &AppService) -> String {
+    if is_running(service) {
+        return "running".to_owned();
+    }
+    let reason = service
+        .containers
+        .iter()
+        .map(|c| c.stop_reason)
+        .find(|r| r.is_problem())
+        .or_else(|| service.containers.first().map(|c| c.stop_reason))
+        .unwrap_or(StopReason::NotStarted);
+    reason_words(reason)
+}
+
+/// A reason's plain words in lower case, to follow other words.
+fn reason_words(reason: StopReason) -> String {
+    let text = reason.to_string();
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_lowercase().chain(chars).collect()
+    })
 }
 
 /// Whether any of `service`'s containers is running.
@@ -167,6 +208,52 @@ mod tests {
             ]
         );
         assert_eq!(columns(&[]), [] as [String; 0]);
+    }
+
+    #[test]
+    fn app_status_says_why_when_it_matters() {
+        let crashed = StopReason::Crashed {
+            exit_code: Some(1),
+            oom: false,
+        };
+        let looping = StopReason::CrashLooping {
+            exit_code: None,
+            oom: true,
+        };
+        let cases = [
+            (StackStatus::Running, StopReason::Running, "running"),
+            (StackStatus::Running, crashed, "running"),
+            (
+                StackStatus::Partial,
+                crashed,
+                "partly running, crashed (exit code 1)",
+            ),
+            (
+                StackStatus::Stopped,
+                looping,
+                "stopped, keeps crashing (out of memory)",
+            ),
+            (
+                StackStatus::Stopped,
+                StopReason::StoppedByAlchemy,
+                "stopped",
+            ),
+            (
+                StackStatus::Stopped,
+                StopReason::StoppedOutside,
+                "stopped outside Alchemy",
+            ),
+            (
+                StackStatus::Partial,
+                StopReason::StoppedOutside,
+                "partly running, stopped outside Alchemy",
+            ),
+            (StackStatus::Stopped, StopReason::Finished, "stopped"),
+            (StackStatus::Unknown, crashed, "unknown"),
+        ];
+        for (status, reason, want) in cases {
+            assert_eq!(app_status(status, reason), want, "{status:?} {reason:?}");
+        }
     }
 
     #[test]

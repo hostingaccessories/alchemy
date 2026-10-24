@@ -90,7 +90,7 @@ function AppRow({ app }: { app: App }) {
             <span className="text-sm text-warn">{app.problems[0]?.message}</span>
           )}
         </div>
-        <AppStatus status={app.status} />
+        <AppStatus status={app.status} reason={app.stop_reason} />
         <ChevronRight className="size-4 text-muted" aria-hidden />
       </Link>
     </li>

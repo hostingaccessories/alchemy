@@ -4,7 +4,7 @@ use std::io::Write;
 
 use alchemy_api::apps::{AppDirState, AppList};
 
-use super::{columns, is_running, status_word};
+use super::{app_status, columns, is_running, status_word};
 use crate::context::Context;
 use crate::daemon::Daemon;
 use crate::error::ClientError;
@@ -57,7 +57,7 @@ pub(crate) fn list_lines(apps: &AppList, json: bool) -> Vec<String> {
             };
             vec![
                 app.name.to_string(),
-                status_word(app.status).to_owned(),
+                app_status(app.status, app.stop_reason),
                 services,
                 app.dir.clone(),
             ]
@@ -138,7 +138,7 @@ fn notes(apps: &AppList) -> Vec<String> {
 pub(crate) mod tests {
     use alchemy_api::apps::{
         App, AppContainer, AppDir, AppProblem, AppProblemKind, AppService, ContainerState,
-        ImageSource, SkipReason, SkippedApp, StackName, StackStatus, UnmanagedApp,
+        ImageSource, SkipReason, SkippedApp, StackName, StackStatus, StopReason, UnmanagedApp,
     };
 
     use super::*;
@@ -155,6 +155,11 @@ pub(crate) mod tests {
                     image: Some("nginx".into()),
                     state,
                     health: None,
+                    stop_reason: if state == ContainerState::Running {
+                        StopReason::Running
+                    } else {
+                        StopReason::Unknown
+                    },
                 })
                 .into_iter()
                 .collect(),
@@ -175,6 +180,7 @@ pub(crate) mod tests {
                 service("web", Some(ContainerState::Exited)),
             ],
             problems: vec![],
+            stop_reason: StopReason::Unknown,
         }
     }
 
