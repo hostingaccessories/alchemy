@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ExposedPort, HostLabel, HostSuffix, Reachability, XAlchemy, XAlchemyBlock, match_host,
+    ExposedPort, HostLabel, HostSuffix, Reachability, XAlchemy, XAlchemyBlock, match_host_suffix,
 };
 use crate::network::SHARED_NETWORK;
 use crate::ports::{PortRange, Protocol, PublishedPort};
@@ -63,7 +63,8 @@ pub struct RouteOptions {
     /// How the host reaches containers.
     pub reachability: Reachability,
     /// The domains apps answer under on port 80, such as
-    /// [`HostSuffix::Localhost`].
+    /// [`HostSuffix::Localhost`]. An app with `mdns: false` never answers
+    /// under [`HostSuffix::Local`].
     pub suffixes: Vec<HostSuffix>,
 }
 
@@ -124,6 +125,14 @@ pub struct Route {
     /// Whether its label may be announced as `<label>.local` over mDNS,
     /// as [`RouteTarget::mdns`].
     pub mdns: bool,
+}
+
+impl Route {
+    /// Whether it answers under `suffix`: every suffix, except
+    /// [`HostSuffix::Local`] when its app turned `mdns` off.
+    pub fn answers_under(&self, suffix: HostSuffix) -> bool {
+        suffix != HostSuffix::Local || self.mdns
+    }
 }
 
 /// One candidate port a service could be routed on.
@@ -387,10 +396,16 @@ impl RouteTable {
     }
 
     /// The route a request's `Host` header names, matched as
-    /// [`match_host`] does against the table's suffixes.
+    /// [`match_host`](super::match_host) does against the table's
+    /// suffixes. A `.local` name only finds a route that
+    /// [answers under](Route::answers_under) it.
     pub fn lookup_host(&self, host: &str) -> Option<&Route> {
-        let label = HostLabel::new(&match_host(host, &self.suffixes)?).ok()?;
-        self.by_label.get(&label).and_then(|&i| self.routes.get(i))
+        let (label, suffix) = match_host_suffix(host, &self.suffixes)?;
+        let label = HostLabel::new(&label).ok()?;
+        self.by_label
+            .get(&label)
+            .and_then(|&i| self.routes.get(i))
+            .filter(|route| route.answers_under(suffix))
     }
 
     /// The proxy ports routes answer on, ascending.
@@ -698,7 +713,13 @@ pub fn plan_routes(apps: &[AppRouteInput], options: &RouteOptions) -> RoutePlan 
         route.hosts = route
             .label
             .iter()
-            .flat_map(|l| options.suffixes.iter().map(|&s| l.host(s)))
+            .flat_map(|l| {
+                options
+                    .suffixes
+                    .iter()
+                    .filter(|&&s| route.answers_under(s))
+                    .map(|&s| l.host(s))
+            })
             .collect();
     }
     problems.sort_by(|a, b| a.app.cmp(&b.app));
@@ -1486,6 +1507,60 @@ mod tests {
         assert_eq!(wiki.hosts, ["wiki.localhost", "wiki.local"]);
         assert_eq!(plan.table.lookup_host("wiki.local.").unwrap().app, "wiki");
         assert_eq!(plan.table.suffixes(), opts.suffixes.as_slice());
+    }
+
+    #[test]
+    fn mdns_off_keeps_an_app_off_local() {
+        let both = vec![HostSuffix::Localhost, HostSuffix::Local];
+        let mut quiet = routed("quiet", None, None);
+        quiet.x_alchemy = Some(XAlchemyBlock::Read(XAlchemy {
+            mdns: false,
+            ..XAlchemy::default()
+        }));
+        let apps = [routed("wiki", None, None), quiet];
+        let cases = [
+            (
+                "both suffixes",
+                both.clone(),
+                vec![
+                    ("wiki", vec!["wiki.localhost", "wiki.local"]),
+                    ("quiet", vec!["quiet.localhost"]),
+                ],
+                vec![
+                    ("wiki.local", Some("wiki")),
+                    ("quiet.local", None),
+                    ("quiet.localhost", Some("quiet")),
+                ],
+            ),
+            (
+                "localhost only",
+                vec![HostSuffix::Localhost],
+                vec![
+                    ("wiki", vec!["wiki.localhost"]),
+                    ("quiet", vec!["quiet.localhost"]),
+                ],
+                vec![("wiki.local", None), ("quiet.localhost", Some("quiet"))],
+            ),
+        ];
+        for (name, suffixes, hosts, lookups) in cases {
+            let plan = plan_routes(
+                &apps,
+                &RouteOptions {
+                    reachability: Reachability::ContainerIp,
+                    suffixes,
+                },
+            );
+            for (app, want) in hosts {
+                assert_eq!(plan.table.get(app).unwrap().hosts, want, "{name} {app}");
+            }
+            for (host, want) in lookups {
+                assert_eq!(
+                    plan.table.lookup_host(host).map(|r| r.app.as_str()),
+                    want,
+                    "{name} {host}"
+                );
+            }
+        }
     }
 
     #[test]

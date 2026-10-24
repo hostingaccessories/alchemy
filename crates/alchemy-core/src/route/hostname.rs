@@ -155,11 +155,17 @@ impl fmt::Display for HostSuffix {
 /// is folded. IP literals, bare suffixes, and deeper names such as
 /// `a.wiki.localhost` match nothing.
 pub fn match_host(host: &str, suffixes: &[HostSuffix]) -> Option<String> {
+    match_host_suffix(host, suffixes).map(|(label, _)| label)
+}
+
+/// [`match_host`], also saying which of `suffixes` matched, for routes
+/// that answer under some suffixes only.
+pub fn match_host_suffix(host: &str, suffixes: &[HostSuffix]) -> Option<(String, HostSuffix)> {
     let name = strip_port(host.trim())?;
     let name = name.strip_suffix('.').unwrap_or(name);
-    suffixes.iter().find_map(|suffix| {
+    suffixes.iter().find_map(|&suffix| {
         let label = strip_suffix_ignore_case(name, suffix.as_str())?.strip_suffix('.')?;
-        (!label.is_empty() && !label.contains('.')).then(|| label.to_ascii_lowercase())
+        (!label.is_empty() && !label.contains('.')).then(|| (label.to_ascii_lowercase(), suffix))
     })
 }
 
@@ -286,6 +292,20 @@ mod tests {
                 *want,
                 "{host} {suffixes:?}"
             );
+        }
+    }
+
+    #[test]
+    fn matching_says_which_suffix() {
+        let both = [HostSuffix::Localhost, HostSuffix::Local];
+        let cases = [
+            ("wiki.localhost", Some(("wiki", HostSuffix::Localhost))),
+            ("Wiki.LOCAL.:80", Some(("wiki", HostSuffix::Local))),
+            ("wiki.lan", None),
+        ];
+        for (host, want) in cases {
+            let got = match_host_suffix(host, &both);
+            assert_eq!(got.as_ref().map(|(l, s)| (l.as_str(), *s)), want, "{host}");
         }
     }
 }

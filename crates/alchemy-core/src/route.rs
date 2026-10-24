@@ -10,7 +10,9 @@ mod reach;
 mod spec;
 mod table;
 
-pub use hostname::{HostLabel, HostLabelError, HostSuffix, MAX_LABEL_LEN, match_host};
+pub use hostname::{
+    HostLabel, HostLabelError, HostSuffix, MAX_LABEL_LEN, match_host, match_host_suffix,
+};
 pub use reach::{EngineFacts, HostOs, Reachability, reachability};
 pub use spec::{ExposedPort, ExposedPortError, X_ALCHEMY, XAlchemy, XAlchemyBlock};
 pub use table::{

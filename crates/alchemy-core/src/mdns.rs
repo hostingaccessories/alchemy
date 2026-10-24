@@ -312,6 +312,52 @@ pub fn conflict_problems<'a>(
         .collect()
 }
 
+/// How far a desired name has got, for the `.local` addresses that use
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum NameState {
+    /// Not on the network yet, or not at its current address: being
+    /// announced or re-addressed.
+    Announcing,
+    /// Announced at the address it should have.
+    Announced,
+    /// Another device answers for it, so it can't be used.
+    InUse,
+}
+
+/// The state of every name in `desired`, given what an announcer has
+/// `announced` so far and the labels it reported `conflicts` on.
+///
+/// A conflict wins over anything else. A name counts as announced only
+/// at the desired address and interface, so after the LAN address
+/// changes it is [`NameState::Announcing`] until the readdress is made.
+/// Labels outside `desired` are left out: they get no `.local` address.
+pub fn name_states<'a>(
+    desired: &Announcements,
+    announced: &Announcements,
+    conflicts: impl IntoIterator<Item = &'a HostLabel>,
+) -> BTreeMap<HostLabel, NameState> {
+    let conflicts: BTreeSet<&HostLabel> = conflicts.into_iter().collect();
+    desired
+        .iter()
+        .map(|want| {
+            let state = if conflicts.contains(&want.label) {
+                NameState::InUse
+            } else if announced
+                .get(&want.label)
+                .is_some_and(|a| a.lan == want.lan)
+            {
+                NameState::Announced
+            } else {
+                NameState::Announcing
+            };
+            (want.label.clone(), state)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -652,5 +698,75 @@ mod tests {
             serde_json::to_value(&kind).unwrap(),
             serde_json::json!({"kind": "name_in_use", "label": "immich"})
         );
+    }
+
+    #[test]
+    fn name_states_table() {
+        use NameState::{Announced, Announcing, InUse};
+        let home = lan("en0", "192.168.1.20");
+        let moved = lan("en0", "192.168.1.21");
+        let wifi = lan("en1", "192.168.1.20");
+        let desired: Announcements = [
+            ann("blog", "blog", &home),
+            ann("photos", "photos", &home),
+            ann("wiki", "notes", &home),
+        ]
+        .into_iter()
+        .collect();
+        type Case = (
+            &'static str,
+            Vec<Announcement>,
+            Vec<&'static str>,
+            [NameState; 3],
+        );
+        let cases: [Case; 4] = [
+            (
+                "nothing announced yet",
+                vec![],
+                vec![],
+                [Announcing, Announcing, Announcing],
+            ),
+            (
+                "all announced, one for an app it moved from",
+                vec![
+                    ann("blog", "blog", &home),
+                    ann("photos", "photos", &home),
+                    ann("wiki", "wiki", &home),
+                ],
+                vec![],
+                [Announced, Announced, Announced],
+            ),
+            (
+                "old address, other interface, in use",
+                vec![
+                    ann("blog", "blog", &moved),
+                    ann("photos", "photos", &wifi),
+                    ann("wiki", "notes", &home),
+                ],
+                vec!["wiki", "gone"],
+                [Announcing, Announcing, InUse],
+            ),
+            (
+                "in use before it was ever announced",
+                vec![],
+                vec!["blog"],
+                [InUse, Announcing, Announcing],
+            ),
+        ];
+        for (name, announced, conflicts, want) in cases {
+            let announced: Announcements = announced.into_iter().collect();
+            let conflicts: Vec<HostLabel> = conflicts.into_iter().map(label).collect();
+            let want: BTreeMap<HostLabel, NameState> = ["blog", "photos", "wiki"]
+                .into_iter()
+                .map(label)
+                .zip(want)
+                .collect();
+            assert_eq!(
+                name_states(&desired, &announced, &conflicts),
+                want,
+                "{name}"
+            );
+        }
+        assert!(name_states(&Announcements::default(), &desired, &[]).is_empty());
     }
 }
