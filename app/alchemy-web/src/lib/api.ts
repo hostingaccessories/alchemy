@@ -309,6 +309,87 @@ export type LogEvent =
   | { event: "log"; data: LogLine }
   | { event: "following"; data: Record<string, never> }
   | { event: "done"; data: LogsDone };
+/** Mirrors `alchemy_api::operations::Action`: a lifecycle action on an app. */
+export type Action = "up" | "down" | "start" | "stop" | "restart" | "pull" | "build" | "update";
+
+/** Mirrors `alchemy_api::operations::StepCommand`: the `docker compose` subcommand a step runs. */
+export type StepCommand = "up" | "down" | "start" | "stop" | "restart" | "pull" | "build";
+
+/** Mirrors `alchemy_api::operations::OperationState`; unknown states arrive as `unknown`. */
+export type OperationState =
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "interrupted"
+  | "unknown";
+
+/** Mirrors `alchemy_api::operations::StepState`; unknown states arrive as `unknown`. */
+export type OperationStepState = "pending" | "active" | "done" | "failed" | "skipped" | "unknown";
+
+/** Mirrors `alchemy_api::operations::Step`. */
+export interface OperationStep {
+  command: StepCommand;
+  /** What the step does, in plain words: "Downloading the app". */
+  label: string;
+  state: OperationStepState;
+  /** Progress while it runs, or the problem when it failed. */
+  message: string | null;
+}
+
+/** Mirrors `alchemy_api::operations::Operation`: an action run on one app. */
+export interface Operation {
+  id: string;
+  app: string;
+  action: Action;
+  state: OperationState;
+  steps: OperationStep[];
+  /** Unix seconds. */
+  started_at: number;
+  /** Unix seconds, or `null` while it runs. */
+  finished_at: number | null;
+  /** Why it did not succeed, safe to show. */
+  error: string | null;
+}
+
+/** Mirrors `alchemy_api::operations::ActionRequest`, the body of `POST /api/apps/{name}/actions`. */
+export interface ActionRequest {
+  action: Action;
+  /** Go ahead even though another app shares this app's Compose project. */
+  force?: boolean;
+}
+
+/** Mirrors `alchemy_api::operations::OperationResponse`. */
+export interface OperationResponse {
+  operation: Operation;
+}
+
+/** Mirrors `alchemy_api::OperationList`, returned by `GET /api/operations` and sent as `operations`. */
+export interface OperationList {
+  /** Newest first. */
+  operations: Operation[];
+}
+
+/** Mirrors `alchemy_api::operations::OutputLine`: one line of an operation's raw output. */
+export interface OutputLine {
+  /** Counts up from 0; a gap means older lines were dropped. */
+  seq: number;
+  /** Index into {@link Operation.steps}. */
+  step: number;
+  text: string;
+}
+
+/**
+ * Mirrors `alchemy_api::operations::OperationEvent`: one message on
+ * `GET /api/operations/{id}/events`. `done` is always last.
+ */
+export type OperationEvent =
+  | { event: "operation"; data: Operation }
+  | { event: "output"; data: OutputLine }
+  | { event: "done"; data: Operation };
+
+/** Every event name on an operation's stream. */
+const OPERATION_EVENT_NAMES: readonly OperationEvent["event"][] = ["operation", "output", "done"];
 
 /**
  * Mirrors `alchemy_api::ApiEvent`: one message on `GET /api/events`. The SSE
@@ -317,7 +398,8 @@ export type LogEvent =
 export type ApiEvent =
   | { event: "engine"; data: EngineStatus }
   | { event: "metrics"; data: MetricsResponse }
-  | { event: "apps"; data: AppList };
+  | { event: "apps"; data: AppList }
+  | { event: "operations"; data: OperationList };
 
 /** Every SSE event name the daemon sends. */
 export type ApiEventName = ApiEvent["event"];
@@ -330,6 +412,7 @@ const EVENT_NAMES: { [K in ApiEventName]: K } = {
   engine: "engine",
   metrics: "metrics",
   apps: "apps",
+  operations: "operations",
 };
 
 /** The event names {@link subscribe} listens for. Others are ignored. */
@@ -359,6 +442,7 @@ export type ErrorCode =
   | "conflict"
   | "invalid"
   | "app_not_found"
+  | "operation_not_found"
   | "internal"
   | "unknown";
 
@@ -518,6 +602,32 @@ export function subscribe(
   };
 }
 
+/**
+ * Follow `GET /api/operations/{id}/events`, calling `onEvent` for each event
+ * until `done`, then closing the stream. The daemon replays the output it
+ * kept first, so following late misses nothing it still has.
+ *
+ * Returns a function that closes the stream.
+ */
+export function followOperation(id: string, onEvent: (event: OperationEvent) => void): () => void {
+  const source = new EventSource(`${apiBase()}/api/operations/${encodeURIComponent(id)}/events`);
+  for (const name of OPERATION_EVENT_NAMES) {
+    source.addEventListener(name, (message: MessageEvent<string>) => {
+      let data: unknown;
+      try {
+        data = JSON.parse(message.data);
+      } catch {
+        return;
+      }
+      onEvent({ event: name, data } as OperationEvent);
+      if (name === "done") {
+        source.close();
+      }
+    });
+  }
+  return () => source.close();
+}
+
 export const api = {
   health: (signal?: AbortSignal) => request<HealthResponse>("GET", "/health", { signal }),
   version: (signal?: AbortSignal) => request<VersionResponse>("GET", "/version", { signal }),
@@ -534,5 +644,11 @@ export const api = {
   appSettings: (signal?: AbortSignal) => request<AppSettings>("GET", "/settings/apps", { signal }),
   setAppSettings: (update: AppSettingsUpdate) =>
     request<AppSettings>("PUT", "/settings/apps", { body: update }),
+  startAction: (name: string, body: ActionRequest) =>
+    request<OperationResponse>("POST", `/apps/${encodeURIComponent(name)}/actions`, { body }),
+  operations: (signal?: AbortSignal) => request<OperationList>("GET", "/operations", { signal }),
+  cancelOperation: (id: string) =>
+    request<OperationResponse>("POST", `/operations/${encodeURIComponent(id)}/cancel`),
+  followOperation,
   subscribe,
 };

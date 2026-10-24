@@ -109,6 +109,9 @@ beforeEach(() => {
       if (url === "/api/metrics") {
         return new Response(JSON.stringify(metrics));
       }
+      if (url === "/api/operations") {
+        return new Response(JSON.stringify({ operations: [] }));
+      }
       return new Response(JSON.stringify({ version: "9.9.9", api: 1 }));
     }),
   );

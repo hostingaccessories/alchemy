@@ -3,6 +3,7 @@ import { Link, createRoute } from "@tanstack/react-router";
 
 import { Advanced } from "../components/Advanced.tsx";
 import { AppLogs } from "../components/AppLogs.tsx";
+import { AppActions } from "../components/AppActions.tsx";
 import { AppStatus, StopReasonStatus } from "../components/AppStatus.tsx";
 import { ErrorState } from "../components/ErrorState.tsx";
 import { Loading } from "../components/Loading.tsx";
@@ -17,8 +18,9 @@ import { rootRoute } from "./root.tsx";
 
 /**
  * One app: how it's doing, its services, and where it lives. Read from the
- * live app list, so it updates as the app does. Actions, logs, and the
- * compose file editor go on this page too.
+ * live app list, so it updates as the app does, with its lifecycle actions
+ * and their progress, and its logs. The compose file editor goes on this
+ * page too.
  */
 export const appRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -84,6 +86,7 @@ function AppView({ app }: { app: App }) {
           ))}
         </section>
       )}
+      <AppActions app={app} />
       <section aria-labelledby="services" className="flex flex-col gap-3">
         <h2 id="services" className="text-base font-semibold">
           Services

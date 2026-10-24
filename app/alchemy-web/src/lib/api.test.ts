@@ -7,7 +7,9 @@ import {
   type EngineStatus,
   NO_RESPONSE,
   RESUBSCRIBE_DELAY_MS,
+  type OperationEvent,
   api,
+  followOperation,
   request,
   subscribe,
 } from "./api.ts";
@@ -223,5 +225,29 @@ describe("subscribe", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("followOperation", () => {
+  beforeEach(() => {
+    FakeEventSource.instances = [];
+    vi.stubGlobal("EventSource", FakeEventSource);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("delivers output and closes after done", () => {
+    const events: OperationEvent[] = [];
+    followOperation("op 1", (event) => events.push(event));
+    const source = FakeEventSource.last();
+    expect(source.url).toBe("/api/operations/op%201/events");
+    source.emit("output", JSON.stringify({ seq: 0, step: 0, text: "hi" }));
+    source.emit("output", "not json");
+    expect(source.closed).toBe(false);
+    source.emit("done", JSON.stringify({ id: "op 1" }));
+    expect(events.map((e) => e.event)).toEqual(["output", "done"]);
+    expect(source.closed).toBe(true);
   });
 });
