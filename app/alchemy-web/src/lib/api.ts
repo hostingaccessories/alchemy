@@ -123,12 +123,137 @@ export interface MetricsHistory {
 }
 
 /**
+ * Mirrors `alchemy_api::apps::StackStatus`. A status a newer daemon sends
+ * that this build doesn't know should be treated as `unknown`.
+ */
+export type StackStatus = "running" | "partial" | "stopped" | "unknown";
+
+/** Mirrors `alchemy_api::apps::ImageSource`. */
+export type ImageSource = "registry" | "build";
+
+/** Mirrors `alchemy_core::engine::ContainerState`. */
+export type ContainerState =
+  | "created"
+  | "running"
+  | "paused"
+  | "restarting"
+  | "removing"
+  | "exited"
+  | "dead";
+
+/** Mirrors `alchemy_core::engine::Health`. */
+export type Health = "starting" | "healthy" | "unhealthy";
+
+/** Mirrors `alchemy_api::apps::AppContainer`. */
+export interface AppContainer {
+  id: string;
+  name: string;
+  image: string | null;
+  state: ContainerState;
+  health: Health | null;
+}
+
+/** Mirrors `alchemy_api::apps::AppService`. */
+export interface AppService {
+  name: string;
+  containers: AppContainer[];
+}
+
+/** Mirrors `alchemy_api::apps::AppProblemKind`; unknown kinds arrive as `other`. */
+export type AppProblemKind = "compose_error" | "compose_unavailable" | "shared_project" | "other";
+
+/** Mirrors `alchemy_api::apps::AppProblem`. `message` is safe to show as is. */
+export interface AppProblem {
+  kind: AppProblemKind;
+  message: string;
+}
+
+/** Mirrors `alchemy_api::apps::App`, returned by `GET /api/apps/{name}`. */
+export interface App {
+  /** The app's name: its folder's name. */
+  name: string;
+  status: StackStatus;
+  /** The app's folder. */
+  dir: string;
+  /** The app folder it was found in. */
+  root: string;
+  compose_file: string;
+  /** The Compose project name; `null` until Compose has read the app, or when it can't. */
+  project: string | null;
+  images: ImageSource | null;
+  services: AppService[];
+  problems: AppProblem[];
+}
+
+/** Mirrors `alchemy_api::apps::UnmanagedApp`. */
+export interface UnmanagedApp {
+  project: string;
+  dir: string | null;
+  status: StackStatus;
+  services: AppService[];
+}
+
+/** Mirrors `alchemy_api::apps::AppDirState`; unknown states arrive as `other`. */
+export type AppDirState = "ok" | "missing" | "not_a_directory" | "unreadable" | "other";
+
+/** Mirrors `alchemy_api::apps::SkipReason`; unknown reasons arrive as `other`. */
+export type SkipReason =
+  | "invalid_name"
+  | "duplicate"
+  | "linked_compose_file"
+  | "compose_file_not_regular"
+  | "linked_folder"
+  | "other";
+
+/** Mirrors `alchemy_api::apps::SkippedApp`. */
+export interface SkippedApp {
+  name: string;
+  path: string;
+  reason: SkipReason;
+  message: string;
+}
+
+/** Mirrors `alchemy_api::apps::AppDir`. */
+export interface AppDir {
+  path: string;
+  /** Whether this is the home, where new apps go. */
+  home: boolean;
+  state: AppDirState;
+  /** Why the folder can't be used, when `state` isn't `ok`. */
+  message: string | null;
+  skipped: SkippedApp[];
+}
+
+/** Mirrors `alchemy_api::apps::AppList`, returned by `GET /api/apps` and sent as `apps`. */
+export interface AppList {
+  apps: App[];
+  unmanaged: UnmanagedApp[];
+  dirs: AppDir[];
+}
+
+/** Mirrors `alchemy_api::apps::AppSettings`, returned by `GET /api/settings/apps`. */
+export interface AppSettings {
+  /** The home in effect: the chosen one, else `default_home`. */
+  home: string | null;
+  default_home: string | null;
+  extra: string[];
+}
+
+/** Mirrors `alchemy_api::apps::AppSettingsUpdate`, the body of `PUT /api/settings/apps`. */
+export interface AppSettingsUpdate {
+  /** A full path, or `null` for the default home. */
+  home: string | null;
+  extra: string[];
+}
+
+/**
  * Mirrors `alchemy_api::ApiEvent`: one message on `GET /api/events`. The SSE
  * `event:` field is `event`, and its `data:` field is `data` as JSON.
  */
 export type ApiEvent =
   | { event: "engine"; data: EngineStatus }
-  | { event: "metrics"; data: MetricsResponse };
+  | { event: "metrics"; data: MetricsResponse }
+  | { event: "apps"; data: AppList };
 
 /** Every SSE event name the daemon sends. */
 export type ApiEventName = ApiEvent["event"];
@@ -137,7 +262,11 @@ export type ApiEventName = ApiEvent["event"];
 export type ApiEventData<K extends ApiEventName> = Extract<ApiEvent, { event: K }>["data"];
 
 /** One key per event name, so adding an {@link ApiEvent} variant fails to compile until listed. */
-const EVENT_NAMES: { [K in ApiEventName]: K } = { engine: "engine", metrics: "metrics" };
+const EVENT_NAMES: { [K in ApiEventName]: K } = {
+  engine: "engine",
+  metrics: "metrics",
+  apps: "apps",
+};
 
 /** The event names {@link subscribe} listens for. Others are ignored. */
 export const API_EVENT_NAMES: readonly ApiEventName[] = Object.values(EVENT_NAMES);
@@ -165,6 +294,7 @@ export type ErrorCode =
   | "unsupported_media_type"
   | "conflict"
   | "invalid"
+  | "app_not_found"
   | "internal"
   | "unknown";
 
@@ -334,5 +464,12 @@ export const api = {
     if (project !== undefined) query.set("project", project);
     return request<MetricsHistory>("GET", `/metrics/history?${query.toString()}`, { signal });
   },
+  apps: (signal?: AbortSignal) => request<AppList>("GET", "/apps", { signal }),
+  app: (name: string, signal?: AbortSignal) =>
+    request<App>("GET", `/apps/${encodeURIComponent(name)}`, { signal }),
+  appSettings: (signal?: AbortSignal) =>
+    request<AppSettings>("GET", "/settings/apps", { signal }),
+  setAppSettings: (update: AppSettingsUpdate) =>
+    request<AppSettings>("PUT", "/settings/apps", { body: update }),
   subscribe,
 };

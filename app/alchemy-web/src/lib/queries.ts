@@ -19,6 +19,15 @@ export const versionQuery = queryOptions({
   retry: false,
 });
 
+/**
+ * `GET /api/settings/apps`: the app folders in effect. Saving them replaces
+ * this query's data with the daemon's answer.
+ */
+export const appSettingsQuery = queryOptions({
+  queryKey: ["settings", "apps"],
+  queryFn: ({ signal }) => api.appSettings(signal),
+});
+
 /** A query whose data is one event's payload. */
 export interface LiveQuery<K extends ApiEventName> {
   queryKey: DataTag<QueryKey, ApiEventData<K>, DefaultError>;
@@ -42,6 +51,11 @@ export const liveQueries = {
   metrics: queryOptions({
     queryKey: ["metrics"],
     queryFn: ({ signal }) => api.metrics(signal),
+    staleTime: Infinity,
+  }),
+  apps: queryOptions({
+    queryKey: ["apps"],
+    queryFn: ({ signal }) => api.apps(signal),
     staleTime: Infinity,
   }),
 } satisfies { [K in ApiEventName]: LiveQuery<K> };
