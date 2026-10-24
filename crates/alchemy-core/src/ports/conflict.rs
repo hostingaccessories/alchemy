@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::{PortClaim, PortRange, PortSource, Protocol, PublishedPort, ServicePort};
+use super::{PortClaim, PortHolder, PortRange, PortSource, Protocol, PublishedPort, ServicePort};
 
 /// A port an app wants that something else already holds.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -22,24 +22,20 @@ pub struct PortConflict {
 impl fmt::Display for PortConflict {
     /// A plain sentence naming the port and its holder.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let verb = match self.claim.source {
-            PortSource::Reserved => "is reserved",
-            PortSource::Declared => "is published by",
-            PortSource::Live => "is in use by",
-        };
-        let holder = &self.claim.holder;
-        if self.claim.source == PortSource::Reserved {
-            write!(
+        let (wanted, service) = (&self.wanted, &self.service);
+        match (&self.claim.holder, self.claim.source) {
+            (PortHolder::Reservation { owner }, _) => write!(
                 f,
-                "Port {} for service {} {verb} as {holder}.",
-                self.wanted, self.service
-            )
-        } else {
-            write!(
+                "Port {wanted} for service {service} is reserved for {owner}."
+            ),
+            (holder, PortSource::Declared) => write!(
                 f,
-                "Port {} for service {} {verb} {holder}.",
-                self.wanted, self.service
-            )
+                "Port {wanted} for service {service} is published by {holder}."
+            ),
+            (holder, _) => write!(
+                f,
+                "Port {wanted} for service {service} is in use by {holder}."
+            ),
         }
     }
 }
@@ -339,7 +335,7 @@ mod tests {
                     },
                     PortSource::Reserved,
                 ),
-                "Port 8080/tcp for service web is reserved as a reservation for proxy.",
+                "Port 8080/tcp for service web is reserved for proxy.",
             ),
             (
                 claim(
