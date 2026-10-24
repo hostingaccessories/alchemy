@@ -190,6 +190,28 @@ the real engine on this machine:
 cargo test -p alchemyd --test engine -- --ignored
 ```
 
+### Stopped or crashed
+
+Every container, and every app, carries a `stop_reason`: running,
+stopped by Alchemy, stopped outside Alchemy, crashed (with its exit code
+and whether it ran out of memory), keeps crashing, or finished. The pure
+rules live in `alchemy_core::engine::stop`. They read the container's
+events (`docker stop` sends `kill`, `die`, then `stop`; an out-of-memory
+kill sends `oom` then `die`; a process killed from the host sends only
+`die`) and the last action Alchemy recorded for its Compose project
+(`bin/alchemyd/src/intent.rs`), which is stored so it survives a restart.
+Containers already stopped when the daemon connects are inspected once
+for their exit code. A one-off job that exits 0 doesn't make its app
+partly running.
+
+To see each case, run an app and then:
+
+```sh
+docker compose stop web               # Stopped outside Alchemy
+docker kill --signal=KILL blog-web-1  # Stopped outside Alchemy
+sudo kill -9 "$(docker inspect -f '{{.State.Pid}}' blog-web-1)"  # Crashed (exit code 137), Linux
+```
+
 ### Metrics
 
 The daemon samples this machine and every running container a minute
