@@ -163,6 +163,30 @@ fn container_status() {
 }
 
 #[test]
+fn container_status_ports() {
+    use alchemy_api::{Protocol, PublishedPort};
+    let mut status = ContainerStatus::new("abc", "blog-web-1", ContainerState::Running);
+    status.stop_reason = StopReason::Running;
+    status.ports = vec![
+        PublishedPort::new(Protocol::Tcp, Some("8080".parse().unwrap()))
+            .with_target(Some("80".parse().unwrap())),
+        PublishedPort::new(Protocol::Udp, Some("5353".parse().unwrap()))
+            .with_host_ip(Some("127.0.0.1".parse().unwrap()))
+            .with_target(Some("53".parse().unwrap())),
+    ];
+    assert_wire(
+        &status,
+        concat!(
+            r#"{"id":"abc","name":"blog-web-1","image":null,"project":null,"#,
+            r#""service":null,"working_dir":null,"state":"running","health":null,"#,
+            r#""stop_reason":{"kind":"running"},"ports":["#,
+            r#"{"protocol":"tcp","host_ip":null,"published":"8080","target":"80"},"#,
+            r#"{"protocol":"udp","host_ip":"127.0.0.1","published":"5353","target":"53"}]}"#,
+        ),
+    );
+}
+
+#[test]
 fn stop_reasons() {
     let reasons = [
         (StopReason::Running, r#"{"kind":"running"}"#),

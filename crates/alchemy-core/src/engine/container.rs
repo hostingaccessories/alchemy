@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::stop::{InspectedExit, Intent, StopReason, Trail, stop_reason};
+use crate::ports::PublishedPort;
 
 /// A container's lifecycle state, as Docker names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -102,6 +103,10 @@ pub struct ContainerStatus {
     /// from the container's events and its project's [`Intent`].
     #[serde(default)]
     pub stop_reason: StopReason,
+    /// The host ports it publishes, from the engine's container listing.
+    /// Empty while it is not running, and left off the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PublishedPort>,
     /// The history `stop_reason` is decided from. Not on the wire.
     #[serde(skip)]
     trail: Trail,
@@ -120,6 +125,7 @@ impl ContainerStatus {
             state,
             health: None,
             stop_reason: stop_reason(state, &Trail::default(), None),
+            ports: Vec::new(),
             trail: Trail::default(),
         }
     }
@@ -311,6 +317,25 @@ impl Containers {
         changed
     }
 
+    /// Take the ports of each container in `listed` whose state still
+    /// matches the one known. Returns whether any changed.
+    ///
+    /// Events carry no ports, so a container started after the last full
+    /// listing learns them from a later one. Nothing else is taken from
+    /// it, and a container whose state has moved on since is left alone,
+    /// so a listing that raced an event cannot undo it.
+    pub fn update_ports(&mut self, listed: impl IntoIterator<Item = ContainerStatus>) -> bool {
+        listed.into_iter().fold(false, |changed, fresh| {
+            match self.by_id.get_mut(&fresh.id) {
+                Some(known) if known.state == fresh.state && known.ports != fresh.ports => {
+                    known.ports = fresh.ports;
+                    true
+                }
+                _ => changed,
+            }
+        })
+    }
+
     /// Record what Alchemy asked of Compose project `project`, replacing
     /// any earlier intent. Returns whether any container's reason changed.
     pub fn set_intent(&mut self, project: &str, intent: Intent) -> bool {
@@ -455,6 +480,9 @@ fn transition(status: &mut ContainerStatus, action: ContainerAction) {
     }
     if let Some(state) = action.implied_state() {
         status.state = state;
+        if !matches!(state, ContainerState::Running | ContainerState::Paused) {
+            status.ports.clear();
+        }
     }
 }
 
@@ -735,6 +763,88 @@ mod tests {
             serde_json::from_value::<ContainerStatus>(json).unwrap(),
             status
         );
+    }
+
+    #[test]
+    fn ports_are_on_the_wire_only_when_published() {
+        use crate::ports::Protocol;
+        let mut status = ContainerStatus::new("abc", "web-1", ContainerState::Running);
+        status.ports = vec![
+            PublishedPort::new(Protocol::Tcp, Some("8080".parse().unwrap()))
+                .with_target(Some("80".parse().unwrap())),
+        ];
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json["ports"],
+            serde_json::json!([
+                {"protocol": "tcp", "host_ip": null, "published": "8080", "target": "80"}
+            ])
+        );
+        assert_eq!(
+            serde_json::from_value::<ContainerStatus>(json).unwrap(),
+            status
+        );
+        let bare = ContainerStatus::new("abc", "web-1", ContainerState::Running);
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json.get("ports").is_none(), "{json}");
+        assert_eq!(
+            serde_json::from_value::<ContainerStatus>(json).unwrap(),
+            bare
+        );
+    }
+
+    fn publishing(id: &str, state: ContainerState, port: &str) -> ContainerStatus {
+        let mut status = ContainerStatus::new(id, id, state);
+        status.ports = vec![crate::ports::PublishedPort::new(
+            crate::ports::Protocol::Tcp,
+            Some(port.parse().unwrap()),
+        )];
+        status
+    }
+
+    #[test]
+    fn update_ports_takes_only_ports_of_containers_in_the_same_state() {
+        let mut containers = Containers::new();
+        containers.replace_all([running("a"), running("b"), running("c")]);
+        containers.apply(&ContainerEvent::new("b", ContainerAction::Die));
+
+        let changed = containers.update_ports([
+            publishing("a", ContainerState::Running, "8080"),
+            publishing("b", ContainerState::Running, "9090"),
+            publishing("x", ContainerState::Running, "7070"),
+        ]);
+        assert!(changed);
+        let ports = |id: &str| {
+            containers
+                .get(id)
+                .map(|c| c.ports.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        assert_eq!(ports("a"), Some(vec!["8080/tcp".to_owned()]));
+        assert_eq!(ports("b"), Some(vec![]), "stopped since the listing");
+        assert_eq!(ports("c"), Some(vec![]), "not listed");
+        assert_eq!(ports("x"), None, "unknown containers are not added");
+        assert!(!containers.update_ports([publishing("a", ContainerState::Running, "8080")]));
+    }
+
+    #[test]
+    fn stopping_releases_ports() {
+        let cases = [
+            (ContainerAction::Stop, false),
+            (ContainerAction::Die, false),
+            (ContainerAction::Pause, true),
+            (ContainerAction::Health(Health::Healthy), true),
+            (ContainerAction::Kill, true),
+        ];
+        for (action, kept) in cases {
+            let mut containers = Containers::new();
+            containers.replace_all([publishing("a", ContainerState::Running, "8080")]);
+            containers.apply(&ContainerEvent::new("a", action));
+            assert_eq!(
+                containers.get("a").unwrap().ports.is_empty(),
+                !kept,
+                "{action:?}"
+            );
+        }
     }
 
     #[test]

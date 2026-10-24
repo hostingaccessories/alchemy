@@ -23,7 +23,9 @@ mod discovery;
 mod monitor;
 mod probe;
 
-pub use api::{ApiError, BollardApi, DockerApi, EngineVersion};
+pub use api::{
+    AddressPool, ApiError, BollardApi, DockerApi, DockerNetwork, EngineVersion, NetworkSpec,
+};
 pub use cli::{CliError, DockerCli, ProcessDockerCli, parse_compose_version, parse_context_host};
 pub use discovery::{
     Candidate, Endpoint, EndpointError, EndpointSource, HostEnv, Os, desktop_install_paths,

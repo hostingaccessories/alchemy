@@ -62,6 +62,23 @@ export interface ContainerStatus {
   health: Health | null;
   /** Absent from a daemon older than stop reasons; treat as `unknown`. */
   stop_reason?: StopReason;
+  /** Host ports it publishes while running. Absent when there are none. */
+  ports?: PublishedPort[];
+}
+
+/** Mirrors `alchemy_api::Protocol`. */
+export type Protocol = "tcp" | "udp";
+
+/**
+ * Mirrors `alchemy_api::PublishedPort`. Ports are text: `8080` or a range
+ * such as `8000-8010`. `host_ip` null means every address; `published`
+ * null is an ephemeral port Docker picks at start.
+ */
+export interface PublishedPort {
+  protocol: Protocol;
+  host_ip: string | null;
+  published: string | null;
+  target: string | null;
 }
 
 /**

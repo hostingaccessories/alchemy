@@ -6,8 +6,8 @@
 //!
 //! `GET /api/engine` returns an [`EngineStatus`], re-exported from
 //! `alchemy-core` so the wire type and the domain type cannot drift.
-//! [`ContainerStatus`] and its [`StopReason`] are re-exported the same way
-//! for routes that show containers.
+//! [`ContainerStatus`], its [`StopReason`], and the [`PublishedPort`]s it
+//! holds are re-exported the same way for routes that show containers.
 //! `GET /api/metrics` returns a [`MetricsResponse`] and
 //! `GET /api/metrics/history` a [`MetricsHistory`], built from the
 //! resource-usage types in `alchemy_core::metrics`.
@@ -27,6 +27,7 @@ pub use alchemy_core::engine::{
 pub use alchemy_core::metrics::{
     ContainerUsage, MachineUsage, MetricsPoint, MetricsRange, ProjectUsage,
 };
+pub use alchemy_core::ports::{PortRange, Protocol, PublishedPort};
 use serde::{Deserialize, Serialize, Serializer};
 
 pub mod apps;

@@ -1,8 +1,9 @@
 //! The Docker Engine API behind [`DockerApi`], and the only place
 //! `bollard` types are mapped to core types.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -12,12 +13,17 @@ use alchemy_core::engine::{
     flavor_from_platform, parse_action, parse_timestamp_ms,
 };
 use alchemy_core::metrics::{ContainerSample, DiskIo, Traffic, container_memory};
+use alchemy_core::network::Ipv4Net;
+use alchemy_core::ports::{PortRange, Protocol, PublishedPort};
 use bollard::container::LogOutput;
 use bollard::models::{
     ContainerInspectResponse, ContainerStatsResponse, ContainerSummary, EventMessage,
-    EventMessageTypeEnum, SystemVersion,
+    EventMessageTypeEnum, Ipam, IpamConfig, Network, NetworkCreateRequest, PortSummary,
+    PortSummaryTypeEnum, SystemInfo, SystemVersion,
 };
-use bollard::query_parameters::{EventsOptions, ListContainersOptions, LogsOptions, StatsOptions};
+use bollard::query_parameters::{
+    EventsOptions, ListContainersOptions, ListNetworksOptions, LogsOptions, StatsOptions,
+};
 use bollard::{ClientVersion, Docker};
 use futures_util::stream::BoxStream;
 use futures_util::{Stream, StreamExt as _};
@@ -63,6 +69,83 @@ pub trait DockerApi {
         drop(id);
         std::future::ready(Ok(None))
     }
+
+    /// `GET /networks`: every network the engine knows.
+    ///
+    /// The default reports none, for engines whose tests do not care.
+    fn list_networks(&self) -> impl Future<Output = Result<Vec<DockerNetwork>, ApiError>> + Send {
+        std::future::ready(Ok(Vec::new()))
+    }
+
+    /// `POST /networks/create`: a bridge network as `spec` describes,
+    /// returning its ID.
+    ///
+    /// The default refuses, as an engine without network support would.
+    fn create_network(
+        &self,
+        spec: NetworkSpec,
+    ) -> impl Future<Output = Result<String, ApiError>> + Send {
+        drop(spec);
+        std::future::ready(Err(ApiError::Server {
+            status: 501,
+            message: "creating networks is not supported".to_owned(),
+        }))
+    }
+
+    /// The IPv4 subnets of the default `bridge` network, from
+    /// `GET /networks/bridge`. `/info` does not report them.
+    ///
+    /// The default reports none, for engines whose tests do not care.
+    fn bridge_subnets(&self) -> impl Future<Output = Result<Vec<Ipv4Net>, ApiError>> + Send {
+        std::future::ready(Ok(Vec::new()))
+    }
+
+    /// The address pools the engine was configured with, from
+    /// `GET /info`. Empty when it uses Docker's built-in defaults.
+    ///
+    /// The default reports none, for engines whose tests do not care.
+    fn address_pools(&self) -> impl Future<Output = Result<Vec<AddressPool>, ApiError>> + Send {
+        std::future::ready(Ok(Vec::new()))
+    }
+}
+
+/// A Docker network, reduced to what overlap checks need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerNetwork {
+    /// Full network ID.
+    pub id: String,
+    /// Network name, such as `bridge` or `blog_default`.
+    pub name: String,
+    /// Driver, such as `bridge`, `host`, or `overlay`.
+    pub driver: Option<String>,
+    /// The IPv4 subnets from its IPAM config. IPv6 subnets are left out.
+    pub subnets: Vec<Ipv4Net>,
+    /// Its labels, without the Compose project label.
+    pub labels: BTreeMap<String, String>,
+    /// The Compose project that created it, from the
+    /// `com.docker.compose.project` label.
+    pub project: Option<String>,
+}
+
+/// A bridge network for [`DockerApi::create_network`] to create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkSpec {
+    /// Network name.
+    pub name: String,
+    /// The one IPv4 subnet its IPAM config holds.
+    pub subnet: Ipv4Net,
+    /// Labels to set on it.
+    pub labels: BTreeMap<String, String>,
+}
+
+/// One of the engine's `default-address-pools`: networks Docker creates
+/// without a subnet are carved from `base` in blocks of `/size`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressPool {
+    /// The range blocks are carved from.
+    pub base: Ipv4Net,
+    /// The prefix length of each block.
+    pub size: u8,
 }
 
 /// Why an Engine API call failed.
@@ -181,7 +264,53 @@ fn container_status(summary: ContainerSummary) -> Option<ContainerStatus> {
         .health
         .and_then(|h| h.status)
         .and_then(|s| Health::from_docker(s.as_ref()));
+    status.ports = published_ports(summary.ports.unwrap_or_default());
     Some(status)
+}
+
+/// The host ports in a container listing's `Ports`, in a stable order.
+///
+/// Ports that are only exposed, and SCTP ports, are left out. Docker lists
+/// a port published on every address twice, on `0.0.0.0` and on `::`; the
+/// pair becomes one port with no host IP.
+fn published_ports(ports: Vec<PortSummary>) -> Vec<PublishedPort> {
+    let found: Vec<PublishedPort> = ports
+        .into_iter()
+        .filter_map(|port| {
+            let protocol = match port.typ? {
+                PortSummaryTypeEnum::TCP => Protocol::Tcp,
+                PortSummaryTypeEnum::UDP => Protocol::Udp,
+                PortSummaryTypeEnum::EMPTY | PortSummaryTypeEnum::SCTP => return None,
+            };
+            let published = PortRange::single(port.public_port?).ok()?;
+            let host_ip = port.ip.as_deref().and_then(|ip| ip.parse().ok());
+            Some(
+                PublishedPort::new(protocol, Some(published))
+                    .with_host_ip(host_ip)
+                    .with_target(PortRange::single(port.private_port).ok()),
+            )
+        })
+        .collect();
+    let on = |port: &PublishedPort, ip: IpAddr| PublishedPort {
+        host_ip: Some(ip),
+        ..*port
+    };
+    let any_v4 = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    let any_v6 = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+    let mut merged: Vec<PublishedPort> = found
+        .iter()
+        .filter_map(|port| {
+            let paired = |other: IpAddr| found.contains(&on(port, other));
+            match port.host_ip {
+                Some(ip) if ip == any_v4 && paired(any_v6) => Some(port.with_host_ip(None)),
+                Some(ip) if ip == any_v6 && paired(any_v4) => None,
+                _ => Some(*port),
+            }
+        })
+        .collect();
+    merged.sort_by_key(|p| (p.published, p.protocol, p.host_ip, p.target));
+    merged.dedup();
+    merged
 }
 
 fn container_event(message: EventMessage) -> Option<ContainerEvent> {
@@ -220,6 +349,62 @@ fn inspected_exit(response: ContainerInspectResponse) -> Option<InspectedExit> {
             .and_then(|count| u32::try_from(count).ok())
             .unwrap_or(0),
     })
+}
+
+/// The IPv4 subnets in `ipam`'s config; IPv6 and unreadable ones are
+/// left out.
+fn ipv4_subnets(ipam: Option<Ipam>) -> Vec<Ipv4Net> {
+    ipam.and_then(|ipam| ipam.config)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|config| config.subnet?.parse().ok())
+        .collect()
+}
+
+fn docker_network(network: Network) -> Option<DockerNetwork> {
+    let id = network.id.filter(|id| !id.is_empty())?;
+    let name = network.name.filter(|name| !name.is_empty())?;
+    let mut labels: BTreeMap<String, String> =
+        network.labels.unwrap_or_default().into_iter().collect();
+    Some(DockerNetwork {
+        id,
+        name,
+        driver: network.driver.filter(|d| !d.is_empty()),
+        subnets: ipv4_subnets(network.ipam),
+        project: labels.remove(PROJECT_LABEL),
+        labels,
+    })
+}
+
+fn network_request(spec: NetworkSpec) -> NetworkCreateRequest {
+    NetworkCreateRequest {
+        name: spec.name,
+        driver: Some("bridge".to_owned()),
+        ipam: Some(Ipam {
+            driver: Some("default".to_owned()),
+            config: Some(vec![IpamConfig {
+                subnet: Some(spec.subnet.to_string()),
+                ..IpamConfig::default()
+            }]),
+            options: None,
+        }),
+        labels: Some(spec.labels.into_iter().collect()),
+        ..NetworkCreateRequest::default()
+    }
+}
+
+/// The IPv4 pools in `info`; IPv6 pools and unreadable entries are left
+/// out.
+fn address_pools(info: SystemInfo) -> Vec<AddressPool> {
+    info.default_address_pools
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|pool| {
+            let base = pool.base?.parse().ok()?;
+            let size = u8::try_from(pool.size?).ok().filter(|size| *size <= 32)?;
+            Some(AddressPool { base, size })
+        })
+        .collect()
 }
 
 /// The API version the client is configured with.
@@ -301,6 +486,27 @@ impl DockerApi for BollardApi {
     async fn inspect_exit(&self, id: String) -> Result<Option<InspectedExit>, ApiError> {
         let response = self.docker.inspect_container(&id, None).await?;
         Ok(inspected_exit(response))
+    }
+
+    async fn list_networks(&self) -> Result<Vec<DockerNetwork>, ApiError> {
+        let networks = self
+            .docker
+            .list_networks(None::<ListNetworksOptions>)
+            .await?;
+        Ok(networks.into_iter().filter_map(docker_network).collect())
+    }
+
+    async fn create_network(&self, spec: NetworkSpec) -> Result<String, ApiError> {
+        Ok(self.docker.create_network(network_request(spec)).await?.id)
+    }
+
+    async fn bridge_subnets(&self) -> Result<Vec<Ipv4Net>, ApiError> {
+        let bridge = self.docker.inspect_network("bridge", None).await?;
+        Ok(ipv4_subnets(bridge.ipam))
+    }
+
+    async fn address_pools(&self) -> Result<Vec<AddressPool>, ApiError> {
+        Ok(address_pools(self.docker.info().await?))
     }
 }
 
@@ -544,6 +750,92 @@ mod tests {
     }
 
     #[test]
+    fn published_ports_keep_host_bindings() {
+        use PortSummaryTypeEnum::{SCTP, TCP, UDP};
+        let port = |ip: Option<&str>, private: u16, public: Option<u16>, typ| PortSummary {
+            ip: ip.map(Into::into),
+            private_port: private,
+            public_port: public,
+            typ: Some(typ),
+        };
+        let want = |s: &str, ip: Option<&str>, target: &str| {
+            let (range, proto) = s.split_once('/').unwrap();
+            PublishedPort::new(proto.parse().unwrap(), Some(range.parse().unwrap()))
+                .with_host_ip(ip.map(|ip| ip.parse().unwrap()))
+                .with_target(Some(target.parse().unwrap()))
+        };
+        let cases = [
+            (
+                vec![
+                    port(Some("::"), 80, Some(8080), TCP),
+                    port(Some("0.0.0.0"), 80, Some(8080), TCP),
+                ],
+                vec![want("8080/tcp", None, "80")],
+            ),
+            (
+                vec![
+                    port(Some("127.0.0.1"), 443, Some(8443), TCP),
+                    port(Some("0.0.0.0"), 53, Some(53), UDP),
+                    port(Some("::1"), 6000, Some(6000), TCP),
+                ],
+                vec![
+                    want("53/udp", Some("0.0.0.0"), "53"),
+                    want("6000/tcp", Some("::1"), "6000"),
+                    want("8443/tcp", Some("127.0.0.1"), "443"),
+                ],
+            ),
+            (
+                vec![
+                    port(None, 6379, None, TCP),
+                    port(Some("0.0.0.0"), 9, Some(9), SCTP),
+                    port(Some("0.0.0.0"), 1, Some(0), TCP),
+                    PortSummary {
+                        typ: None,
+                        ..port(Some("0.0.0.0"), 1, Some(1), TCP)
+                    },
+                ],
+                vec![],
+            ),
+            (
+                vec![
+                    port(Some("::"), 5000, Some(5000), UDP),
+                    port(None, 5000, Some(5000), UDP),
+                    port(None, 5000, Some(5000), UDP),
+                ],
+                vec![
+                    want("5000/udp", None, "5000"),
+                    want("5000/udp", Some("::"), "5000"),
+                ],
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(published_ports(input.clone()), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn container_status_maps_ports() {
+        let listed = ContainerSummary {
+            ports: Some(vec![PortSummary {
+                ip: Some("0.0.0.0".into()),
+                private_port: 80,
+                public_port: Some(8080),
+                typ: Some(PortSummaryTypeEnum::TCP),
+            }]),
+            ..summary("abc", "/web", ContainerSummaryStateEnum::RUNNING)
+        };
+        let status = container_status(listed).unwrap();
+        assert_eq!(
+            status
+                .ports
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["0.0.0.0:8080/tcp"]
+        );
+    }
+
+    #[test]
     fn container_event_maps_messages() {
         use EventMessageTypeEnum::{CONTAINER, NETWORK};
         let mut start = ContainerEvent::new("abc", ContainerAction::Start);
@@ -687,6 +979,153 @@ mod tests {
         for (input, want) in cases {
             assert_eq!(inspected_exit(input.clone()), want, "{input:?}");
         }
+    }
+
+    fn net(cidr: &str) -> Ipv4Net {
+        cidr.parse().unwrap()
+    }
+
+    fn ipam(subnets: &[&str]) -> Ipam {
+        Ipam {
+            config: Some(
+                subnets
+                    .iter()
+                    .map(|s| IpamConfig {
+                        subnet: Some((*s).into()),
+                        ..IpamConfig::default()
+                    })
+                    .collect(),
+            ),
+            ..Ipam::default()
+        }
+    }
+
+    #[test]
+    fn docker_network_maps_networks() {
+        let compose = Network {
+            id: Some("n1".into()),
+            name: Some("blog_default".into()),
+            driver: Some("bridge".into()),
+            ipam: Some(ipam(&["172.18.0.0/16", "fd00::/64", "not a subnet"])),
+            labels: Some(labels(&[
+                (PROJECT_LABEL, "blog"),
+                ("com.docker.compose.network", "default"),
+            ])),
+            ..Network::default()
+        };
+        let host = Network {
+            id: Some("n2".into()),
+            name: Some("host".into()),
+            driver: Some("host".into()),
+            ipam: Some(Ipam::default()),
+            ..Network::default()
+        };
+        let cases = [
+            (
+                compose,
+                Some(DockerNetwork {
+                    id: "n1".into(),
+                    name: "blog_default".into(),
+                    driver: Some("bridge".into()),
+                    subnets: vec![net("172.18.0.0/16")],
+                    labels: BTreeMap::from([(
+                        "com.docker.compose.network".to_owned(),
+                        "default".to_owned(),
+                    )]),
+                    project: Some("blog".into()),
+                }),
+            ),
+            (
+                host,
+                Some(DockerNetwork {
+                    id: "n2".into(),
+                    name: "host".into(),
+                    driver: Some("host".into()),
+                    subnets: vec![],
+                    labels: BTreeMap::new(),
+                    project: None,
+                }),
+            ),
+            (
+                Network {
+                    name: Some("x".into()),
+                    ..Network::default()
+                },
+                None,
+            ),
+            (
+                Network {
+                    id: Some("n3".into()),
+                    name: Some(String::new()),
+                    ..Network::default()
+                },
+                None,
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(docker_network(input.clone()), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn network_request_creates_a_labelled_bridge_on_one_subnet() {
+        let request = network_request(NetworkSpec {
+            name: "alchemy".into(),
+            subnet: net("10.200.0.0/24"),
+            labels: BTreeMap::from([("com.alchemy.managed".to_owned(), "true".to_owned())]),
+        });
+        assert_eq!(
+            request,
+            NetworkCreateRequest {
+                name: "alchemy".into(),
+                driver: Some("bridge".into()),
+                ipam: Some(Ipam {
+                    driver: Some("default".into()),
+                    config: Some(vec![IpamConfig {
+                        subnet: Some("10.200.0.0/24".into()),
+                        ..IpamConfig::default()
+                    }]),
+                    options: None,
+                }),
+                labels: Some(labels(&[("com.alchemy.managed", "true")])),
+                ..NetworkCreateRequest::default()
+            }
+        );
+    }
+
+    #[test]
+    fn address_pools_keep_ipv4_pools() {
+        use bollard::models::SystemInfoDefaultAddressPools as Pool;
+        let pool = |base: Option<&str>, size: Option<i64>| Pool {
+            base: base.map(Into::into),
+            size,
+        };
+        let info = SystemInfo {
+            default_address_pools: Some(vec![
+                pool(Some("172.17.0.0/16"), Some(16)),
+                pool(Some("192.168.0.0/16"), Some(20)),
+                pool(Some("fd00::/48"), Some(64)),
+                pool(Some("10.0.0.0/8"), Some(33)),
+                pool(Some("10.0.0.0/8"), Some(-1)),
+                pool(None, Some(24)),
+                pool(Some("10.0.0.0/8"), None),
+            ]),
+            ..SystemInfo::default()
+        };
+        assert_eq!(
+            address_pools(info),
+            [
+                AddressPool {
+                    base: net("172.17.0.0/16"),
+                    size: 16
+                },
+                AddressPool {
+                    base: net("192.168.0.0/16"),
+                    size: 20
+                },
+            ]
+        );
+        assert_eq!(address_pools(SystemInfo::default()), []);
     }
 
     #[test]
