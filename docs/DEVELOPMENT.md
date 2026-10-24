@@ -101,8 +101,12 @@ Anything that isn't `GET`, `HEAD`, or `OPTIONS` must send
 `Content-Type: application/json`, body or not, on both the port and the
 socket (415 `unsupported_media_type` otherwise). On the port it is also
 refused when it carries an `Origin` other than its own or the desktop
-shell's (403 `forbidden`). The socket ignores `Host` and `Origin`: no
-browser can open it.
+shell's (403 `forbidden`). Any request under `/api` on the port, `GET`
+included, is refused the same way when the browser marks it
+`Sec-Fetch-Site: cross-site` or `same-site` and its `Origin` isn't the
+shell's, so another page can't open log streams with `no-cors` fetches;
+requests without the header, like `curl`'s, pass. The socket ignores
+`Host`, `Origin`, and `Sec-Fetch-Site`: no browser can open it.
 
 ```sh
 curl -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:7240/api/...
@@ -357,9 +361,11 @@ curl -N --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/o
 read from the Engine API, never a `docker compose logs` process. The
 containers are the app's, as `/api/apps` lists them; `service=web`
 limits them to one service (400 `bad_request` for one the app doesn't
-have). It sends the last `tail` lines (200 by default, at most 5000)
-across the containers in the order Docker timestamped them, as one `log`
-event each, then `done`. With `follow=true` it sends `following` instead
+have). It sends the last `tail` lines (200 by default, at most 5000, and
+only the newest that fit in 2 MiB) across the containers in the order
+Docker timestamped them, as one `log` event each, then `done`. At most 16
+log streams are open at once across the port and the socket; past that
+a request is 503 `busy`. With `follow=true` it sends `following` instead
 of `done` and then each new line as it arrives, until the client leaves:
 a container that stops is picked up again, without repeating a line, when
 it starts, and one Compose creates later is followed from its first line.
@@ -497,7 +503,8 @@ checks:
 - the daemon creates its state database `0600` in a `0700` directory;
 - `/api/health` and `/api/engine` respond on the port, and `/api/health`
   on the socket, where `/` is a JSON 404;
-- a rebinding `Host` and a cross-origin form `POST` are refused with 403;
+- a rebinding `Host`, a cross-origin form `POST`, and a cross-site `GET`
+  are refused with 403;
 - `/api/events` streams an `engine` event to the Tauri origin;
 - `/api/metrics` reports the machine, `/api/metrics/history` has a
   stored point, and `alchemy machine stats` prints them;

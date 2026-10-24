@@ -277,7 +277,10 @@ alchemy app logs blog -f               # keep following until Ctrl-C
 ```
 
 Lines print as `service | line`, merged across containers in the order
-Docker recorded them. `--tail` goes up to 5000. While following, a
+Docker recorded them. `--tail` goes up to 5000, keeping the newest lines
+that fit in 2 MiB. Alchemy serves up to 16 log views at once, across the
+web UI, the desktop app, and the CLI; past that it answers that it is busy
+until one is closed. While following, a
 container that restarts or is recreated, for example by Update, is picked up
 again without repeating lines. Lines are read from Docker directly, the same
 lines `docker compose logs` shows. A line longer than 8 KiB is cut short and
