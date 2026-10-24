@@ -550,6 +550,124 @@ them, and the Machines page charts them.
 curl --unix-socket /run/user/1000/alchemy/alchemyd.sock 'http://alchemyd/api/metrics/history?range=24h&app=blog'
 ```
 
+### Ports
+
+The port registry lists every host port that is in use, reserved, or
+declared, and who holds it. It is merged in `alchemy_core::ports` from
+four sources, read fresh on each request:
+
+- the ports Docker publishes for running containers (`in use`);
+- port reservations in the state database (`reserved`);
+- the ports apps' compose files publish, from the cached `docker compose
+  config`, so Compose isn't run again (`declared` while the app is
+  stopped);
+- sockets other programs listen on (`in use`): `/proc/net` on Linux,
+  and `netstat` on macOS.
+
+A port a running container publishes is listed once, held by the
+container, although `docker-proxy` or Docker Desktop also listens on it.
+Ports without a fixed host port are left out. Holders are named as
+`service web of app blog`, `container pihole`, `a reservation for
+proxy`, or `another program (nginx, pid 42)`. Only the daemon user's
+processes are named; on Linux others show as `another program`. On
+macOS, `netstat` shows no sockets to an unsigned binary like a dev build
+of alchemyd, so it falls back to `lsof`, which misses listeners owned by
+root (the system `sshd`, `cupsd`). If listeners can't be read at all, the
+list says so in `warnings`.
+
+`GET /api/ports` returns the list, `alchemy machine ports [--json]`
+prints it as a table, and the Machines page has a Ports panel. The code is
+in `bin/alchemyd/src/ports.rs`.
+
+```sh
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/ports
+```
+
+Before `up`, `start`, `restart`, or `update`, the daemon checks the
+ports the app's compose file publishes against the registry. A port held
+by a running container of another app, a container outside Compose, a
+reservation, or another program refuses the action with 409 `conflict`,
+and the message names each one:
+
+```
+Port 8080/tcp for service app is in use by service web of app blog. Free that port, or force up to start wiki anyway.
+```
+
+The app's own containers and reservations never block it, and another
+app's declared port only blocks while that app runs. `"force": true` on
+the action skips the check: `alchemy app up NAME --force`, or Start anyway
+under Advanced on the app page. Docker still refuses a port that is
+really taken ("port is already allocated"); the check is there to name the
+holder first. Save and start returns the refusal as `start_error`. `GET
+/api/apps/NAME/plan?action=up` lists the conflicts in `conflicts`, and
+`alchemy app up NAME --dry-run` prints a `port taken:` line for each. If
+the registry can't be read, the daemon logs a warning and starts the app
+anyway. The check is in `bin/alchemyd/src/operations/manager.rs`.
+
+### Networks
+
+Alchemy keeps one Docker network of its own, the bridge `alchemy`,
+labelled `com.alchemy.managed=true`. While Docker is ready, the daemon
+checks the networks at startup, 2 seconds after the engine or the
+containers change, and every 30 seconds. If `alchemy` is missing, it is
+created on the first `/24` from Docker's default pools (`172.17.0.0/16`
+to `172.31.0.0/16`, then `192.168.0.0/16`), then from `10.200.0.0/16`,
+that overlaps none of:
+
+- the LAN: the IPv4 subnets of this machine's physical interfaces
+  (`docker0`, `br-*`, `veth*`, `tun*`, `wg*`, `tailscale*`, and the other
+  virtual interfaces metrics skip are left out);
+- routes: `/proc/net/route` on Linux, `netstat -rn` on macOS, without the
+  default route, routes inside a LAN subnet, and Docker's own;
+- the default bridge and every other Docker network.
+
+The subnet is saved in the `settings` table (`network.alchemy`) and
+reused when the network has to be created again, while it is still free.
+An `alchemy` network that already exists is never changed, even when it
+overlaps, since containers may be on it; `docker network rm alchemy`
+makes the daemon create it again on a free subnet within seconds.
+Alchemy never relabels or replaces a network it didn't create, and never
+edits compose files. Only IPv4 is checked.
+
+The same check compares Docker's default bridge, its address pools, and
+every Docker network with the LAN and routes. The pools are the engine's
+configured `default-address-pools`, else those in
+`/etc/docker/daemon.json` on Linux, else Docker's built-in defaults
+(`pools_source`). Each overlap is a warning: `bridge_overlap`,
+`pool_overlap`, `network_overlap`, or `alchemy_network_overlap`, plus
+`no_free_subnet`, `create_failed`, `host_unreadable`, and
+`engine_unreadable`. An app whose Compose networks overlap gets a
+`network_overlap` problem.
+
+A bridge or pool overlap comes with a fix: a `daemon.json` fragment that
+moves the pools to `/24`s of `10.200.0.0/16` (or the default pools that
+don't overlap, when that is taken too) and, for the bridge, sets `bip`.
+It says where the settings go for the engine in use: `/etc/docker/daemon.json`
+and `sudo systemctl restart docker` for Docker Engine, Settings, then
+Docker Engine, for Docker Desktop. Networks that already exist keep their
+subnets until they are removed and created again.
+
+`GET /api/network` returns the whole report (`lan`, `routes`, `bridge`,
+`pools`, `networks`, `alchemy` with its `state` and `subnet`, and
+`warnings`). `alchemy status` prints each warning and its fix after the
+Docker line, `status --json` adds `network`, and the Machines page shows
+them too. The pure logic is in `alchemy_core::network`, the daemon side in
+`bin/alchemyd/src/subnets/`.
+
+```console
+$ alchemy status
+alchemyd 0.1.0 (protocol 1) at /run/user/1000/alchemy/alchemyd.sock
+Docker ready: Engine 28.0.1, Compose v2.33.0
+Warning: Docker's address pool 192.168.0.0/16 overlaps your local network 192.168.0.0/16, so a new network may be given addresses that hide devices on it.
+  Fix: Add these settings to /etc/docker/daemon.json (create it if it doesn't exist), then restart Docker with `sudo systemctl restart docker`:
+  {
+    "default-address-pools": [
+      { "base": "10.200.0.0/16", "size": 24 }
+    ]
+  }
+  Networks that already exist keep their subnets until they are removed and created again.
+```
+
 ### Web UI in debug vs release
 
 The daemon serves `app/alchemy-web/dist`. Debug builds read it from disk, so
@@ -636,6 +754,58 @@ checks:
 
 Set `SMOKE_SKIP_BUILD=1` to reuse an existing build. CI runs it on Linux and
 macOS.
+
+### Home-network test
+
+```sh
+HOME_NET_CONFIRM=1 scripts/home-network.sh
+```
+
+This proves the [network checks](#networks) on a real engine, on Linux. For
+each of three home networks, `10.0.1.5/24`, `172.17.0.5/16` (on top of
+Docker's default bridge), and `192.168.1.5/16` (on top of Docker's
+`192.168.0.0/16` pool), it puts the address on a dummy interface,
+`alchemy-lan0`, starts `alchemyd` with a fresh state directory, waits for
+`/api/network` to finish checking Docker, and checks that:
+
+- the address's subnet is among the LAN subnets, and the pools are
+  Docker's defaults;
+- the `alchemy` network is `ready`, exists in Docker with that subnet and
+  the `com.alchemy.managed` label, overlaps no LAN subnet, route, or the
+  bridge, and is `172.18.0.0/24` on an engine with only its default
+  networks;
+- the warnings are exactly none, `bridge_overlap` and `pool_overlap` for
+  `172.17.0.0/16`, and `pool_overlap` for `192.168.0.0/16`, with their
+  messages, and the fix moves the pools to `10.200.0.0/16` and, for
+  `172.17.0.0/16`, the bridge to a free subnet, worded for the engine's
+  flavor;
+- `alchemy status` prints the warnings and the fix once, and
+  `status --json` carries the report.
+
+Between and after the runs it stops the daemon, deletes the interface, and
+removes the `alchemy` network. It needs `ip`, `jq`, `curl`, `sudo` (unless
+run as root), and a user that can reach Docker. Because it changes the
+machine's interfaces and removes the `alchemy` network, it refuses to run
+unless `CI=true` or `HOME_NET_CONFIRM=1`; run it in a VM or a throwaway
+machine. Set `HOME_NET_SKIP_BUILD=1` to reuse `target/release`. CI runs it
+on Linux after the release smoke test, reusing its build. macOS is covered
+by the table tests on the subnet picker and the `netstat` and `lsof`
+parsers.
+
+To run it on a Mac, use a privileged container running its own engine,
+on a Docker network away from `172.17.0.0/16` so the container's own
+address doesn't overlap the networks under test, with its own target
+directory:
+
+```sh
+docker network create --subnet 10.1.0.0/16 home-net
+docker run --rm -it --privileged --network home-net -v "$PWD:/src:ro" -w /src \
+  -e CARGO_TARGET_DIR=/target -v home-net-target:/target rust:1.99.1 bash
+# inside:
+apt-get update && apt-get install -y docker.io iproute2 jq
+(dockerd >/var/log/dockerd.log 2>&1 &) && sleep 5
+CI=true scripts/home-network.sh
+```
 
 ## 6. Layout
 
