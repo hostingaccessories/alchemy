@@ -30,8 +30,8 @@ mod validate;
 
 pub use cli::CliComposeRunner;
 pub use config::{
-    CliComposeConfig, ComposeConfig, ComposeConfigReader, ConfigError, ExposedPort,
-    FakeComposeConfig, FakeConfig, NetworkConfig, ServiceConfig, config_args, config_error_message,
+    CliComposeConfig, ComposeConfig, ComposeConfigReader, ConfigError, FakeComposeConfig,
+    FakeConfig, NetworkConfig, ServiceConfig, config_args, config_error_message,
 };
 pub use env::{ALLOWED_ENV, ALLOWED_ENV_PREFIXES, FIXED_ENV, child_env, is_allowed};
 pub use fake::{FakeComposeRunner, FakeOutcome, FakeScript};

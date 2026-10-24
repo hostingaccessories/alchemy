@@ -20,7 +20,7 @@
 mod api;
 mod cli;
 mod discovery;
-mod kind;
+mod facts;
 mod monitor;
 mod probe;
 
@@ -33,7 +33,7 @@ pub use discovery::{
     Candidate, Endpoint, EndpointError, EndpointSource, HostEnv, Os, desktop_install_paths,
     docker_binary_candidates, endpoint_candidates, select_endpoint,
 };
-pub use kind::{EngineKind, engine_kind};
+pub use facts::engine_facts;
 pub use monitor::{Connector, EngineMonitor, EngineSource, POLL_INTERVAL, SystemConnector};
 pub use probe::{
     HostProbe, SocketConnect, SystemProbe, desktop_installed, discover_endpoint,

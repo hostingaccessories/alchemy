@@ -22,10 +22,11 @@ use alchemy_core::engine::{
 };
 use alchemy_core::network::Ipv4Net;
 use alchemy_core::ports::{Protocol, PublishedPort};
+use alchemy_core::route::{EngineFacts, HostOs, Reachability, reachability};
 use alchemyd::engine::{
     AddressPool, ApiError, BollardApi, CliError, Connector, DockerApi, DockerCli, Endpoint,
-    EngineInfo, EngineKind, EngineMonitor, EngineSource, EngineVersion, HostEnv, HostProbe,
-    NetworkSpec, Os, POLL_INTERVAL, ProcessDockerCli, SocketConnect, SystemProbe, engine_kind,
+    EngineInfo, EngineMonitor, EngineSource, EngineVersion, HostEnv, HostProbe, NetworkSpec, Os,
+    POLL_INTERVAL, ProcessDockerCli, SocketConnect, SystemProbe, engine_facts,
 };
 use alchemyd::{Deps, State};
 use futures_util::{Stream, StreamExt as _};
@@ -390,7 +391,9 @@ async fn bollard_api_reads_where_the_engine_runs() {
         }
     );
     let version = api.version().await.unwrap();
-    assert_eq!(engine_kind(&version, &info, Os::Linux), EngineKind::Desktop);
+    let facts = engine_facts(Some(&version), &info, Os::Linux);
+    assert_eq!(facts.flavor, Some(EngineFlavor::DockerDesktop));
+    assert_eq!(reachability(&facts), Reachability::PublishedOnly);
 }
 
 #[tokio::test]
@@ -1016,7 +1019,14 @@ async fn monitor_learns_addresses_of_containers_connected_after_the_listing() {
         vec![ContainerStatus::new("web", "web", ContainerState::Running)];
     let run = spawn_monitor(monitor);
     containers_until(&run.state, |c| !c.is_empty()).await;
-    assert_eq!(run.state.engine_kind(), Some(EngineKind::Native));
+    assert_eq!(
+        run.state.engine_facts(),
+        Some(EngineFacts {
+            host_os: HostOs::Linux,
+            flavor: Some(EngineFlavor::DockerEngine),
+            rootless: false,
+        })
+    );
 
     let mut web = ContainerStatus::new("web", "web", ContainerState::Running);
     web.networks
@@ -1049,7 +1059,7 @@ async fn monitor_learns_addresses_of_containers_connected_after_the_listing() {
         h.streams.clear();
     }
     engine_until(&run.state, |s| s.state != EngineState::Ready).await;
-    assert_eq!(run.state.engine_kind(), None, "unknown while not ready");
+    assert_eq!(run.state.engine_facts(), None, "unknown while not ready");
 
     run.stop().await;
 }

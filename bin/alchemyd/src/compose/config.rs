@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use alchemy_core::network::Ipv4Net;
 use alchemy_core::ports::{PortRange, Protocol, PublishedPort};
+use alchemy_core::route::{ExposedPort, XAlchemy, XAlchemyBlock};
 use futures_util::future::BoxFuture;
 use rustix::process::Signal;
 use serde::Deserialize;
@@ -38,9 +39,10 @@ pub struct ComposeConfig {
     /// The networks its services use, by key. Compose leaves out the ones
     /// no service uses.
     pub networks: Vec<NetworkConfig>,
-    /// The top-level `x-alchemy` block as written, unvalidated, or `None`
-    /// when there is none.
-    pub x_alchemy: Option<serde_json::Value>,
+    /// The top-level `x-alchemy` block, or `None` when there is none. A
+    /// block of the wrong shape is kept as unreadable, for planning to
+    /// report.
+    pub x_alchemy: Option<XAlchemyBlock>,
 }
 
 /// One service of a [`ComposeConfig`].
@@ -59,23 +61,12 @@ pub struct ServiceConfig {
     /// The container ports it `expose`s without publishing, in the order
     /// Compose lists them.
     pub expose: Vec<ExposedPort>,
-    /// Its own `x-alchemy` block as written, unvalidated, or `None` when
-    /// there is none.
+    /// Its own `x-alchemy` block, as for [`ComposeConfig::x_alchemy`].
     ///
     /// Compose 5.5 leaves service extensions out of `config --format
     /// json` (its YAML keeps them), so this is `None` in practice; only
-    /// [`ComposeConfig::x_alchemy`] reaches Alchemy today.
-    pub x_alchemy: Option<serde_json::Value>,
-}
-
-/// One entry of a service's `expose`: container ports reachable on its
-/// networks but not published on the host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ExposedPort {
-    /// The protocol, TCP unless the entry says otherwise.
-    pub protocol: Protocol,
-    /// The port or range.
-    pub ports: PortRange,
+    /// the top-level block reaches Alchemy today.
+    pub x_alchemy: Option<XAlchemyBlock>,
 }
 
 /// One network of a [`ComposeConfig`].
@@ -212,21 +203,22 @@ impl RawPorts {
     fn exposed(&self) -> Option<ExposedPort> {
         match self {
             Self::Number(_) => Some(ExposedPort {
-                protocol: Protocol::Tcp,
                 ports: self.range()?,
+                protocol: Protocol::Tcp,
             }),
-            Self::Text(text) => {
-                let (ports, protocol) = match text.trim().split_once('/') {
-                    Some((ports, protocol)) => (ports, protocol.trim().parse().ok()?),
-                    None => (text.trim(), Protocol::Tcp),
-                };
-                Some(ExposedPort {
-                    protocol,
-                    ports: ports.trim().parse().ok()?,
-                })
-            }
+            Self::Text(text) => text.parse().ok(),
         }
     }
+}
+
+/// An `x-alchemy` value as [`XAlchemyBlock`]: read, or unreadable with
+/// the reason. `null` counts as no block.
+fn x_alchemy_block(value: Option<serde_json::Value>) -> Option<XAlchemyBlock> {
+    let value = value.filter(|value| !value.is_null())?;
+    Some(match serde_json::from_value::<XAlchemy>(value) {
+        Ok(block) => XAlchemyBlock::Read(block),
+        Err(error) => XAlchemyBlock::Unreadable(error.to_string()),
+    })
 }
 
 impl RawPort {
@@ -305,8 +297,8 @@ impl ComposeConfig {
     ///
     /// A port, `expose`, network, or `ipam` entry in a shape Alchemy
     /// can't read is left out rather than failing the whole
-    /// configuration. `x-alchemy` blocks are kept as written, whatever
-    /// their shape, for the route model to validate.
+    /// configuration. An `x-alchemy` block of the wrong shape is kept as
+    /// [`XAlchemyBlock::Unreadable`], so the user hears about it.
     pub fn parse(json: &[u8]) -> Result<Self, serde_json::Error> {
         let raw: RawConfig = serde_json::from_slice(json)?;
         Ok(Self {
@@ -336,7 +328,7 @@ impl ComposeConfig {
                         .into_iter()
                         .filter_map(|port| port.ok()?.exposed())
                         .collect(),
-                    x_alchemy: service.x_alchemy.filter(|value| !value.is_null()),
+                    x_alchemy: x_alchemy_block(service.x_alchemy),
                 })
                 .collect(),
             networks: raw
@@ -344,7 +336,7 @@ impl ComposeConfig {
                 .into_iter()
                 .map(|(key, network)| network.ok().flatten().unwrap_or_default().config(key))
                 .collect(),
-            x_alchemy: raw.x_alchemy.filter(|value| !value.is_null()),
+            x_alchemy: x_alchemy_block(raw.x_alchemy),
         })
     }
 
@@ -1000,24 +992,37 @@ mod tests {
                 "web": {"image": "nginx", "x-alchemy": {"port": "80"}},
                 "db": {"image": "postgres", "x-alchemy": null},
                 "odd": {"image": "redis", "x-alchemy": ["not", "a", "map"]},
+                "bad": {"image": "redis", "x-alchemy": {"port": "http"}},
                 "plain": {"image": "redis"}
             }
         }"#;
         let config = ComposeConfig::parse(json).unwrap();
         assert_eq!(
             config.x_alchemy,
-            Some(serde_json::json!({"service": "web", "port": 8080, "hostname": "blog"}))
+            Some(XAlchemyBlock::Read(XAlchemy {
+                service: Some("web".into()),
+                port: Some(8080),
+                hostname: Some("blog".into()),
+            }))
         );
         assert_eq!(
             service(&config, "web").x_alchemy,
-            Some(serde_json::json!({"port": "80"}))
+            Some(XAlchemyBlock::Read(XAlchemy {
+                port: Some(80),
+                ..XAlchemy::default()
+            }))
         );
         assert_eq!(service(&config, "db").x_alchemy, None);
-        assert_eq!(
-            service(&config, "odd").x_alchemy,
-            Some(serde_json::json!(["not", "a", "map"])),
-            "the route model decides what is wrong with it"
-        );
+        for name in ["odd", "bad"] {
+            assert!(
+                matches!(
+                    &service(&config, name).x_alchemy,
+                    Some(XAlchemyBlock::Unreadable(reason)) if !reason.is_empty()
+                ),
+                "{name}: {:?}",
+                service(&config, name).x_alchemy
+            );
+        }
         assert_eq!(service(&config, "plain").x_alchemy, None);
         assert_eq!(
             ComposeConfig::parse(br#"{"name":"a"}"#).unwrap().x_alchemy,

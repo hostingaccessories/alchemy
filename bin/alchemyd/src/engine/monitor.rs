@@ -14,10 +14,9 @@ use futures_util::future::{FusedFuture as _, FutureExt as _};
 use tokio::sync::watch;
 
 use super::{
-    ApiError, BollardApi, DockerApi, DockerCli, Endpoint, EndpointError, EngineInfo, EngineVersion,
-    HostEnv, HostProbe, Os, ProcessDockerCli, SystemProbe, desktop_install_paths,
-    desktop_installed, discover_endpoint, docker_binary_candidates, engine_kind,
-    find_docker_binary, probe_socket,
+    ApiError, BollardApi, DockerApi, DockerCli, Endpoint, EndpointError, EngineInfo, HostEnv,
+    HostProbe, Os, ProcessDockerCli, SystemProbe, desktop_install_paths, desktop_installed,
+    discover_endpoint, docker_binary_candidates, engine_facts, find_docker_binary, probe_socket,
 };
 use crate::State;
 
@@ -156,11 +155,16 @@ where
             return Outcome::NotReady;
         };
 
-        let version = api.version().await.unwrap_or_else(|error| {
-            tracing::debug!(error = %error, "Docker engine version unavailable");
-            EngineVersion::default()
-        });
-        version.apply_to(&mut status);
+        let version = match api.version().await {
+            Ok(version) => {
+                version.apply_to(&mut status);
+                Some(version)
+            }
+            Err(error) => {
+                tracing::debug!(error = %error, "Docker engine version unavailable");
+                None
+            }
+        };
         let info = api.info().await.unwrap_or_else(|error| {
             tracing::debug!(error = %error, "Docker engine info unavailable");
             EngineInfo::default()
@@ -177,7 +181,7 @@ where
                 flavor,
             });
         }
-        state.set_engine_kind(Some(engine_kind(&version, &info, self.os)));
+        state.set_engine_facts(Some(engine_facts(version.as_ref(), &info, self.os)));
         publish_engine(state, status);
         follow(&api, state).await
     }
@@ -322,7 +326,7 @@ fn publish_engine(state: &State, status: EngineStatus) {
 /// Containers are only known while the engine is ready.
 fn publish_not_ready(state: &State, status: EngineStatus) {
     state.update_containers(|containers| containers.replace_all([]));
-    state.set_engine_kind(None);
+    state.set_engine_facts(None);
     publish_engine(state, status);
 }
 

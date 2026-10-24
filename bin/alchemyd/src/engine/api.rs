@@ -42,11 +42,11 @@ pub trait DockerApi {
     /// `GET /version`.
     fn version(&self) -> impl Future<Output = Result<EngineVersion, ApiError>> + Send;
 
-    /// `GET /info`, reduced to the facts [`engine_kind`] reads.
+    /// `GET /info`, reduced to the facts [`engine_facts`] reads.
     ///
     /// The default reports nothing, for engines whose tests do not care.
     ///
-    /// [`engine_kind`]: super::engine_kind
+    /// [`engine_facts`]: super::engine_facts
     fn info(&self) -> impl Future<Output = Result<EngineInfo, ApiError>> + Send {
         std::future::ready(Ok(EngineInfo::default()))
     }
