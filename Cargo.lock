@@ -64,6 +64,7 @@ dependencies = [
 name = "alchemy-gui"
 version = "0.1.0"
 dependencies = [
+ "alchemy-api",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",

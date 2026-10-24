@@ -16,6 +16,7 @@ path = "src/main.rs"
 tauri-build = { workspace = true }
 
 [dependencies]
+alchemy-api                  = { workspace = true, features = ["state-dir"] }
 tauri                        = { workspace = true }
 tauri-plugin-opener          = { workspace = true }
 tauri-plugin-single-instance = { workspace = true }
