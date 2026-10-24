@@ -8,6 +8,8 @@ import type {
   MetricsHistory,
   MetricsResponse,
   PortList,
+  NetworkReport,
+  NetworkWarning,
 } from "../lib/api.ts";
 import { FakeEventSource, renderAt } from "../test/render.tsx";
 
@@ -37,11 +39,26 @@ let daemonUp = true;
 /** Every `/api/metrics/history` URL requested, in order. */
 let historyRequests: string[] = [];
 
-/** Whether the stubbed daemon predates `/api/metrics`. */
+/** Whether the stubbed daemon predates `/api/metrics` and `/api/network`. */
 let oldDaemon = false;
 
 /** What the stubbed `GET /api/ports` answers; `null` never answers. */
 let portList: PortList | null = null;
+
+const clear: NetworkReport = {
+  engine_ready: true,
+  lan: ["10.0.1.0/24"],
+  routes: [],
+  bridge: "172.17.0.0/16",
+  pools: [{ base: "172.17.0.0/16", size: 16 }],
+  pools_source: "defaults",
+  networks: [],
+  alchemy: { name: "alchemy", state: "ready", subnet: "172.18.0.0/24" },
+  warnings: [],
+};
+
+/** What the stubbed `GET /api/network` answers. */
+let network: NetworkReport = clear;
 
 const GIB = 1024 ** 3;
 
@@ -118,6 +135,7 @@ beforeEach(() => {
   historyRequests = [];
   oldDaemon = false;
   portList = null;
+  network = clear;
   FakeEventSource.instances = [];
   vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal(
@@ -126,7 +144,10 @@ beforeEach(() => {
       if (!daemonUp) {
         throw new TypeError("connection refused");
       }
-      if (oldDaemon && (url.startsWith("/api/metrics") || url === "/api/ports")) {
+      if (
+        oldDaemon &&
+        (url.startsWith("/api/metrics") || url === "/api/ports" || url === "/api/network")
+      ) {
         return new Response(JSON.stringify({ error: "not found", code: "not_found" }), {
           status: 404,
         });
@@ -138,6 +159,9 @@ beforeEach(() => {
       }
       if (url === "/api/engine" || url === "/api/metrics" || url === "/api/apps") {
         return new Promise<Response>(() => {});
+      }
+      if (url === "/api/network") {
+        return new Response(JSON.stringify(network), { status: 200 });
       }
       if (url.startsWith("/api/metrics/history?")) {
         historyRequests.push(url);
@@ -462,5 +486,70 @@ describe("Machines", () => {
     await renderOnline();
     const ports = screen.getByRole("region", { name: "Ports" });
     expect(await within(ports).findByText(/doesn't list ports/)).toBeTruthy();
+  });
+
+  const fix = [
+    "Add these settings to /etc/docker/daemon.json (create it if it doesn't exist), then restart Docker with `sudo systemctl restart docker`:",
+    "{",
+    '  "bip": "172.18.0.1/24"',
+    "}",
+    "Networks that already exist keep their subnets until they are removed and created again.",
+  ].join("\n");
+
+  function warning(kind: NetworkWarning["kind"], message: string, fix: string | null) {
+    return {
+      kind,
+      message,
+      fix,
+      subnet: "172.17.0.0/16",
+      host: "lan" as const,
+      host_subnet: "172.17.0.0/16",
+      network: null,
+    };
+  }
+
+  it("shows no network warnings when nothing overlaps", async () => {
+    await renderOnline();
+    await sendEngine(ready);
+    expect(screen.queryByRole("group", { name: "Network warnings" })).toBeNull();
+  });
+
+  it("explains networks that overlap this machine's, with the fix", async () => {
+    network = {
+      ...clear,
+      lan: ["172.17.0.0/16"],
+      warnings: [
+        warning(
+          "bridge_overlap",
+          "Docker's default bridge network (172.17.0.0/16) overlaps your local network 172.17.0.0/16, so containers on it can't reach devices on it.",
+          fix,
+        ),
+        warning(
+          "pool_overlap",
+          "Docker's address pool 172.17.0.0/16 overlaps your local network 172.17.0.0/16, so a new network may be given addresses that hide devices on it.",
+          fix,
+        ),
+        warning("create_failed", "Alchemy couldn't create its network alchemy.", null),
+      ],
+    };
+    await renderOnline();
+    const group = await screen.findByRole("group", { name: "Network warnings" });
+    expect(within(group).getByText("Docker's default network overlaps your network")).toBeTruthy();
+    expect(within(group).getByText("Docker may put new networks on top of yours")).toBeTruthy();
+    expect(within(group).getByText("Alchemy couldn't create its network")).toBeTruthy();
+    expect(
+      within(group).getByText(/Add these settings to \/etc\/docker\/daemon.json/),
+    ).toBeTruthy();
+    const settings = group.querySelector("pre");
+    expect(settings?.textContent).toBe('{\n  "bip": "172.18.0.1/24"\n}');
+    expect(within(group).getAllByRole("button", { name: "Copy settings" })).toHaveLength(1);
+    expect(within(group).getByText("The same change as above fixes this.")).toBeTruthy();
+  });
+
+  it("shows no network warnings when alchemyd is too old to report them", async () => {
+    oldDaemon = true;
+    await renderOnline();
+    expect(await screen.findByText(/doesn't report usage/)).toBeTruthy();
+    expect(screen.queryByRole("group", { name: "Network warnings" })).toBeNull();
   });
 });

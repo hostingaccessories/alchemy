@@ -276,6 +276,30 @@ describe("App", () => {
     expect(screen.getByText("Not known yet")).toBeTruthy();
   });
 
+  it("names network and port problems", async () => {
+    const overlap =
+      "Docker network blog_default (192.168.0.0/20) overlaps your local network 192.168.0.0/16, so its containers can't reach devices on it.";
+    apps = {
+      ...full,
+      apps: [
+        {
+          ...blog,
+          problems: [
+            { kind: "network_overlap", message: overlap },
+            { kind: "port_conflict", message: "Port 8080/tcp for service web is in use." },
+          ],
+        },
+      ],
+    };
+    await renderAt("/apps/blog");
+    const problems = await screen.findByRole("region", { name: "Problems" });
+    expect(
+      within(problems).getByText("One of this app's networks overlaps your network"),
+    ).toBeTruthy();
+    expect(within(problems).getByText(overlap)).toBeTruthy();
+    expect(within(problems).getByText("A port this app publishes is already taken")).toBeTruthy();
+  });
+
   it("says when there's no such app", async () => {
     apps = full;
     await renderAt("/apps/nope");
