@@ -1,4 +1,5 @@
 import { act, cleanup, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import type {
@@ -8,7 +9,9 @@ import type {
   MetricsHistory,
   MetricsResponse,
   PortList,
+  MdnsReport,
   NetworkReport,
+  NetworkSettings,
   NetworkWarning,
   ProxyListener,
 } from "../lib/api.ts";
@@ -60,6 +63,15 @@ const clear: NetworkReport = {
 
 /** What the stubbed `GET /api/network` answers. */
 let network: NetworkReport = clear;
+
+/** What the stubbed `GET /api/settings/network` answers. */
+let networkSettings: NetworkSettings = { mdns: true };
+
+/** The bodies of every `PUT /api/settings/network`, in order. */
+let settingsPuts: unknown[] = [];
+
+/** Whether the stubbed `PUT /api/settings/network` fails. */
+let settingsPutFails = false;
 
 const GIB = 1024 ** 3;
 
@@ -137,17 +149,23 @@ beforeEach(() => {
   oldDaemon = false;
   portList = null;
   network = clear;
+  networkSettings = { mdns: true };
+  settingsPuts = [];
+  settingsPutFails = false;
   FakeEventSource.instances = [];
   vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (url: string) => {
+    vi.fn(async (url: string, init?: RequestInit) => {
       if (!daemonUp) {
         throw new TypeError("connection refused");
       }
       if (
         oldDaemon &&
-        (url.startsWith("/api/metrics") || url === "/api/ports" || url === "/api/network")
+        (url.startsWith("/api/metrics") ||
+          url === "/api/ports" ||
+          url === "/api/network" ||
+          url === "/api/settings/network")
       ) {
         return new Response(JSON.stringify({ error: "not found", code: "not_found" }), {
           status: 404,
@@ -163,6 +181,32 @@ beforeEach(() => {
       }
       if (url === "/api/network") {
         return new Response(JSON.stringify(network), { status: 200 });
+      }
+      if (url === "/api/settings/network" && init?.method === "PUT") {
+        const update = (typeof init.body === "string" ? JSON.parse(init.body) : {}) as {
+          mdns?: boolean;
+        };
+        settingsPuts.push(update);
+        if (settingsPutFails) {
+          return new Response(
+            JSON.stringify({ error: "the settings store is read-only", code: "internal" }),
+            { status: 500 },
+          );
+        }
+        networkSettings = { mdns: update.mdns ?? networkSettings.mdns };
+        network = {
+          ...network,
+          mdns: {
+            state: networkSettings.mdns ? "starting" : "off",
+            backend: null,
+            message: null,
+            fix: null,
+          },
+        };
+        return new Response(JSON.stringify(networkSettings), { status: 200 });
+      }
+      if (url === "/api/settings/network") {
+        return new Response(JSON.stringify(networkSettings), { status: 200 });
       }
       if (url.startsWith("/api/metrics/history?")) {
         historyRequests.push(url);
@@ -604,12 +648,140 @@ describe("Machines", () => {
     };
     await renderOnline();
     const group = await screen.findByRole("group", { name: "Web address warnings" });
-    expect(within(group).getByText("Alchemy can't listen on port 80")).toBeTruthy();
+    expect(within(group).getByText("Addresses on port 80 don't work")).toBeTruthy();
     expect(within(group).getByText(/doesn't have permission to listen on port 80/)).toBeTruthy();
     expect(within(group).getByText(setcap).tagName).toBe("CODE");
     expect(within(group).getByRole("button", { name: "Copy command" })).toBeTruthy();
     expect(within(group).getByText("wiki's address on port 8101 doesn't work")).toBeTruthy();
     expect(within(group).getByText("Another program is using port 8101.")).toBeTruthy();
     expect(within(group).queryByText(/8100/)).toBeNull();
+  });
+
+  it("says when another program takes port 80 although it is open", async () => {
+    const taken =
+      "Another program on this computer takes port 80. Your apps still work at their IP:port address.";
+    network = {
+      ...clear,
+      proxy: {
+        reachability: "published_only",
+        host: {
+          ...listener(80, null),
+          state: "unavailable",
+          message: taken,
+          fix: "Stop the program or firewall rule that takes port 80; some development tools redirect it with pf on macOS. Alchemy checks the port again every few seconds.",
+        },
+        ports: [],
+      },
+    };
+    await renderOnline();
+    const group = await screen.findByRole("group", { name: "Web address warnings" });
+    expect(within(group).getByText("Addresses on port 80 don't work")).toBeTruthy();
+    expect(within(group).queryByText(/can't listen/)).toBeNull();
+    expect(within(group).getByText(taken)).toBeTruthy();
+    expect(within(group).getByText(/Stop the program or firewall rule/)).toBeTruthy();
+    expect(within(group).queryByRole("button", { name: "Copy command" })).toBeNull();
+  });
+
+  function localNames() {
+    return screen.getByRole("status", { name: "Local names" });
+  }
+
+  const mdns = (report: Partial<MdnsReport>): NetworkReport => ({
+    ...clear,
+    mdns: { state: "announcing", backend: null, message: null, fix: null, ...report },
+  });
+
+  const reports: [string, Partial<MdnsReport>, (string | RegExp)[]][] = [
+    [
+      "announcing through avahi",
+      { backend: "avahi" },
+      ["Devices on your network can open apps at their .local address", "Announced through Avahi."],
+    ],
+    ["announcing through Bonjour", { backend: "dns_sd" }, ["Announced through macOS's Bonjour."]],
+    [
+      "announcing with the built-in responder",
+      { backend: "built_in" },
+      ["Announced by Alchemy's built-in responder."],
+    ],
+    ["starting", { state: "starting" }, ["Alchemy is starting to announce your apps…"]],
+    ["off", { state: "off" }, [/Local names are off/, /at their IP:port address/]],
+    [
+      "unavailable without a message",
+      { state: "unavailable" },
+      [
+        "Alchemy can't announce your apps' .local names",
+        "Your apps still work at their IP:port address.",
+      ],
+    ],
+    [
+      "in a state this build doesn't know",
+      { state: "paused" as MdnsReport["state"] },
+      ["Local names are in a state this version of Alchemy doesn't recognize. Update Alchemy."],
+    ],
+  ];
+
+  it.each(reports)("shows local names %s", async (_name, report, texts) => {
+    network = mdns(report);
+    await renderOnline();
+    await screen.findByRole("heading", { name: "Local names" });
+    for (const text of texts) {
+      expect(within(localNames()).getByText(text)).toBeTruthy();
+    }
+  });
+
+  it("says why names can't be announced, with the fix", async () => {
+    network = mdns({
+      state: "unavailable",
+      backend: "dns_sd",
+      message:
+        "macOS doesn't let Alchemy use your local network. Your apps still work at their IP:port address.",
+      fix: "Allow alchemyd in System Settings › Privacy & Security › Local Network, then run `alchemy status`.",
+    });
+    await renderOnline();
+    await screen.findByRole("heading", { name: "Local names" });
+    const status = localNames();
+    expect(within(status).getByText(/doesn't let Alchemy use your local network/)).toBeTruthy();
+    expect(within(status).getByText("alchemy status").tagName).toBe("CODE");
+    expect(within(status).queryByText(/Announced/)).toBeNull();
+  });
+
+  it("shows nothing about local names when alchemyd is too old to say", async () => {
+    await renderOnline();
+    await screen.findByText(/This machine/);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(screen.queryByRole("heading", { name: "Local names" })).toBeNull();
+  });
+
+  it("turns local names off and on", async () => {
+    network = mdns({ backend: "avahi" });
+    await renderOnline();
+    const toggle = await screen.findByRole("checkbox", { name: /Announce apps on your network/ });
+    expect((toggle as HTMLInputElement).checked).toBe(true);
+
+    await userEvent.setup().click(toggle);
+    expect(await within(localNames()).findByText(/Local names are off/)).toBeTruthy();
+    expect((toggle as HTMLInputElement).checked).toBe(false);
+    expect(settingsPuts).toEqual([{ mdns: false }]);
+
+    await userEvent.setup().click(toggle);
+    expect(
+      await within(localNames()).findByText("Alchemy is starting to announce your apps…"),
+    ).toBeTruthy();
+    expect((toggle as HTMLInputElement).checked).toBe(true);
+    expect(settingsPuts).toEqual([{ mdns: false }, { mdns: true }]);
+  });
+
+  it("says when the setting couldn't be changed", async () => {
+    network = mdns({ backend: "avahi" });
+    settingsPutFails = true;
+    await renderOnline();
+    const toggle = await screen.findByRole("checkbox", { name: /Announce apps on your network/ });
+    await userEvent.setup().click(toggle);
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText("Couldn't change local names")).toBeTruthy();
+    expect(within(alert).getByText("the settings store is read-only")).toBeTruthy();
+    expect((toggle as HTMLInputElement).checked).toBe(true);
   });
 });

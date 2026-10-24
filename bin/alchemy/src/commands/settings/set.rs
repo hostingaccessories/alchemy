@@ -1,12 +1,13 @@
 //! `alchemy settings set KEY VALUE...`: change where alchemyd looks for
-//! apps.
+//! apps, or whether it announces their `.local` names.
 
 use std::io::Write;
 
 use alchemy_api::apps::{AppSettings, AppSettingsUpdate};
+use alchemy_api::network::{NetworkSettings, NetworkSettingsUpdate};
 
-use super::settings_lines;
-use super::show::PATH;
+use super::show::{NETWORK_PATH, PATH};
+use super::{on_off, settings_lines};
 use crate::context::Context;
 use crate::daemon::Daemon;
 use crate::error::ClientError;
@@ -24,6 +25,8 @@ pub enum Key {
     AppHome,
     /// The other folders searched, in order.
     AppFolders,
+    /// Whether apps' NAME.local names are announced on your network.
+    Mdns,
 }
 
 /// Arguments to `alchemy settings set`.
@@ -34,7 +37,7 @@ pub struct Args {
     pub key: Key,
 
     /// The new value: one folder, or `default`, for app-home; any number of
-    /// folders for app-folders.
+    /// folders for app-folders; `on` or `off` for mdns.
     #[arg(value_name = "VALUE")]
     pub values: Vec<String>,
 }
@@ -45,29 +48,54 @@ pub(crate) async fn run<D: Daemon, W: Write>(
     args: Args,
 ) -> Result<(), ClientError> {
     check(args.key, &args.values)?;
-    let current = ctx.get::<AppSettings>(PATH).await?;
-    let update = update(&current, args.key, args.values)?;
-    let settings = ctx.put::<_, AppSettings>(PATH, &update).await?;
-    for line in settings_lines(&settings, ctx.json()) {
+    let (settings, network) = if args.key == Key::Mdns {
+        let update = network_update(&args.values)?;
+        let network = ctx.put::<_, NetworkSettings>(NETWORK_PATH, &update).await?;
+        (ctx.get::<AppSettings>(PATH).await?, network)
+    } else {
+        let current = ctx.get::<AppSettings>(PATH).await?;
+        let update = update(&current, args.key, args.values)?;
+        let settings = ctx.put::<_, AppSettings>(PATH, &update).await?;
+        (settings, ctx.get::<NetworkSettings>(NETWORK_PATH).await?)
+    };
+    for line in settings_lines(&settings, network, ctx.json()) {
         ctx.out().line(line)?;
     }
     Ok(())
 }
 
-/// Refuse a command line that gives `key` the wrong number of values,
-/// before anything is sent.
+/// Refuse a command line that gives `key` the wrong number or kind of
+/// values, before anything is sent.
 fn check(key: Key, values: &[String]) -> Result<(), ClientError> {
-    if key == Key::AppHome && values.len() != 1 {
-        return Err(ClientError::Usage {
+    match key {
+        Key::AppHome if values.len() != 1 => Err(ClientError::Usage {
             message: "app-home takes one folder, or `default`".to_owned(),
             hint: Some("for example: alchemy settings set app-home /srv/apps".to_owned()),
-        });
+        }),
+        Key::Mdns => network_update(values).map(|_| ()),
+        Key::AppHome | Key::AppFolders => Ok(()),
     }
-    Ok(())
 }
 
-/// The update that changes `key` to `values` and keeps the rest of
-/// `current`. A home that is the default stays the default.
+/// The update that turns mdns `on` or `off`, as `values` says.
+fn network_update(values: &[String]) -> Result<NetworkSettingsUpdate, ClientError> {
+    let mdns = match values {
+        [value] if value == on_off(true) => true,
+        [value] if value == on_off(false) => false,
+        _ => {
+            return Err(ClientError::Usage {
+                message: "mdns takes `on` or `off`".to_owned(),
+                hint: Some("for example: alchemy settings set mdns off".to_owned()),
+            });
+        }
+    };
+    Ok(NetworkSettingsUpdate { mdns: Some(mdns) })
+}
+
+/// The update that changes the app folder setting `key` to `values` and
+/// keeps the rest of `current`. A home that is the default stays the
+/// default. [`Key::Mdns`] isn't an app folder setting, so it keeps all of
+/// `current`.
 pub(crate) fn update(
     current: &AppSettings,
     key: Key,
@@ -90,6 +118,10 @@ pub(crate) fn update(
             home: kept_home,
             extra: values,
         }),
+        Key::Mdns => Ok(AppSettingsUpdate {
+            home: kept_home,
+            extra: current.extra.clone(),
+        }),
     }
 }
 
@@ -106,6 +138,7 @@ mod tests {
     use crate::daemon::fake::FakeDaemon;
 
     const HOME: &str = "/home/me/Alchemy/apps";
+    const ON: NetworkSettings = NetworkSettings { mdns: true };
 
     fn settings(home: &str, extra: &[&str]) -> AppSettings {
         AppSettings {
@@ -153,6 +186,12 @@ mod tests {
                 values(&[]),
                 want(Some("/srv/apps"), &[]),
             ),
+            (
+                settings("/srv/apps", &["/opt/stacks"]),
+                Key::Mdns,
+                values(&["off"]),
+                want(Some("/srv/apps"), &["/opt/stacks"]),
+            ),
         ];
         for (current, key, values, want) in cases {
             assert_eq!(update(&current, key, values).unwrap(), want, "{key:?}");
@@ -168,20 +207,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mdns_takes_on_or_off() {
+        let cases = [
+            (values(&["on"]), Some(true)),
+            (values(&["off"]), Some(false)),
+            (values(&[]), None),
+            (values(&["yes"]), None),
+            (values(&["ON"]), None),
+            (values(&["on", "off"]), None),
+        ];
+        for (given, want) in cases {
+            match (network_update(&given), want) {
+                (Ok(update), Some(mdns)) => {
+                    assert_eq!(update.mdns, Some(mdns), "{given:?}");
+                }
+                (Err(err), None) => {
+                    assert_eq!(err.kind(), "usage", "{given:?}");
+                    assert_eq!(err.exit_code(), 2);
+                    assert!(check(Key::Mdns, &given).is_err(), "{given:?}");
+                }
+                (got, want) => panic!("{given:?}: {got:?}, want {want:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_usage_error_sends_nothing() {
-        let mut ctx = Context::buffered(FakeDaemon::new(), false, NAME);
-        let err = run(
-            &mut ctx,
-            Args {
-                key: Key::AppHome,
-                values: values(&[]),
-            },
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.kind(), "usage");
-        assert_eq!(ctx.daemon().requests(), [] as [String; 0]);
+        for (key, given) in [(Key::AppHome, values(&[])), (Key::Mdns, values(&["no"]))] {
+            let mut ctx = Context::buffered(FakeDaemon::new(), false, NAME);
+            let err = run(&mut ctx, Args { key, values: given })
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), "usage");
+            assert_eq!(ctx.daemon().requests(), [] as [String; 0]);
+        }
     }
 
     #[tokio::test]
@@ -190,7 +250,8 @@ mod tests {
         let fake = FakeDaemon::new()
             .version("1.2.3", 1)
             .ok(Method::GET, PATH, &settings(HOME, &[]))
-            .ok(Method::PUT, PATH, &after);
+            .ok(Method::PUT, PATH, &after)
+            .ok(Method::GET, NETWORK_PATH, &ON);
         let mut ctx = Context::buffered(fake, false, NAME);
         run(
             &mut ctx,
@@ -203,20 +264,54 @@ mod tests {
         .unwrap();
         assert_eq!(
             ctx.written(),
-            settings_lines(&after, false).join("\n") + "\n"
+            settings_lines(&after, ON, false).join("\n") + "\n"
         );
         assert_eq!(
             ctx.daemon().requests(),
             [
                 "GET /api/version",
                 "GET /api/settings/apps",
-                "PUT /api/settings/apps"
+                "PUT /api/settings/apps",
+                "GET /api/settings/network"
             ]
         );
         assert_eq!(
             ctx.daemon().bodies(),
             [r#"{"home":null,"extra":["/opt/stacks"]}"#]
         );
+    }
+
+    #[tokio::test]
+    async fn turns_mdns_off_and_prints_the_result() {
+        let apps = settings(HOME, &[]);
+        let off = NetworkSettings { mdns: false };
+        let fake = FakeDaemon::new()
+            .version("1.2.3", 1)
+            .ok(Method::PUT, NETWORK_PATH, &off)
+            .ok(Method::GET, PATH, &apps);
+        let mut ctx = Context::buffered(fake, false, NAME);
+        run(
+            &mut ctx,
+            Args {
+                key: Key::Mdns,
+                values: values(&["off"]),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ctx.written(),
+            settings_lines(&apps, off, false).join("\n") + "\n"
+        );
+        assert_eq!(
+            ctx.daemon().requests(),
+            [
+                "GET /api/version",
+                "PUT /api/settings/network",
+                "GET /api/settings/apps"
+            ]
+        );
+        assert_eq!(ctx.daemon().bodies(), [r#"{"mdns":false}"#]);
     }
 
     #[tokio::test]

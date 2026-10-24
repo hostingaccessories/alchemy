@@ -54,6 +54,25 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # The real mDNS responders, ignored above. `--workspace` keeps the
+      # features, and so the build, of the step before.
+      - name: mDNS backend tests (avahi, built-in)
+        if: matrix.os == 'ubuntu-24.04'
+        timeout-minutes: 5
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 \
+            install -y --no-install-recommends avahi-daemon avahi-utils
+          sudo systemctl start avahi-daemon
+          cargo test --workspace --locked --test mdns -- --ignored --test-threads=1
+          sudo systemctl stop avahi-daemon.socket avahi-daemon.service
+          cargo test --workspace --locked --test mdns -- --ignored --test-threads=1 builtin
+
+      # Also resolves the name with `dns-sd -G v4`.
+      - name: mDNS backend tests (dns-sd)
+        if: runner.os == 'macOS'
+        timeout-minutes: 5
+        run: cargo test --workspace --locked --test mdns -- --ignored --test-threads=1
+
   smoke:
     name: Release smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -104,6 +123,20 @@ jobs:
           WEB_ADDR_SKIP_BUILD: "1"
           WEB_ADDR_SETCAP: "1"
         run: scripts/web-address.sh
+
+      # Reuses the smoke test's release build; grants port 80 with setcap.
+      # Runs last: it installs avahi-daemon, which the steps above don't
+      # expect.
+      - name: mDNS test
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        env:
+          MDNS_SKIP_BUILD: "1"
+          MDNS_SETCAP: "1"
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 \
+            install -y --no-install-recommends avahi-daemon avahi-utils libnss-mdns
+          scripts/mdns.sh
 
   cargo-deny:
     name: Cargo deny

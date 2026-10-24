@@ -193,15 +193,30 @@ fn daemon_line(socket: &Path) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn status_reports_the_daemon_and_docker() {
-    let daemon = Daemon::start(ready_desktop()).await;
+    use std::sync::Arc;
+
+    use alchemyd::network::{FakeNetwork, LanAddress};
+
+    let host = FakeNetwork::new();
+    host.set_lan_addresses(vec![LanAddress {
+        interface: "en0".into(),
+        addr: "192.168.1.20".parse().unwrap(),
+        subnet: "192.168.1.0/24".parse().unwrap(),
+    }]);
+    let daemon =
+        Daemon::start_with(ready_desktop(), |deps| deps.with_network(Arc::new(host))).await;
     let out = run(cli(&daemon.socket, false, false)).await.unwrap();
+    let lines: Vec<&str> = out.lines().collect();
     assert_eq!(
-        out,
-        format!(
-            "{}\nDocker ready: Desktop 4.34.2, Engine 27.3.1, Compose v2.29.7\n",
-            daemon_line(&daemon.socket)
-        )
+        lines[..2],
+        [
+            daemon_line(&daemon.socket).as_str(),
+            "Docker ready: Desktop 4.34.2, Engine 27.3.1, Compose v2.29.7"
+        ],
+        "{out}"
     );
+    assert!(lines[2].starts_with("Local names (mDNS): "), "{out}");
+    assert_eq!(lines.len(), 3, "{out}");
 
     daemon
         .state
@@ -247,13 +262,16 @@ async fn status_explains_networks_that_overlap_the_lan() {
         .unwrap();
 
     let out = run(cli(&daemon.socket, false, false)).await.unwrap();
-    let lines: Vec<&str> = out.lines().collect();
+    let lines: Vec<&str> = out
+        .lines()
+        .skip_while(|line| !line.starts_with("Warning: "))
+        .collect();
     assert_eq!(
-        lines[2],
+        lines[0],
         "Warning: Docker's address pool 192.168.0.0/16 overlaps your local network 192.168.0.0/16, so a new network may be given addresses that hide devices on it."
     );
     assert_eq!(
-        lines[3],
+        lines[1],
         "  Fix: In Docker Desktop, open Settings, then Docker Engine, add these settings to the JSON there, and select Apply & restart:"
     );
     assert!(out.contains("\"default-address-pools\""), "{out}");
@@ -980,14 +998,38 @@ async fn apps_are_found_in_the_folder_the_settings_name() {
     let out = run_args(&daemon.socket, &["settings", "show"])
         .await
         .unwrap();
-    assert_eq!(out, "App home:           none\nOther app folders:  none\n");
+    assert_eq!(
+        out,
+        "App home:            none\nOther app folders:   none\nLocal names (mDNS):  on\n"
+    );
     let out = run_args(&daemon.socket, &["settings", "set", "app-home", home_str])
         .await
         .unwrap();
     assert_eq!(
         out,
-        format!("App home:           {home_str}\nOther app folders:  none\n")
+        format!(
+            "App home:            {home_str}\nOther app folders:   none\nLocal names (mDNS):  on\n"
+        )
     );
+    let out = run_args(&daemon.socket, &["settings", "set", "mdns", "off"])
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        format!(
+            "App home:            {home_str}\nOther app folders:   none\nLocal names (mDNS):  off\n"
+        )
+    );
+    let out = run_args(&daemon.socket, &["--json", "settings", "show"])
+        .await
+        .unwrap();
+    let shown: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+    assert_eq!(shown["home"], home_str);
+    assert_eq!(shown["network"], serde_json::json!({"mdns": false}));
+    let err = run_args(&daemon.socket, &["settings", "set", "mdns", "maybe"])
+        .await
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 2);
 
     let deadline = tokio::time::Instant::now() + DEADLINE;
     let list = loop {

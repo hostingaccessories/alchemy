@@ -301,15 +301,16 @@ describe("App", () => {
     expect(within(problems).getByText("A port this app publishes is already taken")).toBeTruthy();
   });
 
+  const address = (
+    kind: "host" | "port",
+    url: string,
+    state: "ready" | "pending" | "not_running" | "unavailable",
+    message: string | null,
+  ) => ({ kind, url, state, service: "web", port: 80, message });
+
   it("opens the app at its best ready address and lists every address", async () => {
     const open = vi.fn();
     vi.stubGlobal("open", open);
-    const address = (
-      kind: "host" | "port",
-      url: string,
-      state: "ready" | "pending" | "not_running" | "unavailable",
-      message: string | null,
-    ) => ({ kind, url, state, service: "web", port: 80, message });
     apps = {
       ...full,
       apps: [
@@ -344,6 +345,98 @@ describe("App", () => {
     expect(
       within(details).getByText("Alchemy doesn't have permission to listen on port 80."),
     ).toBeTruthy();
+  });
+
+  it("opens the app at its .local address and says where each address works", async () => {
+    apps = {
+      ...full,
+      apps: [
+        {
+          ...blog,
+          addresses: [
+            address("host", "http://blog.local/", "ready", null),
+            address("port", "http://blog.local:8100/", "ready", null),
+            address("port", "http://192.168.1.20:8100/", "ready", null),
+            address("host", "http://blog.localhost/", "ready", null),
+          ],
+        },
+      ],
+    };
+    await renderAt("/apps/blog");
+    const button = await within(screen.getByRole("banner")).findByRole("link", {
+      name: "Open blog",
+    });
+    expect(button.getAttribute("href")).toBe("http://blog.local/");
+
+    const details = screen.getByRole("heading", { name: "Where it lives" }).parentElement!;
+    const items = within(details).getAllByRole("listitem");
+    expect(items.map((item) => item.textContent)).toEqual([
+      "http://blog.local/From any device on your network",
+      "http://blog.local:8100/From any device on your network",
+      "http://192.168.1.20:8100/From any device on your network",
+      "http://blog.localhost/On this computer only",
+    ]);
+  });
+
+  it("says another device uses the app's .local name, and opens the next address", async () => {
+    const inUse = "Another device on your network uses blog.local. Set a hostname in x-alchemy.";
+    apps = {
+      ...full,
+      apps: [
+        {
+          ...blog,
+          problems: [{ kind: "route", message: inUse }],
+          addresses: [
+            address("port", "http://192.168.1.20:8100/", "ready", null),
+            address("host", "http://blog.localhost/", "ready", null),
+            address(
+              "host",
+              "http://blog.local/",
+              "unavailable",
+              "Another device on your network uses blog.local.",
+            ),
+            address(
+              "port",
+              "http://blog.local:8100/",
+              "unavailable",
+              "Another device on your network uses blog.local.",
+            ),
+          ],
+        },
+      ],
+    };
+    await renderAt("/apps/blog");
+    const problems = await screen.findByRole("region", { name: "Problems" });
+    expect(
+      within(problems).getByText("Something is wrong with this app's web address"),
+    ).toBeTruthy();
+    expect(within(problems).getByText(inUse)).toBeTruthy();
+    const button = within(screen.getByRole("banner")).getByRole("link", { name: "Open blog" });
+    expect(button.getAttribute("href")).toBe("http://192.168.1.20:8100/");
+    const details = screen.getByRole("heading", { name: "Where it lives" }).parentElement!;
+    expect(
+      within(details).getAllByText("Another device on your network uses blog.local."),
+    ).toHaveLength(2);
+  });
+
+  it("says when a .local name is still being announced", async () => {
+    const announcing = "Alchemy is announcing blog.local on your network.";
+    apps = {
+      ...full,
+      apps: [
+        {
+          ...blog,
+          addresses: [
+            address("host", "http://blog.localhost/", "ready", null),
+            address("host", "http://blog.local/", "pending", announcing),
+          ],
+        },
+      ],
+    };
+    await renderAt("/apps/blog");
+    expect(await screen.findByText(announcing)).toBeTruthy();
+    const button = within(screen.getByRole("banner")).getByRole("link", { name: "Open blog" });
+    expect(button.getAttribute("href")).toBe("http://blog.localhost/");
   });
 
   it("offers no Open button until an address answers", async () => {

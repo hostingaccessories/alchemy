@@ -6,7 +6,11 @@
 //! overlap, with the fix spelled out. The daemon refreshes it in the
 //! background, so it may be up to half a minute old. Its
 //! [`ProxyReport`] says what the web address proxy listens on, such as
-//! whether port 80 could be opened, and is always current.
+//! whether port 80 could be opened, and its [`MdnsReport`] whether apps'
+//! `.local` names are announced; both are always current.
+//!
+//! `GET /api/settings/network` returns the [`NetworkSettings`]; `PUT`
+//! takes a [`NetworkSettingsUpdate`] and returns the new settings.
 //!
 //! Every human-readable `message` and `fix` here is written for the people
 //! using Alchemy and safe to show as is.
@@ -42,6 +46,10 @@ pub struct NetworkReport {
     /// leaves it out.
     #[serde(default)]
     pub proxy: ProxyReport,
+    /// Announcing apps' `.local` names on the LAN. Defaults to `off` when
+    /// an older daemon, which announces nothing, leaves it out.
+    #[serde(default)]
+    pub mdns: MdnsReport,
 }
 
 impl Default for NetworkReport {
@@ -62,8 +70,106 @@ impl Default for NetworkReport {
             },
             warnings: Vec::new(),
             proxy: ProxyReport::default(),
+            mdns: MdnsReport::default(),
         }
     }
+}
+
+/// The network settings, from `GET /api/settings/network`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkSettings {
+    /// Whether apps' `<label>.local` names are announced on the LAN over
+    /// mDNS: the `network.mdns` setting, on by default. While it is off,
+    /// no app has a `.local` address. An app can also opt out on its own
+    /// with `x-alchemy: { mdns: false }`.
+    pub mdns: bool,
+}
+
+impl Default for NetworkSettings {
+    /// Everything on.
+    fn default() -> Self {
+        Self { mdns: true }
+    }
+}
+
+impl NetworkSettings {
+    /// These settings with `update` applied.
+    #[must_use]
+    pub fn updated(self, update: NetworkSettingsUpdate) -> Self {
+        Self {
+            mdns: update.mdns.unwrap_or(self.mdns),
+        }
+    }
+}
+
+/// The body of `PUT /api/settings/network`. A setting left out keeps its
+/// current value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkSettingsUpdate {
+    /// The new [`NetworkSettings::mdns`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mdns: Option<bool>,
+}
+
+/// Whether apps' `.local` names are announced on the LAN, and how.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MdnsReport {
+    /// Whether names are being announced.
+    pub state: MdnsState,
+    /// What announces them, once one was chosen.
+    pub backend: Option<MdnsBackend>,
+    /// What is wrong or still to happen, when `state` isn't `announcing`.
+    pub message: Option<String>,
+    /// What to do about it, when the user can do something.
+    pub fix: Option<String>,
+}
+
+impl Default for MdnsReport {
+    /// Nothing announced, and nothing to say.
+    fn default() -> Self {
+        Self {
+            state: MdnsState::Off,
+            backend: None,
+            message: None,
+            fix: None,
+        }
+    }
+}
+
+/// The state of an [`MdnsReport`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MdnsState {
+    /// Not announcing, since the `network.mdns` setting is off.
+    Off,
+    /// Not announcing yet: the announcer is being chosen or started.
+    Starting,
+    /// Announcing the names apps' `.local` addresses use. Each address
+    /// says whether its own name is announced yet.
+    Announcing,
+    /// Can't announce, such as when this computer doesn't allow it or no
+    /// announcer works; `message` says why.
+    Unavailable,
+    /// A state this build does not know.
+    #[serde(other)]
+    Other,
+}
+
+/// What announces `.local` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MdnsBackend {
+    /// The avahi daemon, over D-Bus, on Linux.
+    Avahi,
+    /// macOS's mDNSResponder, through `dns-sd`.
+    DnsSd,
+    /// Alchemy's own responder, on Linux without avahi.
+    BuiltIn,
+    /// A backend this build does not know.
+    #[serde(other)]
+    Other,
 }
 
 /// What the web address proxy listens on and how it reaches apps.
@@ -72,7 +178,8 @@ pub struct ProxyReport {
     /// How the proxy reaches apps' containers, or `None` until the engine
     /// has been ready.
     pub reachability: Option<Reachability>,
-    /// The Host listener, port 80, which routes `<app>.localhost`. It is
+    /// The Host listener, port 80, which routes `<app>.localhost` and,
+    /// while names are announced, `<app>.local`. It is
     /// `off` while no app has a hostname.
     pub host: ProxyListener,
     /// Each app's own proxy port, ascending.
@@ -122,11 +229,13 @@ pub struct ProxyListener {
 pub enum ListenerState {
     /// Not wanted, since no route needs it.
     Off,
-    /// Accepting connections.
+    /// Accepting connections. Its addresses are ready only once a request
+    /// sent to it over loopback and the LAN address reached the proxy.
     Listening,
     /// Wanted but couldn't be opened, such as port 80 without permission
-    /// or a port another program holds. It is tried again when the
-    /// routes change.
+    /// or a port another program holds, or open but another program
+    /// answers its traffic, such as a firewall redirect. It is tried
+    /// again when the routes change and checked again every few seconds.
     Unavailable,
     /// A state this build does not know.
     #[serde(other)]

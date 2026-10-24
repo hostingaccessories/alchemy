@@ -1,7 +1,7 @@
 //! The web address proxy against in-process fake apps: routing by port
 //! and by `Host`, streaming both ways, upgraded connections, hot route swaps,
-//! header hygiene, the self-routing guard, a refused Host listener, and
-//! shutdown.
+//! header hygiene, the self-routing guard, a refused Host listener,
+//! answering listener probes, and shutdown.
 
 #![allow(
     clippy::unwrap_used,
@@ -22,8 +22,10 @@ use alchemy_core::route::{
     AppRouteInput, HostSuffix, Reachability, RouteContainer, RouteOptions, RouteTable,
     ServiceRouteInput, XAlchemy, XAlchemyBlock, plan_routes,
 };
+use alchemyd::proxy::probe::classify;
 use alchemyd::proxy::{
-    self, FakeConnector, Listen, ListenerStatus, ProxyConfig, ProxyStatus, SharedConnector,
+    self, FakeConnector, Listen, ListenerProbe, ListenerStatus, PROBE_HEADER, ProbeMarker,
+    ProbeResult, ProxyConfig, ProxyStatus, SharedConnector, TcpProbe,
 };
 use http_body_util::{BodyExt as _, Either, Empty, Full};
 use hyper::body::{Body, Bytes, Frame, Incoming};
@@ -140,7 +142,7 @@ fn app(name: &str, ip: IpAddr, listen_port: Option<u16>, running: bool) -> AppRo
         x_alchemy: Some(XAlchemyBlock::Read(XAlchemy {
             service: Some("web".into()),
             port: Some(80),
-            hostname: None,
+            ..XAlchemy::default()
         })),
         services: vec![ServiceRouteInput {
             name: "web".into(),
@@ -181,6 +183,7 @@ fn table(apps: &[AppRouteInput]) -> RouteTable {
 struct Proxy {
     routes: watch::Sender<RouteTable>,
     status: watch::Receiver<ProxyStatus>,
+    probe: watch::Sender<Option<ProbeMarker>>,
     shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
 }
@@ -189,17 +192,20 @@ impl Proxy {
     fn start(config: ProxyConfig, connector: SharedConnector, routes: RouteTable) -> Self {
         let (routes_tx, routes_rx) = watch::channel(routes);
         let (status_tx, status) = watch::channel(ProxyStatus::default());
+        let (probe, probe_rx) = watch::channel(None);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(proxy::run(
             config,
             connector,
             routes_rx,
             status_tx,
+            probe_rx,
             shutdown_rx,
         ));
         Self {
             routes: routes_tx,
             status,
+            probe,
             shutdown,
             task,
         }
@@ -686,6 +692,86 @@ async fn a_refused_host_listener_is_reported_and_app_ports_still_serve() {
     let addr = proxy.listening(Listen::App(port)).await;
     assert_eq!(text(send(addr, get("/", "x")).await).await, "wiki");
     proxy.stop().await;
+}
+
+fn marker() -> ProbeMarker {
+    ProbeMarker::new("c".repeat(64), "d".repeat(64))
+}
+
+fn probe_request(method: &str, values: &[&str]) -> Request<Empty<Bytes>> {
+    let mut req = Request::builder()
+        .method(method)
+        .uri("/")
+        .header("host", "x");
+    for v in values {
+        req = req.header(PROBE_HEADER, *v);
+    }
+    req.body(Empty::new()).unwrap()
+}
+
+#[tokio::test]
+async fn answers_its_own_probe_before_routing_and_never_forwards_one() {
+    let wiki = fake_app("wiki").await;
+    let connector = FakeConnector::new();
+    connector.redirect(SocketAddr::new(container_ip(2), 80), wiki);
+    let port = free_port().await;
+    let mut proxy = Proxy::start(
+        loopback_config(vec![]),
+        Arc::new(connector.clone()),
+        table(&[app("wiki", container_ip(2), Some(port), true)]),
+    );
+    let app_addr = proxy.listening(Listen::App(port)).await;
+    let host_addr = proxy.listening(Listen::Host).await;
+    let m = marker();
+
+    for addr in [app_addr, host_addr] {
+        let resp = send(addr, probe_request("GET", &[m.challenge()])).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "no round in flight");
+    }
+    proxy.probe.send_replace(Some(m.clone()));
+    for addr in [app_addr, host_addr] {
+        let resp = send(addr, probe_request("GET", &[m.challenge()])).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.headers()[PROBE_HEADER], m.reply());
+        assert_eq!(resp.headers()["cache-control"], "no-store");
+        let reply = TcpProbe.probe(addr, m.clone()).await;
+        assert_eq!(classify(&reply, &m), ProbeResult::Ours, "{addr}");
+    }
+    let wrong = "e".repeat(64);
+    for (name, method, values) in [
+        ("wrong challenge", "GET", vec![wrong.as_str()]),
+        ("the reply", "GET", vec![m.reply()]),
+        ("twice", "GET", vec![m.challenge(), m.challenge()]),
+        ("not a GET", "POST", vec![m.challenge()]),
+        ("empty", "GET", vec![""]),
+    ] {
+        let resp = send(app_addr, probe_request(method, &values)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}");
+        assert!(resp.headers().get(PROBE_HEADER).is_none(), "{name}");
+        assert!(text(resp).await.contains("Alchemy has no app"), "{name}");
+    }
+    assert_eq!(connector.attempts(), [], "a probe reached an app");
+    assert_eq!(text(send(app_addr, get("/", "x")).await).await, "wiki");
+
+    proxy.probe.send_replace(None);
+    let reply = TcpProbe.probe(app_addr, m.clone()).await;
+    assert_eq!(classify(&reply, &m), ProbeResult::Foreign);
+    proxy.stop().await;
+}
+
+#[tokio::test]
+async fn a_probe_tells_another_program_and_a_closed_port_from_the_proxy() {
+    let echo = fake_app("echo").await;
+    let m = marker();
+    assert_eq!(
+        classify(&TcpProbe.probe(echo, m.clone()).await, &m),
+        ProbeResult::Foreign
+    );
+    let closed = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), free_port().await);
+    assert!(matches!(
+        classify(&TcpProbe.probe(closed, m.clone()).await, &m),
+        ProbeResult::Unreachable(_)
+    ));
 }
 
 #[tokio::test]

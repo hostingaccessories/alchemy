@@ -6,7 +6,8 @@
 //! [`alchemy_api::apps`], and the lifecycle operation routes, whose
 //! `/api/operations/{id}/events` streams too, in
 //! [`alchemy_api::operations`]. `/api/network` returns the latest
-//! [`NetworkReport`]. On the TCP listener ([`router`])
+//! [`NetworkReport`], and `/api/settings/network` the
+//! [`NetworkSettings`]. On the TCP listener ([`router`])
 //! everything else is served from the embedded web UI build with an
 //! `index.html` fallback for client-side routing; on the Unix socket
 //! ([`api_router`]) everything else is a JSON 404.
@@ -33,7 +34,7 @@ use std::time::Duration;
 
 use alchemy_api::apps::{App, AppList, AppSettings, AppSettingsUpdate};
 use alchemy_api::logs::LogEvent;
-use alchemy_api::network::NetworkReport;
+use alchemy_api::network::{NetworkReport, NetworkSettings, NetworkSettingsUpdate};
 use alchemy_api::operations::{
     Action, ActionRequest, OperationEvent, OperationList, OperationResponse,
 };
@@ -284,6 +285,10 @@ fn api(
                 .layer(app_files::body_limit()),
         )
         .route("/settings/apps", get(app_settings).put(set_app_settings))
+        .route(
+            "/settings/network",
+            get(network_settings).put(set_network_settings),
+        )
         .route("/ports", get(ports::list))
         .route("/network", get(network))
         .method_not_allowed_fallback(api_method_not_allowed)
@@ -481,7 +486,9 @@ async fn engine(extract::State(state): extract::State<State>) -> Json<EngineStat
 
 async fn network(extract::State(state): extract::State<State>) -> Json<NetworkReport> {
     let mut report = state.network();
-    report.proxy = state.routing().proxy;
+    let routing = state.routing();
+    report.proxy = routing.proxy;
+    report.mdns = routing.mdns;
     Json(report)
 }
 
@@ -962,6 +969,40 @@ async fn set_app_settings(
     state.set_app_settings(effective.clone());
     state.rescan_apps();
     Json(effective).into_response()
+}
+
+async fn network_settings(extract::State(state): extract::State<State>) -> Json<NetworkSettings> {
+    Json(state.network_settings())
+}
+
+/// Store the network settings `PUT` changes and put them in effect. The
+/// routing task follows them at once.
+async fn set_network_settings(
+    extract::State(state): extract::State<State>,
+    extract::State(store): extract::State<SharedStore>,
+    body: Bytes,
+) -> Response {
+    let update: NetworkSettingsUpdate = match serde_json::from_slice(&body) {
+        Ok(update) => update,
+        Err(err) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::BadRequest,
+                &format!("invalid network settings: {err}"),
+            );
+        }
+    };
+    match crate::network::settings::save(&state, &store, update).await {
+        Ok(settings) => Json(settings).into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, "saving the network settings failed");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "alchemyd couldn't save the settings",
+            )
+        }
+    }
 }
 
 async fn events(
@@ -2506,8 +2547,18 @@ data: {"service":"web","container":"blog-web-1","stream":"stdout","time":"2024-0
         content_type: Option<&str>,
         body: &str,
     ) -> (StatusCode, serde_json::Value) {
+        put_json(state, store, "/api/settings/apps", content_type, body).await
+    }
+
+    async fn put_json(
+        state: &State,
+        store: &SharedStore,
+        uri: &str,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
         let (_tx, rx) = watch::channel(false);
-        let mut request = req(Method::PUT, "/api/settings/apps");
+        let mut request = req(Method::PUT, uri);
         if let Some(content_type) = content_type {
             request = request.header(header::CONTENT_TYPE, content_type);
         }
@@ -2636,6 +2687,84 @@ data: {"service":"web","container":"blog-web-1","stream":"stdout","time":"2024-0
                     .await
                     .unwrap(),
                 None,
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn network_settings_are_stored_and_put_in_effect() {
+        let state = State::new();
+        let store = memory();
+        let (status, body) = get_json_from(state.clone(), "/api/settings/network").await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, serde_json::json!({"mdns": true}))
+        );
+
+        let settings = state.watch_network_settings();
+        let json = Some("application/json");
+        let (status, body) = put_json(
+            &state,
+            &store,
+            "/api/settings/network",
+            json,
+            r#"{"mdns":false}"#,
+        )
+        .await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, serde_json::json!({"mdns": false}))
+        );
+        assert!(settings.has_changed().unwrap());
+        assert_eq!(state.network_settings(), NetworkSettings { mdns: false });
+        assert_eq!(
+            store
+                .setting::<crate::network::settings::StoredMdns>(crate::network::settings::MDNS_KEY)
+                .await
+                .unwrap(),
+            Some(crate::network::settings::StoredMdns { enabled: false })
+        );
+        let (status, body) = get_json_from(state.clone(), "/api/settings/network").await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, serde_json::json!({"mdns": false}))
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_network_settings_are_refused_and_change_nothing() {
+        let json = Some("application/json");
+        let cases = [
+            (
+                json,
+                r#"{"mdns":"no"}"#,
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+            (json, r#"{"mdns":null}"#, StatusCode::OK, ""),
+            (json, "not json", StatusCode::BAD_REQUEST, "bad_request"),
+            (
+                None,
+                r#"{"mdns":false}"#,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+            ),
+        ];
+        for (content_type, body, want, code) in cases {
+            let state = State::new();
+            let store = memory();
+            let (status, got) =
+                put_json(&state, &store, "/api/settings/network", content_type, body).await;
+            assert_eq!(status, want, "{body}");
+            if want == StatusCode::OK {
+                assert_eq!(got, serde_json::json!({"mdns": true}), "{body}");
+            } else {
+                assert_eq!(got["code"], code, "{body}");
+            }
+            assert_eq!(
+                state.network_settings(),
+                NetworkSettings { mdns: true },
                 "{body}"
             );
         }

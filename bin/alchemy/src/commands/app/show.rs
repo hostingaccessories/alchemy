@@ -172,6 +172,69 @@ mod tests {
     }
 
     #[test]
+    fn shows_local_addresses_best_first_and_a_name_conflict() {
+        use alchemy_api::apps::{AddressKind, AddressState, AppAddress};
+        let mut app = blog();
+        let in_use = "Another device on your network uses blog.local.";
+        let address = |kind, url: &str, state, message: Option<&str>| AppAddress {
+            kind,
+            url: url.into(),
+            state,
+            service: "web".into(),
+            port: 80,
+            message: message.map(Into::into),
+        };
+        app.addresses = vec![
+            address(
+                AddressKind::Port,
+                "http://192.168.1.20:8100/",
+                AddressState::Ready,
+                None,
+            ),
+            address(
+                AddressKind::Host,
+                "http://blog.localhost/",
+                AddressState::Ready,
+                None,
+            ),
+            address(
+                AddressKind::Host,
+                "http://blog.local/",
+                AddressState::Unavailable,
+                Some(in_use),
+            ),
+            address(
+                AddressKind::Port,
+                "http://blog.local:8100/",
+                AddressState::Pending,
+                Some("Alchemy is announcing blog.local on your network."),
+            ),
+        ];
+        app.problems = vec![AppProblem {
+            kind: AppProblemKind::Route,
+            message: format!("{in_use} Set a hostname in x-alchemy."),
+        }];
+        let lines = show_lines(&app, false);
+        assert_eq!(
+            lines[5..10],
+            [
+                "Addresses:",
+                "  http://192.168.1.20:8100/  ready",
+                "  http://blog.localhost/     ready",
+                "  http://blog.local/         unavailable: Another device on your network uses blog.local.",
+                "  http://blog.local:8100/    starting: Alchemy is announcing blog.local on your network.",
+            ]
+        );
+        assert_eq!(
+            lines[lines.len() - 2..],
+            [
+                "Problems:",
+                "  Another device on your network uses blog.local. Set a hostname in x-alchemy.",
+            ]
+        );
+    }
+
+    #[test]
     fn says_why_services_are_not_running() {
         use alchemy_api::apps::StopReason;
         let mut app = blog();

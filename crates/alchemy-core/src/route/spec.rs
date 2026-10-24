@@ -20,13 +20,14 @@ pub const X_ALCHEMY: &str = "x-alchemy";
 ///   service: web    # top-level only; a service's own block implies it
 ///   port: 8080      # the container port to route to
 ///   hostname: wiki  # the label before .localhost; the app name by default
+///   mdns: false     # don't announce wiki.local on the LAN; true by default
 /// ```
 ///
 /// Every field is optional and unknown fields are ignored, so blocks
 /// written for a newer Alchemy still read. `port` may be a number or a
 /// string of digits. Validation happens when routes are planned, so a bad
 /// value becomes an app problem rather than a parse error.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct XAlchemy {
     /// The service to route to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -41,6 +42,29 @@ pub struct XAlchemy {
     /// The DNS label to answer under instead of the app's name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// Whether to announce the app's `.local` name over mDNS.
+    #[serde(default = "announce_by_default", skip_serializing_if = "is_announced")]
+    pub mdns: bool,
+}
+
+impl Default for XAlchemy {
+    fn default() -> Self {
+        Self {
+            service: None,
+            port: None,
+            hostname: None,
+            mdns: true,
+        }
+    }
+}
+
+fn announce_by_default() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_announced(mdns: &bool) -> bool {
+    *mdns
 }
 
 /// An `x-alchemy` key as the daemon found it.
@@ -166,8 +190,17 @@ mod tests {
                     service: Some("web".into()),
                     port: Some(8080),
                     hostname: Some("wiki".into()),
+                    mdns: true,
                 },
             ),
+            (
+                r#"{"mdns":false}"#,
+                XAlchemy {
+                    mdns: false,
+                    ..XAlchemy::default()
+                },
+            ),
+            (r#"{"mdns":true}"#, XAlchemy::default()),
             (
                 r#"{"port":"80"}"#,
                 XAlchemy {
@@ -198,6 +231,8 @@ mod tests {
             r#"{"port":-1}"#,
             r#"{"port":80.5}"#,
             r#"{"service":3}"#,
+            r#"{"mdns":"no"}"#,
+            r#"{"mdns":null}"#,
             r#""web""#,
         ];
         for json in bad {
@@ -212,6 +247,11 @@ mod tests {
             ..XAlchemy::default()
         };
         assert_eq!(serde_json::to_string(&spec).unwrap(), r#"{"port":80}"#);
+        let quiet = XAlchemy {
+            mdns: false,
+            ..XAlchemy::default()
+        };
+        assert_eq!(serde_json::to_string(&quiet).unwrap(), r#"{"mdns":false}"#);
     }
 
     #[test]

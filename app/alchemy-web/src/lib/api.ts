@@ -313,7 +313,8 @@ export type AddressState = "ready" | "pending" | "not_running" | "unavailable" |
 
 /**
  * Mirrors `alchemy_api::apps::AppAddress`: one web address of an app, such as
- * `http://blog.localhost/` (`host`) or `http://192.168.1.20:8100/` (`port`).
+ * `http://blog.local/` or `http://blog.localhost/` (`host`), or
+ * `http://blog.local:8100/` or `http://192.168.1.20:8100/` (`port`).
  * `message` says why it doesn't answer and is safe to show as is.
  */
 export interface AppAddress {
@@ -729,9 +730,48 @@ export interface NetworkReport {
   warnings: NetworkWarning[];
   /** The web address proxy. Absent from an older daemon. */
   proxy?: ProxyReport;
+  /** Announcing apps' `.local` names. Absent from an older daemon. */
+  mdns?: MdnsReport;
 }
 
-/** Mirrors `alchemy_api::network::ListenerState`; unknown states arrive as `other`. */
+/** Mirrors `alchemy_api::network::MdnsState`; unknown states arrive as `other`. */
+export type MdnsState = "off" | "starting" | "announcing" | "unavailable" | "other";
+
+/** Mirrors `alchemy_api::network::MdnsBackend`; unknown backends arrive as `other`. */
+export type MdnsBackend = "avahi" | "dns_sd" | "built_in" | "other";
+
+/**
+ * Mirrors `alchemy_api::network::MdnsReport`: whether apps' `.local` names are
+ * announced on the LAN. `message` and `fix` are safe to show as is.
+ */
+export interface MdnsReport {
+  /** `off` while the `network.mdns` setting is off. */
+  state: MdnsState;
+  /** `null` until an announcer was chosen. */
+  backend: MdnsBackend | null;
+  message: string | null;
+  fix: string | null;
+}
+
+/** Mirrors `alchemy_api::network::NetworkSettings`, returned by `GET /api/settings/network`. */
+export interface NetworkSettings {
+  /** Whether apps' `.local` names are announced; when off, no app has a `.local` address. */
+  mdns: boolean;
+}
+
+/**
+ * Mirrors `alchemy_api::network::NetworkSettingsUpdate`, the body of
+ * `PUT /api/settings/network`. A setting left out keeps its value.
+ */
+export interface NetworkSettingsUpdate {
+  mdns?: boolean;
+}
+
+/**
+ * Mirrors `alchemy_api::network::ListenerState`; unknown states arrive as
+ * `other`. `unavailable` covers a port that couldn't be opened and one that
+ * is open but another program answers, such as a firewall redirect.
+ */
 export type ListenerState = "off" | "listening" | "unavailable" | "other";
 
 /** Mirrors `alchemy_api::network::Reachability`; unknown values arrive as `other`. */
@@ -754,7 +794,10 @@ export interface ProxyListener {
 export interface ProxyReport {
   /** `null` until the engine has been ready. */
   reachability: Reachability | null;
-  /** Port 80, which routes `<app>.localhost`; `off` while no app has a hostname. */
+  /**
+   * Port 80, which routes `<app>.localhost` and, while names are announced,
+   * `<app>.local`; `off` while no app has a hostname.
+   */
   host: ProxyListener;
   /** Each app's own proxy port, ascending. */
   ports: ProxyListener[];
@@ -984,6 +1027,10 @@ export const api = {
     ),
   operations: (signal?: AbortSignal) => request<OperationList>("GET", "/operations", { signal }),
   network: (signal?: AbortSignal) => request<NetworkReport>("GET", "/network", { signal }),
+  networkSettings: (signal?: AbortSignal) =>
+    request<NetworkSettings>("GET", "/settings/network", { signal }),
+  setNetworkSettings: (update: NetworkSettingsUpdate) =>
+    request<NetworkSettings>("PUT", "/settings/network", { body: update }),
   cancelOperation: (id: string) =>
     request<OperationResponse>("POST", `/operations/${encodeURIComponent(id)}/cancel`),
   followOperation,

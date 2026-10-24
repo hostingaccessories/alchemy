@@ -223,13 +223,19 @@ check() {
       || fail "${name}: ${kind} is not \"${message}\": $(jq -c .warnings <<<"$report")"
   done
 
+  # alchemy status also warns when .local names can't be announced, which
+  # depends on the runner's mDNS responder, not on the network under test.
+  local mdns_warnings
+  mdns_warnings="$("${bin}/alchemy" --socket "$socket" --json status \
+    | jq -r 'if .network.mdns.state == "unavailable" then 1 else 0 end')" \
+    || fail "${name}: alchemy status --json failed"
   local status
   status="$("${bin}/alchemy" --socket "$socket" status)" || fail "${name}: alchemy status failed"
   printf '%s\n' "$status" >"${dir}/status.txt"
   local count
   count="$(grep -c '^Warning: ' <<<"$status" || true)"
-  [[ "$count" -eq "${#expected[@]}" ]] \
-    || fail "${name}: alchemy status printed ${count} warnings, expected ${#expected[@]}: ${status}"
+  [[ "$count" -eq "$((${#expected[@]} + mdns_warnings))" ]] \
+    || fail "${name}: alchemy status printed ${count} warnings, expected ${#expected[@]} and ${mdns_warnings} for local names: ${status}"
   if [[ "${#expected[@]}" -gt 0 ]]; then
     grep -qxF "  Fix: $(head -n 1 <<<"$fix")" <<<"$status" \
       || fail "${name}: alchemy status did not print the fix: ${status}"

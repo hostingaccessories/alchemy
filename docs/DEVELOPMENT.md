@@ -671,16 +671,35 @@ Warning: Docker's address pool 192.168.0.0/16 overlaps your local network 192.16
 ### Web addresses
 
 The daemon runs a reverse proxy in its own process, on listeners of its
-own, never the API's. Each app it can route gets two addresses:
+own, never the API's. Each app it can route gets up to four addresses, in
+this order:
 
-- its own port, reserved in the [port registry](#ports) as `proxy:<app>`
-  from `8100`-`8999` and kept for good, served on every IPv4 address, so
-  `http://<LAN IP>:<port>` works from a phone;
-- `http://<app>.localhost`, routed by `Host` on port 80. The app name
-  becomes a DNS label: lowercased, `_` and other invalid characters turned
-  into `-`, and trimmed. Chrome, Firefox, and curl resolve `*.localhost`
-  to loopback themselves. The proxy listens on IPv4 only, so a client that
-  tries `::1` first falls back to `127.0.0.1`.
+1. `http://<app>.local`, routed by `Host` on port 80 and announced on the
+   LAN with [mDNS](#local-names-mdns), so a phone on the same network
+   opens it by name;
+2. `http://<app>.local:<port>`, the same name on the app's own port;
+3. `http://<LAN IP>:<port>`, its own port, reserved in the
+   [port registry](#ports) as `proxy:<app>` from `8100`-`8999` and kept
+   for good, served on every IPv4 address;
+4. `http://<app>.localhost`, routed by `Host` on port 80, on this computer
+   only. Chrome, Firefox, and curl resolve `*.localhost` to loopback
+   themselves.
+
+The app name becomes a DNS label: lowercased, `_` and other invalid
+characters turned into `-`, and trimmed. The proxy listens on IPv4 only,
+so a client that tries `::1` first falls back to `127.0.0.1`.
+
+`addresses` are sorted by state first (`ready`, `pending`, `not_running`,
+`unavailable`), then in the order above, and the web UI's Open button,
+`alchemy app list`, and `alchemy app show` use the first `ready` one. So
+with port 80 verified and the name announced, Open goes to
+`http://immich.local`; with port 80 unavailable (Linux without the
+capability below, or a redirect) it goes to `http://immich.local:8101`;
+while the name is still being announced, or another device holds it, to
+`http://<LAN IP>:8101`. `.localhost` comes last even when ready, because
+it only works on this computer. The `.local` addresses are left out while
+local names are off, for apps that opt out, and while the computer has no
+LAN address.
 
 Without an `x-alchemy` block, an app is routed when its services have
 exactly one TCP container port between them, counting `expose` and the
@@ -694,7 +713,8 @@ that says what to add, usually this block, at the top level of
 x-alchemy:
   service: web # required when the app has more than one service
   port: 8080 # the container port; optional when web has only one
-  hostname: wiki # optional: wiki.localhost instead of <app>.localhost
+  hostname: wiki # optional: wiki.local and wiki.localhost, not <app>.*
+  mdns: false # optional: no .local name or addresses for this app
 services:
   web:
     image: ghcr.io/example/wiki
@@ -704,7 +724,9 @@ Compose ignores `x-` keys, so the file still works by hand. Put the block
 at the top level: `docker compose config --format json`, which the daemon
 reads, drops `x-` keys inside a service, so a block there never arrives.
 `hostname` is one label, not `wiki.localhost`. Two apps that want the
-same hostname both lose it, and both get a problem.
+same hostname both lose it, and both get a problem. `mdns: false` drops
+the app's `.local` addresses and its `.local` `Host` routing; anything but
+`true` or `false` makes the block unreadable, which is a `route` problem.
 
 How the proxy reaches the container depends on the engine (`reachability`
 in `/api/network`):
@@ -724,8 +746,9 @@ in `/api/network`):
   reach this app."
 
 macOS lets any user listen on port 80. Linux doesn't: when the bind is
-refused, `<app>.localhost` addresses are `unavailable`, `alchemy status`
-prints a warning with the fix, and each app's own port keeps working. To
+refused, the port 80 addresses (`<app>.local` and `<app>.localhost`) are
+`unavailable`, `alchemy status` prints a warning with the fix, and each
+app's own port, by IP or as `<app>.local:<port>`, keeps working. To
 grant the capability (again after every rebuild, since it is stored on the
 file):
 
@@ -734,9 +757,34 @@ sudo setcap cap_net_bind_service=+ep "$(command -v alchemyd)"
 ```
 
 A port 80 that another program holds is tried again every 10 seconds;
-`alchemy machine ports` names the holder. A firewall redirect of port 80,
-which some local development tools install with `pf` on macOS, takes the
-traffic even while alchemyd reports it is listening.
+`alchemy machine ports` names the holder.
+
+Opening a port doesn't prove its traffic arrives: a firewall redirect,
+which some local development tools install with `pf` on macOS, or a
+program on `127.0.0.1:80` that shadows alchemyd's `0.0.0.0:80` takes it
+while the bind succeeds. So before any address is `ready`, alchemyd sends
+each proxy port, 80 and every app port, a `GET` carrying
+`X-Alchemy-Probe` with a random challenge, on loopback and on the LAN
+address. The proxy answers it itself, before routing, with `204` and a
+second random value only alchemyd knows, and never forwards it. Any other
+answer, or none, makes the port `unavailable` ("Another program on this
+computer takes port 80. Your apps still work at their IP:port address."),
+and its addresses drop below the ones that work. Every port is checked
+again every 10 seconds, with new values each time; between checks, a
+request carrying the header gets the proxy's 404. The check is
+`bin/alchemyd/src/proxy/probe.rs`.
+
+**Troubleshooting a `pf` redirect** (macOS tools such as Yerd that send
+port 80 to their own server): alchemyd binds port 80 without error, but
+the probe gets the other server's answer. `/api/network` reports
+`proxy.host` `unavailable` with "Another program on this computer takes
+port 80", the machine page warns "Addresses on port 80 don't work",
+`http://<app>.local` and `http://<app>.localhost` are `unavailable`, and
+Open uses `http://<app>.local:<port>`, which phones can still reach. The
+`_http._tcp` service that `dns-sd` publishes carries the app's port for
+the same reason. `sudo pfctl -s nat` lists the redirect (often under an
+`rdr-anchor`). Stop the tool, or remove its rule, and port 80 is verified
+on the next 10 second check, with no restart.
 
 The proxy answers 404 for a `Host` or port with no app, 503 when the app
 isn't running, and 502 when it can't connect, each with a short page that
@@ -755,10 +803,88 @@ NAME` lists them all with why one doesn't answer. In the API they are
 `proxy` in `GET /api/network` reports the port 80 listener and each app
 port. The route planning is in `alchemy_core::route`, the proxy in
 `bin/alchemyd/src/proxy.rs`, and the wiring in
-`bin/alchemyd/src/routing.rs`.
+`bin/alchemyd/src/routing.rs`. The web UI says where each ready address
+works: "On this computer only" for `.localhost` and loopback, otherwise
+"From any device on your network".
 
 ```sh
 curl --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/network | jq .proxy
+```
+
+#### Local names (mDNS)
+
+alchemyd announces `<label>.local` for every routed app, as an IPv4 `A`
+record pointing at the computer's preferred LAN address (the one on the
+default route's interface), on that interface only: never on Docker
+bridges or VPNs. Stopped apps keep their names, and each label is
+announced once, since the route table already dropped duplicates. The LAN
+address is read on the 10 second routing tick; when it changes, every
+name is announced again with the new address (`LAN address changed` in
+the log). Nothing needs root: port 5353 is shared with the system's
+responder.
+
+There are three backends, picked once at start (`backend` in the report):
+
+| Backend    | Where                           | How                                                                                       |
+| ---------- | ------------------------------- | ----------------------------------------------------------------------------------------- |
+| `dns_sd`   | macOS                           | One `dns-sd -i <if> -P <label> _http._tcp local <port> <label>.local <ip>` child per name |
+| `avahi`    | Linux with avahi-daemon running | One entry group per name over D-Bus (`org.freedesktop.Avahi` on the system bus); `A` only |
+| `built_in` | Linux without avahi on the bus  | The `mdns-sd` crate, in process                                                           |
+
+Neither `dns-sd` nor `mdns-sd` can publish an `A` record alone, so those
+two also publish one `_http._tcp` service per name, on port 80 once it is
+verified, else the app's own port. The pure planning is
+`alchemy_core::mdns` and `bin/alchemyd/src/mdns/plan.rs`; the backends and
+the task that drives them are in `bin/alchemyd/src/mdns/`.
+
+A `.local` address is `pending` ("Alchemy is announcing immich.local on
+your network.") until the responder confirms the name. If another device
+already answers for it, Alchemy never renames it: the app gets a `route`
+problem, "Another device on your network uses immich.local. Set a hostname
+in x-alchemy.", its `.local` addresses are `unavailable`, and `IP:port`
+keeps working. A name in conflict stays that way until its address or
+port changes or it is withdrawn, for example by turning local names off
+and on. `dns-sd` also reports conflicts that start later; avahi and the
+built-in responder notice them only while announcing.
+
+The `network.mdns` setting, on by default, turns this off for the whole
+computer: on the machine page (**Local names**, **Announce apps on your
+network**), with `alchemy settings set mdns on|off` (shown by `alchemy
+settings show`), or with `PUT /api/settings/network` and
+`{"mdns": false}`, a partial update that leaves fields it doesn't name
+alone. Off withdraws every name at once, drops the `.local` addresses,
+and makes `.local` hosts the proxy's 404. `x-alchemy: { mdns: false }`
+does the same for one app.
+
+`mdns` in `GET /api/network` reports `state` (`off`, `starting`,
+`announcing`, `unavailable`), `backend`, and, when unavailable, a
+`message` and a `fix`. `alchemy status` prints it as `Local names (mDNS):
+announced through avahi` (or a warning), and the machine page shows the
+same. It is `unavailable` when the responder can't start (on Linux, the fix
+is to install avahi-daemon), when the computer has no LAN address, when
+announcing keeps failing, and on macOS when Local Network access is
+denied: alchemyd as a per-user launchd agent may be asked for it, and the
+fix says to turn on Alchemy (or alchemyd) in System Settings › Privacy &
+Security › Local Network.
+
+On shutdown alchemyd withdraws every name, waiting at most 5 seconds.
+avahi and the built-in responder send goodbyes, so other devices drop the
+name at once. mDNSResponder does not send one for the `A` record, so with
+`dns-sd` a Mac or phone may keep a withdrawn name for up to its 240 second
+TTL. A changed address replaces the old one at once on every backend.
+
+**From a phone:** it must be on the same network as the computer, not a
+guest or isolated Wi-Fi network, which blocks multicast. If it can't open
+the name, turn off a VPN, and on iOS iCloud Private Relay and Limit IP
+Address Tracking for that network. iOS resolves `.local` in Safari;
+Android does from version 12.
+Without the port 80 capability on Linux, phones get
+`http://<app>.local:<port>` until M8.
+
+```sh
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/network | jq .mdns
+avahi-resolve -4 -n immich.local      # Linux with avahi
+dns-sd -G v4 immich.local             # macOS
 ```
 
 ### Web UI in debug vs release
@@ -807,6 +933,26 @@ once the image is present. A guard runs `docker compose down` in both
 folders even when an assertion fails, and the temporary directory is
 removed with it.
 
+### Tests that publish on the LAN
+
+The real [mDNS](#local-names-mdns) backends are tested in
+`bin/alchemyd/tests/mdns.rs`, ignored because they announce
+`alchemy-test-<pid>-<n>.local` on the first LAN address. Each announces a
+name, resolves it, withdraws it, and loses a name a rival already holds.
+
+```sh
+cargo test --workspace --test mdns -- --ignored --test-threads=1
+```
+
+On macOS this runs the `dns-sd` pair, which also resolve with
+`dscacheutil` and `dns-sd -G v4`, and needs nothing installed. On Linux it
+runs the avahi pair, which needs `avahi-daemon` and `avahi-utils` with
+avahi running, and the built-in pair, which runs with or without it; add
+`builtin` to run just those, with avahi stopped, as `system()` would pick
+them. The Linux rival is a second `mdns-sd` responder on another address
+in the LAN's subnet, since avahi doesn't count its own clients as a
+conflict. CI runs both pairs on Linux and the `dns-sd` pair on macOS.
+
 ## 5. Release smoke test
 
 ```sh
@@ -841,8 +987,10 @@ checks:
   the daemon holds port 80, an unknown `Host` there (even the API's own,
   with the token) gets the proxy's 404 and never the API. It asks on the
   LAN address, since a program on `127.0.0.1:80` would answer first, and
-  skips the `Host` check when something else answers port 80. It needs
-  `jq`;
+  skips the `Host` check when something else answers port 80. Local names
+  are on, the app also gets `http://smokeweb.local:<port>/` when the
+  machine has a LAN address, and `Host: smokeweb.local` on port 80
+  reaches its route. It needs `jq`;
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
 - `alchemy-helper` refuses to run without root;
@@ -930,9 +1078,11 @@ with `alchemy app up`, and checks that:
   `alchemy` network's gateway, so through the container's address on it.
   `Host` is kept, `X-Forwarded-For` is `127.0.0.1` rather than the
   client's, and the `alchemy_session_*` cookie is gone;
-- on port 80, `Host: webaddr.localhost` reaches the app the same way, and
-  `nope.localhost`, `localhost`, and the API's own host get the proxy's
-  404, never the API;
+- the app also has `http://webaddr.local:<port>/`, and on port 80 both
+  `Host: webaddr.localhost` and `Host: webaddr.local` reach the app the
+  same way, while `nope.localhost`, `localhost`, and the API's own host
+  get the proxy's 404, never the API. Resolving `.local` is the
+  [mDNS test](#mdns-test)'s job;
 - once the app is stopped, its port answers 503.
 
 When port 80 is refused, it checks the warning, the `setcap` fix, and the
@@ -956,6 +1106,52 @@ It can run in the same privileged container as the home-network test, but
 inside Docker Desktop's VM the engine reports a `linuxkit` kernel, so
 alchemyd takes it for Docker Desktop (`published_only`) and the test stops
 at the first check. Use a Linux machine or VM.
+
+### mDNS test
+
+```sh
+MDNS_CONFIRM=1 scripts/mdns.sh
+```
+
+This proves [local names](#local-names-mdns) end to end, on Linux. It
+writes an app, `mdnsapp`, whose busybox httpd serves a random value on a
+loopback port, starts avahi-daemon if it isn't running, starts `alchemyd`
+with a fresh state directory and app home, brings the app up, and checks
+that:
+
+- `/api/network` reports `mdns` `announcing` through `avahi`, `alchemy
+  status` says so, the log says the name is on the network, and the app's
+  best address is a ready `http://mdnsapp.local/` (or
+  `http://mdnsapp.local:<port>/` without port 80);
+- `avahi-resolve` and `getent` (nss-mdns) give the LAN address, and `curl`
+  by name gets the random value;
+- once another responder answers for `mdnsrival.local` with another
+  address, a second app, `mdnsrival`, gets the "Another device on your
+  network uses mdnsrival.local" problem and its `.local` addresses are
+  `unavailable`;
+- `alchemy settings set mdns off` withdraws the name, so it no longer
+  resolves, and `on` brings it back; stopping alchemyd withdraws it too.
+
+Then it stops avahi, restarts `alchemyd`, and checks the same on the
+built-in responder, resolving with a plain mDNS query and fetching the
+page at the address it gives. The rival and that query are a few lines of
+Python in the script: an `avahi-publish` rival isn't a conflict to avahi,
+and `python3-zeroconf` doesn't answer the `ANY` questions responders probe
+with. Both share the host's port 5353, so the rival multicasts every
+answer; a rival in another network namespace would need a bridge to the
+LAN interface, which a CI runner can't spare.
+
+It needs `avahi-daemon`, `avahi-utils`, `libnss-mdns`, `python3`, `jq`,
+`curl`, a user that can reach Docker, and `sudo` (unless run as root) to
+start and stop avahi and for `MDNS_SETCAP=1`, which grants port 80 as the
+web-address test does. It leaves avahi running or stopped as it found it,
+and refuses to run unless `CI=true` or `MDNS_CONFIRM=1`. Set
+`MDNS_SKIP_BUILD=1` to reuse `target/release`. CI runs it on Linux last in
+the smoke job, after installing the packages. The app publishes its port,
+so the test also works where the engine is `published_only`, such as a
+privileged container on Docker Desktop with its own `dockerd`, D-Bus
+(`dbus-daemon --system`), and a current Docker Compose plugin (Debian's
+2.26 lacks `--progress json`).
 
 ## 6. Layout
 

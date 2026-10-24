@@ -20,10 +20,14 @@
 //! header rules are in [`headers`]; connecting goes through an
 //! [`UpstreamConnector`], which is never asked for the daemon's own
 //! addresses or the proxy's ([`is_own_address`]).
+//!
+//! Before routing, every listener answers a [`probe`] request itself, so
+//! the routing task can check the port's traffic really reaches it.
 
 mod connect;
 mod forward;
 pub mod headers;
+pub mod probe;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -44,6 +48,10 @@ pub use connect::{
     FakeConnector, SharedConnector, TcpConnector, UpstreamConnector, is_own_address,
 };
 pub use forward::{CONNECT_TIMEOUT, ProxyBody};
+pub use probe::{
+    FakeAnswer, FakeProbe, ListenerProbe, PROBE_HEADER, ProbeMarker, ProbeReply, ProbeResult,
+    SharedProbe, TcpProbe,
+};
 
 use forward::Shared;
 
@@ -180,7 +188,9 @@ pub fn wanted_listeners(table: &RouteTable, host: bool) -> BTreeSet<Listen> {
 }
 
 /// Serve the proxy until `shutdown` turns true, following the route
-/// table in `routes` and publishing listener state to `status`.
+/// table in `routes` and publishing listener state to `status`. A
+/// [`probe`] carrying the challenge of the marker in `probe` is answered
+/// with its reply.
 ///
 /// With an empty table nothing is bound. If the sender of `routes` is
 /// dropped the last table keeps serving. On shutdown every listener
@@ -192,6 +202,7 @@ pub async fn run(
     connector: SharedConnector,
     mut routes: watch::Receiver<RouteTable>,
     status: watch::Sender<ProxyStatus>,
+    probe: watch::Receiver<Option<ProbeMarker>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let (drain, mut drained) = mpsc::channel::<()>(1);
@@ -201,6 +212,7 @@ pub async fn run(
         connector,
         own: config.own.clone(),
         shutdown: shutdown.clone(),
+        probe,
     });
     let mut listeners = Listeners::default();
     loop {
@@ -425,6 +437,7 @@ mod tests {
                 service: Some("web".into()),
                 port: Some(80),
                 hostname: hostname.map(Into::into),
+                ..XAlchemy::default()
             })),
             services: vec![ServiceRouteInput {
                 name: "web".into(),

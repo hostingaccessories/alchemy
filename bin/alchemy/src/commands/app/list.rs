@@ -31,10 +31,10 @@ pub(crate) async fn run<D: Daemon, W: Write>(
     Ok(())
 }
 
-/// What `alchemy app list` prints: a table of apps, each with its best
-/// web address, then the Compose
-/// projects Alchemy doesn't manage, then anything worth a look, such as
-/// folders that were skipped. With `json`, the [`AppList`] as one line.
+/// What `alchemy app list` prints: a table of apps, each with its best web
+/// address (alchemyd lists them best first), then the Compose projects
+/// Alchemy doesn't manage, then anything worth a look, such as folders that
+/// were skipped. With `json`, the [`AppList`] as one line.
 pub(crate) fn list_lines(apps: &AppList, json: bool) -> Vec<String> {
     if json {
         return vec![serde_json::json!(apps).to_string()];
@@ -293,6 +293,35 @@ pub(crate) mod tests {
                 "wiki: Compose can't read compose.yaml: yaml: line 4",
                 "/opt/stacks/My App: \"My App\" can't be an app name.",
                 "/gone: This folder doesn't exist.",
+            ]
+        );
+    }
+
+    #[test]
+    fn shows_the_best_address_alchemyd_ranked_first() {
+        let address = |url: &str, state| AppAddress {
+            kind: AddressKind::Host,
+            url: url.into(),
+            state,
+            service: "web".into(),
+            port: 80,
+            message: None,
+        };
+        let mut app = blog();
+        app.addresses = vec![
+            address("http://blog.local/", AddressState::Ready),
+            address("http://blog.local:8100/", AddressState::Ready),
+            address("http://blog.localhost/", AddressState::Ready),
+        ];
+        let list = AppList {
+            apps: vec![app],
+            ..AppList::default()
+        };
+        assert_eq!(
+            list_lines(&list, false),
+            [
+                "NAME  STATUS          SERVICES  ADDRESS             FOLDER",
+                "blog  partly running  1/2       http://blog.local/  /srv/apps/blog",
             ]
         );
     }

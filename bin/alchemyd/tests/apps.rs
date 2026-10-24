@@ -261,9 +261,22 @@ async fn settings_survive_a_restart() {
         let daemon = tokio::spawn(alchemyd::run_with(config(), deps, async {
             let _ = stop_rx.await;
         }));
+        let (_, got) = call(&socket, "GET", "/api/settings/network", "").await;
+        assert_eq!(
+            got,
+            serde_json::json!({"mdns": round == 0}),
+            "round {round}"
+        );
         if let Some(body) = body {
             let (status, got) = call(&socket, "PUT", "/api/settings/apps", body).await;
             assert_eq!(status, 200, "{got}");
+            let (status, got) =
+                call(&socket, "PUT", "/api/settings/network", r#"{"mdns":false}"#).await;
+            assert_eq!(
+                (status, got),
+                (200, serde_json::json!({"mdns": false})),
+                "round {round}"
+            );
         }
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         loop {

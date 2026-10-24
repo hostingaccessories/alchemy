@@ -1,12 +1,15 @@
 //! `alchemy status`: whether alchemyd is reachable, which version it runs,
-//! whether Docker is ready, whether Docker's networks overlap the home
-//! network, and whether the web address proxy could open its ports.
+//! whether Docker is ready, whether apps' `.local` names are announced,
+//! whether Docker's networks overlap the home network, and whether the web
+//! address proxy's ports work.
 
 use std::io::Write;
 use std::path::Path;
 
 use alchemy_api::ApiEvent;
-use alchemy_api::network::{ListenerState, NetworkReport, NetworkWarning, ProxyReport};
+use alchemy_api::network::{
+    ListenerState, MdnsBackend, MdnsReport, MdnsState, NetworkReport, NetworkWarning, ProxyReport,
+};
 use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
 
 use crate::context::Context;
@@ -76,8 +79,9 @@ async fn watch<D: Daemon, W: Write>(
     }
 }
 
-/// What `alchemy status` prints: the daemon and engine lines, then any
-/// network and proxy warnings, or one JSON object.
+/// What `alchemy status` prints: the daemon, engine, and local names
+/// lines, then any network, proxy, and local names warnings, or one JSON
+/// object.
 pub(crate) fn status_lines(
     daemon: &DaemonInfo,
     socket: &Path,
@@ -90,8 +94,45 @@ pub(crate) fn status_lines(
     }
     let mut lines = vec![daemon_line(daemon, socket), engine_line(engine)];
     if let Some(network) = network {
+        lines.extend(mdns_line(&network.mdns));
         lines.extend(warning_lines(&network.warnings));
         lines.extend(proxy_lines(&network.proxy));
+        lines.extend(mdns_warning_lines(&network.mdns));
+    }
+    lines
+}
+
+/// Whether apps' `.local` names are announced, and through what, or `None`
+/// when they can't be, which [`mdns_warning_lines`] reports instead.
+pub(crate) fn mdns_line(mdns: &MdnsReport) -> Option<String> {
+    let state = match mdns.state {
+        MdnsState::Off => "off".to_owned(),
+        MdnsState::Starting => "starting…".to_owned(),
+        MdnsState::Announcing => match mdns.backend {
+            Some(MdnsBackend::Avahi) => "announced through avahi".to_owned(),
+            Some(MdnsBackend::DnsSd) => "announced through dns-sd (mDNSResponder)".to_owned(),
+            Some(MdnsBackend::BuiltIn) => "announced by the built-in responder".to_owned(),
+            _ => "announced".to_owned(),
+        },
+        MdnsState::Unavailable => return None,
+        _ => "in a state this alchemy doesn't know; upgrade alchemy".to_owned(),
+    };
+    Some(format!("Local names (mDNS): {state}"))
+}
+
+/// A warning, with its fix, when apps' `.local` names can't be announced.
+pub(crate) fn mdns_warning_lines(mdns: &MdnsReport) -> Vec<String> {
+    if mdns.state != MdnsState::Unavailable {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "Warning: {}",
+        mdns.message.as_deref().unwrap_or(
+            "Alchemy can't announce apps' .local names. Your apps still work at their IP:port address."
+        )
+    )];
+    if let Some(fix) = mdns.fix.as_deref() {
+        lines.push(format!("  Fix: {fix}"));
     }
     lines
 }
@@ -104,7 +145,7 @@ pub(crate) fn proxy_lines(proxy: &ProxyReport) -> Vec<String> {
         lines.push(format!(
             "Warning: {}",
             proxy.host.message.as_deref().unwrap_or(
-                "Alchemy can't listen on port 80, so addresses like http://<app>.localhost don't work."
+                "Alchemy can't use port 80. Your apps still work at their IP:port address."
             )
         ));
         if let Some(fix) = proxy.host.fix.as_deref() {
@@ -492,7 +533,10 @@ mod tests {
             .ok(Method::GET, NETWORK, &NetworkReport::default());
         let run = run_with(fake, false, false).await;
         run.result.unwrap();
-        assert_eq!(run.out, format!("{DAEMON_LINE}\n{READY_LINE}\n"));
+        assert_eq!(
+            run.out,
+            format!("{DAEMON_LINE}\n{READY_LINE}\nLocal names (mDNS): off\n")
+        );
         assert_eq!(
             run.requests,
             ["GET /api/version", "GET /api/engine", "GET /api/network"]
@@ -508,8 +552,127 @@ mod tests {
         let run = run_with(fake, false, false).await;
         run.result.unwrap();
         let lines: Vec<&str> = run.out.lines().collect();
-        assert_eq!(lines[..2], [DAEMON_LINE, READY_LINE]);
-        assert_eq!(lines[2..], warning_lines(&overlapping().warnings));
+        assert_eq!(
+            lines[..3],
+            [DAEMON_LINE, READY_LINE, "Local names (mDNS): off"]
+        );
+        assert_eq!(lines[3..], warning_lines(&overlapping().warnings));
+    }
+
+    fn mdns(state: MdnsState, backend: Option<MdnsBackend>) -> MdnsReport {
+        MdnsReport {
+            state,
+            backend,
+            message: None,
+            fix: None,
+        }
+    }
+
+    #[test]
+    fn mdns_line_per_state_and_backend() {
+        use MdnsBackend::{Avahi, BuiltIn, DnsSd, Other};
+        use MdnsState::{Announcing, Off, Starting, Unavailable};
+        let cases = [
+            (mdns(Off, None), Some("Local names (mDNS): off")),
+            (mdns(Starting, None), Some("Local names (mDNS): starting…")),
+            (
+                mdns(Announcing, Some(Avahi)),
+                Some("Local names (mDNS): announced through avahi"),
+            ),
+            (
+                mdns(Announcing, Some(DnsSd)),
+                Some("Local names (mDNS): announced through dns-sd (mDNSResponder)"),
+            ),
+            (
+                mdns(Announcing, Some(BuiltIn)),
+                Some("Local names (mDNS): announced by the built-in responder"),
+            ),
+            (
+                mdns(Announcing, Some(Other)),
+                Some("Local names (mDNS): announced"),
+            ),
+            (
+                mdns(Announcing, None),
+                Some("Local names (mDNS): announced"),
+            ),
+            (
+                mdns(MdnsState::Other, None),
+                Some("Local names (mDNS): in a state this alchemy doesn't know; upgrade alchemy"),
+            ),
+            (mdns(Unavailable, Some(DnsSd)), None),
+        ];
+        for (report, want) in cases {
+            assert_eq!(mdns_line(&report).as_deref(), want, "{report:?}");
+        }
+    }
+
+    #[test]
+    fn mdns_warnings_say_what_still_works_and_the_fix() {
+        let denied = MdnsReport {
+            message: Some(
+                "macOS doesn't let Alchemy use your local network. Your apps still work at their IP:port address.".into(),
+            ),
+            fix: Some("Allow alchemyd in System Settings > Privacy & Security > Local Network.".into()),
+            ..mdns(MdnsState::Unavailable, Some(MdnsBackend::DnsSd))
+        };
+        assert_eq!(
+            mdns_warning_lines(&denied),
+            [
+                "Warning: macOS doesn't let Alchemy use your local network. Your apps still work at their IP:port address.",
+                "  Fix: Allow alchemyd in System Settings > Privacy & Security > Local Network.",
+            ]
+        );
+        assert_eq!(
+            mdns_warning_lines(&mdns(MdnsState::Unavailable, None)),
+            [
+                "Warning: Alchemy can't announce apps' .local names. Your apps still work at their IP:port address."
+            ]
+        );
+        assert_eq!(
+            mdns_warning_lines(&mdns(MdnsState::Announcing, None)),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn status_prints_local_names_and_port_80_warnings_last() {
+        use alchemy_api::network::ProxyListener;
+        let taken = "Another program on this computer takes port 80. Your apps still work at their IP:port address.";
+        let report = NetworkReport {
+            engine_ready: true,
+            proxy: ProxyReport {
+                reachability: None,
+                host: ProxyListener {
+                    port: 80,
+                    app: None,
+                    state: ListenerState::Unavailable,
+                    message: Some(taken.into()),
+                    fix: Some("Stop the program or firewall rule that takes port 80.".into()),
+                },
+                ports: vec![],
+            },
+            mdns: MdnsReport {
+                message: Some("No announcer works on this computer.".into()),
+                ..mdns(MdnsState::Unavailable, None)
+            },
+            ..NetworkReport::default()
+        };
+        let fake = FakeDaemon::new()
+            .version("1.2.3", 1)
+            .ok(Method::GET, ENGINE, &ready())
+            .ok(Method::GET, NETWORK, &report);
+        let run = run_with(fake, false, false).await;
+        run.result.unwrap();
+        assert_eq!(
+            run.out.lines().collect::<Vec<_>>(),
+            [
+                DAEMON_LINE,
+                READY_LINE,
+                &format!("Warning: {taken}"),
+                "  Fix: Stop the program or firewall rule that takes port 80.",
+                "Warning: No announcer works on this computer.",
+            ]
+        );
     }
 
     #[test]
