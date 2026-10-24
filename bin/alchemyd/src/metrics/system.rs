@@ -101,13 +101,16 @@ impl MetricsSource for SystemMetrics {
     }
 }
 
-/// The `sysinfo` state kept between samples. On macOS the CPU figure is
-/// a percentage since the previous refresh, so the first reading after
-/// [`HostReader::new`] is the first meaningful one.
+/// The `sysinfo` state kept between samples.
 struct HostReader {
     system: System,
     networks: Networks,
     disks: Disks,
+    /// Whether a sample has refreshed the CPU figure since [`Self::new`].
+    /// On macOS it is a percentage since the previous refresh, which means
+    /// nothing until there was one a sampling interval ago.
+    #[cfg(target_os = "macos")]
+    cpu_primed: bool,
 }
 
 impl HostReader {
@@ -118,6 +121,8 @@ impl HostReader {
             system,
             networks: Networks::new_with_refreshed_list(),
             disks: Disks::new_with_refreshed_list(),
+            #[cfg(target_os = "macos")]
+            cpu_primed: false,
         }
     }
 
@@ -127,6 +132,7 @@ impl HostReader {
         self.networks.refresh(true);
         self.disks.refresh(true);
 
+        let cpu = self.cpu();
         let load = System::load_average();
         let disk = disk_for(
             self.disks.list().iter().map(sysinfo::Disk::mount_point),
@@ -134,7 +140,7 @@ impl HostReader {
         )
         .and_then(|index| self.disks.list().get(index));
         HostSample {
-            cpu: self.cpu(),
+            cpu,
             cpus: u32::try_from(self.system.cpus().len()).unwrap_or(u32::MAX),
             load: load_average(load.one, load.five, load.fifteen),
             memory_used: self.system.used_memory(),
@@ -178,7 +184,7 @@ impl HostReader {
     /// in one place with everything else.
     #[cfg(target_os = "linux")]
     #[expect(clippy::unused_self, reason = "the macOS reader needs self")]
-    fn cpu(&self) -> Option<CpuReading> {
+    fn cpu(&mut self) -> Option<CpuReading> {
         let text = std::fs::read_to_string("/proc/stat").ok()?;
         super::host::parse_proc_stat(&text)
     }
@@ -187,14 +193,9 @@ impl HostReader {
     /// ticks, and reading them through Mach needs `unsafe`, which this
     /// workspace forbids.
     #[cfg(target_os = "macos")]
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "the Linux reader can fail to read /proc/stat"
-    )]
-    fn cpu(&self) -> Option<CpuReading> {
-        Some(CpuReading::Percent(f64::from(
-            self.system.global_cpu_usage(),
-        )))
+    fn cpu(&mut self) -> Option<CpuReading> {
+        let primed = std::mem::replace(&mut self.cpu_primed, true);
+        primed.then(|| CpuReading::Percent(f64::from(self.system.global_cpu_usage())))
     }
 }
 
@@ -237,6 +238,9 @@ mod tests {
         assert!(first.net.iter().all(|(name, _)| counts_toward_total(name)));
         let second = source.host().await.unwrap();
         assert!(second.cpu.is_some());
+        if cfg!(target_os = "macos") {
+            assert_eq!(first.cpu, None, "a percentage needs a previous refresh");
+        }
     }
 
     #[tokio::test]
