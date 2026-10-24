@@ -20,6 +20,14 @@
 //! A proxy listener another program held is tried again every
 //! [`ProxyDeps::interval`].
 //!
+//! A listener that opens isn't trusted yet: before its addresses are
+//! ready, every listening port is sent a [`probe`](crate::proxy::probe)
+//! through a [`ListenerProbe`] on loopback and the LAN address, and only
+//! one whose probes all reach the proxy is ready. Where another program
+//! answers instead, such as a `pf` redirect of port 80, its addresses are
+//! `unavailable` and the next one is used. Every listener is checked
+//! again each [`ProxyDeps::interval`].
+//!
 //! Its decisions are the pure functions in [`plan`] and
 //! [`alchemy_core::route`].
 
@@ -43,13 +51,14 @@ use tokio::time::MissedTickBehavior;
 
 pub use plan::{AppRouting, Routing};
 
-use self::plan::{Addressing, RoutingInputs};
+use self::plan::{Addressing, ListenerCheck, RoutingInputs};
 use crate::State;
 use crate::network::{SharedNetwork, preferred_lan_address};
 use crate::ports::PortRegistry;
+use crate::proxy::probe::classify;
 use crate::proxy::{
-    FakeConnector, HOST_PORT, ListenerStatus, ProxyConfig, ProxyStatus, SharedConnector,
-    TcpConnector,
+    FakeConnector, HOST_PORT, Listen, ListenerStatus, ProbeMarker, ProxyConfig, ProxyStatus,
+    SharedConnector, SharedProbe, TcpConnector, TcpProbe,
 };
 use crate::subnets::EngineNetworks;
 
@@ -71,6 +80,8 @@ pub fn owner(app: &str) -> String {
 pub struct ProxyDeps {
     /// How the proxy connects to an app.
     pub connector: SharedConnector,
+    /// How the proxy's listeners are checked.
+    pub probe: SharedProbe,
     /// The Host listener's address, or `None` to route by port only.
     pub host_listen: Option<SocketAddr>,
     /// The address app ports listen on.
@@ -83,10 +94,12 @@ pub struct ProxyDeps {
 
 impl ProxyDeps {
     /// This machine's proxy: Host routing on port 80 and app ports on
-    /// every IPv4 address, from [`DEFAULT_RANGE`], connecting over TCP.
+    /// every IPv4 address, from [`DEFAULT_RANGE`], connecting and
+    /// checking listeners over TCP.
     pub fn system() -> Self {
         Self {
             connector: Arc::new(TcpConnector),
+            probe: Arc::new(TcpProbe),
             host_listen: Some(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                 HOST_PORT,
@@ -98,10 +111,12 @@ impl ProxyDeps {
     }
 
     /// A proxy for tests: app ports on loopback only, no Host listener,
-    /// and a [`FakeConnector`] that reaches nothing until told to.
+    /// and a [`FakeConnector`] that reaches nothing until told to. Its
+    /// listeners are checked for real, over loopback.
     pub fn loopback() -> Self {
         Self {
             connector: Arc::new(FakeConnector::new()),
+            probe: Arc::new(TcpProbe),
             host_listen: None,
             app_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             range: default_range(),
@@ -113,6 +128,13 @@ impl ProxyDeps {
     #[must_use]
     pub fn with_connector(mut self, connector: SharedConnector) -> Self {
         self.connector = connector;
+        self
+    }
+
+    /// Check listeners through `probe` instead.
+    #[must_use]
+    pub fn with_probe(mut self, probe: SharedProbe) -> Self {
+        self.probe = probe;
         self
     }
 
@@ -159,6 +181,9 @@ pub struct ProxyHandle {
     pub routes: watch::Sender<RouteTable>,
     /// What the proxy is listening on.
     pub status: watch::Receiver<ProxyStatus>,
+    /// The marker the proxy answers probes with, set only while a round
+    /// of checks is in flight.
+    pub probe: watch::Sender<Option<ProbeMarker>>,
 }
 
 /// Keep the proxy's route table and [`State::routing`] current until
@@ -195,6 +220,9 @@ pub async fn run(
         reserved: BTreeMap::new(),
         unreserved: BTreeMap::new(),
         attached: BTreeMap::new(),
+        lan: None,
+        checks: BTreeMap::new(),
+        recheck: false,
     };
     let mut apps = router.state.watch_apps();
     let mut configs = router.state.watch_app_configs();
@@ -254,6 +282,13 @@ struct Router {
     unreserved: BTreeMap<String, (String, Instant)>,
     /// When each container was last attached, by name.
     attached: BTreeMap<String, Instant>,
+    /// The LAN address, when app ports listen on every address.
+    lan: Option<Ipv4Addr>,
+    /// Each listening listener's last check, with the addresses it
+    /// probed.
+    checks: BTreeMap<Listen, (Vec<SocketAddr>, ListenerCheck)>,
+    /// Whether every listener is due a check, not just new ones.
+    recheck: bool,
 }
 
 impl Router {
@@ -288,7 +323,62 @@ impl Router {
         );
         self.attach(plan::to_attach(&plan.table, &inputs, reach))
             .await;
-        self.publish(&plan, &inputs, reach);
+        let status = self.check_listeners().await;
+        self.publish(&plan, &inputs, reach, &status);
+    }
+
+    /// Probe each listening listener that is new, moved, or due again,
+    /// and return the listener state the checks are for. The proxy
+    /// answers the probes only while this round's marker is set.
+    async fn check_listeners(&mut self) -> ProxyStatus {
+        let status = self.proxy.status.borrow().clone();
+        let wanted = plan::listeners_to_probe(&status, self.lan);
+        self.checks
+            .retain(|listen, (targets, _)| wanted.get(listen) == Some(targets));
+        let recheck = std::mem::take(&mut self.recheck);
+        let due: Vec<(Listen, Vec<SocketAddr>)> = wanted
+            .into_iter()
+            .filter(|(listen, _)| recheck || !self.checks.contains_key(listen))
+            .collect();
+        if due.is_empty() {
+            return status;
+        }
+        let marker = match ProbeMarker::generate() {
+            Ok(marker) => marker,
+            Err(error) => {
+                tracing::warn!(%error, "cannot make a marker to check the proxy's listeners");
+                return status;
+            }
+        };
+        self.proxy.probe.send_replace(Some(marker.clone()));
+        let probe = &self.deps.probe;
+        let replies = futures_util::future::join_all(due.iter().flat_map(|(_, targets)| {
+            targets
+                .iter()
+                .map(|&addr| probe.probe(addr, marker.clone()))
+        }))
+        .await;
+        self.proxy.probe.send_replace(None);
+
+        let mut replies = replies.into_iter();
+        for (listen, targets) in due {
+            let results: Vec<_> = targets
+                .iter()
+                .zip(replies.by_ref())
+                .map(|(&addr, reply)| (addr, classify(&reply, &marker)))
+                .collect();
+            let check = plan::check_listener(&results);
+            let before = self.checks.get(&listen).map(|(_, c)| c);
+            if before != Some(&check) {
+                if check == ListenerCheck::Ours {
+                    tracing::debug!(?listen, "proxy listener checked");
+                } else {
+                    tracing::warn!(?listen, ?check, "proxy listener doesn't reach the proxy");
+                }
+            }
+            self.checks.insert(listen, (targets, check));
+        }
+        status
     }
 
     /// Reserve a port for each of `apps`, skipping those that failed
@@ -362,7 +452,13 @@ impl Router {
         }
     }
 
-    fn publish(&self, plan: &RoutePlan, inputs: &[AppRouteInput], reach: Reachability) {
+    fn publish(
+        &self,
+        plan: &RoutePlan,
+        inputs: &[AppRouteInput],
+        reach: Reachability,
+        status: &ProxyStatus,
+    ) {
         let table = plan.table.clone();
         self.proxy.routes.send_if_modified(|current| {
             if *current == table {
@@ -372,7 +468,11 @@ impl Router {
                 true
             }
         });
-        let status = self.proxy.status.borrow().clone();
+        let checks: BTreeMap<Listen, ListenerCheck> = self
+            .checks
+            .iter()
+            .map(|(listen, (_, check))| (*listen, check.clone()))
+            .collect();
         let unreserved: BTreeMap<String, String> = self
             .unreserved
             .iter()
@@ -384,16 +484,18 @@ impl Router {
             reachability: reach,
             unreserved: &unreserved,
             range: self.deps.range,
-            status: &status,
+            status,
+            checks: &checks,
             addressing: self.addressing,
         }));
     }
 
-    /// Read the LAN address again, and nudge the proxy to retry any
-    /// listener another program held. One refused for lack of permission
-    /// stays refused until the daemon restarts, so it waits for the next
-    /// route change.
+    /// Read the LAN address again, mark every listener due a check, and
+    /// nudge the proxy to retry any listener another program held. One
+    /// refused for lack of permission stays refused until the daemon
+    /// restarts, so it waits for the next route change.
     async fn on_tick(&mut self) {
+        self.recheck = true;
         if self.deps.app_ip.is_unspecified() {
             let (addresses, routes) = tokio::join!(self.host.lan_addresses(), self.host.routes());
             let lan = match (addresses, routes) {
@@ -403,6 +505,7 @@ impl Router {
                     None
                 }
             };
+            self.lan = lan;
             self.addressing.app_host = IpAddr::V4(lan.unwrap_or(Ipv4Addr::LOCALHOST));
         }
         let retry = {

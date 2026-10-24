@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::connect::{SharedConnector, is_own_address};
 use super::headers::{self, Forwarded};
+use super::probe::{self, PROBE_HEADER, ProbeMarker};
 use super::{Listen, ProxyStatus, stopped};
 
 /// The body of a proxied response: the app's, streamed, or one of
@@ -35,6 +36,8 @@ pub(super) struct Shared {
     pub connector: SharedConnector,
     pub own: Vec<SocketAddr>,
     pub shutdown: watch::Receiver<bool>,
+    /// The marker of the round of listener checks in flight, if any.
+    pub probe: watch::Receiver<Option<ProbeMarker>>,
 }
 
 impl Shared {
@@ -75,6 +78,9 @@ pub(super) async fn handle(
     drain: mpsc::Sender<()>,
     mut req: Request<Incoming>,
 ) -> Result<Response<ProxyBody>, Infallible> {
+    if probe::is_probe(req.headers()) {
+        return Ok(answer_probe(&shared, &req));
+    }
     if req.method() == Method::CONNECT {
         return Ok(page(Page::NotAllowed));
     }
@@ -132,6 +138,28 @@ pub(super) async fn handle(
     }
     headers::forward_response(resp.headers_mut(), switching);
     Ok(resp.map(Either::Left))
+}
+
+/// Answer a request carrying [`PROBE_HEADER`] without routing it: `204`
+/// with the reply when it is a `GET` with the current challenge, and the
+/// same 404 as an unknown address otherwise.
+fn answer_probe(shared: &Shared, req: &Request<Incoming>) -> Response<ProxyBody> {
+    let reply = shared
+        .probe
+        .borrow()
+        .as_ref()
+        .filter(|_| req.method() == Method::GET)
+        .and_then(|marker| marker.answer(req.headers()))
+        .and_then(|reply| HeaderValue::from_str(reply).ok());
+    let Some(reply) = reply else {
+        return page(Page::NotFound);
+    };
+    let mut resp = Response::new(Either::Right(Full::new(Bytes::new())));
+    *resp.status_mut() = StatusCode::NO_CONTENT;
+    let headers = resp.headers_mut();
+    headers.insert(PROBE_HEADER, reply);
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
 }
 
 /// Why a request to an app failed before it got a response.

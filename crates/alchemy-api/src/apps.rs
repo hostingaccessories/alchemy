@@ -112,12 +112,13 @@ pub enum AddressState {
     /// Requests reach the app.
     Ready,
     /// The app is running but can't be reached yet, such as while Alchemy
-    /// attaches it to its network or opens the port.
+    /// attaches it to its network, or opens or checks the port.
     Pending,
     /// The app isn't running, so the proxy answers that it's stopped.
     NotRunning,
     /// The proxy can't listen on this address's port, such as port 80
-    /// without permission.
+    /// without permission, or another program answers it, such as a
+    /// firewall redirect.
     Unavailable,
     /// A state this build does not know.
     #[serde(other)]

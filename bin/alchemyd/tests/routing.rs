@@ -2,7 +2,8 @@
 //! Compose configurations and the engine's containers, reserving each
 //! app's proxy port, attaching containers to the `alchemy` network, and
 //! serving the app through the proxy, with its addresses on
-//! `GET /api/apps` and the proxy's listeners on `GET /api/network`.
+//! `GET /api/apps` and the proxy's listeners on `GET /api/network`, with
+//! a listener another program answers made unavailable.
 
 #![allow(
     clippy::unwrap_used,
@@ -28,7 +29,7 @@ use alchemy_core::route::{EngineFacts, ExposedPort, HostOs};
 use alchemyd::apps::{AppsDeps, SystemFs};
 use alchemyd::compose::{ComposeConfig, FakeComposeConfig, FakeConfig, ServiceConfig};
 use alchemyd::engine::{DockerNetwork, EngineSource};
-use alchemyd::proxy::FakeConnector;
+use alchemyd::proxy::{FakeAnswer, FakeConnector, FakeProbe};
 use alchemyd::routing::ProxyDeps;
 use alchemyd::subnets::{FakeDaemonConfig, FakeEngineNetworks, SubnetsDeps};
 use alchemyd::{Deps, State};
@@ -490,6 +491,122 @@ async fn routes_published_ports_by_host_where_container_ips_are_out_of_reach() {
     assert_eq!(report.proxy.reachability, Some(Reachability::PublishedOnly));
     assert_eq!(report.proxy.host.state, ListenerState::Listening);
     assert_eq!(report.proxy.host.port, host_port);
+
+    daemon.stop().await;
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listener_another_program_answers_is_unavailable_and_open_uses_the_next_address() {
+    let upstream = fake_app("wiki").await;
+    let connector = FakeConnector::new();
+    connector.redirect(upstream, upstream);
+    let port = free_port();
+    let probe = FakeProbe::new(FakeAnswer::Foreign(404));
+    probe.set(port, FakeAnswer::Ours);
+
+    let dir = tempdir();
+    let apps = apps_home(
+        dir.path(),
+        vec![(
+            "wiki",
+            vec![service("app", &[], vec![tcp(upstream.port(), 3000)])],
+        )],
+    );
+    let mut wiki = running("wiki-app-1", "wiki", "app");
+    wiki.ports = vec![tcp(upstream.port(), 3000)];
+    let daemon = Daemon::start(
+        dir,
+        Engine {
+            facts: EngineFacts {
+                host_os: HostOs::MacOs,
+                flavor: Some(EngineFlavor::DockerDesktop),
+                rootless: false,
+            },
+            containers: vec![wiki],
+        },
+        apps,
+        FakeEngineNetworks::new(),
+        ProxyDeps::loopback()
+            .with_connector(Arc::new(connector))
+            .with_probe(Arc::new(probe.clone()))
+            .with_range(PortRange::single(port).unwrap())
+            .with_host_listen(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .with_interval(Duration::from_millis(50)),
+    )
+    .await;
+
+    let wiki = daemon
+        .app_where("wiki", |app| {
+            app.addresses
+                .iter()
+                .any(|a| a.kind == AddressKind::Host && a.state == AddressState::Unavailable)
+        })
+        .await;
+    assert_eq!(wiki.addresses.len(), 2, "{wiki:?}");
+    let (first, host) = (&wiki.addresses[0], &wiki.addresses[1]);
+    assert_eq!(first.kind, AddressKind::Port);
+    assert_eq!(first.url, format!("http://127.0.0.1:{port}/"));
+    assert_eq!(first.state, AddressState::Ready);
+    let host_port: u16 = host
+        .url
+        .strip_prefix("http://wiki.localhost:")
+        .and_then(|rest| rest.strip_suffix('/'))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        host.message.as_deref(),
+        Some(format!("Another program on this computer takes port {host_port}.").as_str())
+    );
+    let asked = probe.asked();
+    assert!(
+        asked.contains(&SocketAddr::from(([127, 0, 0, 1], host_port)))
+            && asked.contains(&SocketAddr::from(([127, 0, 0, 1], port))),
+        "{asked:?}"
+    );
+
+    let report: NetworkReport = get_socket(&daemon.socket, "/api/network").await;
+    assert_eq!(report.proxy.host.state, ListenerState::Unavailable);
+    assert_eq!(report.proxy.host.port, host_port);
+    assert_eq!(
+        report.proxy.host.message.as_deref(),
+        Some(
+            format!(
+                "Another program on this computer takes port {host_port}. Your apps still work at their IP:port address."
+            )
+            .as_str()
+        )
+    );
+    assert!(report.proxy.host.fix.is_some());
+    assert_eq!(report.proxy.ports[0].state, ListenerState::Listening);
+
+    probe.set_default(FakeAnswer::Ours);
+    daemon
+        .app_where("wiki", |app| {
+            app.addresses.len() == 2 && app.addresses.iter().all(|a| a.state == AddressState::Ready)
+        })
+        .await;
+    let report: NetworkReport = get_socket(&daemon.socket, "/api/network").await;
+    assert_eq!(report.proxy.host.state, ListenerState::Listening);
+    assert_eq!(report.proxy.host.message, None);
+
+    probe.set(port, FakeAnswer::Foreign(200));
+    let wiki = daemon
+        .app_where("wiki", |app| {
+            app.addresses
+                .iter()
+                .any(|a| a.kind == AddressKind::Port && a.state == AddressState::Unavailable)
+        })
+        .await;
+    assert_eq!(wiki.addresses[0].kind, AddressKind::Host);
+    assert_eq!(wiki.addresses[0].state, AddressState::Ready);
+    let report: NetworkReport = get_socket(&daemon.socket, "/api/network").await;
+    assert_eq!(report.proxy.ports[0].state, ListenerState::Unavailable);
+    assert_eq!(
+        report.proxy.ports[0].message.as_deref(),
+        Some(format!("Another program on this computer takes port {port}.").as_str())
+    );
 
     daemon.stop().await;
 }

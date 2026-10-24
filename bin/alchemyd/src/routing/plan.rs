@@ -1,10 +1,11 @@
 //! The routing task's decisions, as pure functions over the daemon's
 //! state: what to plan routes from, which apps need a proxy port, which
-//! containers to attach, and what clients are told.
+//! containers to attach, which listeners to check and what the checks
+//! mean, and what clients are told.
 
 use std::collections::BTreeMap;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -20,7 +21,7 @@ use alchemy_core::route::{
 };
 
 use crate::apps::ConfigOutcome;
-use crate::proxy::{BindError, ListenerStatus, ProxyStatus};
+use crate::proxy::{BindError, Listen, ListenerStatus, ProbeResult, ProxyStatus};
 
 /// What the routing task last decided, kept in
 /// [`State`](crate::State) for the apps task and `GET /api/network`.
@@ -154,6 +155,106 @@ pub fn due(
         .collect()
 }
 
+/// The addresses to probe a listener bound to `bound` on: loopback and
+/// the LAN address `lan` when it listens on every address, since a
+/// redirect or a shadowing program may take either, else just `bound`.
+pub fn probe_targets(bound: SocketAddr, lan: Option<Ipv4Addr>) -> Vec<SocketAddr> {
+    let port = bound.port();
+    match bound.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => std::iter::once(Ipv4Addr::LOCALHOST)
+            .chain(lan)
+            .map(|ip| SocketAddr::new(IpAddr::V4(ip), port))
+            .collect(),
+        IpAddr::V6(ip) if ip.is_unspecified() => {
+            vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)]
+        }
+        _ => vec![bound],
+    }
+}
+
+/// Each listener `status` says is listening, with the addresses to probe
+/// it on, given the LAN address `lan`.
+pub fn listeners_to_probe(
+    status: &ProxyStatus,
+    lan: Option<Ipv4Addr>,
+) -> BTreeMap<Listen, Vec<SocketAddr>> {
+    std::iter::once((Listen::Host, &status.host))
+        .chain(status.ports.iter().map(|(&p, s)| (Listen::App(p), s)))
+        .filter_map(|(listen, s)| match s {
+            ListenerStatus::Listening(bound) => Some((listen, probe_targets(*bound, lan))),
+            ListenerStatus::Off | ListenerStatus::Unavailable(_) => None,
+        })
+        .collect()
+}
+
+/// What the last check of a listening listener found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenerCheck {
+    /// Every probe reached Alchemy's proxy.
+    Ours,
+    /// Another program answered on this address.
+    Foreign(SocketAddr),
+    /// Nothing answered on this address, with why.
+    Unreachable(SocketAddr, String),
+}
+
+/// Judge a listener by its probes: it is ours only when every probe
+/// reached the proxy. Another program answering anywhere outweighs an
+/// address that didn't answer at all.
+pub fn check_listener(results: &[(SocketAddr, ProbeResult)]) -> ListenerCheck {
+    let foreign = results
+        .iter()
+        .find(|(_, r)| *r == ProbeResult::Foreign)
+        .map(|(addr, _)| ListenerCheck::Foreign(*addr));
+    let unreachable = || {
+        results.iter().find_map(|(addr, r)| match r {
+            ProbeResult::Unreachable(why) => Some(ListenerCheck::Unreachable(*addr, why.clone())),
+            ProbeResult::Ours | ProbeResult::Foreign => None,
+        })
+    };
+    foreign.or_else(unreachable).unwrap_or(ListenerCheck::Ours)
+}
+
+/// A listener as clients see it: whether it could open and, once it is
+/// listening, whether its last check reached the proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach<'a> {
+    Off,
+    Checking,
+    Ready,
+    CantBind(&'a BindError),
+    Taken,
+    Unreachable(SocketAddr, &'a str),
+}
+
+impl<'a> Reach<'a> {
+    fn of(status: &'a ListenerStatus, check: Option<&'a ListenerCheck>) -> Self {
+        match (status, check) {
+            (ListenerStatus::Off, _) => Self::Off,
+            (ListenerStatus::Unavailable(error), _) => Self::CantBind(error),
+            (ListenerStatus::Listening(_), None) => Self::Checking,
+            (ListenerStatus::Listening(_), Some(ListenerCheck::Ours)) => Self::Ready,
+            (ListenerStatus::Listening(_), Some(ListenerCheck::Foreign(_))) => Self::Taken,
+            (ListenerStatus::Listening(_), Some(ListenerCheck::Unreachable(addr, why))) => {
+                Self::Unreachable(*addr, why)
+            }
+        }
+    }
+
+    /// Why addresses on port `port` don't answer, when they don't.
+    fn problem(self, port: u16) -> Option<String> {
+        match self {
+            Self::Off | Self::Checking | Self::Ready => None,
+            Self::CantBind(error) => Some(cannot_listen(port, error)),
+            Self::Taken => Some(taken(port)),
+            Self::Unreachable(addr, why) => Some(format!(
+                "Alchemy can't reach port {port} at {}: {why}.",
+                addr.ip()
+            )),
+        }
+    }
+}
+
 /// Where the proxy listens and what to call it in URLs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Addressing {
@@ -179,6 +280,9 @@ pub struct RoutingInputs<'a> {
     pub range: PortRange,
     /// What the proxy is listening on.
     pub status: &'a ProxyStatus,
+    /// The last check of each listening listener. One that is listening
+    /// but not checked yet isn't ready.
+    pub checks: &'a BTreeMap<Listen, ListenerCheck>,
     /// What to call its listeners.
     pub addressing: Addressing,
 }
@@ -219,17 +323,21 @@ pub fn routing(inputs: &RoutingInputs<'_>) -> Routing {
 
 fn addresses(route: &Route, inputs: &RoutingInputs<'_>) -> Vec<AppAddress> {
     let base = route_state(route, inputs);
-    let address = |kind, url, listener: &ListenerStatus, port: u16| {
+    let address = |kind, url, listener: Reach<'_>, port: u16| {
         let (state, message) = match (listener, &base) {
-            (ListenerStatus::Unavailable(error), _) => {
-                (AddressState::Unavailable, Some(cannot_listen(port, error)))
+            (Reach::CantBind(_) | Reach::Taken | Reach::Unreachable(..), _) => {
+                (AddressState::Unavailable, listener.problem(port))
             }
             (_, (AddressState::NotRunning, message)) => (AddressState::NotRunning, message.clone()),
-            (ListenerStatus::Off, _) => (
+            (Reach::Off, _) => (
                 AddressState::Pending,
                 Some(format!("Alchemy is opening port {port}.")),
             ),
-            (ListenerStatus::Listening(_), (state, message)) => (*state, message.clone()),
+            (Reach::Checking, _) => (
+                AddressState::Pending,
+                Some(format!("Alchemy is checking port {port}.")),
+            ),
+            (Reach::Ready, (state, message)) => (*state, message.clone()),
         };
         AppAddress {
             kind,
@@ -243,11 +351,12 @@ fn addresses(route: &Route, inputs: &RoutingInputs<'_>) -> Vec<AppAddress> {
 
     let mut found = Vec::new();
     if let Some(configured) = inputs.addressing.host_port {
-        let listener = &inputs.status.host;
-        let port = match listener {
+        let status = &inputs.status.host;
+        let port = match status {
             ListenerStatus::Listening(addr) => addr.port(),
             ListenerStatus::Off | ListenerStatus::Unavailable(_) => configured,
         };
+        let listener = Reach::of(status, inputs.checks.get(&Listen::Host));
         for host in &route.hosts {
             let url = if port == 80 {
                 format!("http://{host}/")
@@ -258,12 +367,13 @@ fn addresses(route: &Route, inputs: &RoutingInputs<'_>) -> Vec<AppAddress> {
         }
     }
     if let Some(port) = route.listen_port {
-        let listener = inputs.status.ports.get(&port).cloned().unwrap_or_default();
+        let status = inputs.status.ports.get(&port).cloned().unwrap_or_default();
+        let listener = Reach::of(&status, inputs.checks.get(&Listen::App(port)));
         let url = format!(
             "http://{}/",
             SocketAddr::new(inputs.addressing.app_host, port)
         );
-        found.push(address(AddressKind::Port, url, &listener, port));
+        found.push(address(AddressKind::Port, url, listener, port));
     }
     found.sort_by_key(|a| rank(a.state));
     found
@@ -323,24 +433,35 @@ fn cannot_listen(port: u16, error: &BindError) -> String {
     }
 }
 
+fn taken(port: u16) -> String {
+    format!("Another program on this computer takes port {port}.")
+}
+
 /// The [`ProxyReport`]: the Host listener, with what to do when it can't
 /// open, and each app port, named by the app `table` serves on it.
 fn proxy_report(inputs: &RoutingInputs<'_>) -> ProxyReport {
     let table = &inputs.plan.table;
-    let host_port = inputs.addressing.host_port.unwrap_or(80);
-    let (state, message, fix) = match &inputs.status.host {
-        ListenerStatus::Off => (ListenerState::Off, None, None),
-        ListenerStatus::Listening(_) => (ListenerState::Listening, None, None),
-        ListenerStatus::Unavailable(error) => {
+    let host_port = match &inputs.status.host {
+        ListenerStatus::Listening(addr) => addr.port(),
+        ListenerStatus::Off | ListenerStatus::Unavailable(_) => {
+            inputs.addressing.host_port.unwrap_or(80)
+        }
+    };
+    let reach = Reach::of(&inputs.status.host, inputs.checks.get(&Listen::Host));
+    let (state, message, fix) = match reach {
+        Reach::Off => (ListenerState::Off, None, None),
+        Reach::Checking | Reach::Ready => (ListenerState::Listening, None, None),
+        Reach::CantBind(error) => {
             let (message, fix) = host_unavailable(host_port, error);
+            (ListenerState::Unavailable, Some(message), fix)
+        }
+        Reach::Taken | Reach::Unreachable(..) => {
+            let (message, fix) = host_unreachable(host_port, reach);
             (ListenerState::Unavailable, Some(message), fix)
         }
     };
     let host = ProxyListener {
-        port: match &inputs.status.host {
-            ListenerStatus::Listening(addr) => addr.port(),
-            _ => host_port,
-        },
+        port: host_port,
         app: None,
         state,
         message,
@@ -351,13 +472,15 @@ fn proxy_report(inputs: &RoutingInputs<'_>) -> ProxyReport {
         .ports
         .iter()
         .map(|(&port, status)| {
-            let (state, message) = match status {
-                ListenerStatus::Off => (ListenerState::Off, None),
-                ListenerStatus::Listening(_) => (ListenerState::Listening, None),
-                ListenerStatus::Unavailable(error) => {
-                    (ListenerState::Unavailable, Some(cannot_listen(port, error)))
+            let reach = Reach::of(status, inputs.checks.get(&Listen::App(port)));
+            let state = match reach {
+                Reach::Off => ListenerState::Off,
+                Reach::Checking | Reach::Ready => ListenerState::Listening,
+                Reach::CantBind(_) | Reach::Taken | Reach::Unreachable(..) => {
+                    ListenerState::Unavailable
                 }
             };
+            let message = reach.problem(port);
             ProxyListener {
                 port,
                 app: table.lookup_port(port).map(|r| r.app.clone()),
@@ -374,11 +497,33 @@ fn proxy_report(inputs: &RoutingInputs<'_>) -> ProxyReport {
     }
 }
 
+/// What still works when the Host listener doesn't.
+const HOST_CONSEQUENCE: &str = "Your apps still work at their IP:port address.";
+
+/// What to tell people when the Host listener is open but its traffic
+/// doesn't reach the proxy, and how to fix it, if they can.
+fn host_unreachable(port: u16, reach: Reach<'_>) -> (String, Option<String>) {
+    if let Reach::Unreachable(addr, why) = reach {
+        return (
+            format!(
+                "Alchemy can't reach port {port} at {} ({why}). {HOST_CONSEQUENCE}",
+                addr.ip()
+            ),
+            None,
+        );
+    }
+    (
+        format!("{} {HOST_CONSEQUENCE}", taken(port)),
+        Some(format!(
+            "Stop the program or firewall rule that takes port {port}; some development tools redirect it with pf on macOS. Alchemy checks the port again every few seconds."
+        )),
+    )
+}
+
 /// What to tell people when the Host listener can't open, and how to fix
 /// it, if they can.
 fn host_unavailable(port: u16, error: &BindError) -> (String, Option<String>) {
-    let consequence =
-        "so addresses like http://<app>.localhost don't work. Each app's own port still does.";
+    let consequence = format!("so addresses that use port {port} don't work. {HOST_CONSEQUENCE}");
     match error.kind {
         io::ErrorKind::PermissionDenied => (
             format!(
@@ -624,6 +769,107 @@ mod tests {
         ListenerStatus::Listening(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))
     }
 
+    /// Every listener `status` says is listening, checked and ours.
+    fn ours(status: &ProxyStatus) -> BTreeMap<Listen, ListenerCheck> {
+        listeners_to_probe(status, None)
+            .into_keys()
+            .map(|listen| (listen, ListenerCheck::Ours))
+            .collect()
+    }
+
+    fn at(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn probe_targets_table() {
+        let lan = Some(Ipv4Addr::new(192, 168, 1, 20));
+        let cases = [
+            (
+                "every address",
+                "0.0.0.0:80",
+                lan,
+                vec!["127.0.0.1:80", "192.168.1.20:80"],
+            ),
+            (
+                "no LAN address",
+                "0.0.0.0:8100",
+                None,
+                vec!["127.0.0.1:8100"],
+            ),
+            ("loopback", "127.0.0.1:8100", lan, vec!["127.0.0.1:8100"]),
+            (
+                "one address",
+                "192.168.1.20:8100",
+                lan,
+                vec!["192.168.1.20:8100"],
+            ),
+            ("IPv6 any", "[::]:80", lan, vec!["[::1]:80"]),
+        ];
+        for (name, bound, lan, want) in cases {
+            let want: Vec<SocketAddr> = want.into_iter().map(at).collect();
+            assert_eq!(probe_targets(at(bound), lan), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn only_listening_listeners_are_probed() {
+        let status = ProxyStatus {
+            host: ListenerStatus::Unavailable(bind_error(80, io::ErrorKind::PermissionDenied)),
+            ports: BTreeMap::from([(8100, listening(8100)), (8101, ListenerStatus::Off)]),
+        };
+        let got = listeners_to_probe(&status, Some(Ipv4Addr::new(10, 0, 0, 5)));
+        assert_eq!(
+            got,
+            BTreeMap::from([(
+                Listen::App(8100),
+                vec![at("127.0.0.1:8100"), at("10.0.0.5:8100")]
+            )])
+        );
+        let status = ProxyStatus {
+            host: listening(80),
+            ports: BTreeMap::new(),
+        };
+        assert_eq!(
+            listeners_to_probe(&status, None)
+                .into_keys()
+                .collect::<Vec<_>>(),
+            [Listen::Host]
+        );
+    }
+
+    #[test]
+    fn check_listener_table() {
+        let lo = at("127.0.0.1:80");
+        let lan = at("192.168.1.20:80");
+        let down = |s: &str| ProbeResult::Unreachable(s.into());
+        let cases = [
+            (
+                "all ours",
+                vec![(lo, ProbeResult::Ours), (lan, ProbeResult::Ours)],
+                ListenerCheck::Ours,
+            ),
+            (
+                "loopback redirected",
+                vec![(lo, ProbeResult::Foreign), (lan, ProbeResult::Ours)],
+                ListenerCheck::Foreign(lo),
+            ),
+            (
+                "foreign outweighs unreachable",
+                vec![(lo, down("refused")), (lan, ProbeResult::Foreign)],
+                ListenerCheck::Foreign(lan),
+            ),
+            (
+                "LAN unreachable",
+                vec![(lo, ProbeResult::Ours), (lan, down("timed out"))],
+                ListenerCheck::Unreachable(lan, "timed out".into()),
+            ),
+        ];
+        for (name, results, want) in cases {
+            assert_eq!(check_listener(&results), want, "{name}");
+        }
+    }
+
     fn summarize(routing: &Routing) -> Vec<String> {
         routing
             .apps
@@ -649,30 +895,37 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn addresses_say_whether_they_answer_and_why_not() {
-        type Case = (&'static str, ProxyStatus, Vec<&'static str>);
+    const NO_PORT: &str = "db problem No service exposes or publishes a port, so Alchemy doesn't know where to send requests. Add an x-alchemy block with service and port.";
+
+    /// The addresses of [`world`], with `blog` on port 8100 and `wiki` on
+    /// 8101, through listeners in `status` checked as `checks`.
+    fn world_addresses(
+        status: &ProxyStatus,
+        checks: &BTreeMap<Listen, ListenerCheck>,
+    ) -> Vec<String> {
         let (apps, configs, containers) = world();
         let reserved = BTreeMap::from([("blog".to_owned(), 8100), ("wiki".to_owned(), 8101)]);
         let inputs = route_inputs(&apps, &configs, &containers, &reserved);
         let plan = plan_routes(&inputs, &options(Reachability::ContainerIp));
-        let addressing = Addressing {
-            host_port: Some(80),
-            app_host: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
-        };
-        let unreserved = BTreeMap::new();
-        let base = |status: &ProxyStatus| {
-            summarize(&routing(&RoutingInputs {
-                plan: &plan,
-                inputs: &inputs,
-                reachability: Reachability::ContainerIp,
-                unreserved: &unreserved,
-                range: PortRange::new(8100, 8999).unwrap(),
-                status,
-                addressing,
-            }))
-        };
-        let no_port = "db problem No service exposes or publishes a port, so Alchemy doesn't know where to send requests. Add an x-alchemy block with service and port.";
+        summarize(&routing(&RoutingInputs {
+            plan: &plan,
+            inputs: &inputs,
+            reachability: Reachability::ContainerIp,
+            unreserved: &BTreeMap::new(),
+            range: PortRange::new(8100, 8999).unwrap(),
+            status,
+            checks,
+            addressing: Addressing {
+                host_port: Some(80),
+                app_host: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+            },
+        }))
+    }
+
+    #[test]
+    fn addresses_say_whether_they_answer_and_why_not() {
+        type Case = (&'static str, ProxyStatus, Vec<&'static str>);
+        let no_port = NO_PORT;
         let cases: [Case; 3] = [
             (
                 "everything listening",
@@ -727,7 +980,70 @@ mod tests {
             ),
         ];
         for (name, status, want) in cases {
-            assert_eq!(base(&status), want, "{name}");
+            assert_eq!(world_addresses(&status, &ours(&status)), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn addresses_on_a_listener_that_fails_its_check_are_unavailable() {
+        let no_port = NO_PORT;
+        let status = ProxyStatus {
+            host: listening(80),
+            ports: BTreeMap::from([(8100, listening(8100)), (8101, listening(8101))]),
+        };
+        let checked = |host: Option<ListenerCheck>, blog: Option<ListenerCheck>| {
+            [(Listen::Host, host), (Listen::App(8100), blog)]
+                .into_iter()
+                .filter_map(|(listen, check)| Some((listen, check?)))
+                .chain([(Listen::App(8101), ListenerCheck::Ours)])
+                .collect::<BTreeMap<_, _>>()
+        };
+        let probed: [(&str, BTreeMap<Listen, ListenerCheck>, Vec<&str>); 3] = [
+            (
+                "port 80 answered by another program",
+                checked(
+                    Some(ListenerCheck::Foreign(at("127.0.0.1:80"))),
+                    Some(ListenerCheck::Ours),
+                ),
+                vec![
+                    "blog Port http://192.168.1.20:8100/ Ready -",
+                    "blog Host http://blog.localhost/ Unavailable Another program on this computer takes port 80.",
+                    no_port,
+                    "wiki Port http://192.168.1.20:8101/ Pending Alchemy is connecting service app to the alchemy network.",
+                    "wiki Host http://wiki.localhost/ Unavailable Another program on this computer takes port 80.",
+                ],
+            ),
+            (
+                "not checked yet",
+                checked(None, None),
+                vec![
+                    "blog Host http://blog.localhost/ Pending Alchemy is checking port 80.",
+                    "blog Port http://192.168.1.20:8100/ Pending Alchemy is checking port 8100.",
+                    no_port,
+                    "wiki Host http://wiki.localhost/ Pending Alchemy is checking port 80.",
+                    "wiki Port http://192.168.1.20:8101/ Pending Alchemy is connecting service app to the alchemy network.",
+                ],
+            ),
+            (
+                "app port unreachable on the LAN",
+                checked(
+                    Some(ListenerCheck::Ours),
+                    Some(ListenerCheck::Unreachable(
+                        at("192.168.1.20:8100"),
+                        "timed out".into(),
+                    )),
+                ),
+                vec![
+                    "blog Host http://blog.localhost/ Ready -",
+                    "blog Port http://192.168.1.20:8100/ Unavailable Alchemy can't reach port 8100 at 192.168.1.20: timed out.",
+                    no_port,
+                    "wiki Host http://wiki.localhost/ Pending Alchemy is connecting service app to the alchemy network.",
+                    "wiki Port http://192.168.1.20:8101/ Pending Alchemy is connecting service app to the alchemy network.",
+                ],
+            ),
+        ];
+        for (name, checks, want) in probed {
+            assert_eq!(world_addresses(&status, &checks), want, "{name}");
         }
     }
 
@@ -770,6 +1086,7 @@ mod tests {
                 unreserved: &unreserved,
                 range: PortRange::new(8100, 8999).unwrap(),
                 status: &status,
+                checks: &ours(&status),
                 addressing: Addressing {
                     host_port: Some(80),
                     app_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -830,39 +1147,74 @@ mod tests {
     fn the_proxy_report_explains_port_80() {
         let plan = RoutePlan::default();
         let unreserved = BTreeMap::new();
+        let ours = Some(ListenerCheck::Ours);
         let cases = [
-            (ListenerStatus::Off, ListenerState::Off, None, false),
-            (listening(80), ListenerState::Listening, None, false),
+            (ListenerStatus::Off, None, ListenerState::Off, None, false),
+            (
+                listening(80),
+                ours.clone(),
+                ListenerState::Listening,
+                None,
+                false,
+            ),
+            (listening(80), None, ListenerState::Listening, None, false),
             (
                 ListenerStatus::Unavailable(bind_error(80, io::ErrorKind::PermissionDenied)),
+                ours.clone(),
                 ListenerState::Unavailable,
                 Some(
-                    "Alchemy doesn't have permission to listen on port 80, so addresses like http://<app>.localhost don't work. Each app's own port still does.",
+                    "Alchemy doesn't have permission to listen on port 80, so addresses that use port 80 don't work. Your apps still work at their IP:port address.",
                 ),
                 true,
             ),
             (
                 ListenerStatus::Unavailable(bind_error(80, io::ErrorKind::AddrInUse)),
+                None,
                 ListenerState::Unavailable,
                 Some(
-                    "Another program is using port 80, so addresses like http://<app>.localhost don't work. Each app's own port still does.",
+                    "Another program is using port 80, so addresses that use port 80 don't work. Your apps still work at their IP:port address.",
                 ),
                 true,
             ),
             (
                 ListenerStatus::Unavailable(bind_error(80, io::ErrorKind::Other)),
+                None,
                 ListenerState::Unavailable,
                 Some(
-                    "Alchemy can't listen on port 80 (nope), so addresses like http://<app>.localhost don't work. Each app's own port still does.",
+                    "Alchemy can't listen on port 80 (nope), so addresses that use port 80 don't work. Your apps still work at their IP:port address.",
+                ),
+                false,
+            ),
+            (
+                listening(80),
+                Some(ListenerCheck::Foreign(at("127.0.0.1:80"))),
+                ListenerState::Unavailable,
+                Some(
+                    "Another program on this computer takes port 80. Your apps still work at their IP:port address.",
+                ),
+                true,
+            ),
+            (
+                listening(80),
+                Some(ListenerCheck::Unreachable(
+                    at("192.168.1.20:80"),
+                    "connection refused".into(),
+                )),
+                ListenerState::Unavailable,
+                Some(
+                    "Alchemy can't reach port 80 at 192.168.1.20 (connection refused). Your apps still work at their IP:port address.",
                 ),
                 false,
             ),
         ];
-        for (host, state, message, fix) in cases {
+        for (host, check, state, message, fix) in cases {
             let status = ProxyStatus {
                 host,
                 ports: BTreeMap::new(),
             };
+            let checks = check
+                .map(|c| BTreeMap::from([(Listen::Host, c)]))
+                .unwrap_or_default();
             let report = routing(&RoutingInputs {
                 plan: &plan,
                 inputs: &[],
@@ -870,6 +1222,7 @@ mod tests {
                 unreserved: &unreserved,
                 range: PortRange::new(8100, 8999).unwrap(),
                 status: &status,
+                checks: &checks,
                 addressing: Addressing {
                     host_port: Some(80),
                     app_host: IpAddr::V4(Ipv4Addr::LOCALHOST),

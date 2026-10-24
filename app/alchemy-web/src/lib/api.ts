@@ -731,7 +731,11 @@ export interface NetworkReport {
   proxy?: ProxyReport;
 }
 
-/** Mirrors `alchemy_api::network::ListenerState`; unknown states arrive as `other`. */
+/**
+ * Mirrors `alchemy_api::network::ListenerState`; unknown states arrive as
+ * `other`. `unavailable` covers a port that couldn't be opened and one that
+ * is open but another program answers, such as a firewall redirect.
+ */
 export type ListenerState = "off" | "listening" | "unavailable" | "other";
 
 /** Mirrors `alchemy_api::network::Reachability`; unknown values arrive as `other`. */

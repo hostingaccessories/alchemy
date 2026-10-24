@@ -104,7 +104,7 @@ pub(crate) fn proxy_lines(proxy: &ProxyReport) -> Vec<String> {
         lines.push(format!(
             "Warning: {}",
             proxy.host.message.as_deref().unwrap_or(
-                "Alchemy can't listen on port 80, so addresses like http://<app>.localhost don't work."
+                "Alchemy can't use port 80. Your apps still work at their IP:port address."
             )
         ));
         if let Some(fix) = proxy.host.fix.as_deref() {

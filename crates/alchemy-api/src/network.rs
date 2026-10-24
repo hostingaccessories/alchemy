@@ -122,11 +122,13 @@ pub struct ProxyListener {
 pub enum ListenerState {
     /// Not wanted, since no route needs it.
     Off,
-    /// Accepting connections.
+    /// Accepting connections. Its addresses are ready only once a request
+    /// sent to it over loopback and the LAN address reached the proxy.
     Listening,
     /// Wanted but couldn't be opened, such as port 80 without permission
-    /// or a port another program holds. It is tried again when the
-    /// routes change.
+    /// or a port another program holds, or open but another program
+    /// answers its traffic, such as a firewall redirect. It is tried
+    /// again when the routes change and checked again every few seconds.
     Unavailable,
     /// A state this build does not know.
     #[serde(other)]

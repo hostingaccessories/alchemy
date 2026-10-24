@@ -481,16 +481,19 @@ fn spawn_proxy(
     let (engine, network, ports) = routing;
     let (routes_tx, routes_rx) = watch::channel(RouteTable::default());
     let (status_tx, status_rx) = watch::channel(ProxyStatus::default());
+    let (probe_tx, probe_rx) = watch::channel(None);
     let proxy = tokio::spawn(proxy::run(
         deps.config(vec![api]),
         deps.connector.clone(),
         routes_rx,
         status_tx,
+        probe_rx,
         shutdown.clone(),
     ));
     let handle = ProxyHandle {
         routes: routes_tx,
         status: status_rx,
+        probe: probe_tx,
     };
     let routing = tokio::spawn(routing::run(
         deps,
