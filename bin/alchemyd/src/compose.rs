@@ -7,10 +7,16 @@
 //! [`CancelToken`]. [`CliComposeRunner`] runs the `docker` binary;
 //! [`FakeComposeRunner`] plays back scripts for tests of the code above it.
 //!
+//! Reading a project's resolved configuration, for its project name and
+//! whether it builds, sits behind [`ComposeConfigReader`] the same way:
+//! [`CliComposeConfig`] runs `docker compose config`, and
+//! [`FakeComposeConfig`] answers from a table.
+//!
 //! This lives in the daemon rather than `alchemy-core` because the argv is
 //! a detail of the `docker` binary, not of the domain.
 
 mod cli;
+mod config;
 mod env;
 mod fake;
 mod lines;
@@ -20,6 +26,10 @@ mod project;
 mod runner;
 
 pub use cli::CliComposeRunner;
+pub use config::{
+    CliComposeConfig, ComposeConfig, ComposeConfigReader, ConfigError, FakeComposeConfig,
+    FakeConfig, ServiceConfig, config_args, config_error_message,
+};
 pub use env::{ALLOWED_ENV, ALLOWED_ENV_PREFIXES, FIXED_ENV, child_env, is_allowed};
 pub use fake::{FakeComposeRunner, FakeOutcome, FakeScript};
 pub use plan::{

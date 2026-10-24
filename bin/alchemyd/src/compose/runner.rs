@@ -230,7 +230,7 @@ impl FailureNotes {
 
 /// The last [`MAX_CAPTURED`] bytes of `text`, trimmed, on a character
 /// boundary. Compose prints the reason for a failure last.
-fn tail(text: &str) -> String {
+pub(super) fn tail(text: &str) -> String {
     let text = text.trim();
     let start = text
         .char_indices()

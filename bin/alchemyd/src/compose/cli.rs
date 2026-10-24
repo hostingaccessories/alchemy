@@ -126,17 +126,7 @@ impl CliComposeRunner {
     }
 
     fn command(&self, step: &ComposeStep) -> Command {
-        let mut command = Command::new(&self.binary);
-        command
-            .args(step.args())
-            .env_clear()
-            .envs(&self.env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .kill_on_drop(true);
-        command
+        docker_command(&self.binary, step.args(), &self.env)
     }
 
     async fn run_step(
@@ -155,10 +145,7 @@ impl CliComposeRunner {
                 binary: self.binary.clone(),
                 source,
             })?;
-        let group = child
-            .id()
-            .and_then(|id| i32::try_from(id).ok())
-            .and_then(Pid::from_raw);
+        let group = process_group(&child);
         let stdout = pump(child.stdout.take(), Stream::Stdout, index, events);
         let stderr = pump(child.stderr.take(), Stream::Stderr, index, events);
         let finished = async { tokio::join!(stdout, stderr, child.wait()) };
@@ -285,12 +272,41 @@ fn check(
     }
 }
 
+/// `binary` with `args` and exactly `env`, stdin closed, stdout and stderr
+/// piped, leading its own process group, and killed if dropped. No shell
+/// is involved.
+pub(super) fn docker_command(
+    binary: &Path,
+    args: &[OsString],
+    env: &BTreeMap<OsString, OsString>,
+) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .args(args)
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    command
+}
+
+/// The process group a spawned [`docker_command`] leads.
+pub(super) fn process_group(child: &tokio::process::Child) -> Option<Pid> {
+    child
+        .id()
+        .and_then(|id| i32::try_from(id).ok())
+        .and_then(Pid::from_raw)
+}
+
 /// Send `signal` to the child's process group.
 ///
 /// Only called while the child is unreaped, so its id, and therefore the
 /// group's, cannot have been reused. A group that has already gone is not
 /// an error.
-fn signal(group: Option<Pid>, signal: Signal) {
+pub(super) fn signal(group: Option<Pid>, signal: Signal) {
     if let Some(group) = group
         && let Err(err) = kill_process_group(group, signal)
     {
