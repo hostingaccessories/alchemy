@@ -1,5 +1,5 @@
-//! Persistent daemon state: settings, metrics history, and stop intent
-//! now, and later operation history.
+//! Persistent daemon state: settings, metrics history, stop intent, and
+//! operation history.
 //!
 //! Everything goes through the [`Store`] trait. The daemon runs on
 //! [`SqliteStore`], a SQLite database in the per-user state directory
@@ -9,8 +9,10 @@
 //! Handlers hold the store as a [`SharedStore`] and use the typed accessors
 //! on `dyn Store`: `store.setting::<T>(key)` and `store.set_setting(key, &value)`
 //! for settings, and `store.metric_points(step, from, to)` and
-//! `store.put_metric_points(step, &points)` for metrics history. Intents
-//! go through [`crate::intent`], which also updates the live state.
+//! `store.put_metric_points(step, &points)` for metrics history, and
+//! `store.put_operation(&operation)` and `store.operations(app, limit)`
+//! for operation history. Intents go through [`crate::intent`], which
+//! also updates the live state.
 
 mod dir;
 mod memory;
@@ -26,6 +28,7 @@ use std::sync::Arc;
 
 use alchemy_core::engine::Intent;
 use alchemy_core::metrics::MetricsPoint;
+use alchemy_core::operation::{Operation, OperationState};
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -91,6 +94,46 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// Every stored intent, by project name. A row whose action this
     /// build does not know is left out.
     fn intents(&self) -> BoxFuture<'_, Result<Vec<(String, Intent)>, StoreError>>;
+
+    /// Store `row`, replacing any operation stored with the same id.
+    fn put_operation_row(&self, row: OperationRow) -> BoxFuture<'_, Result<(), StoreError>>;
+
+    /// The operation stored as `id`, if any.
+    fn operation_row(&self, id: String) -> BoxFuture<'_, Result<Option<OperationRow>, StoreError>>;
+
+    /// Up to `limit` operations, of app `app` alone when given, newest
+    /// first.
+    fn operation_rows(
+        &self,
+        app: Option<String>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<OperationRow>, StoreError>>;
+
+    /// Every operation stored in state `state`, oldest first.
+    fn operation_rows_in(
+        &self,
+        state: String,
+    ) -> BoxFuture<'_, Result<Vec<OperationRow>, StoreError>>;
+
+    /// Delete all but the newest `keep` operations, returning how many
+    /// went.
+    fn prune_operations(&self, keep: usize) -> BoxFuture<'_, Result<u64, StoreError>>;
+}
+
+/// One stored operation: the columns it is looked up by, and the whole
+/// [`Operation`] as JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationRow {
+    /// The operation's id.
+    pub id: String,
+    /// The app it ran on.
+    pub app: String,
+    /// Its [`OperationState`], as its wire name.
+    pub state: String,
+    /// When it started, in Unix seconds.
+    pub started_at: i64,
+    /// The operation, as JSON.
+    pub data: String,
 }
 
 /// One stored metrics point: its tier's step in seconds, its Unix
@@ -192,6 +235,57 @@ impl dyn Store {
     }
 }
 
+impl dyn Store {
+    /// Store `operation`, replacing any earlier copy of it.
+    pub async fn put_operation(&self, operation: &Operation) -> Result<(), StoreError> {
+        let data = serde_json::to_string(operation).map_err(|source| StoreError::Encode {
+            key: format!("operations/{}", operation.id),
+            source,
+        })?;
+        self.put_operation_row(OperationRow {
+            id: operation.id.clone(),
+            app: operation.app.to_string(),
+            state: operation.state.as_str().to_owned(),
+            started_at: operation.started_at,
+            data,
+        })
+        .await
+    }
+
+    /// The operation stored as `id`, if any and if it still decodes.
+    pub async fn operation(&self, id: &str) -> Result<Option<Operation>, StoreError> {
+        let row = self.operation_row(id.to_owned()).await?;
+        Ok(row.as_ref().and_then(decode_operation))
+    }
+
+    /// Up to `limit` stored operations, of `app` alone when given, newest
+    /// first. A row that no longer decodes is skipped with a warning.
+    pub async fn operations(
+        &self,
+        app: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Operation>, StoreError> {
+        let rows = self.operation_rows(app.map(str::to_owned), limit).await?;
+        Ok(rows.iter().filter_map(decode_operation).collect())
+    }
+
+    /// Every stored operation in `state`, oldest first.
+    pub async fn operations_in(&self, state: OperationState) -> Result<Vec<Operation>, StoreError> {
+        let rows = self.operation_rows_in(state.as_str().to_owned()).await?;
+        Ok(rows.iter().filter_map(decode_operation).collect())
+    }
+}
+
+fn decode_operation(row: &OperationRow) -> Option<Operation> {
+    match serde_json::from_str(&row.data) {
+        Ok(operation) => Some(operation),
+        Err(error) => {
+            tracing::warn!(id = row.id, %error, "skipping an operation row that does not decode");
+            None
+        }
+    }
+}
+
 /// Why a [`Store`] operation failed.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -252,7 +346,8 @@ pub enum StoreError {
     /// A value could not be encoded as JSON.
     #[error("{key:?} cannot be encoded as JSON")]
     Encode {
-        /// The setting key, or `metrics/STEP/TS` for a metrics point.
+        /// The setting key, `metrics/STEP/TS` for a metrics point, or
+        /// `operations/ID` for an operation.
         key: String,
         /// Why encoding failed.
         #[source]
@@ -398,6 +493,91 @@ mod tests {
         intents_behave(Arc::new(SqliteStore::open(tmp.path()).await.unwrap())).await;
         let reopened: SharedStore = Arc::new(SqliteStore::open(tmp.path()).await.unwrap());
         assert_eq!(reopened.intents().await.unwrap().len(), 2);
+    }
+
+    fn operation(id: &str, app: &str, started_at: i64, state: OperationState) -> Operation {
+        let mut tracker = alchemy_core::operation::Tracker::new(
+            id,
+            alchemy_core::StackName::new(app).unwrap(),
+            alchemy_core::operation::Action::Stop,
+            &[alchemy_core::operation::StepCommand::Stop],
+            started_at,
+        );
+        let outcome = match state {
+            OperationState::Succeeded => Some(alchemy_core::operation::Outcome::Succeeded),
+            OperationState::Failed => Some(alchemy_core::operation::Outcome::Failed("x".into())),
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
+            tracker.finish(&outcome, started_at + 1);
+        }
+        tracker.operation().clone()
+    }
+
+    /// Every store behaves the same: upserts by id, newest first, filtered
+    /// by app or state, and pruned to the newest.
+    async fn operations_behave(store: SharedStore) {
+        let a = operation("a", "blog", 10, OperationState::Succeeded);
+        let b = operation("b", "wiki", 20, OperationState::Running);
+        let c = operation("c", "blog", 30, OperationState::Running);
+        for op in [&a, &b, &c] {
+            store.put_operation(op).await.unwrap();
+        }
+        let ids = |ops: Vec<Operation>| ops.into_iter().map(|o| o.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(store.operations(None, 10).await.unwrap()),
+            ["c", "b", "a"]
+        );
+        assert_eq!(ids(store.operations(None, 2).await.unwrap()), ["c", "b"]);
+        assert_eq!(
+            ids(store.operations(Some("blog"), 10).await.unwrap()),
+            ["c", "a"]
+        );
+        assert_eq!(
+            ids(store.operations_in(OperationState::Running).await.unwrap()),
+            ["b", "c"]
+        );
+
+        let c_done = operation("c", "blog", 30, OperationState::Failed);
+        store.put_operation(&c_done).await.unwrap();
+        assert_eq!(store.operation("c").await.unwrap(), Some(c_done));
+        assert_eq!(store.operation("nope").await.unwrap(), None);
+        assert_eq!(
+            ids(store.operations_in(OperationState::Running).await.unwrap()),
+            ["b"]
+        );
+
+        store
+            .put_operation_row(OperationRow {
+                id: "broken".into(),
+                app: "blog".into(),
+                state: "running".into(),
+                started_at: 5,
+                data: "not json".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(store.operations(None, 10).await.unwrap()),
+            ["c", "b", "a"]
+        );
+        assert_eq!(store.operation("broken").await.unwrap(), None);
+
+        assert_eq!(store.prune_operations(2).await.unwrap(), 2);
+        assert_eq!(ids(store.operations(None, 10).await.unwrap()), ["c", "b"]);
+    }
+
+    #[tokio::test]
+    async fn memory_store_operations() {
+        operations_behave(Arc::new(MemoryStore::new())).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_operations() {
+        let tmp = tempfile::tempdir().unwrap();
+        operations_behave(Arc::new(SqliteStore::open(tmp.path()).await.unwrap())).await;
+        let reopened: SharedStore = Arc::new(SqliteStore::open(tmp.path()).await.unwrap());
+        assert_eq!(reopened.operations(None, 10).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

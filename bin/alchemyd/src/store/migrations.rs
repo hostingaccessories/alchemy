@@ -53,6 +53,20 @@ pub const MIGRATIONS: &[Migration] = &[
             at      INTEGER NOT NULL
           ) STRICT;",
     },
+    Migration {
+        version: 4,
+        name: "operations",
+        sql: "CREATE TABLE operations (
+            id         TEXT PRIMARY KEY NOT NULL,
+            app        TEXT NOT NULL,
+            state      TEXT NOT NULL,
+            started_at INTEGER NOT NULL,
+            data       TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX operations_by_start ON operations (started_at, id);
+          CREATE INDEX operations_by_app ON operations (app, started_at, id);
+          CREATE INDEX operations_by_state ON operations (state);",
+    },
 ];
 
 /// The schema version this build migrates databases to.
@@ -203,7 +217,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         apply(&mut conn, MIGRATIONS).unwrap();
         let tables = tables(&conn);
-        for table in ["settings", "metrics", "intents"] {
+        for table in ["settings", "metrics", "intents", "operations"] {
             assert!(tables.contains(&table.to_owned()), "{table}");
         }
     }

@@ -16,7 +16,7 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension as _};
 use tokio::sync::{mpsc, oneshot};
 
 use super::migrations::{self, MIGRATIONS, MigrateError};
-use super::{DB_FILE, MetricRow, Store, StoreError};
+use super::{DB_FILE, MetricRow, OperationRow, Store, StoreError};
 use crate::secure_fs;
 
 /// How long a statement waits on a lock held by another connection, such
@@ -242,6 +242,73 @@ impl Store for SqliteStore {
             Ok(rows.into_iter().filter_map(known_intent).collect())
         })
     }
+
+    fn put_operation_row(&self, row: OperationRow) -> BoxFuture<'_, Result<(), StoreError>> {
+        Box::pin(self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO operations (id, app, state, started_at, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (id) DO UPDATE SET
+                   app = excluded.app, state = excluded.state,
+                   started_at = excluded.started_at, data = excluded.data",
+                (row.id, row.app, row.state, row.started_at, row.data),
+            )
+            .map(drop)
+        }))
+    }
+
+    fn operation_row(&self, id: String) -> BoxFuture<'_, Result<Option<OperationRow>, StoreError>> {
+        Box::pin(self.call(move |conn| {
+            conn.query_row(
+                &format!("SELECT {OPERATION_COLUMNS} FROM operations WHERE id = ?1"),
+                [id],
+                operation_from,
+            )
+            .optional()
+        }))
+    }
+
+    fn operation_rows(
+        &self,
+        app: Option<String>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<OperationRow>, StoreError>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        Box::pin(self.call(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {OPERATION_COLUMNS} FROM operations
+                 WHERE ?1 IS NULL OR app = ?1
+                 ORDER BY started_at DESC, id DESC LIMIT ?2"
+            ))?;
+            stmt.query_map((app, limit), operation_from)?.collect()
+        }))
+    }
+
+    fn operation_rows_in(
+        &self,
+        state: String,
+    ) -> BoxFuture<'_, Result<Vec<OperationRow>, StoreError>> {
+        Box::pin(self.call(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {OPERATION_COLUMNS} FROM operations
+                 WHERE state = ?1 ORDER BY started_at, id"
+            ))?;
+            stmt.query_map([state], operation_from)?.collect()
+        }))
+    }
+
+    fn prune_operations(&self, keep: usize) -> BoxFuture<'_, Result<u64, StoreError>> {
+        let keep = i64::try_from(keep).unwrap_or(i64::MAX);
+        Box::pin(self.call(move |conn| {
+            let deleted = conn.execute(
+                "DELETE FROM operations WHERE id NOT IN (
+                   SELECT id FROM operations ORDER BY started_at DESC, id DESC LIMIT ?1
+                 )",
+                [keep],
+            )?;
+            Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
+        }))
+    }
 }
 
 type IntentRow = (String, String, i64);
@@ -258,6 +325,18 @@ fn known_intent((project, action, at): IntentRow) -> Option<(String, Intent)> {
     };
     Some((project, Intent::new(known, at)))
 }
+
+fn operation_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
+    Ok(OperationRow {
+        id: row.get(0)?,
+        app: row.get(1)?,
+        state: row.get(2)?,
+        started_at: row.get(3)?,
+        data: row.get(4)?,
+    })
+}
+
+const OPERATION_COLUMNS: &str = "id, app, state, started_at, data";
 
 fn open_connection(dir: &Path, path: &Path) -> Result<Connection, StoreError> {
     secure_fs::create_private_dir(dir).map_err(|source| StoreError::Path {
