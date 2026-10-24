@@ -5,11 +5,14 @@
 //! host, [`FakeNetwork`] in tests. What the OS prints is parsed by pure
 //! functions, [`proc`] for Linux's `/proc/net` and [`netstat`] and
 //! [`lsof`] for macOS, which are compiled and tested on every OS.
+//!
+//! The network settings, such as `network.mdns`, are in [`settings`].
 
 mod fake;
 pub mod lsof;
 pub mod netstat;
 pub mod proc;
+pub mod settings;
 mod system;
 
 use std::collections::HashSet;

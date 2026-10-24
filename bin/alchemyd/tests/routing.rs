@@ -3,7 +3,8 @@
 //! app's proxy port, attaching containers to the `alchemy` network, and
 //! serving the app through the proxy, with its addresses on
 //! `GET /api/apps` and the proxy's listeners on `GET /api/network`, with
-//! a listener another program answers made unavailable.
+//! a listener another program answers made unavailable, and `<app>.local`
+//! routed only while the `network.mdns` setting is on.
 
 #![allow(
     clippy::unwrap_used,
@@ -607,6 +608,154 @@ async fn a_listener_another_program_answers_is_unavailable_and_open_uses_the_nex
         report.proxy.ports[0].message.as_deref(),
         Some(format!("Another program on this computer takes port {port}.").as_str())
     );
+
+    daemon.stop().await;
+}
+
+/// Send `PUT uri` with the JSON `body` over the socket, and return the
+/// response's JSON.
+async fn put_socket<T: serde::de::DeserializeOwned>(socket: &Path, uri: &str, body: &str) -> T {
+    let request = format!(
+        "PUT {uri} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (head, body) = send(
+        tokio::net::UnixStream::connect(socket).await.unwrap(),
+        &request,
+    )
+    .await;
+    assert!(head.starts_with("http/1.1 200"), "{uri}: {head}");
+    serde_json::from_str(&body).unwrap()
+}
+
+/// Ask the Host listener on `port` for `host` until it answers with
+/// `status`, and return the body.
+async fn host_answers(port: u16, host: &str, status: &str) -> String {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let (head, body) = get_tcp(addr, host).await;
+        if head.starts_with(&format!("http/1.1 {status}")) {
+            return body;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{host} never answered {status}: {head}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread")]
+async fn routes_local_names_while_mdns_is_on_except_for_apps_that_opt_out() {
+    use alchemy_api::network::{MdnsState, NetworkSettings};
+    use alchemy_core::route::{XAlchemy, XAlchemyBlock};
+
+    let wiki_app = fake_app("wiki").await;
+    let notes_app = fake_app("notes").await;
+    let connector = FakeConnector::new();
+    connector.redirect(wiki_app, wiki_app);
+    connector.redirect(notes_app, notes_app);
+    let port = free_port();
+
+    let dir = tempdir();
+    let (home, config) = apps_home(
+        dir.path(),
+        vec![
+            (
+                "wiki",
+                vec![service("app", &[], vec![tcp(wiki_app.port(), 3000)])],
+            ),
+            (
+                "notes",
+                vec![service("app", &[], vec![tcp(notes_app.port(), 3000)])],
+            ),
+        ],
+    );
+    config.set(
+        home.join("notes"),
+        FakeConfig::Config(ComposeConfig {
+            name: "notes".into(),
+            services: vec![service("app", &[], vec![tcp(notes_app.port(), 3000)])],
+            x_alchemy: Some(XAlchemyBlock::Read(XAlchemy {
+                mdns: false,
+                ..XAlchemy::default()
+            })),
+            ..ComposeConfig::default()
+        }),
+    );
+    let mut wiki = running("wiki-app-1", "wiki", "app");
+    wiki.ports = vec![tcp(wiki_app.port(), 3000)];
+    let mut notes = running("notes-app-1", "notes", "app");
+    notes.ports = vec![tcp(notes_app.port(), 3000)];
+    let daemon = Daemon::start(
+        dir,
+        Engine {
+            facts: EngineFacts {
+                host_os: HostOs::MacOs,
+                flavor: Some(EngineFlavor::DockerDesktop),
+                rootless: false,
+            },
+            containers: vec![wiki, notes],
+        },
+        (home, config),
+        FakeEngineNetworks::new(),
+        ProxyDeps::loopback()
+            .with_connector(Arc::new(connector))
+            .with_range(PortRange::single(port).unwrap())
+            .with_host_listen(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .with_interval(Duration::from_millis(50)),
+    )
+    .await;
+
+    let settings: NetworkSettings = get_socket(&daemon.socket, "/api/settings/network").await;
+    assert_eq!(settings, NetworkSettings { mdns: true });
+    let wiki = daemon
+        .app_where("wiki", |app| {
+            app.addresses
+                .iter()
+                .any(|a| a.kind == AddressKind::Host && a.state == AddressState::Ready)
+        })
+        .await;
+    let host_port: u16 = wiki
+        .addresses
+        .iter()
+        .find_map(|a| a.url.strip_prefix("http://wiki.localhost:"))
+        .and_then(|rest| rest.strip_suffix('/'))
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let body = host_answers(host_port, &format!("Wiki.Local:{host_port}"), "200").await;
+    assert_eq!(body, format!("wiki wiki.local:{host_port}"));
+    host_answers(host_port, "notes.local", "404").await;
+    let body = host_answers(host_port, "notes.localhost", "200").await;
+    assert_eq!(body, "notes notes.localhost");
+    let report: NetworkReport = get_socket(&daemon.socket, "/api/network").await;
+    assert_eq!(report.mdns.state, MdnsState::Starting);
+
+    let settings: NetworkSettings =
+        put_socket(&daemon.socket, "/api/settings/network", r#"{"mdns":false}"#).await;
+    assert_eq!(settings, NetworkSettings { mdns: false });
+    host_answers(host_port, "wiki.local", "404").await;
+    let body = host_answers(host_port, "wiki.localhost", "200").await;
+    assert_eq!(body, "wiki wiki.localhost");
+    let report: NetworkReport = get_socket(&daemon.socket, "/api/network").await;
+    assert_eq!(report.mdns.state, MdnsState::Off);
+    let settings: NetworkSettings = get_socket(&daemon.socket, "/api/settings/network").await;
+    assert_eq!(settings, NetworkSettings { mdns: false });
+
+    let settings: NetworkSettings = put_socket(&daemon.socket, "/api/settings/network", "{}").await;
+    assert_eq!(
+        settings,
+        NetworkSettings { mdns: false },
+        "{{}} changes nothing"
+    );
+    put_socket::<NetworkSettings>(&daemon.socket, "/api/settings/network", r#"{"mdns":true}"#)
+        .await;
+    let body = host_answers(host_port, "wiki.local", "200").await;
+    assert_eq!(body, "wiki wiki.local");
 
     daemon.stop().await;
 }

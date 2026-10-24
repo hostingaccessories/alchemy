@@ -3,7 +3,7 @@
 //! containers to attach, which listeners to check and what the checks
 //! mean, and what clients are told.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -12,15 +12,19 @@ use std::time::{Duration, Instant};
 use alchemy_api::apps::{
     AddressKind, AddressState, AppAddress, AppList, AppProblem, AppProblemKind,
 };
-use alchemy_api::network::{ListenerState, ProxyListener, ProxyReport};
+use alchemy_api::network::{ListenerState, MdnsReport, MdnsState, ProxyListener, ProxyReport};
 use alchemy_core::engine::{ContainerState, Containers};
+use alchemy_core::mdns::{
+    Announcements, LanIpv4, MdnsProblem, NameState, conflict_problems, name_states,
+};
 use alchemy_core::ports::PortRange;
 use alchemy_core::route::{
-    AppRouteInput, Reachability, Route, RouteContainer, RoutePlan, RouteTable, ServiceRouteInput,
-    choose_target,
+    AppRouteInput, HostLabel, HostSuffix, Reachability, Route, RouteContainer, RoutePlan,
+    RouteTable, ServiceRouteInput, choose_target,
 };
 
 use crate::apps::ConfigOutcome;
+use crate::network::LanAddress;
 use crate::proxy::{BindError, Listen, ListenerStatus, ProbeResult, ProxyStatus};
 
 /// What the routing task last decided, kept in
@@ -32,6 +36,77 @@ pub struct Routing {
     pub apps: BTreeMap<String, AppRouting>,
     /// The proxy's listeners and how it reaches apps.
     pub proxy: ProxyReport,
+    /// Whether apps' `.local` names are announced.
+    pub mdns: MdnsReport,
+}
+
+/// What the mDNS announcer last reported, kept in
+/// [`State`](crate::State) for the routing task, which folds it into
+/// apps' `.local` addresses, their problems, and `GET /api/network`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MdnsStatus {
+    /// The names it holds on the network now, as it applied each
+    /// [`MdnsChange`](alchemy_core::mdns::MdnsChange).
+    pub announced: Announcements,
+    /// The labels another device answers for.
+    pub conflicts: BTreeSet<HostLabel>,
+    /// How it is doing, reported as is while the `network.mdns` setting
+    /// is on.
+    pub report: MdnsReport,
+}
+
+impl Default for MdnsStatus {
+    /// Nothing announced yet, by an announcer that hasn't started.
+    fn default() -> Self {
+        Self {
+            announced: Announcements::default(),
+            conflicts: BTreeSet::new(),
+            report: MdnsReport {
+                state: MdnsState::Starting,
+                ..MdnsReport::default()
+            },
+        }
+    }
+}
+
+/// The suffixes hostnames are routed under: `.localhost` always, and
+/// `.local` while the `network.mdns` setting is on.
+pub fn suffixes(mdns: bool) -> Vec<HostSuffix> {
+    std::iter::once(HostSuffix::Localhost)
+        .chain(mdns.then_some(HostSuffix::Local))
+        .collect()
+}
+
+/// The LAN address to announce names at: `preferred`, as
+/// [`preferred_lan_address`](crate::network::preferred_lan_address)
+/// picked it from `addresses`, on the interface it came from. `None`
+/// when there is none or it can't be announced.
+pub fn lan_ipv4(addresses: &[LanAddress], preferred: Option<Ipv4Addr>) -> Option<LanIpv4> {
+    let preferred = preferred?;
+    addresses
+        .iter()
+        .filter(|a| a.addr == preferred)
+        .find_map(|a| LanIpv4::new(&a.interface, a.addr).ok())
+}
+
+/// The report for `GET /api/network`: the announcer's own while the
+/// `network.mdns` setting is `enabled`, else `off`.
+pub fn mdns_report(enabled: bool, announcer: &MdnsReport) -> MdnsReport {
+    if enabled {
+        announcer.clone()
+    } else {
+        MdnsReport::default()
+    }
+}
+
+/// The app problem for a `.local` name another device answers for: a
+/// [`AppProblemKind::Route`] problem, like any other part of an address
+/// the app can't have, which a hostname in `x-alchemy` fixes.
+pub fn mdns_problem(problem: &MdnsProblem) -> AppProblem {
+    AppProblem {
+        kind: AppProblemKind::Route,
+        message: problem.kind.to_string(),
+    }
 }
 
 /// One app's part of [`Routing`].
@@ -285,16 +360,40 @@ pub struct RoutingInputs<'a> {
     pub checks: &'a BTreeMap<Listen, ListenerCheck>,
     /// What to call its listeners.
     pub addressing: Addressing,
+    /// Which `.local` names there are and how far each has got.
+    pub mdns: MdnsRouting<'a>,
 }
 
-/// Each app's addresses and route problems, and the proxy report.
+/// The mDNS part of [`RoutingInputs`].
+#[derive(Debug, Clone, Copy)]
+pub struct MdnsRouting<'a> {
+    /// The `network.mdns` setting.
+    pub enabled: bool,
+    /// The names that should be announced, from
+    /// [`desired`](alchemy_core::mdns::desired). Only these routes get
+    /// `.local` addresses.
+    pub desired: &'a Announcements,
+    /// What the announcer reported.
+    pub status: &'a MdnsStatus,
+}
+
+/// Each app's addresses and route problems, the proxy report, and the
+/// mDNS report.
 pub fn routing(inputs: &RoutingInputs<'_>) -> Routing {
+    let mdns = &inputs.mdns;
+    let names = name_states(mdns.desired, &mdns.status.announced, &mdns.status.conflicts);
     let mut apps: BTreeMap<String, AppRouting> = BTreeMap::new();
     for route in inputs.plan.table.routes() {
-        let addresses = addresses(route, inputs);
+        let addresses = addresses(route, inputs, &names);
         if !addresses.is_empty() {
             apps.entry(route.app.clone()).or_default().addresses = addresses;
         }
+    }
+    for problem in conflict_problems(mdns.desired, &mdns.status.conflicts) {
+        apps.entry(problem.app.clone())
+            .or_default()
+            .problems
+            .push(mdns_problem(&problem));
     }
     for problem in &inputs.plan.problems {
         apps.entry(problem.app.clone())
@@ -318,10 +417,19 @@ pub fn routing(inputs: &RoutingInputs<'_>) -> Routing {
     Routing {
         apps,
         proxy: proxy_report(inputs),
+        mdns: mdns_report(mdns.enabled, &mdns.status.report),
     }
 }
 
-fn addresses(route: &Route, inputs: &RoutingInputs<'_>) -> Vec<AppAddress> {
+/// `route`'s addresses, best first: by state, then `<label>.local` on
+/// port 80, `<label>.local` on its own port, the LAN address on its own
+/// port, and `<label>.localhost`. A `.local` address is offered only when
+/// its label is in `names`.
+fn addresses(
+    route: &Route,
+    inputs: &RoutingInputs<'_>,
+    names: &BTreeMap<HostLabel, NameState>,
+) -> Vec<AppAddress> {
     let base = route_state(route, inputs);
     let address = |kind, url, listener: Reach<'_>, port: u16| {
         let (state, message) = match (listener, &base) {
@@ -349,34 +457,94 @@ fn addresses(route: &Route, inputs: &RoutingInputs<'_>) -> Vec<AppAddress> {
         }
     };
 
-    let mut found = Vec::new();
-    if let Some(configured) = inputs.addressing.host_port {
+    let local_host = route.label.as_ref().map(|l| l.host(HostSuffix::Local));
+    let local = route
+        .label
+        .as_ref()
+        .and_then(|l| names.get(l).copied())
+        .zip(local_host.clone());
+    let host = inputs.addressing.host_port.map(|configured| {
         let status = &inputs.status.host;
         let port = match status {
             ListenerStatus::Listening(addr) => addr.port(),
             ListenerStatus::Off | ListenerStatus::Unavailable(_) => configured,
         };
-        let listener = Reach::of(status, inputs.checks.get(&Listen::Host));
-        for host in &route.hosts {
-            let url = if port == 80 {
-                format!("http://{host}/")
-            } else {
-                format!("http://{host}:{port}/")
-            };
-            found.push(address(AddressKind::Host, url, listener, port));
+        (port, Reach::of(status, inputs.checks.get(&Listen::Host)))
+    });
+    let own = route.listen_port.map(|port| {
+        let status = inputs
+            .status
+            .ports
+            .get(&port)
+            .unwrap_or(&ListenerStatus::Off);
+        (
+            port,
+            Reach::of(status, inputs.checks.get(&Listen::App(port))),
+        )
+    });
+    let host_url = |name: &str, port: u16| {
+        if port == 80 {
+            format!("http://{name}/")
+        } else {
+            format!("http://{name}:{port}/")
         }
+    };
+
+    let mut found = Vec::new();
+    if let (Some((state, name)), Some((port, listener))) = (&local, host) {
+        let found_at = address(AddressKind::Host, host_url(name, port), listener, port);
+        found.push(named(found_at, name, *state));
     }
-    if let Some(port) = route.listen_port {
-        let status = inputs.status.ports.get(&port).cloned().unwrap_or_default();
-        let listener = Reach::of(&status, inputs.checks.get(&Listen::App(port)));
+    if let (Some((state, name)), Some((port, listener))) = (&local, own) {
+        let found_at = address(
+            AddressKind::Port,
+            format!("http://{name}:{port}/"),
+            listener,
+            port,
+        );
+        found.push(named(found_at, name, *state));
+    }
+    if let Some((port, listener)) = own {
         let url = format!(
             "http://{}/",
             SocketAddr::new(inputs.addressing.app_host, port)
         );
         found.push(address(AddressKind::Port, url, listener, port));
     }
+    if let Some((port, listener)) = host {
+        for name in route
+            .hosts
+            .iter()
+            .filter(|&h| Some(h) != local_host.as_ref())
+        {
+            found.push(address(
+                AddressKind::Host,
+                host_url(name, port),
+                listener,
+                port,
+            ));
+        }
+    }
     found.sort_by_key(|a| rank(a.state));
     found
+}
+
+/// `address`, a `.local` address for `name`, as far as the name has got:
+/// unavailable while another device answers for it, and pending, where it
+/// would otherwise be ready, until it is announced.
+fn named(mut address: AppAddress, name: &str, state: NameState) -> AppAddress {
+    match state {
+        NameState::InUse => {
+            address.state = AddressState::Unavailable;
+            address.message = Some(format!("Another device on your network uses {name}."));
+        }
+        NameState::Announcing if address.state == AddressState::Ready => {
+            address.state = AddressState::Pending;
+            address.message = Some(format!("Alchemy is announcing {name} on your network."));
+        }
+        _ => {}
+    }
+    address
 }
 
 /// Whether `route`'s app can be reached, apart from the proxy's
@@ -897,17 +1065,51 @@ mod tests {
 
     const NO_PORT: &str = "db problem No service exposes or publishes a port, so Alchemy doesn't know where to send requests. Add an x-alchemy block with service and port.";
 
+    /// No `.local` names: the setting is off.
+    fn mdns_off<'a>(desired: &'a Announcements, status: &'a MdnsStatus) -> MdnsRouting<'a> {
+        MdnsRouting {
+            enabled: false,
+            desired,
+            status,
+        }
+    }
+
     /// The addresses of [`world`], with `blog` on port 8100 and `wiki` on
     /// 8101, through listeners in `status` checked as `checks`.
     fn world_addresses(
         status: &ProxyStatus,
         checks: &BTreeMap<Listen, ListenerCheck>,
     ) -> Vec<String> {
-        let (apps, configs, containers) = world();
+        summarize(&world_routing(world(), status, checks, None))
+    }
+
+    /// [`world_addresses`]' routing of `world`, with `.local` names on
+    /// 192.168.1.20 as `mdns` reports them, when given.
+    fn world_routing(
+        world: (AppList, BTreeMap<PathBuf, ConfigOutcome>, Containers),
+        status: &ProxyStatus,
+        checks: &BTreeMap<Listen, ListenerCheck>,
+        mdns: Option<&MdnsStatus>,
+    ) -> Routing {
+        let (apps, configs, containers) = world;
         let reserved = BTreeMap::from([("blog".to_owned(), 8100), ("wiki".to_owned(), 8101)]);
         let inputs = route_inputs(&apps, &configs, &containers, &reserved);
-        let plan = plan_routes(&inputs, &options(Reachability::ContainerIp));
-        summarize(&routing(&RoutingInputs {
+        let enabled = mdns.is_some();
+        let plan = plan_routes(
+            &inputs,
+            &RouteOptions {
+                reachability: Reachability::ContainerIp,
+                suffixes: suffixes(enabled),
+            },
+        );
+        let lan = LanIpv4::new("en0", Ipv4Addr::new(192, 168, 1, 20)).unwrap();
+        let want = alchemy_core::mdns::desired(&alchemy_core::mdns::MdnsInputs {
+            enabled,
+            routes: &plan.table,
+            lan: Some(&lan),
+        });
+        let off = MdnsStatus::default();
+        routing(&RoutingInputs {
             plan: &plan,
             inputs: &inputs,
             reachability: Reachability::ContainerIp,
@@ -919,7 +1121,12 @@ mod tests {
                 host_port: Some(80),
                 app_host: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
             },
-        }))
+            mdns: MdnsRouting {
+                enabled,
+                desired: &want,
+                status: mdns.unwrap_or(&off),
+            },
+        })
     }
 
     #[test]
@@ -934,11 +1141,11 @@ mod tests {
                     ports: BTreeMap::from([(8100, listening(8100)), (8101, listening(8101))]),
                 },
                 vec![
-                    "blog Host http://blog.localhost/ Ready -",
                     "blog Port http://192.168.1.20:8100/ Ready -",
+                    "blog Host http://blog.localhost/ Ready -",
                     no_port,
-                    "wiki Host http://wiki.localhost/ Pending Alchemy is connecting service app to the alchemy network.",
                     "wiki Port http://192.168.1.20:8101/ Pending Alchemy is connecting service app to the alchemy network.",
+                    "wiki Host http://wiki.localhost/ Pending Alchemy is connecting service app to the alchemy network.",
                 ],
             ),
             (
@@ -974,8 +1181,8 @@ mod tests {
                     "blog Host http://blog.localhost:8080/ Ready -",
                     "blog Port http://192.168.1.20:8100/ Unavailable Another program is using port 8100.",
                     no_port,
-                    "wiki Host http://wiki.localhost:8080/ Pending Alchemy is connecting service app to the alchemy network.",
                     "wiki Port http://192.168.1.20:8101/ Pending Alchemy is connecting service app to the alchemy network.",
+                    "wiki Host http://wiki.localhost:8080/ Pending Alchemy is connecting service app to the alchemy network.",
                 ],
             ),
         ];
@@ -1017,11 +1224,11 @@ mod tests {
                 "not checked yet",
                 checked(None, None),
                 vec![
-                    "blog Host http://blog.localhost/ Pending Alchemy is checking port 80.",
                     "blog Port http://192.168.1.20:8100/ Pending Alchemy is checking port 8100.",
+                    "blog Host http://blog.localhost/ Pending Alchemy is checking port 80.",
                     no_port,
-                    "wiki Host http://wiki.localhost/ Pending Alchemy is checking port 80.",
                     "wiki Port http://192.168.1.20:8101/ Pending Alchemy is connecting service app to the alchemy network.",
+                    "wiki Host http://wiki.localhost/ Pending Alchemy is checking port 80.",
                 ],
             ),
             (
@@ -1037,8 +1244,8 @@ mod tests {
                     "blog Host http://blog.localhost/ Ready -",
                     "blog Port http://192.168.1.20:8100/ Unavailable Alchemy can't reach port 8100 at 192.168.1.20: timed out.",
                     no_port,
-                    "wiki Host http://wiki.localhost/ Pending Alchemy is connecting service app to the alchemy network.",
                     "wiki Port http://192.168.1.20:8101/ Pending Alchemy is connecting service app to the alchemy network.",
+                    "wiki Host http://wiki.localhost/ Pending Alchemy is connecting service app to the alchemy network.",
                 ],
             ),
         ];
@@ -1091,6 +1298,7 @@ mod tests {
                     host_port: Some(80),
                     app_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 },
+                mdns: mdns_off(&Announcements::default(), &MdnsStatus::default()),
             });
             assert_eq!(summarize(&got), want, "{reach:?}");
         }
@@ -1227,6 +1435,7 @@ mod tests {
                     host_port: Some(80),
                     app_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 },
+                mdns: mdns_off(&Announcements::default(), &MdnsStatus::default()),
             })
             .proxy;
             assert_eq!(report.host.port, 80);
@@ -1238,5 +1447,302 @@ mod tests {
                 Some(alchemy_api::network::Reachability::PublishedOnly)
             );
         }
+    }
+
+    fn lan() -> LanIpv4 {
+        LanIpv4::new("en0", Ipv4Addr::new(192, 168, 1, 20)).unwrap()
+    }
+
+    fn label(text: &str) -> HostLabel {
+        HostLabel::new(text).unwrap()
+    }
+
+    /// The announcer has put every name in `labels` on the network at
+    /// 192.168.1.20, and reports conflicts on `conflicts`.
+    fn announced(labels: &[&str], conflicts: &[&str]) -> MdnsStatus {
+        MdnsStatus {
+            announced: labels
+                .iter()
+                .map(|&l| alchemy_core::mdns::Announcement {
+                    label: label(l),
+                    app: l.into(),
+                    lan: lan(),
+                })
+                .collect(),
+            conflicts: conflicts.iter().map(|&l| label(l)).collect(),
+            report: MdnsReport {
+                state: MdnsState::Announcing,
+                backend: Some(alchemy_api::network::MdnsBackend::Avahi),
+                ..MdnsReport::default()
+            },
+        }
+    }
+
+    #[test]
+    fn local_addresses_come_first_as_far_as_their_name_has_got() {
+        type Case<'a> = (
+            &'a str,
+            MdnsStatus,
+            &'a BTreeMap<Listen, ListenerCheck>,
+            Vec<String>,
+        );
+        let everything = ProxyStatus {
+            host: listening(80),
+            ports: BTreeMap::from([(8100, listening(8100)), (8101, listening(8101))]),
+        };
+        let connecting = "Pending Alchemy is connecting service app to the alchemy network.";
+        let wiki_connecting = |found: &mut Vec<String>| {
+            found.extend(
+                [
+                    "wiki Host http://wiki.local/",
+                    "wiki Port http://wiki.local:8101/",
+                    "wiki Port http://192.168.1.20:8101/",
+                    "wiki Host http://wiki.localhost/",
+                ]
+                .map(|a| format!("{a} {connecting}")),
+            );
+        };
+        let mut all_announced = vec![
+            "blog Host http://blog.local/ Ready -".to_owned(),
+            "blog Port http://blog.local:8100/ Ready -".to_owned(),
+            "blog Port http://192.168.1.20:8100/ Ready -".to_owned(),
+            "blog Host http://blog.localhost/ Ready -".to_owned(),
+            NO_PORT.to_owned(),
+        ];
+        wiki_connecting(&mut all_announced);
+        let mut announcing = vec![
+            "blog Port http://192.168.1.20:8100/ Ready -".to_owned(),
+            "blog Host http://blog.localhost/ Ready -".to_owned(),
+            "blog Host http://blog.local/ Pending Alchemy is announcing blog.local on your network.".to_owned(),
+            "blog Port http://blog.local:8100/ Pending Alchemy is announcing blog.local on your network.".to_owned(),
+            NO_PORT.to_owned(),
+        ];
+        wiki_connecting(&mut announcing);
+        let mut in_use = vec![
+            "blog Port http://192.168.1.20:8100/ Ready -".to_owned(),
+            "blog Host http://blog.localhost/ Ready -".to_owned(),
+            "blog Host http://blog.local/ Unavailable Another device on your network uses blog.local.".to_owned(),
+            "blog Port http://blog.local:8100/ Unavailable Another device on your network uses blog.local.".to_owned(),
+            "blog problem Another device on your network uses blog.local. Set a hostname in x-alchemy.".to_owned(),
+            NO_PORT.to_owned(),
+        ];
+        wiki_connecting(&mut in_use);
+        let port_80_taken = BTreeMap::from([
+            (Listen::Host, ListenerCheck::Foreign(at("127.0.0.1:80"))),
+            (Listen::App(8100), ListenerCheck::Ours),
+            (Listen::App(8101), ListenerCheck::Ours),
+        ]);
+        let taken = "Unavailable Another program on this computer takes port 80.";
+        let cases: [Case<'_>; 4] = [
+            (
+                "announced",
+                announced(&["blog", "wiki"], &[]),
+                &ours(&everything),
+                all_announced,
+            ),
+            (
+                "not announced yet",
+                MdnsStatus::default(),
+                &ours(&everything),
+                announcing,
+            ),
+            (
+                "in use by another device",
+                announced(&["wiki"], &["blog"]),
+                &ours(&everything),
+                in_use,
+            ),
+            (
+                "port 80 answered by another program",
+                announced(&["blog", "wiki"], &[]),
+                &port_80_taken,
+                vec![
+                    "blog Port http://blog.local:8100/ Ready -".to_owned(),
+                    "blog Port http://192.168.1.20:8100/ Ready -".to_owned(),
+                    format!("blog Host http://blog.local/ {taken}"),
+                    format!("blog Host http://blog.localhost/ {taken}"),
+                    NO_PORT.to_owned(),
+                    format!("wiki Port http://wiki.local:8101/ {connecting}"),
+                    format!("wiki Port http://192.168.1.20:8101/ {connecting}"),
+                    format!("wiki Host http://wiki.local/ {taken}"),
+                    format!("wiki Host http://wiki.localhost/ {taken}"),
+                ],
+            ),
+        ];
+        for (name, mdns, checks, want) in cases {
+            let got = world_routing(world(), &everything, checks, Some(&mdns));
+            assert_eq!(summarize(&got), want, "{name}");
+            assert_eq!(got.mdns, mdns.report, "{name}");
+        }
+    }
+
+    #[test]
+    fn no_local_addresses_when_mdns_is_off_or_there_is_no_lan_address() {
+        let status = ProxyStatus {
+            host: listening(80),
+            ports: BTreeMap::from([(8100, listening(8100)), (8101, listening(8101))]),
+        };
+        let checks = ours(&status);
+        let mdns = announced(&["blog", "wiki"], &["wiki"]);
+
+        let off = world_routing(world(), &status, &checks, None);
+        assert_eq!(off.mdns, MdnsReport::default());
+
+        let (apps, mut configs, containers) = world();
+        configs.insert(
+            PathBuf::from("/srv/apps/blog"),
+            ConfigOutcome::Ready(ComposeConfig {
+                name: "blog".into(),
+                services: vec![service("web", &["80"], &[])],
+                x_alchemy: Some(XAlchemyBlock::Read(XAlchemy {
+                    mdns: false,
+                    ..XAlchemy::default()
+                })),
+                ..ComposeConfig::default()
+            }),
+        );
+        let quiet = world_routing((apps, configs, containers), &status, &checks, Some(&mdns));
+
+        for (name, routing) in [("setting off", &off), ("blog opts out", &quiet)] {
+            let blog: Vec<&str> = routing.apps["blog"]
+                .addresses
+                .iter()
+                .map(|a| a.url.as_str())
+                .collect();
+            assert_eq!(
+                blog,
+                ["http://192.168.1.20:8100/", "http://blog.localhost/"],
+                "{name}"
+            );
+            assert!(routing.apps["blog"].problems.is_empty(), "{name}");
+        }
+        assert_eq!(
+            off.apps["wiki"].addresses.len(),
+            2,
+            "no wiki.local while the setting is off"
+        );
+        assert_eq!(
+            quiet.apps["wiki"].problems,
+            [AppProblem {
+                kind: AppProblemKind::Route,
+                message:
+                    "Another device on your network uses wiki.local. Set a hostname in x-alchemy."
+                        .into(),
+            }]
+        );
+
+        let (apps, configs, containers) = world();
+        let reserved = BTreeMap::from([("blog".to_owned(), 8100)]);
+        let inputs = route_inputs(&apps, &configs, &containers, &reserved);
+        let plan = plan_routes(
+            &inputs,
+            &RouteOptions {
+                reachability: Reachability::ContainerIp,
+                suffixes: suffixes(true),
+            },
+        );
+        let no_lan = alchemy_core::mdns::desired(&alchemy_core::mdns::MdnsInputs {
+            enabled: true,
+            routes: &plan.table,
+            lan: None,
+        });
+        let got = routing(&RoutingInputs {
+            plan: &plan,
+            inputs: &inputs,
+            reachability: Reachability::ContainerIp,
+            unreserved: &BTreeMap::new(),
+            range: PortRange::new(8100, 8999).unwrap(),
+            status: &status,
+            checks: &checks,
+            addressing: Addressing {
+                host_port: Some(80),
+                app_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            },
+            mdns: MdnsRouting {
+                enabled: true,
+                desired: &no_lan,
+                status: &mdns,
+            },
+        });
+        let urls: Vec<&str> = got.apps["blog"]
+            .addresses
+            .iter()
+            .map(|a| a.url.as_str())
+            .collect();
+        assert_eq!(urls, ["http://127.0.0.1:8100/", "http://blog.localhost/"]);
+        assert!(got.apps["wiki"].problems.is_empty(), "no name, no conflict");
+    }
+
+    #[test]
+    fn local_is_routed_only_while_mdns_is_on() {
+        assert_eq!(suffixes(false), [HostSuffix::Localhost]);
+        assert_eq!(suffixes(true), [HostSuffix::Localhost, HostSuffix::Local]);
+    }
+
+    #[test]
+    fn lan_ipv4_keeps_the_interface_of_the_preferred_address() {
+        let address = |interface: &str, addr: [u8; 4]| LanAddress {
+            interface: interface.into(),
+            addr: Ipv4Addr::from(addr),
+            subnet: "192.168.1.0/24".parse().unwrap(),
+        };
+        let addresses = [
+            address("en0", [192, 168, 1, 20]),
+            address("en1", [192, 168, 1, 21]),
+            address("en7", [169, 254, 3, 4]),
+        ];
+        let cases = [
+            (Some([192, 168, 1, 21]), Some(("en1", [192, 168, 1, 21]))),
+            (Some([192, 168, 1, 20]), Some(("en0", [192, 168, 1, 20]))),
+            (Some([169, 254, 3, 4]), None),
+            (Some([10, 0, 0, 1]), None),
+            (None, None),
+        ];
+        for (preferred, want) in cases {
+            let got = lan_ipv4(&addresses, preferred.map(Ipv4Addr::from));
+            let want = want.map(|(i, a)| LanIpv4::new(i, Ipv4Addr::from(a)).unwrap());
+            assert_eq!(got, want, "{preferred:?}");
+        }
+    }
+
+    #[test]
+    fn the_mdns_report_is_off_while_the_setting_is() {
+        let starting = MdnsStatus::default().report;
+        assert_eq!(starting.state, MdnsState::Starting);
+        let unavailable = MdnsReport {
+            state: MdnsState::Unavailable,
+            backend: Some(alchemy_api::network::MdnsBackend::DnsSd),
+            message: Some("m".into()),
+            fix: Some("f".into()),
+        };
+        let cases = [
+            (true, starting.clone(), starting.clone()),
+            (true, unavailable.clone(), unavailable.clone()),
+            (false, unavailable, MdnsReport::default()),
+            (false, starting, MdnsReport::default()),
+        ];
+        for (enabled, announcer, want) in cases {
+            assert_eq!(mdns_report(enabled, &announcer), want, "{enabled}");
+        }
+        assert_eq!(MdnsReport::default().state, MdnsState::Off);
+    }
+
+    #[test]
+    fn a_name_in_use_is_a_route_problem() {
+        let problem = MdnsProblem {
+            app: "immich".into(),
+            kind: alchemy_core::mdns::MdnsProblemKind::NameInUse {
+                label: label("immich"),
+            },
+        };
+        assert_eq!(
+            mdns_problem(&problem),
+            AppProblem {
+                kind: AppProblemKind::Route,
+                message:
+                    "Another device on your network uses immich.local. Set a hostname in x-alchemy."
+                        .into(),
+            }
+        );
     }
 }

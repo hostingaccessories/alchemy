@@ -8,14 +8,14 @@ use std::sync::Arc;
 use alchemy_api::MetricsResponse;
 use alchemy_api::OperationList;
 use alchemy_api::apps::{AppList, AppSettings};
-use alchemy_api::network::NetworkReport;
+use alchemy_api::network::{NetworkReport, NetworkSettings};
 use alchemy_core::engine::{Containers, EngineState, EngineStatus};
 use alchemy_core::route::EngineFacts;
 use tokio::sync::watch;
 
 use crate::apps::ConfigOutcome;
 use crate::logs::LogStreams;
-use crate::routing::Routing;
+use crate::routing::{MdnsStatus, Routing};
 
 /// The daemon's live state. Cheap to clone: every clone shares the same
 /// values.
@@ -42,6 +42,8 @@ struct Inner {
     app_scans: watch::Sender<u64>,
     operations: watch::Sender<OperationList>,
     network: watch::Sender<NetworkReport>,
+    network_settings: watch::Sender<NetworkSettings>,
+    mdns: watch::Sender<MdnsStatus>,
     routing: watch::Sender<Routing>,
     log_streams: LogStreams,
 }
@@ -71,6 +73,8 @@ impl State {
                 app_scans: watch::Sender::new(0),
                 operations: watch::Sender::new(OperationList::default()),
                 network: watch::Sender::new(NetworkReport::default()),
+                network_settings: watch::Sender::new(NetworkSettings::default()),
+                mdns: watch::Sender::new(MdnsStatus::default()),
                 routing: watch::Sender::new(Routing::default()),
                 log_streams: LogStreams::default(),
             }),
@@ -297,6 +301,43 @@ impl State {
     /// are only notified if it did.
     pub fn set_network(&self, network: NetworkReport) -> bool {
         send_if_changed(&self.inner.network, network)
+    }
+
+    /// The network settings in effect.
+    pub fn network_settings(&self) -> NetworkSettings {
+        *self.inner.network_settings.borrow()
+    }
+
+    /// Subscribe to changes to [`Self::network_settings`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_network_settings(&self) -> watch::Receiver<NetworkSettings> {
+        self.inner.network_settings.subscribe()
+    }
+
+    /// Replace the network settings in effect. Returns whether they
+    /// changed; subscribers are only notified if they did.
+    pub fn set_network_settings(&self, settings: NetworkSettings) -> bool {
+        send_if_changed(&self.inner.network_settings, settings)
+    }
+
+    /// What the mDNS announcer last reported: the names it holds, those
+    /// another device answers for, and how it is doing.
+    pub fn mdns(&self) -> MdnsStatus {
+        self.inner.mdns.borrow().clone()
+    }
+
+    /// Subscribe to changes to [`Self::mdns`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_mdns(&self) -> watch::Receiver<MdnsStatus> {
+        self.inner.mdns.subscribe()
+    }
+
+    /// Replace what the mDNS announcer reports. Returns whether it
+    /// changed; subscribers are only notified if it did.
+    pub fn set_mdns(&self, status: MdnsStatus) -> bool {
+        send_if_changed(&self.inner.mdns, status)
     }
 
     /// What the routing task last decided: each app's web addresses and

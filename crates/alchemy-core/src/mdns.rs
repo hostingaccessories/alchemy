@@ -703,6 +703,12 @@ mod tests {
     #[test]
     fn name_states_table() {
         use NameState::{Announced, Announcing, InUse};
+        type Case = (
+            &'static str,
+            Vec<Announcement>,
+            Vec<&'static str>,
+            [NameState; 3],
+        );
         let home = lan("en0", "192.168.1.20");
         let moved = lan("en0", "192.168.1.21");
         let wifi = lan("en1", "192.168.1.20");
@@ -713,12 +719,6 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        type Case = (
-            &'static str,
-            Vec<Announcement>,
-            Vec<&'static str>,
-            [NameState; 3],
-        );
         let cases: [Case; 4] = [
             (
                 "nothing announced yet",

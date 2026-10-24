@@ -17,6 +17,13 @@
 //!   listeners, as a [`Routing`] in [`State`], for the app list and
 //!   `GET /api/network`.
 //!
+//! While the `network.mdns` setting is on, hostnames are routed under
+//! `.local` as well as `.localhost`, except for apps that set
+//! `x-alchemy: { mdns: false }`. Each name [`desired`] for the LAN
+//! address gets `.local` addresses, as far as the announcer's
+//! [`MdnsStatus`] in [`State`] says it has got, and a name another device
+//! answers for is an app problem.
+//!
 //! A proxy listener another program held is tried again every
 //! [`ProxyDeps::interval`].
 //!
@@ -40,18 +47,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alchemy_core::engine::EngineState;
+use alchemy_core::mdns::{LanIpv4, MdnsInputs, desired};
 use alchemy_core::network::SHARED_NETWORK;
 use alchemy_core::ports::{PortRange, Protocol};
 use alchemy_core::route::{
-    AppRouteInput, EngineFacts, HostSuffix, Reachability, RouteOptions, RoutePlan, RouteTable,
-    plan_routes, reachability,
+    AppRouteInput, EngineFacts, Reachability, RouteOptions, RoutePlan, RouteTable, plan_routes,
+    reachability,
 };
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
-pub use plan::{AppRouting, Routing};
+pub use plan::{AppRouting, MdnsStatus, Routing};
 
-use self::plan::{Addressing, ListenerCheck, RoutingInputs};
+use self::plan::{Addressing, ListenerCheck, MdnsRouting, RoutingInputs};
 use crate::State;
 use crate::network::{SharedNetwork, preferred_lan_address};
 use crate::ports::PortRegistry;
@@ -190,8 +198,9 @@ pub struct ProxyHandle {
 /// `shutdown` flips to `true` or its sender is dropped.
 ///
 /// It plans at start, whenever the apps, their configurations, the
-/// containers, the engine, the network check, or the proxy's listeners
-/// change, and every [`ProxyDeps::interval`]. Nothing is routed until the
+/// containers, the engine, the network check, the network settings, the
+/// mDNS announcer's status, or the proxy's listeners change, and every
+/// [`ProxyDeps::interval`]. Nothing is routed until the
 /// engine has been ready once, since how the proxy reaches containers
 /// depends on it; after that the last engine's facts are kept while it
 /// is away. Docker's networks are reached through `engine`, the LAN
@@ -221,6 +230,7 @@ pub async fn run(
         unreserved: BTreeMap::new(),
         attached: BTreeMap::new(),
         lan: None,
+        lan_ipv4: None,
         checks: BTreeMap::new(),
         recheck: false,
     };
@@ -230,6 +240,8 @@ pub async fn run(
     let mut facts = router.state.watch_engine_facts();
     let mut engine = router.state.watch_engine();
     let mut network = router.state.watch_network();
+    let mut settings = router.state.watch_network_settings();
+    let mut mdns = router.state.watch_mdns();
     let mut status = router.proxy.status.clone();
     let mut tick = tokio::time::interval(router.deps.interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -242,6 +254,8 @@ pub async fn run(
         facts.borrow_and_update();
         engine.borrow_and_update();
         network.borrow_and_update();
+        settings.borrow_and_update();
+        mdns.borrow_and_update();
         status.borrow_and_update();
         tokio::select! {
             biased;
@@ -257,6 +271,8 @@ pub async fn run(
             Ok(()) = facts.changed() => false,
             Ok(()) = engine.changed() => false,
             Ok(()) = network.changed() => false,
+            Ok(()) = settings.changed() => false,
+            Ok(()) = mdns.changed() => false,
             Ok(()) = status.changed() => false,
             _ = tick.tick() => true,
         };
@@ -284,6 +300,8 @@ struct Router {
     attached: BTreeMap<String, Instant>,
     /// The LAN address, when app ports listen on every address.
     lan: Option<Ipv4Addr>,
+    /// The same, with its interface, for `.local` names.
+    lan_ipv4: Option<LanIpv4>,
     /// Each listening listener's last check, with the addresses it
     /// probed.
     checks: BTreeMap<Listen, (Vec<SocketAddr>, ListenerCheck)>,
@@ -297,13 +315,18 @@ impl Router {
         if let Some(facts) = self.state.engine_facts() {
             self.facts = Some(facts);
         }
+        let settings = self.state.network_settings();
+        let mdns = self.state.mdns();
         let Some(facts) = self.facts else {
             self.proxy.routes.send_if_modified(|table| {
                 let changed = !table.is_empty();
                 *table = RouteTable::default();
                 changed
             });
-            self.state.set_routing(Routing::default());
+            self.state.set_routing(Routing {
+                mdns: plan::mdns_report(settings.mdns, &mdns.report),
+                ..Routing::default()
+            });
             return;
         };
         let reach = reachability(&facts);
@@ -318,13 +341,28 @@ impl Router {
             &inputs,
             &RouteOptions {
                 reachability: reach,
-                suffixes: vec![HostSuffix::Localhost],
+                suffixes: plan::suffixes(settings.mdns),
             },
         );
         self.attach(plan::to_attach(&plan.table, &inputs, reach))
             .await;
         let status = self.check_listeners().await;
-        self.publish(&plan, &inputs, reach, &status);
+        let want = desired(&MdnsInputs {
+            enabled: settings.mdns,
+            routes: &plan.table,
+            lan: self.lan_ipv4.as_ref(),
+        });
+        self.publish(
+            &plan,
+            &inputs,
+            reach,
+            &status,
+            MdnsRouting {
+                enabled: settings.mdns,
+                desired: &want,
+                status: &mdns,
+            },
+        );
     }
 
     /// Probe each listening listener that is new, moved, or due again,
@@ -458,6 +496,7 @@ impl Router {
         inputs: &[AppRouteInput],
         reach: Reachability,
         status: &ProxyStatus,
+        mdns: MdnsRouting<'_>,
     ) {
         let table = plan.table.clone();
         self.proxy.routes.send_if_modified(|current| {
@@ -487,6 +526,7 @@ impl Router {
             status,
             checks: &checks,
             addressing: self.addressing,
+            mdns,
         }));
     }
 
@@ -498,14 +538,18 @@ impl Router {
         self.recheck = true;
         if self.deps.app_ip.is_unspecified() {
             let (addresses, routes) = tokio::join!(self.host.lan_addresses(), self.host.routes());
-            let lan = match (addresses, routes) {
-                (Ok(addresses), Ok(routes)) => preferred_lan_address(&addresses, &routes),
+            let (lan, lan_ipv4) = match (addresses, routes) {
+                (Ok(addresses), Ok(routes)) => {
+                    let lan = preferred_lan_address(&addresses, &routes);
+                    (lan, plan::lan_ipv4(&addresses, lan))
+                }
                 (Err(error), _) | (_, Err(error)) => {
                     tracing::debug!(%error, "cannot read the LAN address");
-                    None
+                    (None, None)
                 }
             };
             self.lan = lan;
+            self.lan_ipv4 = lan_ipv4;
             self.addressing.app_host = IpAddr::V4(lan.unwrap_or(Ipv4Addr::LOCALHOST));
         }
         let retry = {
