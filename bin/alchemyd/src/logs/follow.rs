@@ -167,11 +167,12 @@ async fn run(
                 target.name
             ))
         })?;
-        let mut cursor = Cursor::new();
+        let mut place = Place::default();
         for entry in &entries {
-            cursor.record(entry.at);
+            place.of(entry.line.stream).record(entry.at);
         }
-        cursors.insert(target.id.clone(), cursor);
+        place.seed();
+        cursors.insert(target.id.clone(), place);
         sources.push(entries);
     }
     let tail = usize::try_from(query.tail).unwrap_or(usize::MAX);
@@ -193,7 +194,7 @@ async fn follow_all(
     query: &LogQuery,
     tx: &Events,
     initial: Vec<Target>,
-    mut cursors: HashMap<String, Cursor>,
+    mut cursors: HashMap<String, Place>,
 ) -> Result<(), Stop> {
     let mut followers = JoinSet::new();
     let mut active = HashSet::new();
@@ -245,9 +246,9 @@ async fn follow(
     state: State,
     app: String,
     target: Target,
-    mut cursor: Cursor,
+    mut cursor: Place,
     tx: Events,
-) -> (String, Cursor) {
+) -> (String, Place) {
     loop {
         if let Some(endpoint) = endpoint(&state) {
             let request = LogRequest {
@@ -282,9 +283,11 @@ async fn follow(
     }
 }
 
-async fn send_new(tx: &Events, cursor: &mut Cursor, entries: impl Iterator<Item = Entry>) -> bool {
+async fn send_new(tx: &Events, cursor: &mut Place, entries: impl Iterator<Item = Entry>) -> bool {
     for entry in entries {
-        if cursor.admit(entry.at) && tx.send(LogEvent::Log(entry.line)).await.is_err() {
+        if cursor.of(entry.line.stream).admit(entry.at)
+            && tx.send(LogEvent::Log(entry.line)).await.is_err()
+        {
             return false;
         }
     }
@@ -330,6 +333,45 @@ fn endpoint(state: &State) -> Option<String> {
     (engine.state == EngineState::Ready)
         .then_some(engine.endpoint)
         .flatten()
+}
+
+/// Where each output of one container's log was left.
+#[derive(Debug, Clone, Copy, Default)]
+struct Place {
+    stdout: Cursor,
+    stderr: Cursor,
+}
+
+impl Place {
+    fn of(&mut self, stream: LogStream) -> &mut Cursor {
+        match stream {
+            LogStream::Stderr => &mut self.stderr,
+            _ => &mut self.stdout,
+        }
+    }
+
+    /// Start an output that sent nothing in the tail where the other was
+    /// left, so resuming doesn't send it from the start of the log.
+    fn seed(&mut self) {
+        match (self.stdout.last(), self.stderr.last()) {
+            (Some(at), None) => self.stderr = Cursor::starting_at(at),
+            (None, Some(at)) => self.stdout = Cursor::starting_at(at),
+            _ => {}
+        }
+    }
+
+    /// The second to resume from: the earlier of the two outputs'.
+    fn since(&self) -> Option<i64> {
+        [self.stdout.since(), self.stderr.since()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    fn resume(&mut self) {
+        self.stdout.resume();
+        self.stderr.resume();
+    }
 }
 
 /// One container whose log is read.
@@ -757,6 +799,31 @@ mod tests {
         assert_eq!(next(&mut events).await, "following");
         source.write("w", LogStream::Stdout, T2, "new");
         assert_eq!(next(&mut events).await, "web Stdout new");
+    }
+
+    #[tokio::test]
+    async fn outputs_out_of_order_with_each_other_are_all_sent_once() {
+        let state = ready_state(blog(&[("web", &[("w", RUNNING)])]));
+        let source = FakeLogSource::new();
+        source.write("w", LogStream::Stdout, T2, "out two");
+        let shared: SharedLogSource = Arc::new(source.clone());
+        let mut events = Box::pin(stream(shared, state.clone(), query(None, 10, true)));
+        assert_eq!(next(&mut events).await, "web Stdout out two");
+        assert_eq!(next(&mut events).await, "following");
+
+        source.write("w", LogStream::Stdout, T4, "out four");
+        source.write("w", LogStream::Stderr, T3, "err three");
+        assert_eq!(next(&mut events).await, "web Stdout out four");
+        assert_eq!(next(&mut events).await, "web Stderr err three");
+
+        source.stop("w");
+        state.set_apps(blog(&[("web", &[("w", ContainerState::Exited)])]));
+        source.write("w", LogStream::Stderr, T4, "err four");
+        source.start("w");
+        state.set_apps(blog(&[("web", &[("w", RUNNING)])]));
+        assert_eq!(next(&mut events).await, "web Stderr err four");
+        source.write("w", LogStream::Stdout, T4, "out four again");
+        assert_eq!(next(&mut events).await, "web Stdout out four again");
     }
 
     #[test]

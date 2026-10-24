@@ -6,8 +6,8 @@
 //! on every line, as Docker writes them (RFC 3339, UTC, nanoseconds). A
 //! [`LineSplitter`] cuts the bytes into lines, [`split_timestamp`] takes
 //! the timestamp off the front, [`merge_tail`] orders the containers'
-//! tails into one, and a [`Cursor`] remembers where a container's log was
-//! left so a reconnect can skip what was already sent.
+//! tails into one, and a [`Cursor`] remembers where each output of a
+//! container's log was left so a reconnect can skip what was already sent.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -324,12 +324,14 @@ pub fn merge_tail<T>(
     merged
 }
 
-/// Where one container's log was left, so following it again after its
-/// stream ends skips every line already sent.
+/// Where one output of a container's log, stdout or stderr, was left, so
+/// following it again after its stream ends skips every line already sent.
 ///
 /// The engine can only start a log at a whole second, so a resumed
 /// stream repeats the lines from the start of that second; the cursor
-/// drops them by their timestamps.
+/// drops them by their timestamps. Keep one cursor per output: Docker
+/// stamps each output's lines in order, but a container's stdout and
+/// stderr lines can reach its log slightly out of order with each other.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Cursor {
     last: Option<Timestamp>,
@@ -341,6 +343,22 @@ impl Cursor {
     /// A cursor before the first line.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A cursor for an output that has sent nothing yet, while another
+    /// output of the same container was left at `at`: lines from before
+    /// `at` are dropped as older than the tail already sent.
+    pub fn starting_at(at: Timestamp) -> Self {
+        Self {
+            last: Some(at),
+            at_last: 0,
+            skip: 0,
+        }
+    }
+
+    /// The last line's time, if any line was noted.
+    pub fn last(&self) -> Option<Timestamp> {
+        self.last
     }
 
     /// The second to ask the engine to start from: the last line's,
@@ -669,5 +687,19 @@ mod tests {
         fresh.resume();
         assert!(fresh.admit(t(1, 0)));
         assert!(fresh.admit(t(1, 0)));
+        assert_eq!(fresh.last(), t(1, 0));
+
+        let mut seeded = Cursor::starting_at(Timestamp::new(5, 5));
+        assert_eq!(seeded.since(), Some(5));
+        seeded.resume();
+        let cases = [
+            (t(5, 4), false),
+            (t(5, 5), true),
+            (t(5, 5), true),
+            (t(4, 9), false),
+        ];
+        for (at, want) in cases {
+            assert_eq!(seeded.admit(at), want, "seeded {at:?}");
+        }
     }
 }
