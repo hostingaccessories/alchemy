@@ -133,9 +133,12 @@ pub enum ErrorCode {
 /// `GET /api/metrics`, and the `metrics` event: the latest usage of the
 /// machine, each Compose project, and each running container.
 ///
-/// With `?project=NAME`, only that project's totals and containers, and no
-/// machine figures. A project with no running containers has none of
-/// either.
+/// With `?app=NAME`, only that app's figures: the totals and containers of
+/// the Compose project its folder resolves to, and no machine figures. An
+/// unknown app is a 404 [`ErrorCode::AppNotFound`], and an app Compose has
+/// not read yet has no figures. `?project=NAME` does the same for a
+/// Compose project by name. Giving both is a 400. A project with no running
+/// containers has no figures.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricsResponse {
     /// When the figures were sampled, in Unix seconds, or `None` before
@@ -156,20 +159,21 @@ pub struct MetricsResponse {
     pub containers: Vec<ContainerUsage>,
 }
 
-/// `GET /api/metrics/history?range=24h[&project=NAME]`: stored usage over
-/// a range, oldest first.
+/// `GET /api/metrics/history?range=24h[&app=NAME|&project=NAME]`: stored
+/// usage over a range, oldest first.
 ///
 /// Points are [`step`](Self::step) seconds apart where data exists; a
 /// longer gap means nothing was recorded, and clients draw it as a gap.
-/// With `project`, points hold only that project's totals and containers,
-/// and no machine figures.
+/// With `app` or `project`, points hold only that project's totals and
+/// containers, and no machine figures, as on [`MetricsResponse`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricsHistory {
     /// The range asked for; `1h` when none was.
     pub range: MetricsRange,
     /// Seconds per point.
     pub step: u32,
-    /// The project asked for, if any.
+    /// The project asked for, or the one the app asked for resolves to.
+    /// `None` for the whole machine or an app Compose has not read yet.
     pub project: Option<String>,
     /// Every stored point in the range, oldest first.
     pub points: Vec<MetricsPoint>,

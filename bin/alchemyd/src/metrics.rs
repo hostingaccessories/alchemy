@@ -64,46 +64,76 @@ pub enum SourceError {
     Timeout,
 }
 
-/// The latest figures as `GET /api/metrics` returns them, with only
-/// `project`'s totals and containers when it is `Some`.
-pub fn current(state: &State, project: Option<&str>) -> MetricsResponse {
+/// Whose figures a metrics route answers with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    /// The machine and every project.
+    All,
+    /// One Compose project's totals and containers, and no machine figures.
+    Project(String),
+    /// An app whose Compose project is not known yet: no machine figures
+    /// and no project's.
+    Unresolved,
+}
+
+impl Scope {
+    fn project(&self) -> Option<&str> {
+        match self {
+            Self::Project(project) => Some(project),
+            Self::All | Self::Unresolved => None,
+        }
+    }
+}
+
+/// The latest figures as `GET /api/metrics` returns them, narrowed to
+/// `scope`.
+pub fn current(state: &State, scope: &Scope) -> MetricsResponse {
     let mut metrics = state.metrics();
-    if let Some(project) = project {
+    if *scope != Scope::All {
+        let project = scope.project();
         metrics.machine = None;
-        metrics.projects.retain(|p| p.name == project);
+        metrics
+            .projects
+            .retain(|p| project.is_some_and(|project| p.name == project));
         metrics
             .containers
-            .retain(|c| c.project.as_deref() == Some(project));
+            .retain(|c| project.is_some() && c.project.as_deref() == project);
     }
     metrics
 }
 
 /// The stored points of `range` up to `now`, in Unix seconds, oldest
-/// first, with only `project`'s figures when it is `Some`.
+/// first, narrowed to `scope`.
 ///
-/// A point where `project` had no container is left out rather than sent
-/// as zeros, so the gap shows.
+/// A point where the project had no container is left out rather than
+/// sent as zeros, so the gap shows. [`Scope::Unresolved`] has no points
+/// and reads nothing.
 pub async fn history(
     store: &SharedStore,
     range: MetricsRange,
-    project: Option<String>,
+    scope: Scope,
     now: i64,
 ) -> Result<MetricsHistory, StoreError> {
     let tier = range.tier();
-    let mut points = store
-        .metric_points(tier.step, now - tier.span, now + 1)
-        .await?;
-    if let Some(project) = project.as_deref() {
-        points = points
+    let points = match &scope {
+        Scope::Unresolved => Vec::new(),
+        Scope::All => {
+            store
+                .metric_points(tier.step, now - tier.span, now + 1)
+                .await?
+        }
+        Scope::Project(project) => store
+            .metric_points(tier.step, now - tier.span, now + 1)
+            .await?
             .into_iter()
             .map(|point| point.for_project(project))
             .filter(|point| !point.containers.is_empty())
-            .collect();
-    }
+            .collect(),
+    };
     Ok(MetricsHistory {
         range,
         step: u32::try_from(tier.step).unwrap_or(u32::MAX),
-        project,
+        project: scope.project().map(str::to_owned),
         points,
     })
 }
@@ -156,11 +186,11 @@ mod tests {
             projects: projects_of(&containers),
             containers,
         });
-        let all = current(&state, None);
+        let all = current(&state, &Scope::All);
         assert_eq!(all.projects.len(), 2);
         assert!(all.machine.is_some());
 
-        let web = current(&state, Some("web"));
+        let web = current(&state, &Scope::Project("web".into()));
         assert_eq!(web.machine, None);
         assert_eq!(web.at, Some(60));
         assert!(web.containers_in_vm);
@@ -175,8 +205,14 @@ mod tests {
             }]
         );
 
-        let none = current(&state, Some("nope"));
-        assert!(none.projects.is_empty() && none.containers.is_empty());
+        for scope in [Scope::Project("nope".into()), Scope::Unresolved] {
+            let none = current(&state, &scope);
+            assert_eq!((none.at, &none.machine), (Some(60), &None), "{scope:?}");
+            assert!(
+                none.projects.is_empty() && none.containers.is_empty(),
+                "{scope:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -204,7 +240,9 @@ mod tests {
             .await
             .unwrap();
 
-        let all = history(&store, MetricsRange::Day, None, now).await.unwrap();
+        let all = history(&store, MetricsRange::Day, Scope::All, now)
+            .await
+            .unwrap();
         assert_eq!(
             (all.range, all.step, all.project.as_deref()),
             (MetricsRange::Day, 1_200, None)
@@ -213,7 +251,7 @@ mod tests {
         assert_eq!(times, [now - day.span, now - 2_400, now - 1_200]);
         assert!(all.points[0].machine.is_some());
 
-        let web = history(&store, MetricsRange::Day, Some("web".into()), now)
+        let web = history(&store, MetricsRange::Day, Scope::Project("web".into()), now)
             .await
             .unwrap();
         assert_eq!(web.project.as_deref(), Some("web"));
@@ -224,5 +262,11 @@ mod tests {
             assert_eq!(point.containers, [container("web-1", "web")]);
             assert_eq!(point.projects.len(), 1);
         }
+
+        let unresolved = history(&store, MetricsRange::Day, Scope::Unresolved, now)
+            .await
+            .unwrap();
+        assert_eq!(unresolved.project, None);
+        assert_eq!(unresolved.points, []);
     }
 }

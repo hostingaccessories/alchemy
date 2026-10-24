@@ -54,6 +54,7 @@ use crate::apps::{self, AppEditor, settings};
 use crate::events::{self, Topic};
 use crate::guard::{self, Refusal, TAURI_ORIGINS};
 use crate::logs::{self, LogQuery, LogsRefusal, SharedLogSource};
+use crate::metrics::Scope;
 use crate::operations::{CancelError, Operations, StartError};
 use crate::store::SharedStore;
 
@@ -289,38 +290,92 @@ async fn engine(extract::State(state): extract::State<State>) -> Json<EngineStat
     Json(state.engine())
 }
 
-/// `?project=NAME` on the metrics routes.
+/// `?app=NAME` or `?project=NAME` on the metrics routes.
 #[derive(Debug, Deserialize)]
 struct MetricsQuery {
+    app: Option<String>,
     project: Option<String>,
 }
 
-/// `?range=24h&project=NAME` on `/api/metrics/history`.
+/// `?range=24h&app=NAME` or `?range=24h&project=NAME` on
+/// `/api/metrics/history`.
 #[derive(Debug, Deserialize)]
 struct HistoryQuery {
     range: Option<String>,
+    app: Option<String>,
     project: Option<String>,
+}
+
+/// Why a metrics route refused its `app` or `project`.
+#[derive(Debug)]
+enum ScopeRefusal {
+    Both,
+    UnknownApp(String),
+}
+
+impl IntoResponse for ScopeRefusal {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Both => api_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::BadRequest,
+                "give app or project, not both",
+            ),
+            Self::UnknownApp(name) => api_error(
+                StatusCode::NOT_FOUND,
+                ErrorCode::AppNotFound,
+                &format!("no app is named {name:?}"),
+            ),
+        }
+    }
+}
+
+/// Whose figures `app` or `project` asks for: an app by its folder name,
+/// through the Compose project it resolves to, or a project by name.
+fn metrics_scope(
+    state: &State,
+    app: Option<String>,
+    project: Option<String>,
+) -> Result<Scope, ScopeRefusal> {
+    match (app, project) {
+        (Some(_), Some(_)) => Err(ScopeRefusal::Both),
+        (None, None) => Ok(Scope::All),
+        (None, Some(project)) => Ok(Scope::Project(project)),
+        (Some(name), None) => match apps::find(&state.apps(), &name) {
+            Some(app) => Ok(app
+                .project
+                .clone()
+                .map_or(Scope::Unresolved, Scope::Project)),
+            None => Err(ScopeRefusal::UnknownApp(name)),
+        },
+    }
 }
 
 async fn metrics(
     extract::State(state): extract::State<State>,
     query: Result<Query<MetricsQuery>, QueryRejection>,
 ) -> Response {
-    match query {
-        Ok(Query(query)) => {
-            Json(crate::metrics::current(&state, query.project.as_deref())).into_response()
-        }
-        Err(rejection) => bad_query(&rejection),
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => return bad_query(&rejection),
+    };
+    match metrics_scope(&state, query.app, query.project) {
+        Ok(scope) => Json(crate::metrics::current(&state, &scope)).into_response(),
+        Err(refusal) => refusal.into_response(),
     }
 }
 
 async fn metrics_history(
-    extract::State(store): extract::State<SharedStore>,
+    extract::State(api): extract::State<Api>,
     query: Result<Query<HistoryQuery>, QueryRejection>,
 ) -> Response {
     let query = match query {
         Ok(Query(query)) => query,
         Err(rejection) => return bad_query(&rejection),
+    };
+    let scope = match metrics_scope(&api.state, query.app, query.project) {
+        Ok(scope) => scope,
+        Err(refusal) => return refusal.into_response(),
     };
     let range = match query.range.as_deref().map(str::parse::<MetricsRange>) {
         None => MetricsRange::Hour,
@@ -333,7 +388,7 @@ async fn metrics_history(
             );
         }
     };
-    match crate::metrics::history(&store, range, query.project, unix_now()).await {
+    match crate::metrics::history(&api.store, range, scope, unix_now()).await {
         Ok(history) => Json(history).into_response(),
         Err(error) => {
             tracing::warn!(%error, "cannot read metrics history");
@@ -918,6 +973,125 @@ mod tests {
         assert_eq!(body["machine"], serde_json::Value::Null);
         assert_eq!(body["projects"][0]["name"], "web");
         assert_eq!(body["containers"].as_array().unwrap().len(), 1);
+    }
+
+    /// `blog`, whose compose file names its project `my-blog`, and `draft`,
+    /// which Compose has not read yet, with `blog`'s container and another
+    /// project's sampled.
+    fn renamed_app_state() -> State {
+        let state = State::new();
+        let app = |name: &str, project: Option<&str>| -> App {
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "status": "running",
+                "dir": format!("/srv/apps/{name}"),
+                "root": "/srv/apps",
+                "compose_file": "compose.yaml",
+                "project": project,
+                "images": project.map(|_| "registry"),
+                "services": [],
+                "problems": [],
+            }))
+            .unwrap()
+        };
+        state.set_apps(AppList {
+            apps: vec![app("blog", Some("my-blog")), app("draft", None)],
+            ..AppList::default()
+        });
+        let containers: Vec<alchemy_api::ContainerUsage> = ["my-blog", "blog"]
+            .map(|project| alchemy_api::ContainerUsage {
+                id: project.into(),
+                name: format!("{project}-1"),
+                project: Some(project.into()),
+                ..Default::default()
+            })
+            .into();
+        state.set_metrics(alchemy_api::MetricsResponse {
+            at: Some(120),
+            interval: 60,
+            containers_in_vm: false,
+            machine: Some(alchemy_api::MachineUsage::default()),
+            projects: alchemy_core::metrics::projects_of(&containers),
+            containers,
+        });
+        state
+    }
+
+    #[tokio::test]
+    async fn metrics_for_an_app_are_its_resolved_projects() {
+        let state = renamed_app_state();
+        for uri in [
+            "/api/metrics?app=blog",
+            "/api/metrics?project=my-blog",
+            "/api/metrics/history?app=blog",
+            "/api/metrics/history?range=24h&app=blog",
+        ] {
+            let (status, body) = get_json_from(state.clone(), uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            if uri.contains("history") {
+                assert_eq!(body["project"], "my-blog", "{uri}");
+            } else {
+                assert_eq!(body["machine"], serde_json::Value::Null, "{uri}");
+                assert_eq!(body["projects"][0]["name"], "my-blog", "{uri}");
+                assert_eq!(body["containers"][0]["name"], "my-blog-1", "{uri}");
+                assert_eq!(body["containers"].as_array().unwrap().len(), 1, "{uri}");
+            }
+        }
+
+        let (_, body) = get_json_from(state.clone(), "/api/metrics?project=blog").await;
+        assert_eq!(
+            body["containers"][0]["name"], "blog-1",
+            "project= still means the Compose project"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_for_an_unread_app_are_empty() {
+        let state = renamed_app_state();
+        let (status, body) = get_json_from(state.clone(), "/api/metrics?app=draft").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "at": 120, "interval": 60, "containers_in_vm": false,
+                "machine": null, "projects": [], "containers": [],
+            })
+        );
+        let (status, body) = get_json_from(state, "/api/metrics/history?app=draft").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["project"], serde_json::Value::Null);
+        assert_eq!(body["points"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn metrics_refuse_an_unknown_app_or_both_filters() {
+        let cases = [
+            (
+                "/api/metrics?app=nope",
+                StatusCode::NOT_FOUND,
+                "app_not_found",
+            ),
+            (
+                "/api/metrics/history?app=nope",
+                StatusCode::NOT_FOUND,
+                "app_not_found",
+            ),
+            (
+                "/api/metrics?app=blog&project=my-blog",
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+            (
+                "/api/metrics/history?app=blog&project=my-blog",
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+        ];
+        for (uri, want, code) in cases {
+            let (status, body) = get_json_from(renamed_app_state(), uri).await;
+            assert_eq!(status, want, "{uri}");
+            assert_eq!(body["code"], code, "{uri}");
+        }
     }
 
     #[tokio::test]
