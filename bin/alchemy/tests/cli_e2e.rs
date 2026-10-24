@@ -287,7 +287,32 @@ async fn status_watch_json_prints_one_object_per_change() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn machine_and_app_stats_show_the_daemons_latest_sample() {
-    let daemon = Daemon::start(EngineStatus::new(EngineState::Ready)).await;
+    use std::sync::Arc;
+
+    use alchemyd::apps::{AppsDeps, SystemFs};
+    use alchemyd::compose::FakeComposeConfig;
+
+    let apps = tempfile::tempdir().unwrap();
+    let home = apps.path().canonicalize().unwrap();
+    std::fs::create_dir(home.join("blog")).unwrap();
+    std::fs::write(home.join("blog/compose.yaml"), "name: my-blog\n").unwrap();
+    let config = FakeComposeConfig::new();
+    config.project(home.join("blog"), "my-blog", &[]);
+    let daemon = Daemon::start_with(EngineStatus::new(EngineState::Ready), |deps| {
+        deps.with_apps(
+            AppsDeps::new(Arc::new(SystemFs), Arc::new(config), Some(home))
+                .with_scan_interval(Duration::from_millis(20)),
+        )
+    })
+    .await;
+    let mut listed = daemon.state.watch_apps();
+    tokio::time::timeout(
+        DEADLINE,
+        listed.wait_for(|list| list.apps.first().is_some_and(|app| app.project.is_some())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let mut metrics = daemon.state.watch_metrics();
     tokio::time::timeout(DEADLINE, metrics.wait_for(|m| m.at.is_some()))
         .await
@@ -321,6 +346,9 @@ async fn machine_and_app_stats_show_the_daemons_latest_sample() {
     let json: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(json["machine"], serde_json::Value::Null);
     assert_eq!(json["projects"], serde_json::json!([]));
+
+    let err = run(parse(&["app", "stats", "my-blog"])).await.unwrap_err();
+    assert_eq!(err.to_string(), "alchemyd: no app is named \"my-blog\"");
 
     daemon.stop().await;
 }

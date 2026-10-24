@@ -16,14 +16,14 @@ pub(crate) const NAME: &str = "app stats";
 /// Arguments to `alchemy app stats`.
 #[derive(Debug, Clone, clap::Args)]
 pub struct Args {
-    /// The app: its Compose project name.
+    /// The app's name: its folder's name.
     #[arg(value_parser = super::parse_name)]
     pub name: StackName,
 }
 
 /// The route for `name`'s figures. Validated names need no escaping.
 pub(crate) fn path(name: &StackName) -> String {
-    format!("/api/metrics?project={}", name.as_str())
+    format!("/api/metrics?app={}", name.as_str())
 }
 
 /// Run `alchemy app stats NAME`.
@@ -39,7 +39,8 @@ pub(crate) async fn run<D: Daemon, W: Write>(
 }
 
 /// What `alchemy app stats` prints: the app's totals, then a table of its
-/// containers, or the response as one JSON object.
+/// containers, or the response as one JSON object. `metrics` holds only
+/// the app's Compose project, whatever it is named.
 pub(crate) fn stats_lines(name: &str, metrics: &MetricsResponse, json: bool) -> Vec<String> {
     if json {
         return vec![serde_json::to_string(metrics).unwrap_or_default()];
@@ -47,7 +48,7 @@ pub(crate) fn stats_lines(name: &str, metrics: &MetricsResponse, json: bool) -> 
     if metrics.at.is_none() {
         return vec!["No usage yet: alchemyd samples it shortly after it starts".to_owned()];
     }
-    let Some(app) = metrics.projects.iter().find(|p| p.name == name) else {
+    let Some(app) = metrics.projects.first() else {
         return vec![format!("{name} has no running containers")];
     };
     let containers = if app.containers == 1 {
@@ -179,7 +180,43 @@ mod tests {
         );
         assert_eq!(
             ctx.daemon().requests(),
-            ["GET /api/version", "GET /api/metrics?project=blog"]
+            ["GET /api/version", "GET /api/metrics?app=blog"]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_names_the_app_even_when_its_project_differs() {
+        let mut renamed = blog();
+        renamed.projects[0].name = "my-blog".into();
+        let name = StackName::new("blog").unwrap();
+        let nope = StackName::new("nope").unwrap();
+        let fake = FakeDaemon::new()
+            .version("1.2.3", 1)
+            .ok(Method::GET, &path(&name), &renamed)
+            .error(
+                Method::GET,
+                &path(&nope),
+                404,
+                "app_not_found",
+                "no app is named \"nope\"",
+            );
+        let mut ctx = Context::buffered(fake, false, NAME);
+        run(&mut ctx, Args { name }).await.unwrap();
+        assert!(
+            ctx.written().starts_with("blog  2 containers"),
+            "{}",
+            ctx.written()
+        );
+        let err = run(&mut ctx, Args { name: nope }).await.unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert_eq!(err.to_string(), "alchemyd: no app is named \"nope\"");
+        assert_eq!(
+            ctx.daemon().requests(),
+            [
+                "GET /api/version",
+                "GET /api/metrics?app=blog",
+                "GET /api/metrics?app=nope"
+            ]
         );
     }
 }
