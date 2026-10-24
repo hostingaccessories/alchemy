@@ -3,13 +3,16 @@
 //! What to run is decided by pure helpers: [`ComposePlan`] turns an action
 //! into one or more `docker compose` steps, and [`child_env`] decides the
 //! child's whole environment. Running a plan sits behind [`ComposeRunner`],
-//! implemented by [`CliComposeRunner`].
+//! which streams each step's output as [`ComposeEvent`]s and stops on a
+//! [`CancelToken`]. [`CliComposeRunner`] runs the `docker` binary;
+//! [`FakeComposeRunner`] plays back scripts for tests of the code above it.
 //!
 //! This lives in the daemon rather than `alchemy-core` because the argv is
 //! a detail of the `docker` binary, not of the domain.
 
 mod cli;
 mod env;
+mod fake;
 mod lines;
 mod plan;
 mod progress;
@@ -18,6 +21,7 @@ mod runner;
 
 pub use cli::CliComposeRunner;
 pub use env::{ALLOWED_ENV, ALLOWED_ENV_PREFIXES, FIXED_ENV, child_env, is_allowed};
+pub use fake::{FakeComposeRunner, FakeOutcome, FakeScript};
 pub use plan::{
     ComposeAction, ComposeCommand, ComposePlan, ComposeStep, ImageSource, UnknownAction,
 };
