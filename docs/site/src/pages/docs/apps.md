@@ -301,10 +301,6 @@ alchemy machine stats
 alchemy app stats blog
 ```
 
-`alchemy app stats` takes the app's Compose project name, which is the
-folder name unless the app sets `name:` (see
-[Adopting existing stacks](#adopting-existing-stacks)).
-
 CPU is a share of the whole machine, so an app's containers add up to the
 machine's figure. A figure that couldn't be measured is shown as `–`, never
 as 0. History has gaps for the time alchemyd wasn't running.

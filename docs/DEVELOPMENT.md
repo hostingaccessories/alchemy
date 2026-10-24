@@ -427,13 +427,15 @@ the collector in `bin/alchemyd/src/metrics/`.
 
 `GET /api/metrics` is the latest sample, also sent as the `metrics`
 event; `GET /api/metrics/history?range=24h` is one tier's points. Both
-take `project=NAME` for one Compose project's figures. `alchemy machine
-stats` and `alchemy app stats NAME` print them, and the Machines page
-charts them. An app's figures are its Compose project's, the `project`
-in its entry from `/api/apps`.
+take `app=NAME` for one app's figures, by folder name like every other
+app route: the daemon resolves it to the app's Compose project (404
+`app_not_found` for an unknown app, no figures while Compose has not read
+it yet). `project=NAME` still asks for a Compose project by name; giving
+both is a 400. `alchemy machine stats` and `alchemy app stats NAME` print
+them, and the Machines page charts them.
 
 ```sh
-curl --unix-socket /run/user/1000/alchemy/alchemyd.sock 'http://alchemyd/api/metrics/history?range=24h&project=blog'
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock 'http://alchemyd/api/metrics/history?range=24h&app=blog'
 ```
 
 ### Web UI in debug vs release
