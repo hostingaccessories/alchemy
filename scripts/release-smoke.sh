@@ -78,13 +78,51 @@ dir_mode="$(stat -c '%a' "$state_dir" 2>/dev/null || stat -f '%Lp' "$state_dir")
 [[ "$db_mode" == 600 ]] || fail "${db} has mode ${db_mode}, expected 600"
 [[ "$dir_mode" == 700 ]] || fail "${state_dir} has mode ${dir_mode}, expected 700"
 
+log "Checking the TCP token"
+token_file="${state_dir}/tcp-token"
+[[ -f "$token_file" ]] || fail "alchemyd did not write ${token_file}"
+token_mode="$(stat -c '%a' "$token_file" 2>/dev/null || stat -f '%Lp' "$token_file")"
+[[ "$token_mode" == 600 ]] || fail "${token_file} has mode ${token_mode}, expected 600"
+token="$(cat "$token_file")"
+[[ "${#token}" == 64 ]] || fail "${token_file} does not hold a 64-character token"
+bearer="Authorization: Bearer ${token}"
+
 log "Checking /api/health"
 health="$(curl -fsS "${base}/api/health")"
 [[ "$health" == *'"ok"'* ]] || fail "unexpected health response: ${health}"
 
-log "Checking /api/engine"
-engine="$(curl -fsS "${base}/api/engine")"
+log "Checking /api/apps and /api/engine need signing in"
+for path in /api/apps /api/engine; do
+  unsigned_code="$(curl -sS -o "${tmp}/unsigned.json" -w '%{http_code}' "${base}${path}")" \
+    || fail "unsigned GET ${path} failed"
+  [[ "$unsigned_code" == 401 ]] || fail "unsigned GET ${path} returned ${unsigned_code}, expected 401"
+  grep -q '"code":"unauthorized"' "${tmp}/unsigned.json" \
+    || fail "unsigned GET ${path} was not a JSON 401: $(cat "${tmp}/unsigned.json")"
+done
+wrong_code="$(curl -sS -o /dev/null -w '%{http_code}' \
+  -H "Authorization: Bearer $(printf '0%.0s' $(seq 1 64))" "${base}/api/apps")" \
+  || fail "GET /api/apps with a wrong token failed"
+[[ "$wrong_code" == 401 ]] || fail "a wrong token returned ${wrong_code}, expected 401"
+engine="$(curl -fsS -H "$bearer" "${base}/api/engine")"
 [[ "$engine" == *'"state":'* ]] || fail "unexpected engine response: ${engine}"
+
+log "Signing in with alchemy open --print"
+login_url="$("${bin}/alchemy" --socket "$socket" open --print)" || fail "alchemy open --print failed"
+[[ "$login_url" == "${base}/login?code="* ]] || fail "unexpected sign-in link: ${login_url}"
+jar="${tmp}/cookies.txt"
+login_code="$(curl -sS -o /dev/null -D "${tmp}/login.head" -w '%{http_code}' -c "$jar" "$login_url")" \
+  || fail "GET /login failed"
+[[ "$login_code" == 303 ]] || fail "GET /login returned ${login_code}, expected 303"
+grep -qi '^set-cookie: alchemy_session_.*HttpOnly; SameSite=Strict; Path=/api' "${tmp}/login.head" \
+  || fail "GET /login set no private session cookie: $(cat "${tmp}/login.head")"
+cookie_apps="$(curl -fsS -b "$jar" "${base}/api/apps")" || fail "GET /api/apps with the cookie failed"
+[[ "$cookie_apps" == *'"apps":'* ]] || fail "unexpected apps response: ${cookie_apps}"
+again_code="$(curl -sS -o /dev/null -w '%{http_code}' "$login_url")" || fail "second GET /login failed"
+[[ "$again_code" == 401 ]] || fail "a sign-in link worked twice (${again_code})"
+launch_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "$bearer" \
+  -H 'Content-Type: application/json' -d '{}' "${base}/api/session/launch")" \
+  || fail "POST /api/session/launch over TCP failed"
+[[ "$launch_code" == 403 ]] || fail "launch codes were issued over TCP (${launch_code})"
 
 log "Checking a rebinding Host, a cross-origin POST, and a cross-site GET are refused"
 rebind_code="$(curl -sS -o "${tmp}/rebind.json" -w '%{http_code}' \
@@ -114,7 +152,7 @@ grep -q '"code":"not_found"' "${tmp}/sock-root.json" \
   || fail "GET / on the socket was not a JSON 404: $(cat "${tmp}/sock-root.json")"
 
 log "Opening /api/events"
-curl -fsSN -H 'Origin: tauri://localhost' "${base}/api/events" \
+curl -fsSN -H 'Origin: tauri://localhost' -H "$bearer" "${base}/api/events" \
   >"${tmp}/events.txt" 2>/dev/null &
 events_pid=$!
 for _ in $(seq 1 50); do
@@ -212,6 +250,7 @@ set -e
 daemon_pid=""
 [[ "$code" -eq 0 ]] || { cat "${tmp}/alchemyd.log" >&2; fail "alchemyd exited ${code}"; }
 [[ ! -e "$socket" ]] || fail "socket ${socket} left behind after shutdown"
+[[ ! -e "$token_file" ]] || fail "token ${token_file} left behind after shutdown"
 set +e
 wait "$events_pid"
 set -e
