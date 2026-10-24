@@ -7,6 +7,7 @@ import { Loading } from "../components/Loading.tsx";
 import { NetworkWarnings } from "../components/NetworkWarnings.tsx";
 import { PageHeader } from "../components/PageHeader.tsx";
 import { PortsSection } from "../components/Ports.tsx";
+import { ProxyWarnings } from "../components/ProxyWarnings.tsx";
 import { AppUsageTable, MachineUsageView, RangePicker } from "../components/Usage.tsx";
 import { type MetricsRange, api } from "../lib/api.ts";
 import { useDaemonConnection } from "../lib/live.tsx";
@@ -43,6 +44,7 @@ function MachinesPage() {
           <p className="text-muted">Docker status appears once alchemyd is reachable.</p>
         )}
         {online && <NetworkWarnings />}
+        {online && <ProxyWarnings />}
       </section>
       {online && <Usage />}
       {online && <PortsSection />}

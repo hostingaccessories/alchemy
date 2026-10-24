@@ -10,6 +10,7 @@ import type {
   PortList,
   NetworkReport,
   NetworkWarning,
+  ProxyListener,
 } from "../lib/api.ts";
 import { FakeEventSource, renderAt } from "../test/render.tsx";
 
@@ -551,5 +552,64 @@ describe("Machines", () => {
     await renderOnline();
     expect(await screen.findByText(/doesn't report usage/)).toBeTruthy();
     expect(screen.queryByRole("group", { name: "Network warnings" })).toBeNull();
+  });
+
+  const listener = (port: number, app: string | null): ProxyListener => ({
+    port,
+    app,
+    state: "listening",
+    message: null,
+    fix: null,
+  });
+
+  it("shows no web address warnings while every listener works", async () => {
+    network = {
+      ...clear,
+      proxy: {
+        reachability: "container_ip",
+        host: listener(80, null),
+        ports: [listener(8100, "blog")],
+      },
+    };
+    await renderOnline();
+    await screen.findByText(/This machine/);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(screen.queryByRole("group", { name: "Web address warnings" })).toBeNull();
+  });
+
+  it("warns when port 80 and an app's port can't be opened, with the fix", async () => {
+    const setcap = 'sudo setcap cap_net_bind_service=+ep "$(command -v alchemyd)"';
+    network = {
+      ...clear,
+      proxy: {
+        reachability: "container_ip",
+        host: {
+          ...listener(80, null),
+          state: "unavailable",
+          message:
+            "Alchemy doesn't have permission to listen on port 80, so addresses like http://<app>.localhost don't work. Each app's own port still does.",
+          fix: `Let alchemyd use low ports with \`${setcap}\`, then restart it.`,
+        },
+        ports: [
+          listener(8100, "blog"),
+          {
+            ...listener(8101, "wiki"),
+            state: "unavailable",
+            message: "Another program is using port 8101.",
+          },
+        ],
+      },
+    };
+    await renderOnline();
+    const group = await screen.findByRole("group", { name: "Web address warnings" });
+    expect(within(group).getByText("Alchemy can't listen on port 80")).toBeTruthy();
+    expect(within(group).getByText(/doesn't have permission to listen on port 80/)).toBeTruthy();
+    expect(within(group).getByText(setcap).tagName).toBe("CODE");
+    expect(within(group).getByRole("button", { name: "Copy command" })).toBeTruthy();
+    expect(within(group).getByText("wiki's address on port 8101 doesn't work")).toBeTruthy();
+    expect(within(group).getByText("Another program is using port 8101.")).toBeTruthy();
+    expect(within(group).queryByText(/8100/)).toBeNull();
   });
 });

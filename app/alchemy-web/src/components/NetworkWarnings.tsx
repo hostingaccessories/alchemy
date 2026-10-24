@@ -7,16 +7,19 @@ import { Notice } from "./Notice.tsx";
 /** How often the report is refetched: the daemon checks every 30 seconds. */
 export const NETWORK_REFRESH_MS = 30_000;
 
+/** `GET /api/network`, shared by everything on the page that reads the report. */
+export const networkQuery = {
+  queryKey: ["network"],
+  queryFn: ({ signal }: { signal: AbortSignal }) => api.network(signal),
+  refetchInterval: NETWORK_REFRESH_MS,
+};
+
 /**
  * What overlaps between Docker's networks and this machine's, each with its
  * fix. Renders nothing when nothing does, or when alchemyd is too old to say.
  */
 export function NetworkWarnings() {
-  const network = useQuery({
-    queryKey: ["network"],
-    queryFn: ({ signal }) => api.network(signal),
-    refetchInterval: NETWORK_REFRESH_MS,
-  });
+  const network = useQuery(networkQuery);
   const warnings = network.data?.warnings ?? [];
   if (warnings.length === 0) {
     return null;

@@ -7,6 +7,22 @@ import { FakeEventSource, renderAt } from "./test/render.tsx";
 const ANSWERS: Record<string, unknown> = {
   "/api/apps": { apps: [], unmanaged: [], dirs: [] },
   "/api/ports": { ports: [], warnings: [] },
+  "/api/network": {
+    engine_ready: true,
+    lan: [],
+    routes: [],
+    bridge: null,
+    pools: [],
+    pools_source: "defaults",
+    networks: [],
+    alchemy: { name: "alchemy", state: "ready", subnet: "172.18.0.0/24" },
+    warnings: [],
+    proxy: {
+      reachability: "published_only",
+      host: { port: 80, app: null, state: "off", message: null, fix: null },
+      ports: [],
+    },
+  },
   "/api/settings/apps": {
     home: "/home/me/Alchemy/apps",
     default_home: "/home/me/Alchemy/apps",
