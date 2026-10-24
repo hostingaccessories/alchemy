@@ -143,6 +143,22 @@ refused="$(curl -sS --unix-socket "$socket" -o /dev/null -w '%{http_code}' -X PO
   http://localhost/api/apps/smoke-missing/actions)"
 [[ "$refused" == 404 ]] || fail "an action on a missing app answered ${refused}, not 404"
 
+log "Checking app discovery in a throwaway app home"
+apps_dir="${tmp}/apps"
+mkdir -p "${apps_dir}/Not_An_App"
+printf 'services: {}\n' >"${apps_dir}/Not_An_App/compose.yaml"
+"${bin}/alchemy" --socket "$socket" settings set app-home "$apps_dir" >/dev/null \
+  || fail "alchemy settings set app-home failed"
+for _ in $(seq 1 50); do
+  apps="$("${bin}/alchemy" --socket "$socket" --json app list)" \
+    || fail "alchemy app list failed"
+  [[ "$apps" == *'"reason":"invalid_name"'* ]] && break
+  sleep 0.2
+done
+[[ "$apps" == *"\"path\":\"${apps_dir}\""* ]] || fail "app list does not search ${apps_dir}: ${apps}"
+[[ "$apps" == *'"apps":[]'* ]] || fail "an empty app home listed apps: ${apps}"
+[[ "$apps" == *'"reason":"invalid_name"'* ]] || fail "Not_An_App was not reported as skipped: ${apps}"
+
 log "Checking embedded web UI"
 index="$(curl -fsS "${base}/")" || fail "GET / failed (web UI not embedded?)"
 [[ "$index" == *'id="root"'* ]] || fail "GET / did not return the web UI"

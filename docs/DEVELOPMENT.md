@@ -490,6 +490,9 @@ checks:
   stored point, and `alchemy machine stats` prints them;
 - `/api/operations` answers, and an action on an app that doesn't exist
   is refused with 404;
+- `alchemy settings set app-home` points the daemon at an empty temporary
+  folder, and `alchemy app list` then lists no apps and reports a folder
+  with an invalid name as skipped, all without Docker;
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
 - `alchemy-helper` refuses to run without root;
