@@ -13,7 +13,7 @@
 //!   ([`builtin`]).
 //!
 //! Each backend reports what became of every name it publishes, a
-//! conflict with another device included, as [`NameStates`] on a watch
+//! conflict with another device included, as [`RecordStates`] on a watch
 //! channel. Tests use [`FakeAnnouncer`].
 
 pub mod avahi;
@@ -68,7 +68,7 @@ impl fmt::Display for Backend {
 
 /// What became of one published name.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NameState {
+pub enum RecordState {
     /// Handed to the responder, which is probing for it or starting.
     Registering,
     /// Probed and answered for.
@@ -87,25 +87,26 @@ pub enum NameState {
 
 /// The state of every name an [`Announcer`] publishes, by label.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NameStates(BTreeMap<HostLabel, NameState>);
+pub struct RecordStates(BTreeMap<HostLabel, RecordState>);
 
-impl NameStates {
+impl RecordStates {
     /// The state of `label`, if it is published.
-    pub fn get(&self, label: &HostLabel) -> Option<&NameState> {
+    pub fn get(&self, label: &HostLabel) -> Option<&RecordState> {
         self.0.get(label)
     }
 
     /// Every published name and its state, in label order.
-    pub fn iter(&self) -> impl Iterator<Item = (&HostLabel, &NameState)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&HostLabel, &RecordState)> {
         self.0.iter()
     }
 
     /// The labels another device answers for, in label order: what
-    /// [`alchemy_core::mdns::conflict_problems`] takes.
+    /// [`alchemy_core::mdns::conflict_problems`] and
+    /// [`alchemy_core::mdns::name_states`] take.
     pub fn conflicts(&self) -> impl Iterator<Item = &HostLabel> {
         self.0
             .iter()
-            .filter(|(_, state)| **state == NameState::Conflict)
+            .filter(|(_, state)| **state == RecordState::Conflict)
             .map(|(label, _)| label)
     }
 
@@ -120,8 +121,8 @@ impl NameStates {
     }
 }
 
-impl FromIterator<(HostLabel, NameState)> for NameStates {
-    fn from_iter<I: IntoIterator<Item = (HostLabel, NameState)>>(iter: I) -> Self {
+impl FromIterator<(HostLabel, RecordState)> for RecordStates {
+    fn from_iter<I: IntoIterator<Item = (HostLabel, RecordState)>>(iter: I) -> Self {
         Self(iter.into_iter().collect())
     }
 }
@@ -179,7 +180,7 @@ pub trait Announcer: Send + Sync + fmt::Debug {
 
     /// The state of every published name, updated as the responder
     /// reports.
-    fn states(&self) -> watch::Receiver<NameStates>;
+    fn states(&self) -> watch::Receiver<RecordStates>;
 }
 
 /// An [`Announcer`] shared by the daemon's tasks.
@@ -212,21 +213,21 @@ pub async fn system() -> Result<SharedAnnouncer, AnnounceError> {
 /// The published names and their states, shared by a backend's tasks.
 #[derive(Debug, Clone)]
 pub(crate) struct Board {
-    tx: Arc<watch::Sender<NameStates>>,
+    tx: Arc<watch::Sender<RecordStates>>,
 }
 
 impl Board {
     pub(crate) fn new() -> Self {
         Self {
-            tx: Arc::new(watch::Sender::new(NameStates::default())),
+            tx: Arc::new(watch::Sender::new(RecordStates::default())),
         }
     }
 
-    pub(crate) fn subscribe(&self) -> watch::Receiver<NameStates> {
+    pub(crate) fn subscribe(&self) -> watch::Receiver<RecordStates> {
         self.tx.subscribe()
     }
 
-    pub(crate) fn set(&self, label: &HostLabel, state: NameState) {
+    pub(crate) fn set(&self, label: &HostLabel, state: RecordState) {
         self.tx.send_if_modified(|states| {
             if states.0.get(label) == Some(&state) {
                 return false;
@@ -295,11 +296,11 @@ mod tests {
 
     #[test]
     fn conflicts_lists_only_conflicting_labels_in_order() {
-        let states: NameStates = [
-            (label("zed"), NameState::Conflict),
-            (label("immich"), NameState::Established),
-            (label("alpha"), NameState::Conflict),
-            (label("beta"), NameState::Failed("boom".to_owned())),
+        let states: RecordStates = [
+            (label("zed"), RecordState::Conflict),
+            (label("immich"), RecordState::Established),
+            (label("alpha"), RecordState::Conflict),
+            (label("beta"), RecordState::Failed("boom".to_owned())),
         ]
         .into_iter()
         .collect();
@@ -311,18 +312,18 @@ mod tests {
     fn board_notifies_only_on_change() {
         let board = Board::new();
         let mut rx = board.subscribe();
-        board.set(&label("immich"), NameState::Registering);
+        board.set(&label("immich"), RecordState::Registering);
         assert!(rx.has_changed().unwrap());
         rx.borrow_and_update();
-        board.set(&label("immich"), NameState::Registering);
+        board.set(&label("immich"), RecordState::Registering);
         assert!(!rx.has_changed().unwrap());
         board.remove(&label("other"));
         assert!(!rx.has_changed().unwrap());
-        board.set(&label("immich"), NameState::Established);
+        board.set(&label("immich"), RecordState::Established);
         assert!(rx.has_changed().unwrap());
         assert_eq!(
             rx.borrow_and_update().get(&label("immich")),
-            Some(&NameState::Established)
+            Some(&RecordState::Established)
         );
         board.clear();
         assert!(rx.borrow().is_empty());

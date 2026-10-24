@@ -8,7 +8,7 @@ use alchemy_core::route::HostLabel;
 use futures_util::future::BoxFuture;
 use tokio::sync::watch;
 
-use super::{AnnounceError, Announcer, Backend, Board, NameState, NameStates, Record};
+use super::{AnnounceError, Announcer, Backend, Board, Record, RecordState, RecordStates};
 
 /// One call a [`FakeAnnouncer`] received.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +33,7 @@ struct Inner {
 /// An [`Announcer`] for tests.
 ///
 /// It records every call, and a name it publishes is
-/// [`NameState::Established`] at once, or [`NameState::Conflict`] when
+/// [`RecordState::Established`] at once, or [`RecordState::Conflict`] when
 /// [`take`](Self::take) says another device has it. Clones share their
 /// state, so a test can steer it while the daemon holds a clone.
 #[derive(Debug, Clone)]
@@ -60,13 +60,13 @@ impl FakeAnnouncer {
     }
 
     /// Act as if another device answers for `label`: a published name
-    /// goes to [`NameState::Conflict`] now, as a late conflict would,
+    /// goes to [`RecordState::Conflict`] now, as a late conflict would,
     /// and an announced one does from then on.
     pub fn take(&self, label: &HostLabel) {
         let mut inner = self.lock();
         inner.taken.insert(label.clone());
         if inner.published.contains_key(label) {
-            self.board.set(label, NameState::Conflict);
+            self.board.set(label, RecordState::Conflict);
         }
     }
 
@@ -83,7 +83,7 @@ impl FakeAnnouncer {
     }
 
     /// Put `label` in `state`, as a backend reporting on its own would.
-    pub fn set_state(&self, label: &HostLabel, state: NameState) {
+    pub fn set_state(&self, label: &HostLabel, state: RecordState) {
         self.board.set(label, state);
     }
 
@@ -134,9 +134,9 @@ impl Announcer for FakeAnnouncer {
                 return Ok(());
             }
             let state = if inner.taken.contains(&record.label) {
-                NameState::Conflict
+                RecordState::Conflict
             } else {
-                NameState::Established
+                RecordState::Established
             };
             self.board.set(&record.label, state);
             inner.published.insert(record.label.clone(), record);
@@ -168,7 +168,7 @@ impl Announcer for FakeAnnouncer {
         Box::pin(async {})
     }
 
-    fn states(&self) -> watch::Receiver<NameStates> {
+    fn states(&self) -> watch::Receiver<RecordStates> {
         self.board.subscribe()
     }
 }

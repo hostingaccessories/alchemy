@@ -9,7 +9,7 @@
 //! record conflicts, so only the record line counts ([`parse_line`]).
 //!
 //! On a conflict, at registration or later, `dns-sd` prints the line and
-//! exits with 255. The supervisor reports [`NameState::Conflict`] and
+//! exits with 255. The supervisor reports [`RecordState::Conflict`] and
 //! doesn't restart it. Any other exit is restarted with backoff
 //! ([`restart_delay`]).
 //!
@@ -35,7 +35,7 @@ use tokio::sync::{Mutex, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::{
-    AnnounceError, Announcer, Backend, Board, NameState, NameStates, Record, SERVICE_TYPE,
+    AnnounceError, Announcer, Backend, Board, Record, RecordState, RecordStates, SERVICE_TYPE,
 };
 
 /// Where macOS keeps `dns-sd`.
@@ -102,11 +102,11 @@ fn leading_code(text: &str) -> Option<i64> {
 }
 
 /// The state an mDNSResponder error `code` puts a name in.
-pub fn error_state(code: i64) -> NameState {
+pub fn error_state(code: i64) -> RecordState {
     match code {
-        NAME_CONFLICT => NameState::Conflict,
-        POLICY_DENIED => NameState::Denied,
-        _ => NameState::Failed(format!("mDNSResponder failed with error {code}")),
+        NAME_CONFLICT => RecordState::Conflict,
+        POLICY_DENIED => RecordState::Denied,
+        _ => RecordState::Failed(format!("mDNSResponder failed with error {code}")),
     }
 }
 
@@ -217,7 +217,7 @@ impl Announcer for DnsSdAnnouncer {
             if let Some(old) = children.remove(&record.label) {
                 old.stop().await;
             }
-            self.board.set(&record.label, NameState::Registering);
+            self.board.set(&record.label, RecordState::Registering);
             children.insert(record.label.clone(), self.supervise(record));
             Ok(())
         })
@@ -245,7 +245,7 @@ impl Announcer for DnsSdAnnouncer {
         })
     }
 
-    fn states(&self) -> watch::Receiver<NameStates> {
+    fn states(&self) -> watch::Receiver<RecordStates> {
         self.board.subscribe()
     }
 }
@@ -257,7 +257,7 @@ enum Ended {
     /// It reported a conflict.
     Conflict,
     /// It exited or could not start, with the state to report.
-    Exited(NameState),
+    Exited(RecordState),
 }
 
 struct Child {
@@ -274,7 +274,7 @@ impl Child {
             match self.run(&mut stopped, &mut failures).await {
                 Ended::Stopped => return,
                 Ended::Conflict => {
-                    self.board.set(&self.record.label, NameState::Conflict);
+                    self.board.set(&self.record.label, RecordState::Conflict);
                     drop(stopped.await);
                     return;
                 }
@@ -303,7 +303,7 @@ impl Child {
         let mut child = match spawned {
             Ok(child) => child,
             Err(error) => {
-                return Ended::Exited(NameState::Failed(format!(
+                return Ended::Exited(RecordState::Failed(format!(
                     "cannot run {}: {error}",
                     self.binary.display()
                 )));
@@ -322,10 +322,10 @@ impl Child {
                 line = next_line(&mut err) => self.saw(line, &mut err, &mut last, failures),
                 status = child.wait(), if out.is_none() && err.is_none() => {
                     return match (last, status) {
-                        (Some(NameState::Conflict), _) => Ended::Conflict,
+                        (Some(RecordState::Conflict), _) => Ended::Conflict,
                         (Some(state), _) => Ended::Exited(state),
-                        (None, Ok(status)) => Ended::Exited(NameState::Failed(format!("dns-sd exited with {status}"))),
-                        (None, Err(error)) => Ended::Exited(NameState::Failed(format!("dns-sd failed: {error}"))),
+                        (None, Ok(status)) => Ended::Exited(RecordState::Failed(format!("dns-sd exited with {status}"))),
+                        (None, Err(error)) => Ended::Exited(RecordState::Failed(format!("dns-sd failed: {error}"))),
                     };
                 }
             }
@@ -336,7 +336,7 @@ impl Child {
         &self,
         line: Option<String>,
         stream: &mut Option<R>,
-        last: &mut Option<NameState>,
+        last: &mut Option<RecordState>,
         failures: &mut u32,
     ) {
         let Some(line) = line else {
@@ -347,17 +347,17 @@ impl Child {
             Some(Line::Registered) => {
                 *failures = 0;
                 *last = None;
-                NameState::Established
+                RecordState::Established
             }
-            Some(Line::Conflict) => NameState::Conflict,
+            Some(Line::Conflict) => RecordState::Conflict,
             Some(Line::Error(code)) => error_state(code),
             None => return,
         };
         tracing::debug!(label = %self.record.label, ?state, "dns-sd");
-        if state != NameState::Established {
+        if state != RecordState::Established {
             *last = Some(state.clone());
         }
-        if state != NameState::Conflict {
+        if state != RecordState::Conflict {
             self.board.set(&self.record.label, state);
         }
     }
@@ -445,11 +445,11 @@ mod tests {
 
     #[test]
     fn error_codes_map_to_states() {
-        assert_eq!(error_state(NAME_CONFLICT), NameState::Conflict);
-        assert_eq!(error_state(POLICY_DENIED), NameState::Denied);
+        assert_eq!(error_state(NAME_CONFLICT), RecordState::Conflict);
+        assert_eq!(error_state(POLICY_DENIED), RecordState::Denied);
         assert_eq!(
             error_state(-65563),
-            NameState::Failed("mDNSResponder failed with error -65563".to_owned())
+            RecordState::Failed("mDNSResponder failed with error -65563".to_owned())
         );
     }
 

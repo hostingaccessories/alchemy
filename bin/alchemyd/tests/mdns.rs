@@ -20,7 +20,7 @@ use alchemy_core::mdns::{
 use alchemy_core::route::HostLabel;
 use alchemyd::mdns::dnssd::DnsSdAnnouncer;
 use alchemyd::mdns::{
-    AnnounceError, Announcer, Backend, FakeAnnouncer, FakeCall, NameState, NameStates, Record,
+    AnnounceError, Announcer, Backend, FakeAnnouncer, FakeCall, Record, RecordState, RecordStates,
 };
 use tokio::sync::watch;
 
@@ -43,10 +43,10 @@ fn ann(name: &str, on: &LanIpv4) -> Announcement {
 }
 
 async fn wait_for(
-    states: &mut watch::Receiver<NameStates>,
+    states: &mut watch::Receiver<RecordStates>,
     what: &str,
-    mut ok: impl FnMut(&NameStates) -> bool,
-) -> NameStates {
+    mut ok: impl FnMut(&RecordStates) -> bool,
+) -> RecordStates {
     let found = match tokio::time::timeout(WAIT, states.wait_for(|s| ok(s))).await {
         Ok(Ok(states)) => Some(states.clone()),
         _ => None,
@@ -71,10 +71,10 @@ async fn eventually(what: &str, ok: impl Fn() -> bool) {
 }
 
 async fn wait_state(
-    states: &mut watch::Receiver<NameStates>,
+    states: &mut watch::Receiver<RecordStates>,
     name: &str,
-    want: &NameState,
-) -> NameStates {
+    want: &RecordState,
+) -> RecordStates {
     let label = label(name);
     wait_for(states, &format!("{name} to be {want:?}"), |s| {
         s.get(&label) == Some(want)
@@ -118,8 +118,8 @@ async fn fake_follows_the_diff_and_reports_conflicts_as_problems() {
     let changes = diff(&current, &want);
     apply(announcer, &mut current, changes, 80).await;
     assert_eq!(current, want);
-    let seen = wait_state(&mut states, "plex", &NameState::Conflict).await;
-    assert_eq!(seen.get(&label("immich")), Some(&NameState::Established));
+    let seen = wait_state(&mut states, "plex", &RecordState::Conflict).await;
+    assert_eq!(seen.get(&label("immich")), Some(&RecordState::Established));
     let problems = conflict_problems(&want, seen.conflicts());
     assert_eq!(problems.len(), 1);
     assert_eq!(problems[0].app, "plex");
@@ -197,7 +197,7 @@ async fn fake_failure_leaves_the_change_for_the_next_tick() {
     assert_eq!(current, want);
     assert_eq!(
         fake.states().borrow().get(&label("immich")),
-        Some(&NameState::Established)
+        Some(&RecordState::Established)
     );
 }
 
@@ -254,7 +254,7 @@ async fn dns_sd_runs_one_child_per_name_and_kills_it_on_withdraw() {
         .announce(ann("immich", &home), 8101)
         .await
         .unwrap();
-    wait_state(&mut states, "immich", &NameState::Established).await;
+    wait_state(&mut states, "immich", &RecordState::Established).await;
     let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
     assert_eq!(
         args.trim(),
@@ -274,7 +274,7 @@ async fn dns_sd_runs_one_child_per_name_and_kills_it_on_withdraw() {
         .unwrap();
     assert!(!alive(first), "the old child is gone");
     eventually("the new child", || starts(dir.path()).len() == 2).await;
-    wait_state(&mut states, "immich", &NameState::Established).await;
+    wait_state(&mut states, "immich", &RecordState::Established).await;
     let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
     assert!(args.trim().ends_with("immich.local 10.0.1.77"), "{args}");
 
@@ -299,7 +299,7 @@ async fn dns_sd_reports_a_conflict_and_does_not_restart() {
         .announce(ann("immich", &lan("en0", "10.0.1.50")), 80)
         .await
         .unwrap();
-    wait_state(&mut states, "immich", &NameState::Conflict).await;
+    wait_state(&mut states, "immich", &RecordState::Conflict).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(starts(dir.path()).len(), 1);
     assert_eq!(
@@ -339,7 +339,7 @@ async fn dns_sd_restarts_a_child_that_exits() {
     eventually("three starts", || starts(dir.path()).len() >= 3).await;
     let seen = states.borrow().get(&label("immich")).cloned();
     assert!(
-        matches!(&seen, Some(NameState::Failed(why)) if why.contains("dns-sd exited")),
+        matches!(&seen, Some(RecordState::Failed(why)) if why.contains("dns-sd exited")),
         "{seen:?}"
     );
 
@@ -362,7 +362,7 @@ async fn dns_sd_reports_denied_and_missing_binary() {
         .announce(ann("immich", &lan("en0", "10.0.1.50")), 80)
         .await
         .unwrap();
-    wait_state(&mut states, "immich", &NameState::Denied).await;
+    wait_state(&mut states, "immich", &RecordState::Denied).await;
     announcer.shutdown().await;
     assert!(!alive(starts(dir.path())[0]));
     assert_eq!(
@@ -378,11 +378,11 @@ async fn dns_sd_reports_denied_and_missing_binary() {
         .unwrap();
     let label = label("immich");
     let seen = wait_for(&mut states, "a failure", |s| {
-        matches!(s.get(&label), Some(NameState::Failed(_)))
+        matches!(s.get(&label), Some(RecordState::Failed(_)))
     })
     .await;
     assert!(
-        matches!(seen.get(&label), Some(NameState::Failed(why)) if why.contains("cannot run")),
+        matches!(seen.get(&label), Some(RecordState::Failed(why)) if why.contains("cannot run")),
         "{seen:?}"
     );
     missing.shutdown().await;
@@ -440,7 +440,7 @@ mod macos {
         let mut states = announcer.states();
 
         announcer.announce(ann(&name, &lan), 80).await.unwrap();
-        wait_state(&mut states, &name, &NameState::Established).await;
+        wait_state(&mut states, &name, &RecordState::Established).await;
         let found = resolves(&host).await;
         assert!(found.contains(&lan.addr().to_string()), "{found}");
 
@@ -483,7 +483,7 @@ mod macos {
         let announcer = DnsSdAnnouncer::new(DNS_SD);
         let mut states = announcer.states();
         announcer.announce(ann(&name, &lan), 80).await.unwrap();
-        wait_state(&mut states, &name, &NameState::Conflict).await;
+        wait_state(&mut states, &name, &RecordState::Conflict).await;
 
         announcer.shutdown().await;
         rival.kill().await.unwrap();
@@ -594,7 +594,7 @@ mod linux {
         let mut states = announcer.states();
 
         announcer.announce(ann(&name, &lan), 80).await.unwrap();
-        wait_state(&mut states, &name, &NameState::Established).await;
+        wait_state(&mut states, &name, &RecordState::Established).await;
         let found = avahi_resolves(&host).await.unwrap_or_default();
         assert!(found.contains(&lan.addr().to_string()), "{found}");
         let peer = peer(&lan);
@@ -620,7 +620,7 @@ mod linux {
         let announcer = AvahiAnnouncer::connect().await.unwrap().unwrap();
         let mut states = announcer.states();
         announcer.announce(ann(&name, &lan), 80).await.unwrap();
-        wait_state(&mut states, &name, &NameState::Conflict).await;
+        wait_state(&mut states, &name, &RecordState::Conflict).await;
 
         announcer.shutdown().await;
         drop(rival.shutdown());
@@ -636,7 +636,7 @@ mod linux {
         let mut states = announcer.states();
 
         announcer.announce(ann(&name, &lan), 80).await.unwrap();
-        wait_state(&mut states, &name, &NameState::Established).await;
+        wait_state(&mut states, &name, &RecordState::Established).await;
         let peer = peer(&lan);
         let found = peer_resolves(&peer, &host).await;
         assert!(found.contains(&lan.addr().to_string()), "{found:?}");
@@ -659,7 +659,7 @@ mod linux {
         let announcer = BuiltinAnnouncer::new().unwrap();
         let mut states = announcer.states();
         announcer.announce(ann(&name, &lan), 80).await.unwrap();
-        wait_state(&mut states, &name, &NameState::Conflict).await;
+        wait_state(&mut states, &name, &RecordState::Conflict).await;
 
         announcer.shutdown().await;
         drop(rival.shutdown());

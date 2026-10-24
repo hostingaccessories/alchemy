@@ -17,7 +17,7 @@
 //! The decisions are pure and compiled on every OS; the D-Bus client is
 //! Linux only.
 
-use super::NameState;
+use super::RecordState;
 
 /// avahi's well-known name on the system bus.
 pub const AVAHI_SERVICE: &str = "org.freedesktop.Avahi";
@@ -39,17 +39,17 @@ pub const COLLISION_ERROR: &str = "org.freedesktop.Avahi.CollisionError";
 ///
 /// States: 0 uncommitted, 1 registering, 2 established, 3 collision,
 /// 4 failure.
-pub fn group_state(state: i32, error: &str) -> NameState {
+pub fn group_state(state: i32, error: &str) -> RecordState {
     match state {
-        0 | 1 => NameState::Registering,
-        2 => NameState::Established,
-        3 => NameState::Conflict,
-        4 => NameState::Failed(if error.is_empty() {
+        0 | 1 => RecordState::Registering,
+        2 => RecordState::Established,
+        3 => RecordState::Conflict,
+        4 => RecordState::Failed(if error.is_empty() {
             "avahi failed to publish the name".to_owned()
         } else {
             format!("avahi failed to publish the name: {error}")
         }),
-        other => NameState::Failed(format!("avahi reported an unknown state {other}")),
+        other => RecordState::Failed(format!("avahi reported an unknown state {other}")),
     }
 }
 
@@ -76,7 +76,9 @@ mod linux {
     use zbus::fdo::DBusProxy;
     use zbus::names::BusName;
 
-    use super::super::{AnnounceError, Announcer, Backend, Board, NameState, NameStates, Record};
+    use super::super::{
+        AnnounceError, Announcer, Backend, Board, Record, RecordState, RecordStates,
+    };
     use super::{AVAHI_SERVICE, PROTO_INET, PUBLISH_NO_REVERSE, group_state, is_collision};
 
     mod server {
@@ -221,12 +223,12 @@ mod linux {
                     if let Err(error) = self.publish(group).await {
                         tracing::warn!(%error, label = %group.record.label, "cannot publish with avahi");
                         self.board
-                            .set(&group.record.label, NameState::Failed(error.to_string()));
+                            .set(&group.record.label, RecordState::Failed(error.to_string()));
                     }
                 } else {
                     self.board.set(
                         &group.record.label,
-                        NameState::Failed("avahi-daemon stopped".to_owned()),
+                        RecordState::Failed("avahi-daemon stopped".to_owned()),
                     );
                 }
             }
@@ -270,7 +272,7 @@ mod linux {
                 group.proxy = Some(proxy.clone());
                 proxy
             };
-            self.board.set(&label, NameState::Registering);
+            self.board.set(&label, RecordState::Registering);
             let added = proxy
                 .add_address(
                     interface,
@@ -283,7 +285,7 @@ mod linux {
             match added {
                 Ok(()) => proxy.commit().await,
                 Err(zbus::Error::MethodError(name, _, _)) if is_collision(name.as_str()) => {
-                    self.board.set(&label, NameState::Conflict);
+                    self.board.set(&label, RecordState::Conflict);
                     Ok(())
                 }
                 Err(error) => Err(error),
@@ -365,7 +367,7 @@ mod linux {
             })
         }
 
-        fn states(&self) -> watch::Receiver<NameStates> {
+        fn states(&self) -> watch::Receiver<RecordStates> {
             self.inner.board.subscribe()
         }
     }
@@ -384,18 +386,18 @@ mod tests {
     #[test]
     fn group_states_map_to_name_states() {
         let cases = [
-            (0, "", NameState::Registering),
-            (1, "org.freedesktop.Avahi.Success", NameState::Registering),
-            (2, "org.freedesktop.Avahi.Success", NameState::Established),
+            (0, "", RecordState::Registering),
+            (1, "org.freedesktop.Avahi.Success", RecordState::Registering),
+            (2, "org.freedesktop.Avahi.Success", RecordState::Established),
             (
                 3,
                 "org.freedesktop.Avahi.CollisionError",
-                NameState::Conflict,
+                RecordState::Conflict,
             ),
             (
                 4,
                 "org.freedesktop.Avahi.FailureError",
-                NameState::Failed(
+                RecordState::Failed(
                     "avahi failed to publish the name: org.freedesktop.Avahi.FailureError"
                         .to_owned(),
                 ),
@@ -403,12 +405,12 @@ mod tests {
             (
                 4,
                 "",
-                NameState::Failed("avahi failed to publish the name".to_owned()),
+                RecordState::Failed("avahi failed to publish the name".to_owned()),
             ),
             (
                 9,
                 "",
-                NameState::Failed("avahi reported an unknown state 9".to_owned()),
+                RecordState::Failed("avahi reported an unknown state 9".to_owned()),
             ),
         ];
         for (state, error, want) in cases {

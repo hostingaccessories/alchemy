@@ -9,7 +9,7 @@
 //! On a conflict while probing, `mdns-sd` renames the host silently
 //! (`immich.local.` to `immich-2.local.`) and reports a `NameChange` for
 //! the A record. Names never change silently in Alchemy, so the backend
-//! unregisters the service at once and reports [`NameState::Conflict`].
+//! unregisters the service at once and reports [`RecordState::Conflict`].
 //! A later conflict goes unreported, as with avahi (#100).
 //!
 //! Not used on macOS, where raw multicast from a launchd agent may need
@@ -67,7 +67,7 @@ mod linux {
     use tokio::task::JoinHandle;
 
     use super::super::{
-        AnnounceError, Announcer, Backend, Board, NameState, NameStates, Record, SERVICE_TYPE,
+        AnnounceError, Announcer, Backend, Board, Record, RecordState, RecordStates, SERVICE_TYPE,
     };
     use super::{announced_label, conflict_label};
 
@@ -169,14 +169,14 @@ mod linux {
                     tracing::info!(%label, renamed = %change.new_name, "mDNS name in use by another device");
                     registered.conflicted = true;
                     self.unregister(&registered.fullname).await;
-                    self.board.set(&label, NameState::Conflict);
+                    self.board.set(&label, RecordState::Conflict);
                 }
                 DaemonEvent::Announce(_, detail) => {
                     let Some(label) = announced_label(&detail) else {
                         return;
                     };
                     if names.by_label.get(&label).is_some_and(|r| !r.conflicted) {
-                        self.board.set(&label, NameState::Established);
+                        self.board.set(&label, RecordState::Established);
                     }
                 }
                 DaemonEvent::Error(error) => {
@@ -254,7 +254,7 @@ mod linux {
                     inner.withdraw(old).await;
                 }
                 let fullname = inner.register(names, &record)?;
-                inner.board.set(&record.label, NameState::Registering);
+                inner.board.set(&record.label, RecordState::Registering);
                 names.by_label.insert(
                     record.label.clone(),
                     Registered {
@@ -298,7 +298,7 @@ mod linux {
             })
         }
 
-        fn states(&self) -> watch::Receiver<NameStates> {
+        fn states(&self) -> watch::Receiver<RecordStates> {
             self.inner.board.subscribe()
         }
     }
