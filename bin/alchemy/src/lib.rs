@@ -72,8 +72,8 @@ pub struct Cli {
 /// Top-level subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Show whether alchemyd is reachable, which version it runs, and
-    /// whether Docker is ready.
+    /// Show whether alchemyd is reachable, which version it runs, whether
+    /// Docker is ready, and whether its networks overlap the local network.
     Status(commands::status::Args),
 
     /// Work with apps: the Compose projects Alchemy runs, found in the app

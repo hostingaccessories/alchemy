@@ -231,6 +231,41 @@ async fn status_json_adds_the_engine() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn status_explains_networks_that_overlap_the_lan() {
+    use std::sync::Arc;
+
+    use alchemyd::network::FakeNetwork;
+
+    let host = FakeNetwork::new();
+    host.set_lan_subnets(vec!["192.168.0.0/16".parse().unwrap()]);
+    let daemon =
+        Daemon::start_with(ready_desktop(), |deps| deps.with_network(Arc::new(host))).await;
+    let mut network = daemon.state.watch_network();
+    tokio::time::timeout(DEADLINE, network.wait_for(|r| r.engine_ready))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let out = run(cli(&daemon.socket, false, false)).await.unwrap();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines[2],
+        "Warning: Docker's address pool 192.168.0.0/16 overlaps your local network 192.168.0.0/16, so a new network may be given addresses that hide devices on it."
+    );
+    assert_eq!(
+        lines[3],
+        "  Fix: In Docker Desktop, open Settings, then Docker Engine, add these settings to the JSON there, and select Apply & restart:"
+    );
+    assert!(out.contains("\"default-address-pools\""), "{out}");
+
+    let out = run(cli(&daemon.socket, true, false)).await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(json["network"]["alchemy"]["state"], "ready");
+    assert_eq!(json["network"]["warnings"][0]["kind"], "pool_overlap");
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn status_watch_prints_a_line_per_change_until_the_daemon_stops() {
     let daemon = Daemon::start(EngineStatus::new(EngineState::NotRunning)).await;
     let mut watch = Watch::start(cli(&daemon.socket, false, true));
