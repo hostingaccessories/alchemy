@@ -85,7 +85,7 @@ pub enum Command {
     Machine(commands::machine::Args),
 
     /// Show and change alchemyd's settings, such as where it looks for
-    /// apps.
+    /// apps and whether it announces their .local names.
     Settings(commands::settings::Args),
 
     /// Show the versions of alchemy and alchemyd, and the protocol each

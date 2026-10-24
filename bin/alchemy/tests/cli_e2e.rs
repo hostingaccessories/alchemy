@@ -980,14 +980,38 @@ async fn apps_are_found_in_the_folder_the_settings_name() {
     let out = run_args(&daemon.socket, &["settings", "show"])
         .await
         .unwrap();
-    assert_eq!(out, "App home:           none\nOther app folders:  none\n");
+    assert_eq!(
+        out,
+        "App home:            none\nOther app folders:   none\nLocal names (mDNS):  on\n"
+    );
     let out = run_args(&daemon.socket, &["settings", "set", "app-home", home_str])
         .await
         .unwrap();
     assert_eq!(
         out,
-        format!("App home:           {home_str}\nOther app folders:  none\n")
+        format!(
+            "App home:            {home_str}\nOther app folders:   none\nLocal names (mDNS):  on\n"
+        )
     );
+    let out = run_args(&daemon.socket, &["settings", "set", "mdns", "off"])
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        format!(
+            "App home:            {home_str}\nOther app folders:   none\nLocal names (mDNS):  off\n"
+        )
+    );
+    let out = run_args(&daemon.socket, &["--json", "settings", "show"])
+        .await
+        .unwrap();
+    let shown: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+    assert_eq!(shown["home"], home_str);
+    assert_eq!(shown["network"], serde_json::json!({"mdns": false}));
+    let err = run_args(&daemon.socket, &["settings", "set", "mdns", "maybe"])
+        .await
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 2);
 
     let deadline = tokio::time::Instant::now() + DEADLINE;
     let list = loop {
