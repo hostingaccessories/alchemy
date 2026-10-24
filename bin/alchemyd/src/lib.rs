@@ -13,8 +13,10 @@
 //! It talks to the Docker engine through [`engine`], finds the user's
 //! Compose stacks through [`apps`], samples resource usage through
 //! [`metrics`], reads app logs through [`logs`], runs lifecycle actions
-//! on apps through [`operations`], keeps what it learns in [`State`], and
-//! persists settings, history, and stop [`intent`] in a [`store::Store`].
+//! on apps through [`operations`], reads the host's own subnets, routes,
+//! and listeners through [`network`], keeps what it learns in [`State`],
+//! and persists settings, history, and stop [`intent`] in a
+//! [`store::Store`].
 
 pub mod apps;
 pub mod auth;
@@ -26,6 +28,7 @@ pub mod http;
 pub mod intent;
 pub mod logs;
 pub mod metrics;
+pub mod network;
 pub mod operations;
 mod secure_fs;
 pub mod session;
@@ -48,6 +51,7 @@ use crate::apps::{AppEditor, AppsDeps};
 use crate::engine::{EngineMonitor, EngineSource, SystemConnector, SystemProbe};
 use crate::logs::{SharedLogSource, SystemLogs};
 use crate::metrics::{Collector, MetricsSource, SystemMetrics};
+use crate::network::{FakeNetwork, SharedNetwork, SystemNetwork};
 use crate::operations::{OperationRunner, Operations, SystemRunner};
 use crate::session::{Auth, TokenFile};
 use crate::store::{SharedStore, SqliteStore, StateLock};
@@ -88,6 +92,8 @@ pub struct Deps<E, M = SystemMetrics> {
     pub runner: Arc<dyn OperationRunner>,
     /// Creates apps and edits their files for the API.
     pub editor: Arc<AppEditor>,
+    /// Where the host's LAN subnets, routes, and listeners are read.
+    pub network: SharedNetwork,
 }
 
 impl<E> Deps<E> {
@@ -104,8 +110,10 @@ impl<E> Deps<E> {
     /// without running anything. The editor writes to the real
     /// filesystem but validates with a
     /// [`FakeComposeValidator`](compose::FakeComposeValidator) that
-    /// accepts everything. Use [`Self::with_apps`],
-    /// [`Self::with_runner`], and [`Self::with_editor`] to change them.
+    /// accepts everything. The host network is a
+    /// [`FakeNetwork`] with nothing on it. Use [`Self::with_apps`],
+    /// [`Self::with_runner`], [`Self::with_editor`], and
+    /// [`Self::with_network`] to change them.
     pub fn new(engine: E) -> Self {
         Self {
             state: State::new(),
@@ -122,6 +130,7 @@ impl<E> Deps<E> {
                 Arc::new(apps::SystemDisk),
                 Arc::new(compose::FakeComposeValidator::new()),
             )),
+            network: Arc::new(FakeNetwork::new()),
         }
     }
 }
@@ -137,6 +146,7 @@ impl<E, M> Deps<E, M> {
             logs: self.logs,
             runner: self.runner,
             editor: self.editor,
+            network: self.network,
         }
     }
 
@@ -167,16 +177,24 @@ impl<E, M> Deps<E, M> {
         self.editor = Arc::new(editor);
         self
     }
+
+    /// Read the host's subnets, routes, and listeners from `network`.
+    #[must_use]
+    pub fn with_network(mut self, network: SharedNetwork) -> Self {
+        self.network = network;
+        self
+    }
 }
 
 impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
-    /// The real engine monitor, apps task, and `docker compose` for this
-    /// host.
+    /// The real engine monitor, apps task, `docker compose`, and host
+    /// network for this host.
     pub fn system() -> Self {
         Self::new(EngineMonitor::system())
             .with_apps(AppsDeps::system())
             .with_runner(Arc::new(SystemRunner::new()))
             .with_editor(AppEditor::system())
+            .with_network(Arc::new(SystemNetwork::new()))
     }
 }
 
