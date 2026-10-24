@@ -307,6 +307,61 @@ curl --unix-socket /run/user/1000/alchemy/alchemyd.sock -X PUT \
   http://alchemyd/api/settings/apps
 ```
 
+### Creating and editing apps
+
+Alchemy writes only an app's compose file and its `.env`, and never
+leaves a broken one on disk. Each file is at most 256 KiB of UTF-8 text
+without NUL bytes. A write is staged in a hidden
+`.alchemy-tmp-NAME-XXXX` folder inside the app folder it goes to,
+validated with `docker compose --project-directory DIR [-f FILE]
+[--env-file FILE] config`, and only then moved into place with one
+rename. If Compose rejects it, the answer is 422 `invalid` with
+Compose's own message, staging paths removed, and nothing changes.
+
+- `POST /api/apps` (`{"name","folder","compose","env"}`) creates
+  `FOLDER/NAME` holding `compose.yaml` and, if given, `.env`. `folder` is
+  the home when `null` and must otherwise be one of the app folders; the
+  home is created on first use. A folder that already exists, empty or
+  not, or a name another app has, is 409 `conflict`: Alchemy never
+  replaces a folder, since it may hold data. It answers 201 with the app.
+- `GET /api/apps/NAME/files/compose` (or `env`) answers
+  `{"kind","name","content","hash"}`, with `hash` (SHA-256, hex) also as
+  the `ETag`. A missing `.env` is empty with a `null` hash.
+- `PUT /api/apps/NAME/files/compose` (or `env`) takes
+  `{"content","base_hash"}`. `base_hash` is the hash the edit started
+  from, in the body rather than `If-Match` so the CLI and web UI send it
+  the same way; if the file on disk no longer has it, checked before
+  staging and again after Compose runs, the answer is 409 `conflict` and
+  the hand edit stays. A compose file is validated against the app's own
+  folder with its override file; a `.env` with `--env-file`. Only the
+  edited file is replaced, keeping its mode and owner.
+- Both take `"dry_run": true` to check and validate without writing.
+
+`.env` is always written `0600`, whatever the umask, and a new app's
+compose file `0644` in a `0755` folder. Symlinked app folders and files
+are refused, never followed, and only apps in the app folders can be
+edited. Bodies over 3 MiB are refused with 413. The code is in
+`bin/alchemyd/src/apps/edit.rs` and `disk.rs`; validation is
+`ComposeValidator` in `bin/alchemyd/src/compose/validate.rs`.
+
+`alchemy app create NAME [--file compose.yaml] [--env-file PATH]
+[--folder PATH]` reads `compose.yaml` in the current folder unless told
+otherwise (`--file -` reads stdin). `alchemy app edit NAME [--env]` opens
+a private `0600` copy in `$VISUAL` or `$EDITOR` (`vi` otherwise; the
+value is split on spaces, never run by a shell), re-opens it with
+Compose's message on top until Compose accepts it or it is left
+unchanged, asks, then saves. On a conflict it keeps your copy and says
+where; `--force` saves over the change on disk instead. Both take
+`--dry-run` and `--yes`. On the web, Apps has "Add app", and each app's
+page an Edit section.
+
+```sh
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"hello","compose":"services:\n  web:\n    image: nginx\n","dry_run":true}' \
+  http://alchemyd/api/apps
+```
+
 ### Logs
 
 `GET /api/apps/NAME/logs` streams an app's logs as server-sent events,
@@ -704,7 +759,7 @@ message. `kind` is a contract.
 | Exit | When                                                    | `kind`                                                                   |
 | ---- | ------------------------------------------------------- | ------------------------------------------------------------------------ |
 | 0    | It did what was asked                                   |                                                                          |
-| 1    | It failed, for example alchemyd refused it              | `daemon`, `runtime`, `operation_failed`                                  |
+| 1    | It failed, for example alchemyd refused it              | `daemon`, `runtime`, `operation_failed`, `editor`, `file`                |
 | 2    | The command line or daemon target is invalid            | `usage`, `remote_daemon`, `invalid_target`                               |
 | 3    | Confirmation was declined, or needed without a terminal | `declined`, `confirmation_required`                                      |
 | 69   | alchemyd is unreachable or went away                    | `daemon_unreachable`, `disconnected`                                     |
@@ -757,9 +812,11 @@ pub(crate) async fn run<D: Daemon, W: Write, P: Prompt>(
 Its arm in `run_with` passes `prompt`. alchemyd's plan request for
 lifecycle actions is `GET /api/apps/NAME/plan?action=ACTION`, an
 `ActionPlan` in `alchemy-api`; `src/commands/app/action.rs` shows the
-whole flow, and a new destructive command adds its own plan route. The
-hidden `safety-probe` command in `src/commands/safety_probe.rs` is the
-smallest example, and its JSON isn't a contract.
+whole flow, and a new destructive command adds its own plan route.
+`app create` and `app edit` instead send `"dry_run": true`, which
+validates without writing. The hidden `safety-probe` command in
+`src/commands/safety_probe.rs` is the smallest example, and its JSON
+isn't a contract.
 
 ### Help, completions, and man pages
 
