@@ -4,8 +4,9 @@ use std::io::{Read as _, Write};
 use std::path::{Path, PathBuf};
 
 use alchemy_api::apps::files::MAX_FILE_LEN;
-use alchemy_api::apps::{App, NewApp};
+use alchemy_api::apps::{App, NewApp, Saved};
 
+use super::action::follow_start;
 use super::parse_name;
 use crate::context::{Context, Sent};
 use crate::daemon::{Daemon, Method};
@@ -40,14 +41,19 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub folder: Option<String>,
 
+    /// Start the app once it is created, and follow it to the end as
+    /// `alchemy app up` does.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub start: bool,
+
     /// The shared safety flags.
     #[command(flatten)]
     pub safety: Safety,
 }
 
 /// Run `alchemy app create`: read the files, confirm, then have alchemyd
-/// validate them with Compose and create the app, or with `--dry-run` only
-/// validate them.
+/// validate them with Compose and create the app, and with `--start` start
+/// it, or with `--dry-run` only validate them.
 pub(crate) async fn run<D: Daemon, W: Write, P: Prompt>(
     ctx: &mut Context<D, W>,
     prompt: &mut P,
@@ -68,13 +74,17 @@ pub(crate) async fn run<D: Daemon, W: Write, P: Prompt>(
         compose,
         env,
         dry_run,
+        start: args.start,
     };
-    match ctx.send::<_, App>(Method::POST, "/api/apps", &new).await? {
-        Sent::Done(app) => {
-            for line in created_lines(&app, dry_run, ctx.json()) {
+    match ctx
+        .send::<_, Saved<App>>(Method::POST, "/api/apps", &new)
+        .await?
+    {
+        Sent::Done(saved) => {
+            for line in created_lines(&saved.saved, dry_run, ctx.json()) {
                 ctx.out().line(line)?;
             }
-            Ok(())
+            follow_start(ctx, &saved, name.as_str(), args.start).await
         }
         Sent::Refused(refusal) => Err(ClientError::Daemon(refusal.error)),
     }
@@ -138,9 +148,13 @@ pub(crate) fn created_lines(app: &App, dry_run: bool, json: bool) -> Vec<String>
 )]
 mod tests {
     use alchemy_api::apps::{AppService, StackName, StackStatus, StopReason};
+    use alchemy_api::operations::{Action, Operation, OperationEvent, OperationState};
+    use alchemy_api::{ErrorCode, ErrorResponse};
+    use clap::Parser as _;
 
     use super::*;
-    use crate::daemon::fake::FakeDaemon;
+    use crate::Cli;
+    use crate::daemon::fake::{FakeDaemon, sse};
     use crate::prompt::FakePrompt;
 
     fn app(services: &[&str]) -> App {
@@ -222,6 +236,7 @@ mod tests {
             file: dir.path().join("compose.yaml"),
             env_file: Some(dir.path().join(".env")),
             folder: None,
+            start: false,
             safety: Safety {
                 yes: true,
                 ..Safety::default()
@@ -279,6 +294,121 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&ctx.daemon().bodies()[0]).unwrap();
         assert_eq!(body["dry_run"], true);
         assert_eq!(body["folder"], "/opt/stacks");
+    }
+
+    fn up(state: OperationState) -> Operation {
+        Operation {
+            id: "op1".into(),
+            app: StackName::new("blog").unwrap(),
+            action: Action::Up,
+            state,
+            steps: vec![],
+            started_at: 0,
+            finished_at: None,
+            error: None,
+        }
+    }
+
+    fn saved(operation: Option<Operation>, start_error: Option<ErrorResponse>) -> Vec<u8> {
+        serde_json::to_vec(&Saved {
+            saved: app(&["web"]),
+            operation,
+            start_error,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn starts_the_app_and_follows_it_to_the_end() {
+        let done = OperationEvent::Done(up(OperationState::Succeeded));
+        let done = sse(done.name(), &serde_json::to_string(&done.data()).unwrap());
+        let cases = [
+            (
+                false,
+                "created blog in /home/me/Alchemy/apps/blog
+Compose project blog: web
+blog is up
+",
+            ),
+            (true, ""),
+        ];
+        for (json, want) in cases {
+            let (_dir, mut args) = files();
+            args.start = true;
+            let fake = FakeDaemon::new()
+                .version("1.2.3", 1)
+                .reply(
+                    Method::POST,
+                    "/api/apps",
+                    201,
+                    saved(Some(up(OperationState::Running)), None),
+                )
+                .stream("/api/operations/op1/events", [Ok(done.clone())]);
+            let mut ctx = Context::buffered(fake, json, NAME);
+            run(&mut ctx, &mut FakePrompt::no_tty(), args)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_str(&ctx.daemon().bodies()[0]).unwrap();
+            assert_eq!(body["start"], true, "json {json}");
+            if json {
+                let lines: Vec<serde_json::Value> = ctx
+                    .written()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(lines.len(), 2, "{}", ctx.written());
+                assert_eq!(lines[0]["app"]["name"], "blog");
+                assert_eq!(lines[1]["event"], "done");
+            } else {
+                assert_eq!(ctx.written(), want);
+                assert!(
+                    ctx.progress_written()
+                        .starts_with("Bringing up blog (operation op1).")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_refused_after_the_save_fails_once_it_is_said() {
+        let busy = "blog is busy with another operation (op9); wait for it to finish";
+        let cases = [
+            (
+                saved(None, Some(ErrorResponse::new(ErrorCode::Conflict, busy))),
+                format!("alchemyd: {busy}"),
+            ),
+            (
+                saved(None, None),
+                "alchemyd: saved blog, but this alchemyd doesn't start apps on save; run `alchemy app up blog`".to_owned(),
+            ),
+        ];
+        for (reply, want) in cases {
+            let (_dir, mut args) = files();
+            args.start = true;
+            let fake =
+                FakeDaemon::new()
+                    .version("1.2.3", 1)
+                    .reply(Method::POST, "/api/apps", 201, reply);
+            let mut ctx = Context::buffered(fake, false, NAME);
+            let err = run(&mut ctx, &mut FakePrompt::no_tty(), args)
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), want);
+            assert_eq!(err.exit_code(), 1);
+            assert!(ctx.written().starts_with("created blog in "), "{want}");
+            assert_eq!(
+                ctx.daemon().requests(),
+                ["GET /api/version", "POST /api/apps"]
+            );
+        }
+    }
+
+    #[test]
+    fn start_and_dry_run_are_refused_together() {
+        let err = Cli::try_parse_from(["alchemy", "app", "create", "blog", "--start", "--dry-run"])
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be used with"), "{err}");
+        Cli::try_parse_from(["alchemy", "app", "create", "blog", "--start", "--yes"]).unwrap();
     }
 
     #[tokio::test]

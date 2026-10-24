@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import type { App, AppFile, AppList } from "../lib/api.ts";
+import type { App, AppFile, AppList, Operation } from "../lib/api.ts";
 import { FakeEventSource, renderAt } from "../test/render.tsx";
 
 const blog: App = {
@@ -78,7 +78,50 @@ function error(status: number, code: string, message: string) {
   return () => new Response(JSON.stringify({ error: message, code }), { status });
 }
 
+const upBlog: Operation = {
+  id: "op1",
+  app: "blog",
+  action: "up",
+  state: "running",
+  steps: [{ command: "up", label: "Starting the app", state: "active", message: null }],
+  started_at: 1_700_000_000,
+  finished_at: null,
+  error: null,
+};
+
 describe("AppFileEditor", () => {
+  it("saves and starts the app, showing its progress", async () => {
+    const edited = `${COMPOSE}    restart: always\n`;
+    putReply = () => new Response(JSON.stringify({ ...file(edited, "h2"), operation: upBlog }));
+    const area = await openCompose();
+    fireEvent.change(area, { target: { value: edited } });
+    fireEvent.click(screen.getByRole("button", { name: "Save and start" }));
+
+    expect(await screen.findByText("Saved compose.yaml.")).toBeTruthy();
+    const actions = screen.getByRole("region", { name: "Actions" });
+    expect(within(actions).getAllByText("Creating and starting blog…").length).toBeGreaterThan(0);
+    expect(puts).toEqual([{ content: edited, base_hash: "h1", dry_run: false, start: true }]);
+    expect(screen.getByRole("button", { name: "Save and start" }).hasAttribute("disabled")).toBe(
+      true,
+    );
+  });
+
+  it("says when the file was saved but the app not started", async () => {
+    const why = "blog is busy with another operation (op9); wait for it to finish";
+    putReply = () =>
+      new Response(
+        JSON.stringify({ ...file("x: 1\n", "h2"), start_error: { error: why, code: "conflict" } }),
+      );
+    const area = await openCompose();
+    fireEvent.change(area, { target: { value: "x: 1\n" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save and start" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText("Saved compose.yaml, but couldn't start the app")).toBeTruthy();
+    expect(within(alert).getByText(why)).toBeTruthy();
+    expect(area.value).toBe("x: 1\n");
+  });
+
   it("saves an edit against the hash it was opened at", async () => {
     const edited = `${COMPOSE}    restart: always\n`;
     putReply = () => new Response(JSON.stringify(file(edited, "h2")));

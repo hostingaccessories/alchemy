@@ -1,7 +1,8 @@
 //! Operations wiring: `run_with` starting lifecycle actions on apps found
 //! in a real folder, streaming their progress over the API socket,
-//! refusing a second action on a busy app, and recording what shutdown
-//! interrupts, all against a fake Compose runner.
+//! refusing a second action on a busy app, recording what shutdown
+//! interrupts, and showing a failing build's step output, all against a
+//! fake Compose runner.
 
 #![allow(
     clippy::unwrap_used,
@@ -272,4 +273,68 @@ async fn runs_actions_streams_progress_and_refuses_a_busy_app() {
             .map(|i| i.action.as_str()),
         Some("stop")
     );
+}
+
+/// `BuildKit` status lines as `docker compose --progress json build`
+/// writes them for a `RUN` step that fails, its output in base64.
+const FAILING_BUILD: [&str; 5] = [
+    r#"{"vertexes":[{"digest":"sha256:58489c9b","name":"[1/2] FROM docker.io/library/alpine:3.20","started":"2026-10-24T00:33:39.1Z","completed":"2026-10-24T00:33:39.2Z","cached":true}]}"#,
+    r#"{"vertexes":[{"digest":"sha256:9c2f41aa","inputs":["sha256:58489c9b"],"name":"[2/2] RUN ./build.sh","started":"2026-10-24T00:33:39.5Z"}]}"#,
+    r#"{"vertexes":[],"statuses":[],"logs":[{"vertex":"sha256:9c2f41aa","stream":1,"data":"Y29tcGlsaW5nIGFwcAo=","timestamp":"2026-10-24T00:33:39.6Z"},{"vertex":"sha256:9c2f41aa","stream":2,"data":"ZXJyb3I6IG1pc3NpbmcgZGVwZW5kZW5jeSBsaWJmb28K","timestamp":"2026-10-24T00:33:39.7Z"}]}"#,
+    r#"{"logs":[{"vertex":"sha256:9c2f41aa","stream":2,"data":"bWFrZTogKioqIFthbGxdIEVycm9yIDE=","timestamp":"2026-10-24T00:33:39.8Z"}]}"#,
+    r#"{"vertexes":[{"digest":"sha256:9c2f41aa","inputs":["sha256:58489c9b"],"name":"[2/2] RUN ./build.sh","started":"2026-10-24T00:33:39.5Z","completed":"2026-10-24T00:33:39.9Z","error":"process did not complete successfully: exit code: 1"}]}"#,
+];
+
+#[tokio::test]
+async fn a_failing_build_shows_the_output_of_its_run_step() {
+    let dir = tempfile::Builder::new()
+        .prefix("ab")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let script = FAILING_BUILD
+        .iter()
+        .fold(FakeScript::new(), |script, line| {
+            script.line(Stream::Stdout, *line)
+        })
+        .outcome(FakeOutcome::Fail {
+            code: 1,
+            message: "failed to solve: process did not complete successfully: exit code: 1"
+                .to_owned(),
+        });
+    let runner = FakeComposeRunner::new().with_script(ComposeAction::Build, script);
+    let daemon = start(&root, runner).await;
+    let socket = daemon.socket.clone();
+
+    let (status, body) = call(
+        &socket,
+        "POST",
+        "/api/apps/blog/actions",
+        r#"{"action":"build"}"#,
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let id = body["operation"]["id"].as_str().unwrap().to_owned();
+
+    let events = follow(&socket, &id).await;
+    let texts: Vec<String> = events
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .filter_map(|data| data["text"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "[1/2] FROM docker.io/library/alpine:3.20: cached",
+            "[2/2] RUN ./build.sh",
+            "[2/2] RUN ./build.sh | compiling app",
+            "[2/2] RUN ./build.sh | error: missing dependency libfoo",
+            "[2/2] RUN ./build.sh | make: *** [all] Error 1",
+            "[2/2] RUN ./build.sh: error: process did not complete successfully: exit code: 1",
+        ],
+        "{events}"
+    );
+    assert!(events.contains(r#""state":"failed""#), "{events}");
+    daemon.stop().await;
 }

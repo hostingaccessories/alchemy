@@ -1127,6 +1127,52 @@ async fn lifecycle_actions_run_in_the_daemon_and_follow_to_the_end() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cancel_stops_an_apps_running_operation() {
+    use alchemyd::compose::{ComposeAction, FakeComposeRunner, FakeOutcome, FakeScript};
+
+    let runner = FakeComposeRunner::new().with_script(
+        ComposeAction::Stop,
+        FakeScript::new().outcome(FakeOutcome::UntilCancelled),
+    );
+    let (daemon, _apps) = daemon_with_blog(runner).await;
+    let socket = daemon.socket.clone();
+
+    let cancel = async {
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            match run_args(&socket, &["app", "cancel", "blog"]).await {
+                Ok(out) => break out,
+                Err(err) => assert_eq!(err.kind(), "nothing_to_cancel", "{err}"),
+            }
+            assert!(tokio::time::Instant::now() < deadline, "stop never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let (stopped, cancelled) = tokio::join!(run_args(&socket, &["app", "stop", "blog"]), cancel);
+    assert!(
+        cancelled.starts_with("Cancelling stop blog (operation "),
+        "{cancelled}"
+    );
+    let err = stopped.unwrap_err();
+    assert_eq!(err.kind(), "operation_failed");
+    assert!(
+        err.to_string().starts_with("stop blog was cancelled"),
+        "{err}"
+    );
+
+    let err = run_args(&socket, &["app", "cancel", "blog"])
+        .await
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert_eq!(
+        err.to_string(),
+        "nothing to cancel: blog has no operation running"
+    );
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn app_create_validates_then_creates_and_never_replaces() {
     let daemon = Daemon::start(EngineStatus::new(EngineState::Ready)).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1182,6 +1228,60 @@ async fn app_create_validates_then_creates_and_never_replaces() {
         .unwrap_err();
     assert_eq!(err.exit_code(), 1);
     assert!(err.to_string().contains("already exists"), "{err}");
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn app_create_start_brings_the_new_app_up_or_says_why_not() {
+    use std::sync::Arc;
+
+    use alchemyd::apps::{AppsDeps, SystemFs};
+    use alchemyd::compose::FakeComposeConfig;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let home = root.join("apps");
+    let compose = root.join("compose.yaml");
+    std::fs::write(&compose, "services: {}\n").unwrap();
+    let config = FakeComposeConfig::new();
+    config.project(home.join("web"), "web", &[]);
+    let daemon = Daemon::start_with(EngineStatus::new(EngineState::Ready), |deps| {
+        deps.with_apps(
+            AppsDeps::new(Arc::new(SystemFs), Arc::new(config), Some(home.clone()))
+                .with_scan_interval(Duration::from_secs(60)),
+        )
+    })
+    .await;
+    let compose_str = compose.to_str().unwrap();
+
+    let start = |name| {
+        [
+            "app",
+            "create",
+            name,
+            "--file",
+            compose_str,
+            "--yes",
+            "--start",
+        ]
+    };
+    let out = run_args(&daemon.socket, &start("web")).await.unwrap();
+    assert_eq!(
+        out,
+        format!(
+            "created web in {}\nCompose project web, with no services\nweb is up\n",
+            home.join("web").display()
+        )
+    );
+
+    let err = run_args(&daemon.socket, &start("blog")).await.unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert!(
+        err.to_string().contains("Compose hasn't read blog yet"),
+        "{err}"
+    );
+    assert!(home.join("blog/compose.yaml").exists(), "the save stands");
 
     daemon.stop().await;
 }

@@ -1,6 +1,6 @@
 //! App file wiring: `run_with` creating an app in a real home and editing
 //! its files over the API socket, with a stub validator in place of
-//! Compose.
+//! Compose, and starting it in the same request with a fake runner.
 
 #![allow(
     clippy::unwrap_used,
@@ -18,7 +18,10 @@ use std::time::Duration;
 use alchemy_api::apps::{AppFile, AppList};
 use alchemy_core::engine::{EngineState, EngineStatus};
 use alchemyd::apps::{AppEditor, AppsDeps, SystemDisk, SystemFs, content_hash};
-use alchemyd::compose::{ComposeConfig, FakeComposeConfig, FakeComposeValidator, FakeConfig};
+use alchemyd::compose::{
+    ComposeAction, ComposeConfig, FakeComposeConfig, FakeComposeRunner, FakeComposeValidator,
+    FakeConfig, FakeOutcome, FakeScript,
+};
 use alchemyd::engine::EngineSource;
 use alchemyd::{Deps, State};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -256,6 +259,167 @@ async fn creates_an_app_and_edits_its_files_without_overwriting_a_hand_edit() {
         .collect();
     assert_eq!(names, ["blog"], "a staging folder was left behind");
 
+    stop.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+}
+
+async fn operation_until(socket: &Path, id: &str, state: &str) {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let reply = call(socket, "GET", &format!("/api/operations/{id}"), "").await;
+        if reply.body["state"] == state {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "operation {id} never {state}: {}",
+            reply.body
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one daemon walked through the whole flow"
+)]
+async fn saves_and_starts_an_app_in_one_request() {
+    let dir = tempfile::Builder::new()
+        .prefix("as")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let home = root.join("home/Alchemy/apps");
+    let blog = home.join("blog");
+    let socket = root.join("alchemyd.sock");
+    let config = FakeComposeConfig::new();
+    config.project(&blog, "blog", &["web"]);
+    let runner = FakeComposeRunner::new().with_script(
+        ComposeAction::Stop,
+        FakeScript::new().outcome(FakeOutcome::UntilCancelled),
+    );
+    let deps = Deps::new(FixedEngine(EngineStatus::new(EngineState::Ready)))
+        .with_apps(
+            AppsDeps::new(Arc::new(SystemFs), Arc::new(config.clone()), Some(home))
+                .with_scan_interval(Duration::from_secs(60)),
+        )
+        .with_editor(AppEditor::new(
+            Arc::new(SystemDisk),
+            Arc::new(FakeComposeValidator::new()),
+        ))
+        .with_runner(Arc::new(runner.clone()));
+    let (stop, stop_rx) = oneshot::channel::<()>();
+    let daemon = tokio::spawn(alchemyd::run_with(
+        alchemyd::Config {
+            listen: free_port(),
+            socket: socket.clone(),
+            state_dir: root.join("state"),
+        },
+        deps,
+        async {
+            let _ = stop_rx.await;
+        },
+    ));
+    apps_until(&socket, "the home listed", |a| !a.dirs.is_empty()).await;
+
+    let dry =
+        serde_json::json!({ "name": "blog", "compose": COMPOSE, "dry_run": true, "start": true });
+    let reply = call(&socket, "POST", "/api/apps", &dry.to_string()).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert_eq!(reply.body["code"], "bad_request");
+    assert!(!blog.exists());
+
+    let new = serde_json::json!({ "name": "blog", "compose": COMPOSE, "start": true });
+    let reply = call(&socket, "POST", "/api/apps", &new.to_string()).await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    assert_eq!(reply.body["name"], "blog");
+    assert_eq!(reply.body["operation"]["action"], "up");
+    assert_eq!(reply.body["operation"]["app"], "blog");
+    assert!(reply.body.get("start_error").is_none(), "{}", reply.body);
+    let id = reply.body["operation"]["id"].as_str().unwrap().to_owned();
+    operation_until(&socket, &id, "succeeded").await;
+    assert_eq!(runner.runs().len(), 1);
+    assert_eq!(runner.runs()[0].action(), ComposeAction::Up);
+
+    let reply = call(&socket, "GET", "/api/apps/blog/files/compose", "").await;
+    let hash = reply.body["hash"].as_str().unwrap().to_owned();
+    let edited = format!("{COMPOSE}    restart: always\n");
+    let reply = call(
+        &socket,
+        "PUT",
+        "/api/apps/blog/files/compose",
+        &put(&edited, Some(&hash)),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let keys: Vec<_> = reply.body.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, ["content", "hash", "kind", "name"], "without start");
+
+    config.project(&blog, "renamed", &["web"]);
+    let update = serde_json::json!({
+        "content": COMPOSE,
+        "base_hash": content_hash(edited.as_bytes()),
+        "start": true,
+    });
+    let reply = call(
+        &socket,
+        "PUT",
+        "/api/apps/blog/files/compose",
+        &update.to_string(),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["content"], COMPOSE);
+    let id = reply.body["operation"]["id"].as_str().unwrap().to_owned();
+    let reply = call(&socket, "GET", "/api/apps/blog", "").await;
+    assert_eq!(
+        reply.body["project"], "renamed",
+        "started once the edit was read"
+    );
+    operation_until(&socket, &id, "succeeded").await;
+    assert_eq!(runner.runs().len(), 2);
+
+    let reply = call(
+        &socket,
+        "POST",
+        "/api/apps/blog/actions",
+        r#"{"action":"stop"}"#,
+    )
+    .await;
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    let stopping = reply.body["operation"]["id"].as_str().unwrap().to_owned();
+    let update = serde_json::json!({
+        "content": edited,
+        "base_hash": content_hash(COMPOSE.as_bytes()),
+        "start": true,
+    });
+    let reply = call(
+        &socket,
+        "PUT",
+        "/api/apps/blog/files/compose",
+        &update.to_string(),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(reply.body.get("operation").is_none(), "{}", reply.body);
+    assert_eq!(reply.body["start_error"]["code"], "conflict");
+    let error = reply.body["start_error"]["error"].as_str().unwrap();
+    assert!(error.contains(&stopping), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(blog.join("compose.yaml")).unwrap(),
+        edited,
+        "a refused start keeps the save"
+    );
+
+    let reply = call(
+        &socket,
+        "POST",
+        &format!("/api/operations/{stopping}/cancel"),
+        "{}",
+    )
+    .await;
+    assert_eq!(reply.status, 202, "{}", reply.body);
     stop.send(()).unwrap();
     daemon.await.unwrap().unwrap();
 }

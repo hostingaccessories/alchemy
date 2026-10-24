@@ -4,7 +4,7 @@ use std::io::Write;
 
 use alchemy_api::apps::{AppDirState, AppList};
 
-use super::{app_status, columns, is_running, status_word};
+use super::{app_status, columns, is_running, unmanaged_status};
 use crate::context::Context;
 use crate::daemon::Daemon;
 use crate::error::ClientError;
@@ -74,7 +74,7 @@ pub(crate) fn list_lines(apps: &AppList, json: bool) -> Vec<String> {
             .map(|project| {
                 vec![
                     project.project.clone(),
-                    status_word(project.status).to_owned(),
+                    unmanaged_status(project.status, project.stop_reason),
                     project.dir.clone().unwrap_or_default(),
                 ]
             })
@@ -208,12 +208,32 @@ pub(crate) mod tests {
         }];
         AppList {
             apps: vec![blog(), broken],
-            unmanaged: vec![UnmanagedApp {
-                project: "legacy".into(),
-                dir: Some("/home/me/legacy".into()),
-                status: StackStatus::Running,
-                services: vec![],
-            }],
+            unmanaged: vec![
+                UnmanagedApp {
+                    project: "legacy".into(),
+                    dir: Some("/home/me/legacy".into()),
+                    status: StackStatus::Running,
+                    services: vec![],
+                    stop_reason: StopReason::Running,
+                },
+                UnmanagedApp {
+                    project: "worker".into(),
+                    dir: None,
+                    status: StackStatus::Stopped,
+                    services: vec![],
+                    stop_reason: StopReason::Crashed {
+                        exit_code: Some(1),
+                        oom: false,
+                    },
+                },
+                UnmanagedApp {
+                    project: "tools".into(),
+                    dir: Some("/home/me/tools".into()),
+                    status: StackStatus::Stopped,
+                    services: vec![],
+                    stop_reason: StopReason::StoppedOutside,
+                },
+            ],
             dirs: vec![
                 home(AppDirState::Missing),
                 AppDir {
@@ -249,7 +269,9 @@ pub(crate) mod tests {
                 "wiki  unknown         -         /opt/stacks/wiki",
                 "",
                 "Not managed by Alchemy:",
-                "  legacy  running  /home/me/legacy",
+                "  legacy  running                         /home/me/legacy",
+                "  worker  stopped, crashed (exit code 1)",
+                "  tools   stopped                         /home/me/tools",
                 "",
                 "wiki: Compose can't read compose.yaml: yaml: line 4",
                 "/opt/stacks/My App: \"My App\" can't be an app name.",

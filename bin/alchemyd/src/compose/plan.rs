@@ -1,6 +1,7 @@
 //! What each action runs: a plan of one or more `docker compose` steps.
 
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 pub use alchemy_core::operation::{
     Action as ComposeAction, StepCommand as ComposeCommand, UnknownAction,
@@ -13,6 +14,7 @@ use super::ComposeProject;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ComposeStep {
     command: ComposeCommand,
+    dir: PathBuf,
     args: Vec<OsString>,
 }
 
@@ -27,12 +29,21 @@ impl ComposeStep {
             command.as_str().into(),
         ];
         args.extend(flags.iter().map(OsString::from));
-        Self { command, args }
+        Self {
+            command,
+            dir: project.dir().to_path_buf(),
+            args,
+        }
     }
 
     /// The subcommand this step runs.
     pub fn command(&self) -> ComposeCommand {
         self.command
+    }
+
+    /// The project's directory, which the step also runs in.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// The argv after the `docker` binary, such as

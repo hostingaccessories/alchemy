@@ -7,7 +7,14 @@ import {
   queryOptions,
 } from "@tanstack/react-query";
 
-import { type ApiEvent, type ApiEventData, type ApiEventName, api } from "./api.ts";
+import {
+  type ApiEvent,
+  type ApiEventData,
+  type ApiEventName,
+  type Operation,
+  type OperationList,
+  api,
+} from "./api.ts";
 
 /**
  * `GET /api/version`, which doubles as the daemon reachability probe behind
@@ -85,6 +92,16 @@ export const liveQueries = {
 export function writeLiveEvent(client: QueryClient, event: ApiEvent): void {
   const { queryKey }: { queryKey: QueryKey } = liveQueries[event.event];
   client.setQueryData<ApiEvent["data"]>(queryKey, event.data);
+}
+
+/**
+ * Put `operation`, just started, first in the operations query, so its
+ * progress shows before the `operations` event brings it.
+ */
+export function showOperation(client: QueryClient, operation: Operation): void {
+  client.setQueryData<OperationList>(liveQueries.operations.queryKey, (list) => ({
+    operations: [operation, ...(list?.operations ?? []).filter((op) => op.id !== operation.id)],
+  }));
 }
 
 const LIVE_KEYS = new Set(Object.values(liveQueries).map(({ queryKey }) => hashKey(queryKey)));

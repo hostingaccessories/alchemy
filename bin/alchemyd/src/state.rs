@@ -31,6 +31,7 @@ struct Inner {
     apps: watch::Sender<AppList>,
     app_settings: watch::Sender<AppSettings>,
     app_rescans: watch::Sender<u64>,
+    app_scans: watch::Sender<u64>,
     operations: watch::Sender<OperationList>,
     log_streams: LogStreams,
 }
@@ -55,6 +56,7 @@ impl State {
                     extra: Vec::new(),
                 }),
                 app_rescans: watch::Sender::new(0),
+                app_scans: watch::Sender::new(0),
                 operations: watch::Sender::new(OperationList::default()),
                 log_streams: LogStreams::default(),
             }),
@@ -161,15 +163,44 @@ impl State {
     /// Ask the apps task to reload its settings, list every app folder,
     /// and read every app's configuration again, without waiting for its
     /// next scan.
-    pub fn rescan_apps(&self) {
-        self.inner
-            .app_rescans
-            .send_modify(|n| *n = n.wrapping_add(1));
+    ///
+    /// Returns the request's generation, which rises with every request,
+    /// to pass to [`Self::app_scan_done`].
+    pub fn rescan_apps(&self) -> u64 {
+        let mut generation = 0;
+        self.inner.app_rescans.send_modify(|n| {
+            *n = n.saturating_add(1);
+            generation = *n;
+        });
+        generation
     }
 
-    /// Subscribe to [`Self::rescan_apps`] requests.
+    /// Subscribe to [`Self::rescan_apps`] requests, by generation.
     pub fn watch_app_rescans(&self) -> watch::Receiver<u64> {
         self.inner.app_rescans.subscribe()
+    }
+
+    /// Record that [`Self::apps`] holds the results of every rescan up to
+    /// `generation`: the folders listed and every app read again after it
+    /// was asked for. Generations only rise, so an older one changes
+    /// nothing. Returns whether it changed.
+    pub fn set_app_scan_done(&self, generation: u64) -> bool {
+        self.inner.app_scans.send_if_modified(|done| {
+            if generation > *done {
+                *done = generation;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Wait until [`Self::apps`] holds the results of the rescan
+    /// `generation`, as [`Self::rescan_apps`] returned it. This never
+    /// times out on its own: the apps task may not be running.
+    pub async fn app_scan_done(&self, generation: u64) {
+        let mut done = self.inner.app_scans.subscribe();
+        let _ = done.wait_for(|done| *done >= generation).await;
     }
 
     /// Every operation held in memory, newest first.
@@ -292,6 +323,7 @@ mod tests {
             dir: None,
             status: alchemy_api::apps::StackStatus::Running,
             services: vec![],
+            stop_reason: alchemy_api::apps::StopReason::Running,
         });
         assert!(state.set_apps(apps.clone()));
         assert!(rx.has_changed().unwrap());
@@ -302,11 +334,43 @@ mod tests {
     fn rescans_wake_subscribers() {
         let state = State::new();
         let mut rx = state.watch_app_rescans();
-        state.rescan_apps();
+        assert_eq!(state.rescan_apps(), 1);
         assert!(rx.has_changed().unwrap());
-        rx.mark_unchanged();
-        state.rescan_apps();
+        assert_eq!(*rx.borrow_and_update(), 1);
+        assert_eq!(state.rescan_apps(), 2);
         assert!(rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn scans_done_only_rise() {
+        let state = State::new();
+        let cases = [(2, true), (1, false), (2, false), (3, true)];
+        for (generation, want) in cases {
+            assert_eq!(state.set_app_scan_done(generation), want, "{generation}");
+        }
+    }
+
+    #[tokio::test]
+    async fn waits_for_a_scan_to_be_done() {
+        let state = State::new();
+        let ticket = state.rescan_apps();
+        let waiting = tokio::spawn({
+            let state = state.clone();
+            async move { state.app_scan_done(ticket).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        state.set_app_scan_done(ticket);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.app_scan_done(ticket - 1),
+        )
+        .await
+        .unwrap();
     }
 
     #[test]

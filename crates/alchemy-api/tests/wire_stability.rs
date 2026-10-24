@@ -498,6 +498,7 @@ fn app_list() -> AppList {
             dir: Some("/home/me/legacy".into()),
             status: StackStatus::Running,
             services: vec![],
+            stop_reason: StopReason::Running,
         }],
         dirs: vec![
             AppDir {
@@ -525,7 +526,7 @@ fn app_list() -> AppList {
 
 const APP_LIST_TAIL: &str = concat!(
     r#""unmanaged":[{"project":"legacy","dir":"/home/me/legacy","status":"running","#,
-    r#""services":[]}],"dirs":[{"path":"/srv/apps","home":true,"state":"ok","message":null,"#,
+    r#""services":[],"stop_reason":{"kind":"running"}}],"dirs":[{"path":"/srv/apps","home":true,"state":"ok","message":null,"#,
     r#""skipped":[{"name":"My App","path":"/srv/apps/My App","reason":"invalid_name","#,
     r#""message":"y"}]},{"path":"/opt/stacks","home":false,"state":"missing","#,
     r#""message":"z","skipped":[]}]}"#,
@@ -544,6 +545,34 @@ fn app_list_and_event() {
     assert_eq!(event.name(), "apps");
     assert_wire(&event, &format!(r#"{{"event":"apps","data":{json}}}"#));
     assert_eq!(serde_json::to_string(&event.data()).unwrap(), json);
+}
+
+#[test]
+fn unmanaged_app() {
+    let json = r#"{"project":"legacy","dir":null,"status":"stopped","services":[]"#;
+    let crashed = UnmanagedApp {
+        project: "legacy".into(),
+        dir: None,
+        status: StackStatus::Stopped,
+        services: vec![],
+        stop_reason: StopReason::Crashed {
+            exit_code: Some(1),
+            oom: false,
+        },
+    };
+    assert_wire(
+        &crashed,
+        &format!(r#"{json},"stop_reason":{{"kind":"crashed","exit_code":1,"oom":false}}}}"#),
+    );
+    let older: UnmanagedApp = serde_json::from_str(&format!("{json}}}")).unwrap();
+    assert_eq!(
+        older,
+        UnmanagedApp {
+            stop_reason: StopReason::Unknown,
+            ..crashed
+        },
+        "a daemon without stop reasons"
+    );
 }
 
 #[test]
@@ -915,6 +944,7 @@ fn new_app() {
             compose: "services: {}\n".into(),
             env: Some("A=1\n".into()),
             dry_run: true,
+            start: false,
         },
         r#"{"name":"blog","folder":"/opt/stacks","compose":"services: {}\n","env":"A=1\n","dry_run":true}"#,
     );
@@ -926,7 +956,19 @@ fn new_app() {
             compose: "x".into(),
             env: None,
             dry_run: false,
+            start: false,
         }
+    );
+    assert_wire(
+        &NewApp {
+            name: "blog".into(),
+            folder: None,
+            compose: "x".into(),
+            env: None,
+            dry_run: false,
+            start: true,
+        },
+        r#"{"name":"blog","folder":null,"compose":"x","env":null,"dry_run":false,"start":true}"#,
     );
 }
 
@@ -958,6 +1000,7 @@ fn app_files() {
             content: "A=2\n".into(),
             base_hash: Some("ab12".into()),
             dry_run: false,
+            start: false,
         },
         r#"{"content":"A=2\n","base_hash":"ab12","dry_run":false}"#,
     );
@@ -967,7 +1010,58 @@ fn app_files() {
             content: String::new(),
             base_hash: None,
             dry_run: false,
+            start: false,
         }
+    );
+    assert_wire(
+        &AppFileUpdate {
+            content: "A=2\n".into(),
+            base_hash: None,
+            dry_run: false,
+            start: true,
+        },
+        r#"{"content":"A=2\n","base_hash":null,"dry_run":false,"start":true}"#,
+    );
+}
+
+#[test]
+fn saved() {
+    use alchemy_api::apps::files::{AppFile, AppFileKind, Saved};
+    let file = AppFile {
+        kind: AppFileKind::Env,
+        name: ".env".into(),
+        content: "A=1\n".into(),
+        hash: Some("ab12".into()),
+    };
+    assert_wire(
+        &Saved::new(file.clone()),
+        r#"{"kind":"env","name":".env","content":"A=1\n","hash":"ab12"}"#,
+    );
+    assert_wire(&Saved::new(blog()), BLOG);
+    assert_wire(
+        &Saved {
+            saved: file,
+            operation: Some(update()),
+            start_error: None,
+        },
+        &[
+            r#"{"kind":"env","name":".env","content":"A=1\n","hash":"ab12","operation":"#,
+            UPDATE,
+            "}",
+        ]
+        .concat(),
+    );
+    assert_wire(
+        &Saved {
+            saved: blog(),
+            operation: None,
+            start_error: Some(ErrorResponse::new(ErrorCode::Conflict, "blog is busy")),
+        },
+        &[
+            BLOG.strip_suffix('}').unwrap(),
+            r#","start_error":{"error":"blog is busy","code":"conflict"}}"#,
+        ]
+        .concat(),
     );
 }
 

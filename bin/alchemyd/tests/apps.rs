@@ -1,6 +1,7 @@
 //! Apps wiring: `run_with` finding stacks in real folders, matching them to
 //! containers, and serving them and their settings over the API socket,
-//! without changing any file in the folders.
+//! without changing any file in the folders but staging folders a stopped
+//! daemon left behind.
 
 #![allow(
     clippy::unwrap_used,
@@ -16,7 +17,7 @@ use std::time::{Duration, SystemTime};
 
 use alchemy_api::apps::{AppDirState, AppList, SkipReason, StackStatus};
 use alchemy_core::engine::{ContainerState, ContainerStatus, EngineState, EngineStatus};
-use alchemyd::apps::{AppsDeps, SystemFs};
+use alchemyd::apps::{AppsDeps, SystemDisk, SystemFs};
 use alchemyd::compose::FakeComposeConfig;
 use alchemyd::engine::EngineSource;
 use alchemyd::{Deps, State};
@@ -289,4 +290,86 @@ async fn settings_survive_a_restart() {
             .unwrap()
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn removes_staging_folders_left_by_a_crash_and_nothing_else() {
+    let dir = tempfile::Builder::new()
+        .prefix("ac")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let home = root.join("apps");
+    let two_hours_ago = SystemTime::now() - Duration::from_hours(2);
+    std::fs::create_dir_all(home.join("blog")).unwrap();
+    std::fs::write(home.join("blog/compose.yaml"), "services: {}\n").unwrap();
+    let create = home.join(".alchemy-tmp-shop-a1B2c3");
+    let edit = home.join("blog/.alchemy-tmp-blog-d4E5f6");
+    for left in [&create.join("shop"), &edit] {
+        std::fs::create_dir_all(left).unwrap();
+        std::fs::write(left.join("compose.yaml"), "services: {}\n").unwrap();
+    }
+    for left in [&create, &edit] {
+        std::fs::File::open(left)
+            .unwrap()
+            .set_modified(two_hours_ago)
+            .unwrap();
+    }
+    std::os::unix::fs::symlink(home.join("blog"), home.join(".alchemy-tmp-blog-g7H8i9")).unwrap();
+    std::fs::create_dir(home.join(".alchemy-tmp-blog-j1K2l3")).unwrap();
+    let kept: Vec<_> = snapshot(&home)
+        .into_iter()
+        .filter(|(path, _, _)| !path.starts_with(&create) && !path.starts_with(&edit))
+        .map(|(path, _, _)| path)
+        .collect();
+
+    let socket = root.join("alchemyd.sock");
+    let deps = Deps::new(FixedEngine(EngineStatus::new(EngineState::Ready))).with_apps(
+        AppsDeps::new(
+            Arc::new(SystemFs),
+            Arc::new(FakeComposeConfig::new()),
+            Some(home.clone()),
+        )
+        .with_scan_interval(Duration::from_millis(50))
+        .with_disk(Arc::new(SystemDisk)),
+    );
+    let (stop, stop_rx) = oneshot::channel::<()>();
+    let daemon = tokio::spawn(alchemyd::run_with(
+        alchemyd::Config {
+            listen: free_port(),
+            socket: socket.clone(),
+            state_dir: root.join("state"),
+        },
+        deps,
+        async {
+            let _ = stop_rx.await;
+        },
+    ));
+
+    let apps = apps_until(&socket, "blog found", |a| a.apps.len() == 1).await;
+    assert_eq!(apps.apps[0].name.as_str(), "blog");
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while create.exists() || edit.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "staging folders kept"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let now: Vec<_> = snapshot(&home)
+        .into_iter()
+        .map(|(path, _, _)| path)
+        .collect();
+    assert_eq!(now, kept);
+    assert_eq!(
+        std::fs::read(home.join("blog/compose.yaml")).unwrap(),
+        b"services: {}\n"
+    );
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(TIMEOUT, daemon)
+        .await
+        .expect("daemon did not shut down")
+        .unwrap()
+        .unwrap();
 }

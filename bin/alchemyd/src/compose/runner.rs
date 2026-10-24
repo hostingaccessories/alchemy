@@ -155,6 +155,12 @@ pub enum ComposeError {
         /// The rejected path.
         binary: PathBuf,
     },
+    /// The project's directory is gone, so nothing could run in it.
+    #[error("the project directory {} doesn't exist", dir.display())]
+    MissingDir {
+        /// The directory the step should have run in.
+        dir: PathBuf,
+    },
     /// The binary could not be started.
     #[error("failed to run {}", binary.display())]
     Spawn {

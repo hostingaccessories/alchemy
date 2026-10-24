@@ -5,10 +5,11 @@
 //! follows `/api/operations/{id}/events`: each step as it starts or fails
 //! goes to stderr, and the result to stdout. With `--json`, every event is
 //! one line on stdout instead. Ctrl-C stops following; the operation keeps
-//! running in alchemyd.
+//! running in alchemyd until `alchemy app cancel NAME` stops it.
 
 use std::io::Write;
 
+use alchemy_api::apps::Saved;
 use alchemy_api::operations::{
     Action, ActionPlan, ActionRequest, Operation, OperationEvent, OperationResponse,
     OperationState, OutputLine, StepState,
@@ -92,9 +93,19 @@ pub(crate) async fn run<D: Daemon, W: Write, P: Prompt>(
     };
     let path = format!("/api/apps/{app}/actions");
     let OperationResponse { operation } = ctx.post(&path, &request).await?;
+    follow(ctx, &operation).await
+}
+
+/// Follow `operation`, just started, to the end: its steps as progress
+/// and the result on stdout, or with `--json` every event as one line on
+/// stdout. Fails unless it succeeds.
+pub(crate) async fn follow<D: Daemon, W: Write>(
+    ctx: &mut Context<D, W>,
+    operation: &Operation,
+) -> Result<(), ClientError> {
     let json = ctx.json();
     if !json {
-        ctx.out().progress(started_line(&operation));
+        ctx.out().progress(started_line(operation));
     }
     let mut events = ctx
         .stream(&format!("/api/operations/{}/events", operation.id))
@@ -117,6 +128,25 @@ pub(crate) async fn run<D: Daemon, W: Write, P: Prompt>(
         }
     }
     Err(ClientError::Disconnected)
+}
+
+/// After a save sent with `start` when `asked`: follow the operation
+/// alchemyd started, or fail with why it didn't start the app. The save
+/// itself stands either way.
+pub(crate) async fn follow_start<D: Daemon, W: Write, T>(
+    ctx: &mut Context<D, W>,
+    saved: &Saved<T>,
+    app: &str,
+    asked: bool,
+) -> Result<(), ClientError> {
+    match (&saved.operation, &saved.start_error) {
+        (_, Some(refusal)) => Err(ClientError::Daemon(refusal.error.clone())),
+        (Some(operation), None) => follow(ctx, operation).await,
+        (None, None) if asked => Err(ClientError::Daemon(format!(
+            "saved {app}, but this alchemyd doesn't start apps on save; run `alchemy app up {app}`"
+        ))),
+        (None, None) => Ok(()),
+    }
 }
 
 fn finish<D: Daemon, W: Write>(ctx: &mut Context<D, W>, op: &Operation) -> Result<(), ClientError> {
@@ -146,14 +176,14 @@ fn decode(raw: &SseEvent) -> Result<Option<OperationEvent>, ClientError> {
         .map_err(|e| ProtocolError::Decode(e).into())
 }
 
-/// The first progress line: what started, and that Ctrl-C leaves it
-/// running.
+/// The first progress line: what started, that Ctrl-C leaves it running,
+/// and how to stop it.
 pub(crate) fn started_line(op: &Operation) -> String {
     format!(
-        "{} {} (operation {}). Ctrl-C stops watching; alchemyd keeps going.",
+        "{} {app} (operation {}). Ctrl-C stops watching; alchemyd keeps going until `alchemy app cancel {app}`.",
         doing(op.action),
-        op.app,
-        op.id
+        op.id,
+        app = op.app,
     )
 }
 
@@ -505,7 +535,7 @@ mod tests {
         assert_eq!(ctx.written(), "updated blog\n");
         assert_eq!(
             ctx.progress_written(),
-            "Updating blog (operation op1). Ctrl-C stops watching; alchemyd keeps going.\n\
+            "Updating blog (operation op1). Ctrl-C stops watching; alchemyd keeps going until `alchemy app cancel blog`.\n\
              Downloading updates…\n"
         );
         assert_eq!(

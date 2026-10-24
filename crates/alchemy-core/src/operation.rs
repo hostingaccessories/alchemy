@@ -21,11 +21,15 @@ use crate::StackName;
 use crate::engine::IntentAction;
 
 pub use output::{OutputBuffer, OutputLine};
-pub use track::{Applied, BuildStep, Outcome, Progress, ResourceState, Tracker};
+pub use track::{Applied, BuildLog, BuildStep, Outcome, Progress, ResourceState, Tracker};
 
 /// How many output lines an operation keeps by default. Older lines are
 /// dropped first.
 pub const OUTPUT_LINES: usize = 5000;
+
+/// The most bytes kept of one output line. The daemon cuts Compose's own
+/// lines here, and a build step's log lines, tag included, stay within it.
+pub const MAX_OUTPUT_LINE: usize = 64 * 1024;
 
 /// A lifecycle action on an app.
 ///

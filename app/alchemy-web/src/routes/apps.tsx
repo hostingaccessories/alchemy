@@ -15,6 +15,7 @@ import { PageHeader } from "../components/PageHeader.tsx";
 import type { App, AppDir, AppList, UnmanagedApp } from "../lib/api.ts";
 import { useDaemonConnection } from "../lib/live.tsx";
 import { liveQueries } from "../lib/queries.ts";
+import { unmanagedStopReason } from "../lib/stopReason.ts";
 import { rootRoute } from "./root.tsx";
 
 /** The apps in the app folders, live, and running projects Alchemy doesn't manage. */
@@ -173,7 +174,7 @@ function Unmanaged({ projects }: { projects: UnmanagedApp[] }) {
               <span className="font-medium">{project.project}</span>
               <span className="truncate text-sm text-muted">{project.dir ?? "Folder unknown"}</span>
             </div>
-            <AppStatus status={project.status} />
+            <AppStatus status={project.status} reason={unmanagedStopReason(project.stop_reason)} />
           </li>
         ))}
       </ul>

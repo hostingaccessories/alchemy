@@ -1,14 +1,16 @@
 //! The task that keeps the app list in [`State`] current.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use alchemy_api::apps::AppProblemKind;
 use alchemy_core::engine::EngineState;
 use alchemy_core::stack::{
     Discovery, FileInfo, FoundStack, ListedDir, StackDirs, default_stack_home, discover,
+    is_stale_staging,
 };
 use futures_util::StreamExt as _;
 use futures_util::future::BoxFuture;
@@ -17,6 +19,7 @@ use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use super::assemble::{ConfigOutcome, Inputs, app_list};
+use super::disk::{AppDisk, SystemDisk};
 use super::fs::{AppFs, SystemFs};
 use super::settings::{SETTINGS_KEY, StoredDirs, effective};
 use crate::State;
@@ -49,21 +52,25 @@ pub struct AppsDeps {
     pub default_home: Option<PathBuf>,
     /// How often to list the folders again.
     pub scan_interval: Duration,
+    /// Removes staging folders a stopped daemon left behind. With none,
+    /// they are left alone.
+    pub disk: Option<Arc<dyn AppDisk>>,
 }
 
 impl AppsDeps {
     /// The real filesystem and `docker compose`, with `~/Alchemy/apps` as
-    /// the default home.
+    /// the default home, removing staging folders left behind.
     pub fn system() -> Self {
         Self::new(
             Arc::new(SystemFs),
             Arc::new(CliComposeConfig::system()),
             default_stack_home(HostEnv::current().home.as_deref()),
         )
+        .with_disk(Arc::new(SystemDisk))
     }
 
     /// These effects and default home, listed every
-    /// [`DEFAULT_SCAN_INTERVAL`].
+    /// [`DEFAULT_SCAN_INTERVAL`], leaving staging folders alone.
     pub fn new(
         fs: Arc<dyn AppFs>,
         config: Arc<dyn ComposeConfigReader>,
@@ -74,7 +81,15 @@ impl AppsDeps {
             config,
             default_home,
             scan_interval: DEFAULT_SCAN_INTERVAL,
+            disk: None,
         }
+    }
+
+    /// Remove staging folders left behind through `disk`.
+    #[must_use]
+    pub fn with_disk(mut self, disk: Arc<dyn AppDisk>) -> Self {
+        self.disk = Some(disk);
+        self
     }
 
     /// List the folders every `interval` instead.
@@ -85,15 +100,26 @@ impl AppsDeps {
     }
 }
 
-/// A finished read: the stack's directory, the files it was read at, and
-/// what came of it.
-type Read = (PathBuf, BTreeMap<String, FileInfo>, ConfigOutcome);
+/// A finished read.
+#[derive(Debug)]
+struct Read {
+    /// The stack's directory.
+    dir: PathBuf,
+    /// The files it was read at.
+    files: BTreeMap<String, FileInfo>,
+    /// What came of it.
+    outcome: ConfigOutcome,
+    /// The rescan generation in effect when it started.
+    generation: u64,
+}
 
-/// When an app was last read, and at which files.
+/// When an app was last read, at which files, and in which rescan
+/// generation the read started.
 #[derive(Debug)]
 struct ReadAt {
     files: Option<BTreeMap<String, FileInfo>>,
     at: Instant,
+    generation: u64,
 }
 
 /// Keeps the app list, and the app settings in effect, in [`State`]
@@ -104,13 +130,24 @@ struct ReadAt {
 /// [`AppsDeps::scan_interval`], at start, and on a rescan; reads an app's
 /// configuration when it is new, its watched files changed, or a rescan
 /// asks; and rebuilds the list whenever any of that, the containers, or
-/// the engine status changes. It never writes to an app folder, and never
-/// creates one: the home is created when the first app is added.
+/// the engine status changes. It never creates an app folder: the home is
+/// created when the first app is added.
+///
+/// The only thing it removes is a staging folder a stopped daemon left
+/// behind, as [`is_stale_staging`] decides, through [`AppsDeps::disk`]. It
+/// looks in each folder, and each app found in it, on the first scan after
+/// start and on the first scan after the settings add the folder.
 ///
 /// A read that failed for a reason other than the app's files, such as
 /// Docker not being installed, is retried after a while and whenever the
 /// engine becomes ready. While a changed app is read again, its previous
 /// result stays in the list.
+///
+/// Once the list holds the results of a rescan, the folders listed after
+/// it was asked for and every app read again by a read started after it,
+/// the task records its generation with [`State::set_app_scan_done`]. A
+/// read already running when a rescan arrives does not count: the app is
+/// read once more.
 pub async fn run(
     deps: AppsDeps,
     state: State,
@@ -129,6 +166,9 @@ struct Monitor {
     outcomes: BTreeMap<PathBuf, ConfigOutcome>,
     read_at: BTreeMap<PathBuf, ReadAt>,
     reading: BTreeSet<PathBuf>,
+    swept: BTreeSet<PathBuf>,
+    generation: u64,
+    scanned: Option<u64>,
 }
 
 impl Monitor {
@@ -142,6 +182,9 @@ impl Monitor {
             outcomes: BTreeMap::new(),
             read_at: BTreeMap::new(),
             reading: BTreeSet::new(),
+            swept: BTreeSet::new(),
+            generation: 0,
+            scanned: None,
         }
     }
 
@@ -149,6 +192,7 @@ impl Monitor {
         let mut containers = self.state.watch_containers();
         let mut engine = self.state.watch_engine();
         let mut rescans = self.state.watch_app_rescans();
+        self.generation = *rescans.borrow_and_update();
         let mut tick = tokio::time::interval(self.deps.scan_interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut reads: FuturesUnordered<BoxFuture<'static, Read>> = FuturesUnordered::new();
@@ -161,7 +205,7 @@ impl Monitor {
                 _ = shutdown.wait_for(|stop| *stop) => return,
                 Some(read) = reads.next(), if !reads.is_empty() => self.finish(read),
                 Ok(()) = rescans.changed() => {
-                    rescans.mark_unchanged();
+                    self.generation = *rescans.borrow_and_update();
                     (reload, scan, reread) = (true, true, true);
                 }
                 _ = tick.tick() => scan = true,
@@ -178,9 +222,13 @@ impl Monitor {
             }
             if scan {
                 self.scan(reread).await;
+                self.sweep().await;
             }
             self.start_reads(&mut reads);
             self.publish();
+            if let Some(done) = self.done() {
+                self.state.set_app_scan_done(done);
+            }
         }
     }
 
@@ -238,6 +286,58 @@ impl Monitor {
                 read.files = None;
             }
         }
+        self.scanned = Some(self.generation);
+    }
+
+    /// The newest rescan generation the list holds every result of, or
+    /// `None` before the first scan.
+    fn done(&self) -> Option<u64> {
+        let scanned = self.scanned?;
+        Some(
+            self.discovery
+                .stacks
+                .iter()
+                .map(|stack| self.read_at.get(&stack.dir).map_or(0, |r| r.generation))
+                .fold(scanned, u64::min),
+        )
+    }
+
+    /// Remove staging folders left behind in each folder not yet swept,
+    /// and in the apps found in it.
+    async fn sweep(&mut self) {
+        let roots: BTreeSet<PathBuf> = self
+            .dirs
+            .iter()
+            .flat_map(StackDirs::all)
+            .map(Path::to_owned)
+            .collect();
+        self.swept.retain(|root| roots.contains(root));
+        let Some(disk) = self.deps.disk.clone() else {
+            return;
+        };
+        let new: BTreeSet<PathBuf> = roots.difference(&self.swept).cloned().collect();
+        if new.is_empty() {
+            return;
+        }
+        let apps = self
+            .discovery
+            .stacks
+            .iter()
+            .filter(|stack| new.contains(&stack.root))
+            .map(|stack| stack.dir.clone());
+        let folders: Vec<PathBuf> = new.iter().cloned().chain(apps).collect();
+        self.swept.extend(new);
+        let uid = rustix::process::getuid().as_raw();
+        let now = SystemTime::now();
+        let swept = tokio::task::spawn_blocking(move || {
+            for folder in &folders {
+                sweep_folder(&*disk, folder, uid, now);
+            }
+        })
+        .await;
+        if let Err(error) = swept {
+            tracing::warn!(error = %error, "removing leftover staging folders failed");
+        }
     }
 
     fn retry_transient(&mut self) {
@@ -284,23 +384,26 @@ impl Monitor {
                 self.deps.config.clone(),
                 stack,
                 endpoint.clone(),
+                self.generation,
             )));
         }
     }
 
-    fn finish(&mut self, (dir, files, outcome): Read) {
-        self.reading.remove(&dir);
-        if !self.discovery.stacks.iter().any(|s| s.dir == dir) {
+    fn finish(&mut self, read: Read) {
+        self.reading.remove(&read.dir);
+        if !self.discovery.stacks.iter().any(|s| s.dir == read.dir) {
             return;
         }
+        let current = read.generation >= self.generation;
         self.read_at.insert(
-            dir.clone(),
+            read.dir.clone(),
             ReadAt {
-                files: Some(files),
+                files: current.then_some(read.files),
                 at: Instant::now(),
+                generation: read.generation,
             },
         );
-        self.outcomes.insert(dir, outcome);
+        self.outcomes.insert(read.dir, read.outcome);
     }
 
     fn publish(&self) {
@@ -316,7 +419,36 @@ impl Monitor {
     }
 }
 
-async fn read(config: Arc<dyn ComposeConfigReader>, stack: FoundStack, endpoint: Endpoint) -> Read {
+/// Remove the staging folders in `folder` that [`is_stale_staging`] says
+/// were left behind, for the daemon running as `uid` at `now`.
+fn sweep_folder(disk: &dyn AppDisk, folder: &Path, uid: u32, now: SystemTime) {
+    let entries = match disk.list_entries(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(%error, dir = %folder.display(), "listing a folder for leftover staging folders failed");
+            return;
+        }
+    };
+    for entry in entries.iter().filter(|e| is_stale_staging(e, uid, now)) {
+        let dir = folder.join(&entry.name);
+        match disk.remove_left_staging(&dir) {
+            Ok(()) => {
+                tracing::info!(dir = %dir.display(), "removed a staging folder left by an earlier run");
+            }
+            Err(error) => {
+                tracing::warn!(%error, dir = %dir.display(), "removing a leftover staging folder failed");
+            }
+        }
+    }
+}
+
+async fn read(
+    config: Arc<dyn ComposeConfigReader>,
+    stack: FoundStack,
+    endpoint: Endpoint,
+    generation: u64,
+) -> Read {
     let outcome = match ComposeProject::new(&stack.dir) {
         Ok(project) => {
             ConfigOutcome::from_result(config.read(&project, &endpoint).await, stack.compose_file)
@@ -326,7 +458,12 @@ async fn read(config: Arc<dyn ComposeConfigReader>, stack: FoundStack, endpoint:
             message: error.to_string(),
         },
     };
-    (stack.dir, stack.files, outcome)
+    Read {
+        dir: stack.dir,
+        files: stack.files,
+        outcome,
+        generation,
+    }
 }
 
 #[cfg(test)]
@@ -337,9 +474,12 @@ async fn read(config: Arc<dyn ComposeConfigReader>, stack: FoundStack, endpoint:
     clippy::indexing_slicing
 )]
 mod tests {
+    use std::fs::{self, File};
+    use std::os::unix::fs::symlink;
+
     use alchemy_api::apps::{AppList, StackStatus};
     use alchemy_core::engine::{ContainerState, ContainerStatus, EngineStatus};
-    use alchemy_core::stack::{EntryKind, ListedEntry, Listing};
+    use alchemy_core::stack::{EntryKind, ListedEntry, Listing, STAGING_MAX_AGE};
 
     use super::*;
     use crate::apps::FakeFs;
@@ -514,6 +654,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_done_rescan_has_every_app_read_again() {
+        let h = start();
+        h.config.project(format!("{HOME}/blog"), "blog", &["web"]);
+        h.fs.set(HOME, stacks(&[("blog", 1)]));
+        until(&h.state, "blog read", resolved).await;
+
+        let project = |apps: &AppList, name: &str| {
+            apps.apps
+                .iter()
+                .find(|a| a.name.as_str() == name)
+                .and_then(|a| a.project.clone())
+        };
+        let blog_and_wiki = [("blog", 1), ("wiki", 1)];
+        let cases = [
+            (
+                "an edit with the same files",
+                "blog",
+                &blog_and_wiki[..1],
+                "edited",
+            ),
+            ("a new app", "wiki", &blog_and_wiki[..], "wiki"),
+        ];
+        for (what, name, listed, want) in cases {
+            h.config.project(format!("{HOME}/{name}"), want, &["web"]);
+            h.fs.set(HOME, stacks(listed));
+            let ticket = h.state.rescan_apps();
+            tokio::time::timeout(WAIT, h.state.app_scan_done(ticket))
+                .await
+                .unwrap_or_else(|_| panic!("{what}: rescan {ticket} never done"));
+            assert_eq!(
+                project(&h.state.apps(), name).as_deref(),
+                Some(want),
+                "{what}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn retries_a_read_that_failed_without_the_files_changing() {
         let h = start();
         let blog = format!("{HOME}/blog");
@@ -548,6 +726,133 @@ mod tests {
         assert_eq!(state.apps(), AppList::default());
         assert_eq!(state.app_settings().home, None);
         drop(stop);
+        tokio::time::timeout(WAIT, task).await.unwrap().unwrap();
+    }
+
+    /// Make the directory `dir`, with everything in `files`, last changed
+    /// `age` ago.
+    fn staging(dir: &Path, files: &[&str], age: Duration) {
+        fs::create_dir_all(dir).unwrap();
+        for file in files {
+            fs::write(dir.join(file), "x").unwrap();
+        }
+        File::open(dir)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    const OLD: Duration = Duration::from_hours(2);
+
+    #[test]
+    fn sweeps_only_staging_folders_left_behind() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let outside = dir.join("outside");
+        staging(&outside, &["data"], OLD);
+        let uid = rustix::process::getuid().as_raw();
+        let left = [".alchemy-tmp-blog-a1B2c3", ".alchemy-tmp-my-app-Zz9"];
+        for name in left {
+            staging(&dir.join(name), &["compose.yaml"], OLD);
+        }
+        staging(&dir.join(".alchemy-tmp-blog-fresh1"), &[], Duration::ZERO);
+        staging(&dir.join(".alchemy-tmp-blog-"), &[], OLD);
+        staging(&dir.join(".alchemy-tmp-Blog-a1B2c3"), &[], OLD);
+        staging(&dir.join(".alchemy-tmp-blog-a1.b2"), &[], OLD);
+        staging(&dir.join(".alchemy-cache"), &[], OLD);
+        staging(&dir.join("blog"), &["compose.yaml"], OLD);
+        symlink(&outside, dir.join(".alchemy-tmp-blog-d4E5f6")).unwrap();
+        fs::write(dir.join(".alchemy-tmp-blog-g7H8i9"), "keep").unwrap();
+        let kept: BTreeSet<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|name| !left.iter().any(|l| name == l))
+            .collect();
+
+        sweep_folder(&SystemDisk, dir, uid, SystemTime::now());
+        let now: BTreeSet<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(now, kept);
+        assert!(outside.join("data").exists());
+
+        sweep_folder(
+            &SystemDisk,
+            dir,
+            uid.wrapping_add(1),
+            SystemTime::now() + OLD,
+        );
+        sweep_folder(&SystemDisk, dir, uid, SystemTime::UNIX_EPOCH);
+        sweep_folder(&SystemDisk, &dir.join("missing"), uid, SystemTime::now());
+        assert!(dir.join(".alchemy-tmp-blog-fresh1").exists());
+        sweep_folder(&SystemDisk, dir, uid, SystemTime::now() + OLD);
+        assert!(!dir.join(".alchemy-tmp-blog-fresh1").exists());
+        assert!(OLD > STAGING_MAX_AGE);
+    }
+
+    async fn until_gone(path: &Path) {
+        let deadline = Instant::now() + WAIT;
+        while fs::symlink_metadata(path).is_ok() {
+            assert!(Instant::now() < deadline, "{} was kept", path.display());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sweeps_each_folder_and_its_apps_once() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("apps");
+        let extra = root.path().join("stacks");
+        staging(&home.join("blog"), &["compose.yaml"], Duration::ZERO);
+        let create = home.join(".alchemy-tmp-shop-a1B2c3");
+        let edit = home.join("blog/.alchemy-tmp-blog-d4E5f6");
+        let fresh = home.join("blog/.alchemy-tmp-blog-g7H8i9");
+        staging(&create, &[], OLD);
+        staging(&edit, &["compose.yaml"], OLD);
+        staging(&fresh, &[], Duration::ZERO);
+        staging(&extra.join("db"), &["compose.yaml"], Duration::ZERO);
+        let later = extra.join("db/.alchemy-tmp-db-j1K2l3");
+        staging(&later, &[], OLD);
+
+        let state = State::new();
+        let store: SharedStore = Arc::new(MemoryStore::new());
+        let deps = AppsDeps::new(
+            Arc::new(SystemFs),
+            Arc::new(FakeComposeConfig::new()),
+            Some(home.clone()),
+        )
+        .with_scan_interval(Duration::from_millis(10))
+        .with_disk(Arc::new(SystemDisk));
+        let (stop, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run(deps, state.clone(), store.clone(), stop_rx));
+        until_gone(&create).await;
+        until_gone(&edit).await;
+        assert!(fresh.exists());
+
+        let again = home.join(".alchemy-tmp-shop-m4N5o6");
+        staging(&again, &[], OLD);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(again.exists(), "a folder already swept was swept again");
+        assert!(later.exists(), "a folder not in the settings was swept");
+
+        store
+            .set_setting(
+                SETTINGS_KEY,
+                &StoredDirs {
+                    home: None,
+                    extra: vec![extra.clone()],
+                },
+            )
+            .await
+            .unwrap();
+        state.rescan_apps();
+        until_gone(&later).await;
+        assert!(again.exists());
+        assert!(home.join("blog/compose.yaml").exists());
+        assert!(extra.join("db/compose.yaml").exists());
+
+        stop.send_replace(true);
         tokio::time::timeout(WAIT, task).await.unwrap().unwrap();
     }
 }

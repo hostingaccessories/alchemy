@@ -209,18 +209,37 @@ pub fn split_timestamp(line: &str) -> (Option<(&str, Timestamp)>, &str) {
 /// Cuts one stream of log bytes, delivered in any chunks, into lines.
 ///
 /// Lines end at `\n`, with a `\r` before it dropped. Bytes that are not
-/// UTF-8 become U+FFFD. A line longer than [`MAX_LINE`] bytes is cut at a
-/// character boundary and marked with [`TRUNCATED`].
-#[derive(Debug, Default, Clone)]
+/// UTF-8 become U+FFFD. A line longer than [`MAX_LINE`] bytes, or the
+/// limit given to [`Self::with_max`], is cut at a character boundary and
+/// marked with [`TRUNCATED`].
+#[derive(Debug, Clone)]
 pub struct LineSplitter {
     line: Vec<u8>,
     cut: bool,
+    max: usize,
+}
+
+impl Default for LineSplitter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LineSplitter {
-    /// A splitter at the start of a stream.
+    /// A splitter at the start of a stream, keeping [`MAX_LINE`] bytes of
+    /// each line.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max(MAX_LINE)
+    }
+
+    /// A splitter at the start of a stream, keeping `max` bytes of each
+    /// line.
+    pub fn with_max(max: usize) -> Self {
+        Self {
+            line: Vec::new(),
+            cut: false,
+            max,
+        }
     }
 
     /// Feed the next `chunk` and return the lines it completed, in order.
@@ -245,7 +264,7 @@ impl LineSplitter {
         if self.cut {
             return;
         }
-        let room = MAX_LINE.saturating_sub(self.line.len());
+        let room = self.max.saturating_sub(self.line.len());
         if bytes.len() <= room {
             self.line.extend_from_slice(bytes);
             return;
@@ -648,6 +667,22 @@ mod tests {
         ];
         for (name, chunks, want) in cases {
             assert_eq!(split(&chunks), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn splits_lines_at_a_given_limit() {
+        let cases: [(&str, &[u8], Vec<&str>); 4] = [
+            ("under", b"abc\n", vec!["abc"]),
+            ("at", b"abcd\n", vec!["abcd"]),
+            ("over", b"abcdef\ngh\n", vec!["abcd…", "gh"]),
+            ("cut mid character", b"abc\xc3\xa9\n", vec!["abc…"]),
+        ];
+        for (name, input, want) in cases {
+            let mut splitter = LineSplitter::with_max(4);
+            let mut lines = splitter.push(input);
+            lines.extend(splitter.finish());
+            assert_eq!(lines, want, "{name}");
         }
     }
 

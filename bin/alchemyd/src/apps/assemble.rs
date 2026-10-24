@@ -213,7 +213,8 @@ fn status(services: &[AppService], counted: usize, engine_ready: bool) -> StackS
 }
 
 /// The app's reason from the containers of the first `counted` services,
-/// as [`status`] counts them, and its project's last intent.
+/// as [`status`] counts them, and its project's last intent, if Alchemy
+/// has acted on it.
 fn reason(
     services: &[AppService],
     counted: usize,
@@ -272,6 +273,7 @@ fn unmanaged(project: &str, containers: &[&ContainerStatus], engine_ready: bool)
         project: project.to_owned(),
         dir: containers.iter().find_map(|c| c.working_dir.clone()),
         status: status(&services, counted, engine_ready),
+        stop_reason: reason(&services, counted, None, engine_ready),
         services,
     }
 }
@@ -723,8 +725,53 @@ mod tests {
         assert_eq!(legacy.project, "legacy");
         assert_eq!(legacy.dir.as_deref(), Some("/home/me/legacy"));
         assert_eq!(legacy.status, StackStatus::Partial);
+        assert_eq!(
+            legacy.stop_reason,
+            StopReason::Unknown,
+            "an exit with no history outranks the running service"
+        );
         let services: Vec<_> = legacy.services.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(services, ["db", "web"]);
+    }
+
+    #[test]
+    fn unmanaged_projects_carry_a_stop_reason() {
+        use alchemy_core::engine::{ContainerAction, ContainerEvent};
+        let found = discovery(&[("/srv/apps", &[])]);
+        let died = |id: &str, code| {
+            let mut event = ContainerEvent::new(id, ContainerAction::Die);
+            event.exit_code = Some(code);
+            event
+        };
+        let both = || {
+            containers(vec![
+                container("1", "legacy", "db", Running),
+                container("2", "legacy", "web", Running),
+            ])
+        };
+        let mut finished = both();
+        finished.apply(&died("1", 0));
+        let mut crashed = both();
+        crashed.apply(&died("1", 0));
+        crashed.apply(&died("2", 1));
+        let cases: [(&str, Containers, bool, StopReason); 4] = [
+            ("running", both(), true, StopReason::Running),
+            ("a finished job", finished, true, StopReason::Running),
+            (
+                "crashed",
+                crashed,
+                true,
+                StopReason::Crashed {
+                    exit_code: Some(1),
+                    oom: false,
+                },
+            ),
+            ("engine not ready", both(), false, StopReason::Unknown),
+        ];
+        for (name, list_of, ready, want) in cases {
+            let got = list(&found, &BTreeMap::new(), &list_of, ready);
+            assert_eq!(got.unmanaged[0].stop_reason, want, "{name}");
+        }
     }
 
     #[test]

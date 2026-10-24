@@ -138,6 +138,9 @@ pub enum ClientError {
         /// What failed and why, from the operation.
         message: String,
     },
+    /// There was no running operation to cancel.
+    #[error("nothing to cancel: {0}")]
+    NothingToCancel(String),
     /// The user interrupted the command.
     #[error("interrupted")]
     Interrupted,
@@ -203,6 +206,7 @@ impl ClientError {
             Self::Daemon(_)
             | Self::Runtime(_)
             | Self::OperationFailed { .. }
+            | Self::NothingToCancel(_)
             | Self::Editor(_)
             | Self::File(_) => Exit::Failure,
             Self::Usage { .. } | Self::RemoteDaemon { .. } | Self::InvalidTarget { .. } => {
@@ -238,6 +242,7 @@ impl ClientError {
             Self::Interrupted => "interrupted",
             Self::Runtime(_) => "runtime",
             Self::OperationFailed { .. } => "operation_failed",
+            Self::NothingToCancel(_) => "nothing_to_cancel",
             Self::Editor(_) => "editor",
             Self::File(_) => "file",
         }
@@ -275,6 +280,7 @@ impl ClientError {
             | Self::Interrupted
             | Self::Runtime(_)
             | Self::OperationFailed { .. }
+            | Self::NothingToCancel(_)
             | Self::File(_) => return None,
         };
         Some(hint.to_owned())
@@ -542,6 +548,13 @@ mod tests {
                 1,
                 "operation_failed",
                 "couldn't update blog: pull access denied".into(),
+                None,
+            ),
+            (
+                ClientError::NothingToCancel("blog has no operation running".into()),
+                1,
+                "nothing_to_cancel",
+                "nothing to cancel: blog has no operation running".into(),
                 None,
             ),
             (

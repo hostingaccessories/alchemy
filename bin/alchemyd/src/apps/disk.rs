@@ -2,16 +2,18 @@
 //!
 //! The only writes Alchemy makes in an app folder go through here, and
 //! [`AppEditor`](super::AppEditor) decides which: a staging directory, the
-//! files staged in it, and one rename into place. Nothing here follows a
-//! symlink at the path it is given.
+//! files staged in it, and one rename into place. The apps task also
+//! lists folders and removes staging directories a stopped daemon left
+//! behind through it. Nothing here follows a symlink at the path it is
+//! given.
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
-use alchemy_core::stack::EntryKind;
+use alchemy_core::stack::{EntryKind, EntryStat};
 use rustix::fs::{CWD, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
 
@@ -83,6 +85,22 @@ pub trait AppDisk: Send + Sync + fmt::Debug {
 
     /// Remove the staging directory `dir` and everything in it.
     fn remove_staging(&self, dir: &Path) -> io::Result<()>;
+
+    /// Remove the directory `dir` if it is empty, and never anything in
+    /// it. Anything but a real directory at `dir`, such as a symlink to
+    /// one, fails with [`io::ErrorKind::NotADirectory`] and is left alone.
+    fn remove_empty_dir(&self, dir: &Path) -> io::Result<()>;
+
+    /// Every entry in `dir`, each looked at without following a symlink.
+    /// `dir` itself may be a symlink to a directory, since the user chose
+    /// it. An entry that vanishes while listing is left out.
+    fn list_entries(&self, dir: &Path) -> io::Result<Vec<EntryStat>>;
+
+    /// Remove the staging directory `dir`, left behind by an earlier run,
+    /// and everything in it. Anything but a real directory at `dir`, such
+    /// as a symlink to one, fails with [`io::ErrorKind::NotADirectory`]
+    /// and is left alone.
+    fn remove_left_staging(&self, dir: &Path) -> io::Result<()>;
 }
 
 /// [`AppDisk`] over the real filesystem.
@@ -92,18 +110,7 @@ pub struct SystemDisk;
 impl AppDisk for SystemDisk {
     fn kind(&self, path: &Path) -> io::Result<Option<EntryKind>> {
         match fs::symlink_metadata(path) {
-            Ok(meta) => {
-                let kind = meta.file_type();
-                Ok(Some(if kind.is_symlink() {
-                    EntryKind::Link
-                } else if kind.is_dir() {
-                    EntryKind::Dir
-                } else if kind.is_file() {
-                    EntryKind::File
-                } else {
-                    EntryKind::Other
-                }))
-            }
+            Ok(meta) => Ok(Some(kind_of(&meta))),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err),
         }
@@ -201,6 +208,57 @@ impl AppDisk for SystemDisk {
 
     fn remove_staging(&self, dir: &Path) -> io::Result<()> {
         fs::remove_dir_all(dir)
+    }
+
+    fn remove_empty_dir(&self, dir: &Path) -> io::Result<()> {
+        if self.kind(dir)? != Some(EntryKind::Dir) {
+            return Err(io::ErrorKind::NotADirectory.into());
+        }
+        fs::remove_dir(dir)
+    }
+
+    fn list_entries(&self, dir: &Path) -> io::Result<Vec<EntryStat>> {
+        let mut listed = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let meta = match fs::symlink_metadata(entry.path()) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            listed.push(EntryStat {
+                name: entry.file_name(),
+                kind: kind_of(&meta),
+                uid: meta.uid(),
+                modified: meta.modified().ok(),
+            });
+        }
+        Ok(listed)
+    }
+
+    /// The check before removing narrows, but cannot close, the window in
+    /// which `dir` could be swapped for a symlink. That costs no more than
+    /// the symlink: [`fs::remove_dir_all`] removes a symlink at `dir`
+    /// itself and never follows one, there or anywhere below it.
+    fn remove_left_staging(&self, dir: &Path) -> io::Result<()> {
+        if self.kind(dir)? != Some(EntryKind::Dir) {
+            return Err(io::ErrorKind::NotADirectory.into());
+        }
+        fs::remove_dir_all(dir)
+    }
+}
+
+/// What `meta`, from `lstat`, says the entry is.
+fn kind_of(meta: &Metadata) -> EntryKind {
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        EntryKind::Link
+    } else if kind.is_dir() {
+        EntryKind::Dir
+    } else if kind.is_file() {
+        EntryKind::File
+    } else {
+        EntryKind::Other
     }
 }
 
@@ -337,6 +395,93 @@ mod tests {
         assert_eq!(mode(&staging.join("blog")), 0o755);
         SystemDisk.remove_staging(&staging).unwrap();
         assert!(!staging.exists());
+    }
+
+    #[test]
+    fn removes_only_empty_real_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let empty = root.path().join("empty");
+        let full = root.path().join("full");
+        fs::create_dir(&empty).unwrap();
+        fs::create_dir(&full).unwrap();
+        fs::write(full.join("data"), "keep").unwrap();
+        fs::write(root.path().join("file"), "keep").unwrap();
+        symlink(&empty, root.path().join("link")).unwrap();
+        let cases = [
+            ("full", Some(io::ErrorKind::DirectoryNotEmpty)),
+            ("file", Some(io::ErrorKind::NotADirectory)),
+            ("link", Some(io::ErrorKind::NotADirectory)),
+            ("missing", Some(io::ErrorKind::NotADirectory)),
+            ("empty", None),
+        ];
+        for (name, want) in cases {
+            let got = SystemDisk.remove_empty_dir(&root.path().join(name));
+            assert_eq!(got.err().map(|e| e.kind()), want, "{name}");
+        }
+        assert!(!empty.exists());
+        assert!(full.join("data").exists());
+        assert!(root.path().join("file").exists());
+        assert!(fs::symlink_metadata(root.path().join("link")).is_ok());
+    }
+
+    #[test]
+    fn lists_entries_without_following_links() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        fs::write(root.path().join("file"), "").unwrap();
+        symlink(root.path().join("dir"), root.path().join("link")).unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        File::open(root.path().join("dir"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let (uid, _) = SystemDisk.owner(root.path()).unwrap();
+
+        let mut listed = SystemDisk.list_entries(root.path()).unwrap();
+        listed.sort_by(|a, b| a.name.cmp(&b.name));
+        let kinds: Vec<_> = listed
+            .iter()
+            .map(|e| (e.name.to_str().unwrap(), e.kind, e.uid))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("dir", EntryKind::Dir, uid),
+                ("file", EntryKind::File, uid),
+                ("link", EntryKind::Link, uid),
+            ]
+        );
+        assert_eq!(listed[0].modified, Some(old));
+        let err = SystemDisk
+            .list_entries(&root.path().join("missing"))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn removes_left_staging_only_when_a_real_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("data"), "keep").unwrap();
+        let staging = root.path().join(".alchemy-tmp-blog-a1B2c3");
+        fs::create_dir_all(staging.join("blog")).unwrap();
+        fs::write(staging.join("blog/compose.yaml"), "x").unwrap();
+        symlink(&outside, staging.join("blog/linked")).unwrap();
+        let linked = root.path().join(".alchemy-tmp-blog-d4E5f6");
+        symlink(&outside, &linked).unwrap();
+        let file = root.path().join(".alchemy-tmp-blog-g7H8i9");
+        fs::write(&file, "keep").unwrap();
+
+        for path in [&linked, &file, &root.path().join("missing")] {
+            let err = SystemDisk.remove_left_staging(path).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::NotADirectory, "{path:?}");
+        }
+        SystemDisk.remove_left_staging(&staging).unwrap();
+        assert!(!staging.exists());
+        assert!(fs::symlink_metadata(&linked).is_ok());
+        assert!(file.exists());
+        assert_eq!(fs::read(outside.join("data")).unwrap(), b"keep");
     }
 
     #[test]

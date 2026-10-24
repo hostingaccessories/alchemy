@@ -710,12 +710,17 @@ fn bad_path(rejection: &PathRejection) -> Response {
 }
 
 fn start_refused(error: &StartError) -> Response {
-    let (status, code) = match error {
+    let (status, code) = start_refusal(error);
+    api_error(status, code, &error.to_string())
+}
+
+/// The status and code an action refused with `error` answers with.
+fn start_refusal(error: &StartError) -> (StatusCode, ErrorCode) {
+    match error {
         StartError::AppNotFound { .. } => (StatusCode::NOT_FOUND, ErrorCode::AppNotFound),
         StartError::Project { .. } => (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal),
         _ => (StatusCode::CONFLICT, ErrorCode::Conflict),
-    };
-    api_error(status, code, &error.to_string())
+    }
 }
 
 fn operation_not_found(id: &str) -> Response {

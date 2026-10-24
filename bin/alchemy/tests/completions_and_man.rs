@@ -85,6 +85,7 @@ fn generated_man_pages_render() {
         names,
         [
             "alchemy-app-build.1",
+            "alchemy-app-cancel.1",
             "alchemy-app-create.1",
             "alchemy-app-down.1",
             "alchemy-app-edit.1",

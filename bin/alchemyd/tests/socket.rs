@@ -258,7 +258,7 @@ async fn a_second_daemon_refuses_a_live_socket() {
     let config = alchemyd::Config {
         listen: free_port(),
         socket: first.socket.clone(),
-        state_dir: first.socket.with_file_name("state"),
+        state_dir: first.socket.with_file_name("second-state"),
     };
     let deps = Deps::new(FixedEngine(EngineStatus::new(EngineState::Ready)));
     let err = alchemyd::run_with(config, deps, std::future::pending())

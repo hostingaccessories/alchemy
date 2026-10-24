@@ -117,7 +117,10 @@ impl ComposeValidator for CliComposeConfig {
         check: &'a ComposeCheck,
         endpoint: &'a Endpoint,
     ) -> BoxFuture<'a, Result<ComposeConfig, ConfigError>> {
-        Box::pin(async move { self.run(&check_args(check), endpoint).await })
+        Box::pin(async move {
+            self.run(check.project().dir(), &check_args(check), endpoint)
+                .await
+        })
     }
 }
 

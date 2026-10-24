@@ -132,6 +132,29 @@ impl<D: Daemon, W: Write> Context<D, W> {
         decode(&reply.body).map(Sent::Done)
     }
 
+    /// `POST` to `path` with no body and decode the JSON answer. Any error
+    /// the daemon answers with comes back as [`Sent::Refused`] for the
+    /// command to word, except a sign that the daemon predates the route,
+    /// which is a [`ClientError`] as with [`Self::get`].
+    pub(crate) async fn post_empty<T: DeserializeOwned>(
+        &mut self,
+        path: &str,
+    ) -> Result<Sent<T>, ClientError> {
+        let daemon = self.daemon_info().await?.version.clone();
+        let reply = self.daemon.request(Method::POST, path, None).await?;
+        if (400..600).contains(&reply.status) {
+            let refusal = error_reply(&reply)?;
+            if !matches!(
+                refusal.code,
+                ErrorCode::NotFound | ErrorCode::MethodNotAllowed
+            ) {
+                return Ok(Sent::Refused(refusal));
+            }
+        }
+        accept(&reply, &daemon, self.command)?;
+        decode(&reply.body).map(Sent::Done)
+    }
+
     /// Follow [`EVENTS_PATH`]. A refusal comes back as a [`ClientError`].
     pub(crate) async fn events(&mut self) -> Result<Subscription<D::Events>, ClientError> {
         self.stream(EVENTS_PATH)
@@ -164,7 +187,8 @@ pub(crate) fn decode_data<T: DeserializeOwned>(raw: &SseEvent) -> Result<T, Clie
 pub(crate) enum Sent<T> {
     /// The daemon did it and answered with this.
     Done(T),
-    /// The daemon refused it as a `conflict` or as `invalid`.
+    /// The daemon refused it, as a `conflict` or as `invalid` for
+    /// [`Context::send`].
     Refused(ErrorResponse),
 }
 

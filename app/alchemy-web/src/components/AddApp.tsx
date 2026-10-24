@@ -2,8 +2,16 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { type FormEvent, useState } from "react";
 
-import { type AppDir, type AppList, ApiError, api } from "../lib/api.ts";
-import { liveQueries } from "../lib/queries.ts";
+import {
+  type App,
+  type AppDir,
+  type AppList,
+  ApiError,
+  type NewApp,
+  type Saved,
+  api,
+} from "../lib/api.ts";
+import { liveQueries, showOperation } from "../lib/queries.ts";
 import { Advanced } from "./Advanced.tsx";
 import { Button } from "./Button.tsx";
 import { FILE_TEXTAREA } from "./AppFileEditor.tsx";
@@ -24,6 +32,9 @@ export const STARTER_COMPOSE = `services:
  * A new app from a name and a compose file. alchemyd checks the file with
  * Docker Compose first and creates the app's folder only if Compose accepts
  * it and no folder of that name exists; on success this opens the new app.
+ * Create and start also starts it, and the app's page shows the progress.
+ * If the app was created but couldn't be started, this says why instead,
+ * with a way to open it.
  */
 export function AddApp({ dirs, onCancel }: { dirs: AppDir[]; onCancel: () => void }) {
   const client = useQueryClient();
@@ -33,29 +44,42 @@ export function AddApp({ dirs, onCancel }: { dirs: AppDir[]; onCancel: () => voi
   const [folder, setFolder] = useState(home);
   const [compose, setCompose] = useState(STARTER_COMPOSE);
   const [env, setEnv] = useState("");
+  const [unstarted, setUnstarted] = useState<{ app: App; error: string } | null>(null);
   const create = useMutation({
     mutationFn: api.createApp,
-    onSuccess: (app) => {
+    onSuccess: ({ operation, start_error, ...app }: Saved<App>) => {
       client.setQueryData<AppList>(liveQueries.apps.queryKey, (list) =>
         list && !list.apps.some((a) => a.name === app.name)
           ? { ...list, apps: [...list.apps, app] }
           : list,
       );
-      void navigate({ to: "/apps/$name", params: { name: app.name } });
+      if (operation) showOperation(client, operation);
+      if (start_error) {
+        setUnstarted({ app, error: start_error.error });
+        return;
+      }
+      openApp(app);
     },
   });
+  const openApp = (app: App) => void navigate({ to: "/apps/$name", params: { name: app.name } });
 
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
-    create.mutate({
+  const send = (start: boolean) => {
+    const body: NewApp = {
       name: name.trim(),
       folder: folder === home ? null : folder,
       compose,
       env: env === "" ? null : env,
       dry_run: false,
-    });
+    };
+    if (start) body.start = true;
+    create.mutate(body);
+  };
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    send(false);
   };
   const failure = create.error instanceof ApiError ? create.error : null;
+  const disabled = create.isPending || unstarted !== null || name.trim() === "";
 
   return (
     <form
@@ -130,11 +154,27 @@ export function AddApp({ dirs, onCancel }: { dirs: AppDir[]; onCancel: () => voi
         />
       </Advanced>
       <div className="flex items-center gap-3">
-        <Button type="submit" variant="primary" disabled={create.isPending || name.trim() === ""}>
+        <Button type="submit" variant="primary" disabled={disabled}>
           Create app
+        </Button>
+        <Button disabled={disabled} onClick={() => send(true)}>
+          Create and start
         </Button>
         <Button onClick={onCancel}>Cancel</Button>
       </div>
+      {unstarted && (
+        <div role="alert">
+          <Notice
+            tone="warn"
+            title={`Created ${unstarted.app.name}, but couldn't start it`}
+            action={
+              <Button onClick={() => openApp(unstarted.app)}>Open {unstarted.app.name}</Button>
+            }
+          >
+            <p>{unstarted.error}</p>
+          </Notice>
+        </div>
+      )}
       {create.isError && (
         <div role="alert">
           <Notice

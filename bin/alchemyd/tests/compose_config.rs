@@ -35,13 +35,15 @@ async fn reads_the_resolved_config_through_the_docker_binary() {
     let dir = tempfile::tempdir().unwrap();
     let argv_log = dir.path().join("argv.log");
     let env_log = dir.path().join("env.log");
+    let cwd_log = dir.path().join("cwd.log");
     let ok = write_script(
         dir.path(),
         "ok",
         &format!(
-            "printf '%s\\n' \"$@\" > '{}'\nenv > '{}'\necho 'time=\"x\" level=warning msg=\"unset\"' >&2\necho '{CONFIG}'",
+            "printf '%s\\n' \"$@\" > '{}'\nenv > '{}'\npwd -P > '{}'\necho 'time=\"x\" level=warning msg=\"unset\"' >&2\necho '{CONFIG}'",
             argv_log.display(),
-            env_log.display()
+            env_log.display(),
+            cwd_log.display()
         ),
     );
     let failing = write_script(
@@ -51,7 +53,9 @@ async fn reads_the_resolved_config_through_the_docker_binary() {
     );
     let garbage = write_script(dir.path(), "garbage", "echo 'not json'");
     let slow = write_script(dir.path(), "slow", "sleep 30");
-    let project = ComposeProject::new("/srv/blog").unwrap();
+    let blog = dir.path().join("blog");
+    std::fs::create_dir(&blog).unwrap();
+    let project = ComposeProject::new(&blog).unwrap();
     let endpoint = Endpoint::unix("/run/user/1000/docker.sock").unwrap();
 
     let reader = CliComposeConfig::new(&ok).with_parent_env([
@@ -65,7 +69,14 @@ async fn reads_the_resolved_config_through_the_docker_binary() {
     assert_eq!(config.images(), ImageSource::Build);
     assert_eq!(
         std::fs::read_to_string(&argv_log).unwrap(),
-        "compose\n--project-directory\n/srv/blog\nconfig\n--format\njson\n"
+        format!(
+            "compose\n--project-directory\n{}\nconfig\n--format\njson\n",
+            blog.display()
+        )
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cwd_log).unwrap().trim_end(),
+        blog.canonicalize().unwrap().to_str().unwrap()
     );
     let env = std::fs::read_to_string(&env_log).unwrap();
     assert!(
@@ -93,6 +104,16 @@ async fn reads_the_resolved_config_through_the_docker_binary() {
         .await
         .unwrap_err();
     assert!(matches!(err, ConfigError::Unreadable(_)), "{err:?}");
+
+    let gone = dir.path().join("gone");
+    let err = CliComposeConfig::new(&ok)
+        .read(&ComposeProject::new(&gone).unwrap(), &endpoint)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ConfigError::MissingDir { dir } if *dir == gone),
+        "{err:?}"
+    );
 
     let err = CliComposeConfig::new(dir.path().join("missing"))
         .read(&project, &endpoint)
@@ -133,10 +154,14 @@ async fn validates_staged_files_through_the_docker_binary() {
         "failing",
         "echo 'services.web Additional property imagee is not allowed' >&2\nexit 1",
     );
-    let check = ComposeCheck::new(ComposeProject::new("/srv/apps/blog").unwrap())
-        .with_file("/srv/apps/.alchemy-tmp-blog-1/compose.yaml")
+    let apps = dir.path().join("apps");
+    let blog = apps.join("blog");
+    std::fs::create_dir_all(&blog).unwrap();
+    let staged = apps.join(".alchemy-tmp-blog-1");
+    let check = ComposeCheck::new(ComposeProject::new(&blog).unwrap())
+        .with_file(staged.join("compose.yaml"))
         .unwrap()
-        .with_env_file("/srv/apps/.alchemy-tmp-blog-1/.env")
+        .with_env_file(staged.join(".env"))
         .unwrap();
     let endpoint = Endpoint::unix("/run/user/1000/docker.sock").unwrap();
 
@@ -147,7 +172,12 @@ async fn validates_staged_files_through_the_docker_binary() {
     assert_eq!(config.name, "fancy");
     assert_eq!(
         std::fs::read_to_string(&argv_log).unwrap(),
-        "compose\n--project-directory\n/srv/apps/blog\n-f\n/srv/apps/.alchemy-tmp-blog-1/compose.yaml\n--env-file\n/srv/apps/.alchemy-tmp-blog-1/.env\nconfig\n--format\njson\n"
+        format!(
+            "compose\n--project-directory\n{}\n-f\n{}\n--env-file\n{}\nconfig\n--format\njson\n",
+            blog.display(),
+            staged.join("compose.yaml").display(),
+            staged.join(".env").display()
+        )
     );
 
     let err = CliComposeConfig::new(&failing)

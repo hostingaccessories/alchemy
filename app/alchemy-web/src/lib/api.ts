@@ -234,6 +234,8 @@ export interface UnmanagedApp {
   dir: string | null;
   status: StackStatus;
   services: AppService[];
+  /** The most pressing of its containers' reasons. Absent from an older daemon. */
+  stop_reason?: StopReason;
 }
 
 /** Mirrors `alchemy_api::apps::AppDirState`; unknown states arrive as `other`. */
@@ -301,6 +303,8 @@ export interface NewApp {
   /** Saved as `.env`, readable by its owner alone; `null` writes none. */
   env: string | null;
   dry_run: boolean;
+  /** Start the app once it is created. Refused with `dry_run`. */
+  start?: boolean;
 }
 
 /** Mirrors `alchemy_api::apps::files::AppFileKind`, also the route's path segment. */
@@ -327,7 +331,22 @@ export interface AppFileUpdate {
   content: string;
   base_hash: string | null;
   dry_run: boolean;
+  /** Start the app once the file is saved. Refused with `dry_run`. */
+  start?: boolean;
 }
+
+/**
+ * Mirrors `alchemy_api::apps::files::Saved`: the created {@link App} or the
+ * saved {@link AppFile}, and, when the request sent `start`, either the
+ * operation that started the app or why it wasn't started. The save stands
+ * either way.
+ */
+export type Saved<T> = T & {
+  /** The `up` operation started on the app, running. */
+  operation?: Operation;
+  /** Why the app was saved but not started, as an action would be refused. */
+  start_error?: ErrorResponse;
+};
 
 /** Mirrors `alchemy_api::logs::LogStream`; unknown outputs arrive as `other`. */
 export type LogStream = "stdout" | "stderr" | "other";
@@ -740,10 +759,12 @@ export const api = {
   cancelOperation: (id: string) =>
     request<OperationResponse>("POST", `/operations/${encodeURIComponent(id)}/cancel`),
   followOperation,
-  createApp: (app: NewApp) => request<App>("POST", "/apps", { body: app }),
+  createApp: (app: NewApp) => request<Saved<App>>("POST", "/apps", { body: app }),
   appFile: (name: string, kind: AppFileKind, signal?: AbortSignal) =>
     request<AppFile>("GET", `/apps/${encodeURIComponent(name)}/files/${kind}`, { signal }),
   saveAppFile: (name: string, kind: AppFileKind, update: AppFileUpdate) =>
-    request<AppFile>("PUT", `/apps/${encodeURIComponent(name)}/files/${kind}`, { body: update }),
+    request<Saved<AppFile>>("PUT", `/apps/${encodeURIComponent(name)}/files/${kind}`, {
+      body: update,
+    }),
   subscribe,
 };

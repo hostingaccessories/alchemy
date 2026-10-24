@@ -1,5 +1,6 @@
-//! State store wiring: `run_with` opening, creating, or refusing the state
-//! database before it binds either listener.
+//! State store wiring: `run_with` locking the state directory, and
+//! opening, creating, or refusing the state database, before it binds
+//! either listener.
 
 #![allow(
     clippy::unwrap_used,
@@ -172,4 +173,51 @@ async fn daemon_refuses_a_bad_database_before_listening() {
         assert!(message.contains(want), "{name}: {message}");
         assert!(!socket.exists(), "{name}");
     }
+}
+
+#[tokio::test]
+async fn daemon_refuses_a_state_dir_another_daemon_holds() {
+    let (dir, first) = config();
+    let state_dir = first.state_dir.clone();
+    let first_socket = first.socket.clone();
+    let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let daemon = tokio::spawn(alchemyd::run_with(first, Deps::new(FixedEngine), async {
+        let _ = stop_rx.await;
+    }));
+    tokio::time::timeout(TIMEOUT, async {
+        while !first_socket.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let second = || Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        socket: dir.path().join("second.sock"),
+        state_dir: state_dir.clone(),
+    };
+    let err = tokio::time::timeout(
+        TIMEOUT,
+        alchemyd::run_with(second(), Deps::new(FixedEngine), std::future::pending()),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    let message = format!("{err:#}");
+    let want = format!(
+        "another alchemyd is already using the state directory {}; stop it first",
+        state_dir.display()
+    );
+    assert!(message.contains(&want), "{message}");
+    assert!(!second().socket.exists());
+    assert!(first_socket.exists());
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(TIMEOUT, daemon)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    run_until_listening(second()).await;
 }

@@ -65,7 +65,11 @@ The state directory is `$XDG_STATE_HOME/alchemy` (else
 on macOS. It holds `alchemy.db`, the daemon's SQLite database of the app
 folder settings, operation and metrics history, and stop intents, and
 `tcp-token`, which signs clients in to the TCP port
-([Signing in to the TCP port](#signing-in-to-the-tcp-port)). The directory is `0700` and the database and token `0600`. A
+([Signing in to the TCP port](#signing-in-to-the-tcp-port)). The directory is `0700` and the database and token `0600`. One
+daemon owns a state directory: at startup, before opening the database,
+alchemyd takes an exclusive `flock` on `alchemyd.lock` in it, and a second
+daemon on the same directory fails at once, naming it. The OS drops the
+lock when the daemon exits, so a leftover file is harmless. A
 database that is corrupt, or was written by a newer alchemyd, stops startup
 with a message saying so; move it aside to start fresh. Point
 `--state-dir` at a temporary directory to run a throwaway daemon. The schema
@@ -331,6 +335,10 @@ validated with `docker compose --project-directory DIR [-f FILE]
 [--env-file FILE] config`, and only then moved into place with one
 rename. If Compose rejects it, the answer is 422 `invalid` with
 Compose's own message, staging paths removed, and nothing changes.
+A staging folder left by a daemon that stopped mid-write is removed on
+the first scan after the next start, or after the settings add its
+folder, once it is over an hour old, is a real directory (never a
+symlink), and is owned by the daemon's user.
 
 - `POST /api/apps` (`{"name","folder","compose","env"}`) creates
   `FOLDER/NAME` holding `compose.yaml` and, if given, `.env`. `folder` is
@@ -350,6 +358,15 @@ Compose's own message, staging paths removed, and nothing changes.
   folder with its override file; a `.env` with `--env-file`. Only the
   edited file is replaced, keeping its mode and owner.
 - Both take `"dry_run": true` to check and validate without writing.
+- Both take `"start": true` to bring the app up after saving. alchemyd
+  asks the apps task to look again, waits up to 10 seconds for a scan
+  whose reads all started after the save (`State::rescan_apps` returns
+  its generation, the apps task reports it done with
+  `set_app_scan_done`), then runs `up` as `POST /api/apps/NAME/actions`
+  would. The answer adds `"operation"`, the running operation, or
+  `"start_error"`, `{"error","code"}` as that route would refuse with;
+  either way the save stands and the status is 201 or 200. Without
+  `start` neither field is sent. `start` with `dry_run` is 400.
 
 `.env` is always written `0600`, whatever the umask, and a new app's
 compose file `0644` in a `0755` folder. Symlinked app folders and files
@@ -359,15 +376,20 @@ edited. Bodies over 3 MiB are refused with 413. The code is in
 `ComposeValidator` in `bin/alchemyd/src/compose/validate.rs`.
 
 `alchemy app create NAME [--file compose.yaml] [--env-file PATH]
-[--folder PATH]` reads `compose.yaml` in the current folder unless told
-otherwise (`--file -` reads stdin). `alchemy app edit NAME [--env]` opens
+[--folder PATH] [--start]` reads `compose.yaml` in the current folder
+unless told otherwise (`--file -` reads stdin). `alchemy app edit NAME [--env]` opens
 a private `0600` copy in `$VISUAL` or `$EDITOR` (`vi` otherwise; the
 value is split on spaces, never run by a shell), re-opens it with
 Compose's message on top until Compose accepts it or it is left
 unchanged, asks, then saves. On a conflict it keeps your copy and says
 where; `--force` saves over the change on disk instead. Both take
-`--dry-run` and `--yes`. On the web, Apps has "Add app", and each app's
-page an Edit section.
+`--dry-run` and `--yes`, and `--start` (not with `--dry-run`), which
+follows the `up` alchemyd starts as `alchemy app up` does, with
+`--json` printing the save's line and then each event. If alchemyd saved
+but didn't start the app, the command prints the save and fails with
+the reason, exit 1. On the web, Apps has "Add app" with Create app and
+Create and start, and each app's page an Edit section with Save and
+Save and start.
 
 ```sh
 curl --unix-socket /run/user/1000/alchemy/alchemyd.sock -X POST \
@@ -402,7 +424,12 @@ proxies, and `SSH_AUTH_SOCK` never do.
 events: `operation` first and on every step change, `output` for each line
 of output (from its first kept line, so a late follower misses nothing
 still held), then `done`. Each step has a plain-words `label` and a
-one-line `message`, such as "2 of 3 images downloaded". The daemon keeps
+one-line `message`, such as "2 of 3 images downloaded". During a build,
+the base64 logs in BuildKit's JSON status lines are decoded and split into
+`output` lines tagged with their build step, `[2/3] RUN npm ci | LINE`
+(the start of the step's digest before its name is known); a line still
+open when its step ends is written then. Each output line is at most
+64 KiB. The daemon keeps
 the newest 5000 output lines per operation, and finished operations in
 memory for an hour (at most 100); `GET /api/operations[?app=NAME]` lists
 recent ones, newest first, from the state database too, which keeps the
@@ -418,7 +445,11 @@ on stdout, and with `--json` every event as one line on stdout. `down`
 asks first (`--yes` skips the question, and without a terminal it refuses
 with exit 3); `--dry-run` prints the plan. A failed, cancelled, or
 interrupted operation exits 1 with kind `operation_failed`. Ctrl-C stops
-following, but the operation keeps running in the daemon. The app page
+following, but the operation keeps running in the daemon.
+`alchemy app cancel NAME|ID` cancels the app's running operation (found
+with `?app=NAME`), or, for anything that is not an app name or is a name
+with no operations, the operation with that id; with nothing running it
+exits 1 with kind `nothing_to_cancel`. The app page
 has the same actions, with Down, Pull, and Build under More actions. The
 pure model is `alchemy_core::operation`, the manager
 `bin/alchemyd/src/operations/`.
@@ -597,6 +628,8 @@ checks:
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
 - `alchemy-helper` refuses to run without root;
+- a second daemon on the same state directory refuses to start, before
+  binding its socket, and the first keeps serving;
 - the daemon shuts down cleanly on `SIGTERM` and removes its socket and
   token;
 - the daemon refuses a corrupt state database before binding its socket.
@@ -885,16 +918,16 @@ The message says what failed, then why, in lower case without a final full
 stop or the `alchemy: ` prefix. The hint is the next step, kept out of the
 message. `kind` is a contract.
 
-| Exit | When                                                    | `kind`                                                                   |
-| ---- | ------------------------------------------------------- | ------------------------------------------------------------------------ |
-| 0    | It did what was asked                                   |                                                                          |
-| 1    | It failed, for example alchemyd refused it              | `daemon`, `runtime`, `operation_failed`, `editor`, `file`                |
-| 2    | The command line or daemon target is invalid            | `usage`, `remote_daemon`, `invalid_target`                               |
-| 3    | Confirmation was declined, or needed without a terminal | `declined`, `confirmation_required`                                      |
-| 69   | alchemyd is unreachable or went away                    | `daemon_unreachable`, `disconnected`                                     |
-| 74   | Writing the output failed                               | `output`                                                                 |
-| 76   | alchemy and alchemyd don't speak the same protocol      | `daemon_too_old`, `protocol`, `unexpected_response`, `connection_closed` |
-| 130  | Interrupted with ctrl-c                                 | `interrupted`                                                            |
+| Exit | When                                                    | `kind`                                                                         |
+| ---- | ------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| 0    | It did what was asked                                   |                                                                                |
+| 1    | It failed, for example alchemyd refused it              | `daemon`, `runtime`, `operation_failed`, `nothing_to_cancel`, `editor`, `file` |
+| 2    | The command line or daemon target is invalid            | `usage`, `remote_daemon`, `invalid_target`                                     |
+| 3    | Confirmation was declined, or needed without a terminal | `declined`, `confirmation_required`                                            |
+| 69   | alchemyd is unreachable or went away                    | `daemon_unreachable`, `disconnected`                                           |
+| 74   | Writing the output failed                               | `output`                                                                       |
+| 76   | alchemy and alchemyd don't speak the same protocol      | `daemon_too_old`, `protocol`, `unexpected_response`, `connection_closed`       |
+| 130  | Interrupted with ctrl-c                                 | `interrupted`                                                                  |
 
 Ctrl-c and a closed stdout (`| head`) only set the exit code. Most commands
 need no new error. Add a `ClientError` variant only when a script would
