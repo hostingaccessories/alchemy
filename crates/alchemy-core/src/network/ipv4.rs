@@ -54,10 +54,17 @@ impl Ipv4Net {
         if prefix > 32 {
             return Err(Ipv4NetError::PrefixTooLong(prefix));
         }
-        Ok(Self {
+        Ok(Self::clamped(addr, prefix))
+    }
+
+    /// Like [`new`](Self::new), with a prefix above 32 treated as 32, for
+    /// built-in tables.
+    pub(crate) fn clamped(addr: Ipv4Addr, prefix: u8) -> Self {
+        let prefix = prefix.min(32);
+        Self {
             network: Ipv4Addr::from_bits(addr.to_bits() & mask_bits(prefix)),
             prefix,
-        })
+        }
     }
 
     /// The network containing `addr` under a dotted netmask, as routing
