@@ -20,17 +20,20 @@
 mod api;
 mod cli;
 mod discovery;
+mod kind;
 mod monitor;
 mod probe;
 
 pub use api::{
-    AddressPool, ApiError, BollardApi, DockerApi, DockerNetwork, EngineVersion, NetworkSpec,
+    AddressPool, ApiError, BollardApi, DockerApi, DockerNetwork, EngineInfo, EngineVersion,
+    NetworkSpec,
 };
 pub use cli::{CliError, DockerCli, ProcessDockerCli, parse_compose_version, parse_context_host};
 pub use discovery::{
     Candidate, Endpoint, EndpointError, EndpointSource, HostEnv, Os, desktop_install_paths,
     docker_binary_candidates, endpoint_candidates, select_endpoint,
 };
+pub use kind::{EngineKind, engine_kind};
 pub use monitor::{Connector, EngineMonitor, EngineSource, POLL_INTERVAL, SystemConnector};
 pub use probe::{
     HostProbe, SocketConnect, SystemProbe, desktop_installed, discover_endpoint,

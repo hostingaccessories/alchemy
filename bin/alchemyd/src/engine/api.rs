@@ -10,16 +10,17 @@ use std::time::Duration;
 use alchemy_api::logs::LogStream;
 use alchemy_core::engine::{
     ContainerEvent, ContainerState, ContainerStatus, EngineStatus, Health, InspectedExit,
-    flavor_from_platform, parse_action, parse_timestamp_ms,
+    flavor_from_platform, parse_action, parse_network_action, parse_timestamp_ms,
 };
 use alchemy_core::metrics::{ContainerSample, DiskIo, Traffic, container_memory};
 use alchemy_core::network::Ipv4Net;
 use alchemy_core::ports::{PortRange, Protocol, PublishedPort};
 use bollard::container::LogOutput;
 use bollard::models::{
-    ContainerInspectResponse, ContainerStatsResponse, ContainerSummary, EventMessage,
-    EventMessageTypeEnum, Ipam, IpamConfig, Network, NetworkCreateRequest, PortSummary,
-    PortSummaryTypeEnum, SystemInfo, SystemVersion,
+    ContainerInspectResponse, ContainerStatsResponse, ContainerSummary,
+    ContainerSummaryNetworkSettings, EventMessage, EventMessageTypeEnum, Ipam, IpamConfig, Network,
+    NetworkConnectRequest, NetworkCreateRequest, PortSummary, PortSummaryTypeEnum, SystemInfo,
+    SystemVersion,
 };
 use bollard::query_parameters::{
     EventsOptions, ListContainersOptions, ListNetworksOptions, LogsOptions, StatsOptions,
@@ -41,7 +42,17 @@ pub trait DockerApi {
     /// `GET /version`.
     fn version(&self) -> impl Future<Output = Result<EngineVersion, ApiError>> + Send;
 
-    /// `GET /containers/json?all=true`: every container, running or not.
+    /// `GET /info`, reduced to the facts [`engine_kind`] reads.
+    ///
+    /// The default reports nothing, for engines whose tests do not care.
+    ///
+    /// [`engine_kind`]: super::engine_kind
+    fn info(&self) -> impl Future<Output = Result<EngineInfo, ApiError>> + Send {
+        std::future::ready(Ok(EngineInfo::default()))
+    }
+
+    /// `GET /containers/json?all=true`: every container, running or not,
+    /// with its IPv4 address on each network it has joined.
     ///
     /// Containers in a state the core model does not know are left out.
     fn list_containers(
@@ -51,7 +62,9 @@ pub trait DockerApi {
     /// `GET /events` for containers, as a stream that lasts as long as the
     /// connection.
     ///
-    /// Events with an action the core model ignores are left out. The
+    /// A network's `connect` and `disconnect` events are included as
+    /// events of the container they name. Events with an action the core
+    /// model ignores are left out. The
     /// stream ends or yields an error when the engine goes away; callers
     /// reconnect with [`reconnect_delay`](alchemy_core::engine::reconnect_delay).
     fn events(
@@ -89,6 +102,23 @@ pub trait DockerApi {
         std::future::ready(Err(ApiError::Server {
             status: 501,
             message: "creating networks is not supported".to_owned(),
+        }))
+    }
+
+    /// `POST /networks/{network}/connect`: attach `container` (an ID or
+    /// name) to `network` (an ID or name). Connecting a container that is
+    /// already attached succeeds.
+    ///
+    /// The default refuses, as an engine without network support would.
+    fn connect_network(
+        &self,
+        network: String,
+        container: String,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
+        drop((network, container));
+        std::future::ready(Err(ApiError::Server {
+            status: 501,
+            message: "connecting networks is not supported".to_owned(),
         }))
     }
 
@@ -178,6 +208,21 @@ pub enum ApiError {
     Transport(#[source] BoxError),
 }
 
+impl ApiError {
+    /// Whether the engine refused to connect a container to a network
+    /// because it is already attached.
+    ///
+    /// Docker answers `403` with `endpoint with name ... already exists in
+    /// network ...`; some versions answer `409`, or say `already attached`.
+    pub fn is_already_connected(&self) -> bool {
+        matches!(
+            self,
+            Self::Server { status: 403 | 409, message }
+                if message.contains("already exists") || message.contains("already attached")
+        )
+    }
+}
+
 impl From<bollard::errors::Error> for ApiError {
     fn from(error: bollard::errors::Error) -> Self {
         use bollard::errors::Error as E;
@@ -222,9 +267,31 @@ impl EngineVersion {
     }
 }
 
+/// What `GET /info` reports, reduced to where the engine runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineInfo {
+    /// `OperatingSystem`: the engine host's OS, such as
+    /// `Ubuntu 24.04.3 LTS`, or `Docker Desktop`.
+    pub operating_system: Option<String>,
+    /// `KernelVersion`, such as `6.10.14-linuxkit` under Docker Desktop.
+    pub kernel_version: Option<String>,
+    /// `SecurityOptions`, such as `name=seccomp,profile=builtin` and,
+    /// for a rootless engine, `name=rootless`.
+    pub security_options: Vec<String>,
+}
+
 const PROJECT_LABEL: &str = "com.docker.compose.project";
 const SERVICE_LABEL: &str = "com.docker.compose.service";
 const WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
+
+fn engine_info(info: SystemInfo) -> EngineInfo {
+    let text = |value: Option<String>| value.filter(|v| !v.trim().is_empty());
+    EngineInfo {
+        operating_system: text(info.operating_system),
+        kernel_version: text(info.kernel_version),
+        security_options: info.security_options.unwrap_or_default(),
+    }
+}
 
 fn engine_version(version: SystemVersion) -> EngineVersion {
     EngineVersion {
@@ -265,7 +332,25 @@ fn container_status(summary: ContainerSummary) -> Option<ContainerStatus> {
         .and_then(|h| h.status)
         .and_then(|s| Health::from_docker(s.as_ref()));
     status.ports = published_ports(summary.ports.unwrap_or_default());
+    status.networks = network_addresses(summary.network_settings);
     Some(status)
+}
+
+/// The IPv4 address on each network in a container listing's
+/// `NetworkSettings`, by network name. A network with no address yet, as
+/// for a container that is not running, is left out.
+fn network_addresses(
+    settings: Option<ContainerSummaryNetworkSettings>,
+) -> BTreeMap<String, Ipv4Addr> {
+    settings
+        .and_then(|settings| settings.networks)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(name, endpoint)| {
+            let ip: Ipv4Addr = endpoint.ip_address?.trim().parse().ok()?;
+            (!ip.is_unspecified()).then_some((name, ip))
+        })
+        .collect()
 }
 
 /// The host ports in a container listing's `Ports`, in a stable order.
@@ -314,6 +399,9 @@ fn published_ports(ports: Vec<PortSummary>) -> Vec<PublishedPort> {
 }
 
 fn container_event(message: EventMessage) -> Option<ContainerEvent> {
+    if message.typ == Some(EventMessageTypeEnum::NETWORK) {
+        return network_event(message);
+    }
     if message.typ != Some(EventMessageTypeEnum::CONTAINER) {
         return None;
     }
@@ -329,6 +417,24 @@ fn container_event(message: EventMessage) -> Option<ContainerEvent> {
     event.working_dir = attributes.remove(WORKING_DIR_LABEL);
     event.exit_code = attributes.remove("exitCode").and_then(|c| c.parse().ok());
     event.signal = attributes.remove("signal").and_then(|s| s.parse().ok());
+    event.at = message
+        .time_nano
+        .map(|nanos| nanos / 1_000_000)
+        .or_else(|| message.time.map(|secs| secs.saturating_mul(1_000)));
+    Some(event)
+}
+
+/// A network's `connect` or `disconnect`, as an event of the container in
+/// its `container` attribute. Its `name` attribute is the network's, so
+/// nothing else is taken from it.
+fn network_event(message: EventMessage) -> Option<ContainerEvent> {
+    let action = parse_network_action(message.action.as_deref()?)?;
+    let id = message
+        .actor?
+        .attributes?
+        .remove("container")
+        .filter(|id| !id.is_empty())?;
+    let mut event = ContainerEvent::new(id, action);
     event.at = message
         .time_nano
         .map(|nanos| nanos / 1_000_000)
@@ -455,6 +561,10 @@ impl DockerApi for BollardApi {
         Ok(engine_version(self.docker.version().await?))
     }
 
+    async fn info(&self) -> Result<EngineInfo, ApiError> {
+        Ok(engine_info(self.docker.info().await?))
+    }
+
     async fn list_containers(&self) -> Result<Vec<ContainerStatus>, ApiError> {
         let options = ListContainersOptions {
             all: true,
@@ -467,7 +577,10 @@ impl DockerApi for BollardApi {
     fn events(
         &self,
     ) -> impl Stream<Item = Result<ContainerEvent, ApiError>> + Send + Unpin + 'static {
-        let filters = HashMap::from([("type".to_owned(), vec!["container".to_owned()])]);
+        let filters = HashMap::from([(
+            "type".to_owned(),
+            vec!["container".to_owned(), "network".to_owned()],
+        )]);
         let options = EventsOptions {
             filters: Some(filters),
             ..EventsOptions::default()
@@ -498,6 +611,20 @@ impl DockerApi for BollardApi {
 
     async fn create_network(&self, spec: NetworkSpec) -> Result<String, ApiError> {
         Ok(self.docker.create_network(network_request(spec)).await?.id)
+    }
+
+    async fn connect_network(&self, network: String, container: String) -> Result<(), ApiError> {
+        let request = NetworkConnectRequest {
+            container,
+            endpoint_config: None,
+        };
+        match self.docker.connect_network(&network, request).await {
+            Ok(()) => Ok(()),
+            Err(error) => match ApiError::from(error) {
+                error if error.is_already_connected() => Ok(()),
+                error => Err(error),
+            },
+        }
     }
 
     async fn bridge_subnets(&self) -> Result<Vec<Ipv4Net>, ApiError> {
@@ -1126,6 +1253,171 @@ mod tests {
             ]
         );
         assert_eq!(address_pools(SystemInfo::default()), []);
+    }
+
+    #[test]
+    fn engine_info_keeps_where_the_engine_runs() {
+        let info = SystemInfo {
+            operating_system: Some("Docker Desktop".into()),
+            kernel_version: Some("6.10.14-linuxkit".into()),
+            security_options: Some(vec![
+                "name=seccomp,profile=builtin".into(),
+                "name=cgroupns".into(),
+            ]),
+            name: Some("docker-desktop".into()),
+            ..SystemInfo::default()
+        };
+        assert_eq!(
+            engine_info(info),
+            EngineInfo {
+                operating_system: Some("Docker Desktop".into()),
+                kernel_version: Some("6.10.14-linuxkit".into()),
+                security_options: vec![
+                    "name=seccomp,profile=builtin".into(),
+                    "name=cgroupns".into()
+                ],
+            }
+        );
+        let blank = SystemInfo {
+            operating_system: Some(" ".into()),
+            kernel_version: Some(String::new()),
+            ..SystemInfo::default()
+        };
+        assert_eq!(engine_info(blank), EngineInfo::default());
+    }
+
+    #[test]
+    fn network_addresses_keep_assigned_ipv4_addresses() {
+        use bollard::models::EndpointSettings;
+        let endpoint = |ip: Option<&str>| EndpointSettings {
+            ip_address: ip.map(Into::into),
+            ..EndpointSettings::default()
+        };
+        let settings = ContainerSummaryNetworkSettings {
+            networks: Some(HashMap::from([
+                ("alchemy".to_owned(), endpoint(Some("172.30.0.4"))),
+                ("blog_default".to_owned(), endpoint(Some(" 172.19.0.2 "))),
+                ("stopped".to_owned(), endpoint(Some(""))),
+                ("unset".to_owned(), endpoint(None)),
+                ("zero".to_owned(), endpoint(Some("0.0.0.0"))),
+                ("v6".to_owned(), endpoint(Some("fd00::2"))),
+                ("junk".to_owned(), endpoint(Some("nope"))),
+            ])),
+        };
+        assert_eq!(
+            network_addresses(Some(settings)),
+            BTreeMap::from([
+                ("alchemy".to_owned(), "172.30.0.4".parse().unwrap()),
+                ("blog_default".to_owned(), "172.19.0.2".parse().unwrap()),
+            ])
+        );
+        assert_eq!(network_addresses(None), BTreeMap::new());
+        assert_eq!(
+            network_addresses(Some(ContainerSummaryNetworkSettings { networks: None })),
+            BTreeMap::new()
+        );
+    }
+
+    #[test]
+    fn container_status_maps_network_addresses() {
+        use bollard::models::EndpointSettings;
+        let listed = ContainerSummary {
+            network_settings: Some(ContainerSummaryNetworkSettings {
+                networks: Some(HashMap::from([(
+                    "alchemy".to_owned(),
+                    EndpointSettings {
+                        ip_address: Some("172.30.0.4".into()),
+                        ..EndpointSettings::default()
+                    },
+                )])),
+            }),
+            ..summary("abc", "/web", ContainerSummaryStateEnum::RUNNING)
+        };
+        let status = container_status(listed).unwrap();
+        assert_eq!(
+            status.networks,
+            BTreeMap::from([("alchemy".to_owned(), "172.30.0.4".parse().unwrap())])
+        );
+    }
+
+    #[test]
+    fn network_events_become_container_events() {
+        use EventMessageTypeEnum::NETWORK;
+        let network = |action: &str, attrs: &[(&str, &str)]| EventMessage {
+            typ: Some(NETWORK),
+            action: Some(action.into()),
+            actor: Some(EventActor {
+                id: Some("net123".into()),
+                attributes: Some(labels(attrs)),
+            }),
+            time: Some(1_700_000_000),
+            ..EventMessage::default()
+        };
+        let attached = [
+            ("container", "abc"),
+            ("name", "alchemy"),
+            ("type", "bridge"),
+        ];
+        let event = |action| {
+            let mut event = ContainerEvent::new("abc", action);
+            event.at = Some(1_700_000_000_000);
+            event
+        };
+        let cases = [
+            (
+                network("connect", &attached),
+                Some(event(ContainerAction::NetworkConnect)),
+            ),
+            (
+                network("disconnect", &attached),
+                Some(event(ContainerAction::NetworkDisconnect)),
+            ),
+            (network("create", &[("name", "alchemy")]), None),
+            (network("destroy", &attached), None),
+            (network("connect", &[("name", "alchemy")]), None),
+            (network("connect", &[("container", "")]), None),
+            (
+                EventMessage {
+                    actor: None,
+                    ..network("connect", &attached)
+                },
+                None,
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(container_event(input.clone()), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn already_connected_errors_are_recognised() {
+        let server = |status, message: &str| ApiError::Server {
+            status,
+            message: message.to_owned(),
+        };
+        let cases = [
+            (
+                server(
+                    403,
+                    "endpoint with name blog-web-1 already exists in network alchemy",
+                ),
+                true,
+            ),
+            (
+                server(409, "container abc is already attached to network alchemy"),
+                true,
+            ),
+            (server(404, "network alchemy not found"), false),
+            (
+                server(403, "operation not supported for this network"),
+                false,
+            ),
+            (server(500, "endpoint already exists"), false),
+            (ApiError::Timeout, false),
+        ];
+        for (error, want) in cases {
+            assert_eq!(error.is_already_connected(), want, "{error:?}");
+        }
     }
 
     #[test]

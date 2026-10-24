@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 pub use container::{
     ContainerAction, ContainerEvent, ContainerState, ContainerStatus, Containers, Health,
-    parse_action,
+    parse_action, parse_network_action,
 };
 pub use stop::{
     CLOCK_SLACK_MS, CRASH_LOOP, InspectedExit, Intent, IntentAction, SHORT_RUN_MS, StopReason,

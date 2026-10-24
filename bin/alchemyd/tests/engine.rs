@@ -24,8 +24,8 @@ use alchemy_core::network::Ipv4Net;
 use alchemy_core::ports::{Protocol, PublishedPort};
 use alchemyd::engine::{
     AddressPool, ApiError, BollardApi, CliError, Connector, DockerApi, DockerCli, Endpoint,
-    EngineMonitor, EngineSource, EngineVersion, HostEnv, HostProbe, NetworkSpec, Os, POLL_INTERVAL,
-    ProcessDockerCli, SocketConnect, SystemProbe,
+    EngineInfo, EngineKind, EngineMonitor, EngineSource, EngineVersion, HostEnv, HostProbe,
+    NetworkSpec, Os, POLL_INTERVAL, ProcessDockerCli, SocketConnect, SystemProbe, engine_kind,
 };
 use alchemyd::{Deps, State};
 use futures_util::{Stream, StreamExt as _};
@@ -40,8 +40,11 @@ const CONTAINERS_JSON: &str = r#"[
    "Ports":[{"IP":"0.0.0.0","PrivatePort":5432,"PublicPort":5432,"Type":"tcp"},
             {"IP":"::","PrivatePort":5432,"PublicPort":5432,"Type":"tcp"},{"PrivatePort":8008,"Type":"tcp"}],
    "Labels":{"com.docker.compose.project":"blog","com.docker.compose.service":"db"},
-   "Health":{"Status":"healthy","FailingStreak":0}},
-  {"Id":"def","Names":["/scratch"],"Image":"alpine","State":"exited","Status":"Exited (0)","Labels":{}}
+   "Health":{"Status":"healthy","FailingStreak":0},
+   "NetworkSettings":{"Networks":{"blog_default":{"IPAddress":"172.18.0.2","NetworkID":"n1"},
+                                  "alchemy":{"IPAddress":"10.200.0.3","NetworkID":"n9"}}}},
+  {"Id":"def","Names":["/scratch"],"Image":"alpine","State":"exited","Status":"Exited (0)","Labels":{},
+   "NetworkSettings":{"Networks":{"bridge":{"IPAddress":"","NetworkID":"n0"}}}}
 ]"#;
 
 const INSPECT_JSON: &str = r#"{"Id":"def","Name":"/scratch","RestartCount":2,
@@ -61,7 +64,11 @@ const BRIDGE_JSON: &str = r#"{"Name":"bridge","Id":"n0","Driver":"bridge","Enabl
   "IPAM":{"Driver":"default","Options":null,"Config":[{"Subnet":"172.17.0.0/16","Gateway":"172.17.0.1"}]},
   "Options":{"com.docker.network.bridge.default_bridge":"true"},"Labels":{},"Containers":{}}"#;
 
-const INFO_JSON: &str = r#"{"ID":"x","Containers":2,"DefaultAddressPools":[{"Base":"10.10.0.0/16","Size":24},{"Base":"fd00::/56","Size":64}]}"#;
+const INFO_JSON: &str = r#"{"ID":"x","Containers":2,"DefaultAddressPools":[{"Base":"10.10.0.0/16","Size":24},{"Base":"fd00::/56","Size":64}],
+  "OperatingSystem":"Docker Desktop","KernelVersion":"6.10.14-linuxkit","SecurityOptions":["name=seccomp,profile=builtin","name=cgroupns"]}"#;
+
+const ALREADY_CONNECTED_JSON: &str =
+    r#"{"message":"endpoint with name blog-db-1 already exists in network taken"}"#;
 
 const NETWORK_CREATED_JSON: &str = r#"{"Id":"n9","Warning":""}"#;
 
@@ -73,6 +80,8 @@ const EVENTS_JSON: &str = concat!(
     r#"{"Type":"container","Action":"exec_start: sh","Actor":{"ID":"abc","Attributes":{}},"time":3}"#,
     "\n",
     r#"{"Type":"container","Action":"health_status: unhealthy","Actor":{"ID":"abc","Attributes":{"name":"blog-db-1"}},"time":4}"#,
+    "\n",
+    r#"{"Type":"network","Action":"connect","Actor":{"ID":"n9","Attributes":{"container":"abc","name":"alchemy","type":"bridge"}},"time":5}"#,
     "\n",
 );
 
@@ -165,6 +174,8 @@ impl FakeEngine {
                         "/networks/bridge" => ("200 OK", BRIDGE_JSON),
                         "/networks/create" => ("201 Created", NETWORK_CREATED_JSON),
                         "/info" => ("200 OK", INFO_JSON),
+                        "/networks/alchemy/connect" => ("200 OK", ""),
+                        "/networks/taken/connect" => ("403 Forbidden", ALREADY_CONNECTED_JSON),
                         _ => ("404 Not Found", r#"{"message":"page not found"}"#),
                     };
                     let response = format!(
@@ -242,8 +253,19 @@ async fn bollard_api_lists_all_containers() {
                 .with_target(Some("5432".parse().unwrap()))
         ]
     );
+    assert_eq!(
+        db.networks,
+        BTreeMap::from([
+            ("alchemy".to_owned(), "10.200.0.3".parse().unwrap()),
+            ("blog_default".to_owned(), "172.18.0.2".parse().unwrap()),
+        ])
+    );
     assert_eq!(containers[1].state, ContainerState::Exited);
     assert_eq!(containers[1].ports, [] as [PublishedPort; 0]);
+    assert!(
+        containers[1].networks.is_empty(),
+        "no address while stopped"
+    );
     assert_eq!(containers[1].health, None);
     let requests = engine.requests();
     assert_eq!(requests.len(), 1);
@@ -352,6 +374,61 @@ async fn bollard_api_reads_the_bridge_subnet_and_address_pools() {
 }
 
 #[tokio::test]
+async fn bollard_api_reads_where_the_engine_runs() {
+    let engine = FakeEngine::start();
+    let api = engine.api();
+    let info = api.info().await.unwrap();
+    assert_eq!(
+        info,
+        EngineInfo {
+            operating_system: Some("Docker Desktop".into()),
+            kernel_version: Some("6.10.14-linuxkit".into()),
+            security_options: vec![
+                "name=seccomp,profile=builtin".into(),
+                "name=cgroupns".into()
+            ],
+        }
+    );
+    let version = api.version().await.unwrap();
+    assert_eq!(engine_kind(&version, &info, Os::Linux), EngineKind::Desktop);
+}
+
+#[tokio::test]
+async fn bollard_api_connects_a_container_to_a_network() {
+    let engine = FakeEngine::start();
+    let api = engine.api();
+    api.connect_network("alchemy".into(), "abc".into())
+        .await
+        .unwrap();
+    api.connect_network("taken".into(), "abc".into())
+        .await
+        .unwrap();
+    let missing = api
+        .connect_network("missing".into(), "abc".into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(missing, ApiError::Server { status: 404, .. }),
+        "{missing:?}"
+    );
+    let requests: Vec<_> = engine
+        .requests()
+        .iter()
+        .map(|r| unversioned(r).to_owned())
+        .collect();
+    assert_eq!(
+        requests,
+        [
+            "/networks/alchemy/connect",
+            "/networks/taken/connect",
+            "/networks/missing/connect"
+        ]
+    );
+    let body: serde_json::Value = serde_json::from_str(&engine.bodies()[0]).unwrap();
+    assert_eq!(body, serde_json::json!({"Container": "abc"}));
+}
+
+#[tokio::test]
 async fn default_network_calls_report_nothing() {
     let api = ScriptedApi(SharedHost::default());
     assert_eq!(api.list_networks().await.unwrap(), []);
@@ -369,6 +446,15 @@ async fn default_network_calls_report_nothing() {
         matches!(refused, ApiError::Server { status: 501, .. }),
         "{refused:?}"
     );
+    let refused = api
+        .connect_network("alchemy".into(), "abc".into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, ApiError::Server { status: 501, .. }),
+        "{refused:?}"
+    );
+    assert_eq!(api.info().await.unwrap(), EngineInfo::default());
 }
 
 #[tokio::test]
@@ -376,17 +462,26 @@ async fn bollard_api_streams_container_events_until_the_connection_ends() {
     let engine = FakeEngine::start();
     let events: Vec<_> = engine.api().events().collect().await;
     let events: Vec<_> = events.into_iter().map(Result::unwrap).collect();
-    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events.len(), 3, "{events:?}");
     assert_eq!(events[0].id, "abc");
     assert_eq!(events[0].action, ContainerAction::Start);
     assert_eq!(events[0].project.as_deref(), Some("blog"));
     assert_eq!(events[1].action, ContainerAction::Health(Health::Unhealthy));
+    assert_eq!(
+        (
+            events[2].id.as_str(),
+            events[2].action,
+            events[2].name.as_deref()
+        ),
+        ("abc", ContainerAction::NetworkConnect, None)
+    );
     let requests = engine.requests();
     assert!(
         unversioned(&requests[0]).starts_with("/events?filters="),
         "{requests:?}"
     );
     assert!(requests[0].contains("container"), "{requests:?}");
+    assert!(requests[0].contains("network"), "{requests:?}");
 }
 
 #[tokio::test]
@@ -909,6 +1004,52 @@ async fn monitor_learns_ports_of_containers_started_after_the_listing() {
         containers.get("web").unwrap().ports,
         [] as [PublishedPort; 0]
     );
+
+    run.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitor_learns_addresses_of_containers_connected_after_the_listing() {
+    let (host, monitor) = scripted_monitor(&unix(SOCKET));
+    ready_host(&host);
+    host.lock().unwrap().containers =
+        vec![ContainerStatus::new("web", "web", ContainerState::Running)];
+    let run = spawn_monitor(monitor);
+    containers_until(&run.state, |c| !c.is_empty()).await;
+    assert_eq!(run.state.engine_kind(), Some(EngineKind::Native));
+
+    let mut web = ContainerStatus::new("web", "web", ContainerState::Running);
+    web.networks
+        .insert("alchemy".to_owned(), "10.200.0.3".parse().unwrap());
+    host.lock().unwrap().containers = vec![web.clone()];
+    send(
+        &host,
+        ContainerEvent::new("web", ContainerAction::NetworkConnect),
+    );
+    let containers = containers_until(&run.state, |c| {
+        c.get("web").is_some_and(|w| !w.networks.is_empty())
+    })
+    .await;
+    assert_eq!(containers.get("web").unwrap().networks, web.networks);
+
+    host.lock().unwrap().containers =
+        vec![ContainerStatus::new("web", "web", ContainerState::Running)];
+    send(
+        &host,
+        ContainerEvent::new("web", ContainerAction::NetworkDisconnect),
+    );
+    containers_until(&run.state, |c| {
+        c.get("web").is_some_and(|w| w.networks.is_empty())
+    })
+    .await;
+
+    {
+        let mut h = host.lock().unwrap();
+        h.ping_ok = false;
+        h.streams.clear();
+    }
+    engine_until(&run.state, |s| s.state != EngineState::Ready).await;
+    assert_eq!(run.state.engine_kind(), None, "unknown while not ready");
 
     run.stop().await;
 }

@@ -14,9 +14,10 @@ use futures_util::future::{FusedFuture as _, FutureExt as _};
 use tokio::sync::watch;
 
 use super::{
-    ApiError, BollardApi, DockerApi, DockerCli, Endpoint, EndpointError, HostEnv, HostProbe, Os,
-    ProcessDockerCli, SystemProbe, desktop_install_paths, desktop_installed, discover_endpoint,
-    docker_binary_candidates, find_docker_binary, probe_socket,
+    ApiError, BollardApi, DockerApi, DockerCli, Endpoint, EndpointError, EngineInfo, EngineVersion,
+    HostEnv, HostProbe, Os, ProcessDockerCli, SystemProbe, desktop_install_paths,
+    desktop_installed, discover_endpoint, docker_binary_candidates, engine_kind,
+    find_docker_binary, probe_socket,
 };
 use crate::State;
 
@@ -155,10 +156,15 @@ where
             return Outcome::NotReady;
         };
 
-        match api.version().await {
-            Ok(version) => version.apply_to(&mut status),
-            Err(error) => tracing::debug!(error = %error, "Docker engine version unavailable"),
-        }
+        let version = api.version().await.unwrap_or_else(|error| {
+            tracing::debug!(error = %error, "Docker engine version unavailable");
+            EngineVersion::default()
+        });
+        version.apply_to(&mut status);
+        let info = api.info().await.unwrap_or_else(|error| {
+            tracing::debug!(error = %error, "Docker engine info unavailable");
+            EngineInfo::default()
+        });
         if let Some(cli) = &cli {
             match cli.compose_version().await {
                 Ok(version) => status.compose_version = Some(version),
@@ -171,6 +177,7 @@ where
                 flavor,
             });
         }
+        state.set_engine_kind(Some(engine_kind(&version, &info, self.os)));
         publish_engine(state, status);
         follow(&api, state).await
     }
@@ -211,8 +218,9 @@ where
 /// stopped with no exit known yet are inspected alongside the events, a
 /// few at a time, so each connection inspects a container at most once.
 ///
-/// Events carry no ports, so a `start` or `restart` lists the containers
-/// again, one listing at a time, and takes only their ports from it.
+/// Events carry no ports or addresses, so a `start`, `restart`, or network
+/// `connect` or `disconnect` lists the containers again, one listing at a
+/// time, and takes only their ports and addresses from it.
 async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
     let mut events = api.events();
     let mut pending: Vec<ContainerEvent> = Vec::new();
@@ -258,10 +266,10 @@ async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
         .buffer_unordered(INSPECT_CONCURRENCY);
     let relist = futures_util::future::Fuse::terminated();
     tokio::pin!(relist);
-    let mut ports_stale = false;
+    let mut listing_stale = false;
     loop {
-        if ports_stale && relist.is_terminated() {
-            ports_stale = false;
+        if listing_stale && relist.is_terminated() {
+            listing_stale = false;
             relist.set(api.list_containers().fuse());
         }
         tokio::select! {
@@ -269,9 +277,12 @@ async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
             item = events.next() => match item {
                 Some(Ok(event)) => {
                     delivered = true;
-                    ports_stale |= matches!(
+                    listing_stale |= matches!(
                         event.action,
-                        ContainerAction::Start | ContainerAction::Restart
+                        ContainerAction::Start
+                            | ContainerAction::Restart
+                            | ContainerAction::NetworkConnect
+                            | ContainerAction::NetworkDisconnect
                     );
                     state.update_containers(|containers| containers.apply(&event));
                 }
@@ -286,9 +297,9 @@ async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
             },
             listing = &mut relist, if !relist.is_terminated() => match listing {
                 Ok(listed) => {
-                    state.update_containers(|containers| containers.update_ports(listed));
+                    state.update_containers(|containers| containers.update_listed(listed));
                 }
-                Err(error) => tracing::debug!(error = %error, "listing Docker containers for ports failed"),
+                Err(error) => tracing::debug!(error = %error, "listing Docker containers again failed"),
             },
             Some((id, result)) = inspections.next() => match result {
                 Ok(Some(exit)) => {
@@ -311,6 +322,7 @@ fn publish_engine(state: &State, status: EngineStatus) {
 /// Containers are only known while the engine is ready.
 fn publish_not_ready(state: &State, status: EngineStatus) {
     state.update_containers(|containers| containers.replace_all([]));
+    state.set_engine_kind(None);
     publish_engine(state, status);
 }
 
