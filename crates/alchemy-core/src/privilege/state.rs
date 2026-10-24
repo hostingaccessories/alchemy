@@ -31,8 +31,17 @@ pub enum HostListener {
 pub struct LowPortFacts {
     /// The Host listener.
     pub host_listener: HostListener,
-    /// Whether the running alchemyd holds `cap_net_bind_service`.
+    /// Whether the running alchemyd holds `cap_net_bind_service` in its
+    /// effective set, from `CapEff` rather than the file's xattr, which
+    /// can be present but ignored.
     pub capable: bool,
+    /// Whether the running alchemyd's binary is on a `nosuid` mount, where
+    /// exec ignores file capabilities, as `~/.cargo/bin` can be.
+    pub nosuid: bool,
+    /// Whether alchemyd runs with `no_new_privs`, such as under a systemd
+    /// unit with `NoNewPrivileges=yes`, which also makes exec ignore file
+    /// capabilities.
+    pub no_new_privs: bool,
 }
 
 /// A host firewall Alchemy knows about.
@@ -170,6 +179,15 @@ pub enum UnsupportedReason {
     },
     /// alchemyd runs as root, and a service never does.
     RunsAsRoot,
+    /// alchemyd's binary is on a `nosuid` mount, so a low-ports grant
+    /// would be ignored.
+    NosuidMount {
+        /// The running alchemyd.
+        alchemyd: PathBuf,
+    },
+    /// alchemyd runs with `no_new_privs`, so a low-ports grant would be
+    /// ignored.
+    NoNewPrivileges,
 }
 
 impl fmt::Display for UnsupportedReason {
@@ -185,6 +203,14 @@ impl fmt::Display for UnsupportedReason {
             Self::UnmanagedFirewall { proxy_ports } => write!(
                 f,
                 "Alchemy only changes ufw and firewalld, not this firewall's rules. Allow 80/tcp, {proxy_ports}/tcp, and 5353/udp yourself."
+            ),
+            Self::NosuidMount { alchemyd } => write!(
+                f,
+                "{} is on a nosuid mount, where Linux ignores the low-ports permission. Run alchemyd from another location.",
+                alchemyd.display()
+            ),
+            Self::NoNewPrivileges => f.write_str(
+                "alchemyd runs with no_new_privs, as under NoNewPrivileges=yes, where Linux ignores the low-ports permission.",
             ),
             Self::RunsAsRoot => f.write_str(
                 "alchemyd is running as root, and Alchemy never installs it to run as root.",
@@ -224,6 +250,24 @@ fn base(action: Action, facts: &PrivilegeFacts) -> Base {
     match action {
         Action::LowPorts => match (facts.os, facts.low_ports) {
             (HostOs::Linux, LowPortFacts { capable: true, .. }) => Base::Granted,
+            (
+                HostOs::Linux,
+                LowPortFacts {
+                    host_listener: HostListener::Denied,
+                    no_new_privs: true,
+                    ..
+                },
+            ) => Base::Unsupported(UnsupportedReason::NoNewPrivileges),
+            (
+                HostOs::Linux,
+                LowPortFacts {
+                    host_listener: HostListener::Denied,
+                    nosuid: true,
+                    ..
+                },
+            ) => Base::Unsupported(UnsupportedReason::NosuidMount {
+                alchemyd: facts.alchemyd.clone(),
+            }),
             (
                 HostOs::Linux,
                 LowPortFacts {
@@ -380,6 +424,8 @@ mod tests {
             low_ports: LowPortFacts {
                 host_listener: HostListener::Listening,
                 capable: false,
+                nosuid: false,
+                no_new_privs: false,
             },
             firewall: FirewallFacts {
                 active: None,
@@ -556,6 +602,47 @@ mod tests {
                 PrivilegeState::Unsupported {
                     reason: UnsupportedReason::NoHelper,
                 },
+            ),
+            (
+                "nosuid mount",
+                HostOs::Linux,
+                |f| {
+                    denied(f);
+                    f.low_ports.nosuid = true;
+                },
+                PrivilegeState::Unsupported {
+                    reason: UnsupportedReason::NosuidMount {
+                        alchemyd: PathBuf::from(ALCHEMYD),
+                    },
+                },
+            ),
+            (
+                "no_new_privs",
+                HostOs::Linux,
+                |f| {
+                    denied(f);
+                    f.low_ports.no_new_privs = true;
+                    f.low_ports.nosuid = true;
+                },
+                PrivilegeState::Unsupported {
+                    reason: UnsupportedReason::NoNewPrivileges,
+                },
+            ),
+            (
+                "nosuid, but listening",
+                HostOs::Linux,
+                |f| f.low_ports.nosuid = true,
+                PrivilegeState::NotNeeded,
+            ),
+            (
+                "no_new_privs, but already capable",
+                HostOs::Linux,
+                |f| {
+                    denied(f);
+                    f.low_ports.no_new_privs = true;
+                    f.low_ports.capable = true;
+                },
+                PrivilegeState::Granted,
             ),
         ];
         for (name, os, tweak, want) in cases {
@@ -997,6 +1084,16 @@ mod tests {
             (
                 UnsupportedReason::RunsAsRoot,
                 "alchemyd is running as root, and Alchemy never installs it to run as root.",
+            ),
+            (
+                UnsupportedReason::NosuidMount {
+                    alchemyd: PathBuf::from("/home/me/.cargo/bin/alchemyd"),
+                },
+                "/home/me/.cargo/bin/alchemyd is on a nosuid mount, where Linux ignores the low-ports permission. Run alchemyd from another location.",
+            ),
+            (
+                UnsupportedReason::NoNewPrivileges,
+                "alchemyd runs with no_new_privs, as under NoNewPrivileges=yes, where Linux ignores the low-ports permission.",
             ),
         ];
         for (reason, want) in cases {
