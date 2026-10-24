@@ -5,6 +5,7 @@
 //! in as plain values.
 
 pub mod engine;
+pub mod logs;
 pub mod metrics;
 pub mod stack;
 
