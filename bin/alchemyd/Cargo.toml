@@ -48,8 +48,9 @@ mdns-sd = { workspace = true }
 zbus    = { workspace = true }
 
 [dev-dependencies]
-tokio     = { workspace = true, features = ["test-util"] }
-tower      = { workspace = true }
+alchemy-helper = { workspace = true }
+tokio          = { workspace = true, features = ["test-util"] }
+tower          = { workspace = true }
 
 [lints]
 workspace = true

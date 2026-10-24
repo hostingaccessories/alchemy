@@ -88,6 +88,7 @@ version = "0.1.0"
 dependencies = [
  "alchemy-api",
  "alchemy-core",
+ "alchemy-helper",
  "anyhow",
  "axum",
  "base64 0.22.1",
