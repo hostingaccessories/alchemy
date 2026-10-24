@@ -11,8 +11,9 @@
 //!
 //! It talks to the Docker engine through [`engine`], finds the user's
 //! Compose stacks through [`apps`], samples resource usage through
-//! [`metrics`], keeps what it learns in [`State`], and persists
-//! settings, history, and stop [`intent`] in a [`store::Store`].
+//! [`metrics`], reads app logs through [`logs`], keeps what it learns in
+//! [`State`], and persists settings, history, and stop [`intent`] in a
+//! [`store::Store`].
 
 pub mod apps;
 pub mod compose;
@@ -21,6 +22,7 @@ pub mod events;
 pub mod guard;
 pub mod http;
 pub mod intent;
+pub mod logs;
 pub mod metrics;
 mod secure_fs;
 pub mod socket;
@@ -40,6 +42,7 @@ use tokio::sync::watch;
 
 use crate::apps::AppsDeps;
 use crate::engine::{EngineMonitor, EngineSource, SystemConnector, SystemProbe};
+use crate::logs::{SharedLogSource, SystemLogs};
 use crate::metrics::{Collector, MetricsSource, SystemMetrics};
 use crate::store::{SharedStore, SqliteStore};
 
@@ -72,6 +75,8 @@ pub struct Deps<E, M = SystemMetrics> {
     pub metrics: M,
     /// What the apps task lists folders and reads compose files through.
     pub apps: AppsDeps,
+    /// Where app logs are read.
+    pub logs: SharedLogSource,
 }
 
 impl<E> Deps<E> {
@@ -82,7 +87,7 @@ impl<E> Deps<E> {
     /// searches nothing until the settings name a folder, and a
     /// [`FakeComposeConfig`](compose::FakeComposeConfig) that knows no
     /// projects, so `docker compose` never runs. Use [`Self::with_apps`]
-    /// to change either.
+    /// to change either. Logs are read from the engine.
     pub fn new(engine: E) -> Self {
         Self {
             state: State::new(),
@@ -93,6 +98,7 @@ impl<E> Deps<E> {
                 Arc::new(compose::FakeComposeConfig::new()),
                 None,
             ),
+            logs: Arc::new(SystemLogs::new()),
         }
     }
 }
@@ -105,6 +111,7 @@ impl<E, M> Deps<E, M> {
             engine: self.engine,
             metrics,
             apps: self.apps,
+            logs: self.logs,
         }
     }
 
@@ -112,6 +119,13 @@ impl<E, M> Deps<E, M> {
     #[must_use]
     pub fn with_apps(mut self, apps: AppsDeps) -> Self {
         self.apps = apps;
+        self
+    }
+
+    /// Read app logs from `logs`.
+    #[must_use]
+    pub fn with_logs(mut self, logs: SharedLogSource) -> Self {
+        self.logs = logs;
         self
     }
 }
@@ -191,7 +205,12 @@ pub async fn run_with(
     let socket_task = tokio::spawn(
         axum::serve(
             socket_listener,
-            http::api_router(deps.state.clone(), store.clone(), shutdown_rx.clone()),
+            http::api_router(
+                deps.state.clone(),
+                store.clone(),
+                shutdown_rx.clone(),
+                deps.logs.clone(),
+            ),
         )
         .with_graceful_shutdown(stopped(shutdown_rx.clone()))
         .into_future(),
@@ -199,7 +218,13 @@ pub async fn run_with(
     let http_task = tokio::spawn(
         axum::serve(
             http_listener,
-            http::router(deps.state, store, config.listen.ip(), shutdown_rx.clone()),
+            http::router(
+                deps.state,
+                store,
+                config.listen.ip(),
+                shutdown_rx.clone(),
+                deps.logs,
+            ),
         )
         .with_graceful_shutdown(stopped(shutdown_rx))
         .into_future(),

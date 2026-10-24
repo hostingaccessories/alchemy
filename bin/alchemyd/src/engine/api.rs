@@ -6,20 +6,24 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use alchemy_api::logs::LogStream;
 use alchemy_core::engine::{
     ContainerEvent, ContainerState, ContainerStatus, EngineStatus, Health, InspectedExit,
     flavor_from_platform, parse_action, parse_timestamp_ms,
 };
 use alchemy_core::metrics::{ContainerSample, DiskIo, Traffic, container_memory};
+use bollard::container::LogOutput;
 use bollard::models::{
     ContainerInspectResponse, ContainerStatsResponse, ContainerSummary, EventMessage,
     EventMessageTypeEnum, SystemVersion,
 };
-use bollard::query_parameters::{EventsOptions, ListContainersOptions, StatsOptions};
+use bollard::query_parameters::{EventsOptions, ListContainersOptions, LogsOptions, StatsOptions};
 use bollard::{ClientVersion, Docker};
+use futures_util::stream::BoxStream;
 use futures_util::{Stream, StreamExt as _};
 
 use super::Endpoint;
+use crate::logs::{LogChunk, LogRequest};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -320,6 +324,58 @@ impl BollardApi {
             .ok_or_else(|| ApiError::Decode("the engine sent no stats".into()))??;
         Ok(container_sample(container, stats))
     }
+
+    /// `GET /containers/{id}/logs` for stdout and stderr, with Docker's
+    /// timestamp before every line, as raw chunks in the order the engine
+    /// sends them.
+    ///
+    /// Without `follow` the stream ends after the lines asked for; with
+    /// it, when the container stops or the connection drops.
+    pub fn logs(
+        &self,
+        id: &str,
+        request: &LogRequest,
+    ) -> BoxStream<'static, Result<LogChunk, ApiError>> {
+        let options = LogsOptions {
+            follow: request.follow,
+            stdout: true,
+            stderr: true,
+            since: request
+                .since
+                .map_or(0, |secs| i32::try_from(secs.max(0)).unwrap_or(i32::MAX)),
+            until: 0,
+            timestamps: true,
+            tail: request
+                .tail
+                .map_or_else(|| "all".to_owned(), |n| n.to_string()),
+        };
+        self.docker
+            .logs(id, Some(options))
+            .filter_map(|item| {
+                std::future::ready(match item {
+                    Ok(output) => log_chunk(output).map(Ok),
+                    Err(error) => Some(Err(ApiError::from(error))),
+                })
+            })
+            .boxed()
+    }
+}
+
+/// A log frame as a [`LogChunk`]. A container with a terminal writes
+/// everything to its console, which is reported as stdout; stdin echoes
+/// are dropped.
+fn log_chunk(output: LogOutput) -> Option<LogChunk> {
+    let (stream, bytes) = match output {
+        LogOutput::StdOut { message } | LogOutput::Console { message } => {
+            (LogStream::Stdout, message)
+        }
+        LogOutput::StdErr { message } => (LogStream::Stderr, message),
+        LogOutput::StdIn { .. } => return None,
+    };
+    Some(LogChunk {
+        stream,
+        bytes: bytes.to_vec(),
+    })
 }
 
 /// The raw counters in `stats`, labelled with `container`'s identity.
@@ -789,5 +845,34 @@ mod tests {
             (0, None, 0)
         );
         assert_eq!((empty.net, empty.block), (None, None), "host network");
+    }
+
+    #[test]
+    fn log_chunk_maps_log_frames() {
+        let bytes = || axum::body::Bytes::from_static(b"hi\n");
+        let chunk = |stream| {
+            Some(LogChunk {
+                stream,
+                bytes: b"hi\n".to_vec(),
+            })
+        };
+        let cases = [
+            (
+                LogOutput::StdOut { message: bytes() },
+                chunk(LogStream::Stdout),
+            ),
+            (
+                LogOutput::StdErr { message: bytes() },
+                chunk(LogStream::Stderr),
+            ),
+            (
+                LogOutput::Console { message: bytes() },
+                chunk(LogStream::Stdout),
+            ),
+            (LogOutput::StdIn { message: bytes() }, None),
+        ];
+        for (output, want) in cases {
+            assert_eq!(log_chunk(output.clone()), want, "{output:?}");
+        }
     }
 }

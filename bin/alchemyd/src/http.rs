@@ -1,7 +1,8 @@
 //! HTTP API and web UI.
 //!
 //! Routes under `/api` return JSON, except `/api/events`, which streams
-//! [`ApiEvent`]s as server-sent events. The app routes are described in
+//! [`ApiEvent`]s as server-sent events, and `/api/apps/{name}/logs`,
+//! which streams an app's [`LogEvent`]s. The app routes are described in
 //! [`alchemy_api::apps`]. On the TCP listener ([`router`])
 //! everything else is served from the embedded web UI build with an
 //! `index.html` fallback for client-side routing; on the Unix socket
@@ -17,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alchemy_api::apps::{App, AppList, AppSettings, AppSettingsUpdate};
+use alchemy_api::logs::LogEvent;
 use alchemy_api::{
     ApiEvent, EngineStatus, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, MetricsRange,
     VersionResponse,
@@ -39,6 +41,7 @@ use crate::State;
 use crate::apps::{self, settings};
 use crate::events::{self, Topic};
 use crate::guard::{self, Refusal, TAURI_ORIGINS};
+use crate::logs::{self, LogQuery, LogsRefusal, SharedLogSource};
 use crate::store::SharedStore;
 
 /// How often `/api/events` sends an SSE comment while idle, so proxies and
@@ -51,6 +54,7 @@ struct Api {
     store: SharedStore,
     topics: Arc<[Topic]>,
     shutdown: watch::Receiver<bool>,
+    logs: SharedLogSource,
 }
 
 impl FromRef<Api> for State {
@@ -71,13 +75,19 @@ impl FromRef<Api> for SharedStore {
 /// is a JSON 404. Event streams end once `shutdown` becomes `true` (or its
 /// sender is dropped), so open `/api/events` connections do not hold up
 /// graceful shutdown. Only the socket's share of the [`crate::guard`]
-/// checks applies; see [`socket_checks`].
-pub fn api_router(state: State, store: SharedStore, shutdown: watch::Receiver<bool>) -> Router {
+/// checks applies; see [`socket_checks`]. App logs are read through
+/// `logs`.
+pub fn api_router(
+    state: State,
+    store: SharedStore,
+    shutdown: watch::Receiver<bool>,
+    logs: SharedLogSource,
+) -> Router {
     socket_checks(
         Router::new()
             .nest(
                 alchemy_api::API_PREFIX,
-                api(state, store, events::topics(), shutdown),
+                api(state, store, events::topics(), shutdown, logs),
             )
             .fallback(api_not_found),
     )
@@ -91,8 +101,9 @@ pub fn router(
     store: SharedStore,
     listen: IpAddr,
     shutdown: watch::Receiver<bool>,
+    logs: SharedLogSource,
 ) -> Router {
-    router_with_topics(state, store, listen, events::topics(), shutdown)
+    router_with_topics(state, store, listen, events::topics(), shutdown, logs)
 }
 
 /// [`router`], with `/api/events` publishing `topics` instead of the
@@ -103,10 +114,14 @@ pub fn router_with_topics(
     listen: IpAddr,
     topics: Vec<Topic>,
     shutdown: watch::Receiver<bool>,
+    logs: SharedLogSource,
 ) -> Router {
     tcp_checks(
         Router::new()
-            .nest(alchemy_api::API_PREFIX, api(state, store, topics, shutdown))
+            .nest(
+                alchemy_api::API_PREFIX,
+                api(state, store, topics, shutdown, logs),
+            )
             .fallback(crate::web::serve),
         listen,
     )
@@ -136,6 +151,7 @@ fn api(
     store: SharedStore,
     topics: Vec<Topic>,
     shutdown: watch::Receiver<bool>,
+    logs: SharedLogSource,
 ) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -146,6 +162,7 @@ fn api(
         .route("/metrics/history", get(metrics_history))
         .route("/apps", get(list_apps))
         .route("/apps/{name}", get(show_app))
+        .route("/apps/{name}/logs", get(app_logs))
         .route("/settings/apps", get(app_settings).put(set_app_settings))
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found)
@@ -154,6 +171,7 @@ fn api(
             store,
             topics: topics.into(),
             shutdown,
+            logs,
         })
 }
 
@@ -315,6 +333,73 @@ async fn show_app(
     }
 }
 
+/// `?service=web&tail=200&follow=true` on `/api/apps/{name}/logs`.
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    service: Option<String>,
+    tail: Option<String>,
+    follow: Option<String>,
+}
+
+/// The app's logs as server-sent events, until `done`, the client goes
+/// away, or shutdown.
+async fn app_logs(
+    extract::State(api): extract::State<Api>,
+    name: Result<extract::Path<String>, PathRejection>,
+    query: Result<Query<LogsQuery>, QueryRejection>,
+) -> Response {
+    let extract::Path(name) = match name {
+        Ok(name) => name,
+        Err(rejection) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::BadRequest,
+                &rejection.body_text(),
+            );
+        }
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => return bad_query(&rejection),
+    };
+    let query = match LogQuery::new(
+        &api.state.apps(),
+        &name,
+        query.service.as_deref(),
+        query.tail.as_deref(),
+        query.follow.as_deref(),
+    ) {
+        Ok(query) => query,
+        Err(refusal @ LogsRefusal::AppNotFound(_)) => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                ErrorCode::AppNotFound,
+                &refusal.to_string(),
+            );
+        }
+        Err(refusal) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::BadRequest,
+                &refusal.to_string(),
+            );
+        }
+    };
+    let mut shutdown = api.shutdown.clone();
+    let events = logs::stream(api.logs.clone(), api.state.clone(), query)
+        .map(|event| log_event(&event))
+        .take_until(async move {
+            let _ = shutdown.wait_for(|stop| *stop).await;
+        });
+    Sse::new(events)
+        .keep_alive(KeepAlive::new().interval(KEEP_ALIVE))
+        .into_response()
+}
+
+fn log_event(event: &LogEvent) -> Result<Event, axum::Error> {
+    Event::default().event(event.name()).json_data(event.data())
+}
+
 async fn app_settings(extract::State(state): extract::State<State>) -> Json<AppSettings> {
     Json(state.app_settings())
 }
@@ -425,13 +510,21 @@ mod tests {
         std::sync::Arc::new(crate::store::MemoryStore::new())
     }
 
+    fn no_logs() -> SharedLogSource {
+        std::sync::Arc::new(crate::logs::FakeLogSource::new())
+    }
+
     /// The daemon's router with only the engine topic on `/api/events`, so
     /// these tests read engine frames alone as other topics are added.
     fn test_router(state: State) -> (Router, watch::Sender<bool>) {
+        test_router_with_logs(state, no_logs())
+    }
+
+    fn test_router_with_logs(state: State, logs: SharedLogSource) -> (Router, watch::Sender<bool>) {
         let (tx, rx) = watch::channel(false);
         let engine = Topic::watch(State::watch_engine, ApiEvent::Engine);
         (
-            router_with_topics(state, memory(), LISTEN, vec![engine], rx),
+            router_with_topics(state, memory(), LISTEN, vec![engine], rx, logs),
             tx,
         )
     }
@@ -634,6 +727,7 @@ mod tests {
             LISTEN,
             vec![topic(a_rx), topic(b_rx)],
             stop_rx,
+            no_logs(),
         );
         let mut frames = Frames::new(open_events(app, None).await);
 
@@ -768,7 +862,7 @@ mod tests {
             ("/theme.js", StatusCode::NOT_FOUND),
         ] {
             let (_stop, rx) = watch::channel(false);
-            let resp = api_router(State::new(), memory(), rx)
+            let resp = api_router(State::new(), memory(), rx, no_logs())
                 .oneshot(
                     req(Method::GET, uri)
                         .header(header::ORIGIN, "tauri://localhost")
@@ -1075,7 +1169,7 @@ mod tests {
             origin: None,
             content_type: None,
         };
-        let app = api_router(State::new(), memory(), rx);
+        let app = api_router(State::new(), memory(), rx, no_logs());
         let (status, _, _) = send(app, probe.request("/api/health")).await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -1130,6 +1224,93 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn logs_refuse_unknown_apps_services_and_bad_queries() {
+        let state = State::new();
+        let mut apps = app_list();
+        apps.apps[0].services.push(alchemy_api::apps::AppService {
+            name: "web".into(),
+            containers: vec![],
+        });
+        state.set_apps(apps);
+        let cases = [
+            (
+                "/api/apps/nope/logs",
+                StatusCode::NOT_FOUND,
+                "app_not_found",
+            ),
+            (
+                "/api/apps/blog/logs?service=db",
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+            (
+                "/api/apps/blog/logs?tail=all",
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+            (
+                "/api/apps/blog/logs?follow=maybe",
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+        ];
+        for (uri, want, code) in cases {
+            let (status, body) = get_json_from(state.clone(), uri).await;
+            assert_eq!(status, want, "{uri}: {body}");
+            assert_eq!(body["code"], code, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_stream_lines_then_done() {
+        let state = State::new();
+        let mut engine = EngineStatus::new(EngineState::Ready);
+        engine.endpoint = Some("unix:///fake.sock".into());
+        state.set_engine(engine);
+        let mut apps = app_list();
+        apps.apps[0].services.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "web",
+                "containers": [{
+                    "id": "w1", "name": "blog-web-1", "image": null,
+                    "state": "running", "health": null,
+                }],
+            }))
+            .unwrap(),
+        );
+        state.set_apps(apps);
+        let source = crate::logs::FakeLogSource::new();
+        source.write(
+            "w1",
+            alchemy_api::logs::LogStream::Stdout,
+            "2024-05-06T07:08:09.000000001Z",
+            "hello",
+        );
+        let (app, _stop) = test_router_with_logs(state, std::sync::Arc::new(source));
+        let resp = app
+            .oneshot(
+                req(Method::GET, "/api/apps/blog/logs?service=web&tail=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/event-stream");
+        let mut frames = Frames::new(resp);
+        assert_eq!(
+            frames.next().await.unwrap(),
+            r#"event: log
+data: {"service":"web","container":"blog-web-1","stream":"stdout","time":"2024-05-06T07:08:09.000000001Z","line":"hello"}"#
+        );
+        assert_eq!(
+            frames.next().await.unwrap(),
+            "event: done\ndata: {\"error\":null}"
+        );
+        assert_eq!(frames.next().await, None);
+    }
+
     async fn put_settings(
         state: &State,
         store: &SharedStore,
@@ -1141,7 +1322,7 @@ mod tests {
         if let Some(content_type) = content_type {
             request = request.header(header::CONTENT_TYPE, content_type);
         }
-        let resp = router(state.clone(), store.clone(), LISTEN, rx)
+        let resp = router(state.clone(), store.clone(), LISTEN, rx, no_logs())
             .oneshot(request.body(Body::from(body.to_owned())).unwrap())
             .await
             .unwrap();
