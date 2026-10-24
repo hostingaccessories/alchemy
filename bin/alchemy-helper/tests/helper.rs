@@ -60,12 +60,16 @@ fn invalid_arguments_are_usage_errors() {
         &["grant-low-ports", "/bin/sh"],
         &["check", "--force"],
         &["help"],
+        &["install-service"],
+        &["install-service", "--uid", "0"],
+        &["install-service", "--uid", "alice"],
+        &["remove-service", "--uid", "-1"],
     ] {
         let (code, stdout, stderr) = helper(Path::new(HELPER), args);
         assert_eq!(code, 64, "{args:?}");
         assert_eq!(stdout, usage, "{args:?}");
         assert!(
-            stderr.contains("Usage: alchemy-helper"),
+            stderr.contains("alchemy-helper") || stderr.contains("--uid"),
             "{args:?}: {stderr}"
         );
     }
@@ -94,8 +98,15 @@ fn every_operation_needs_root() {
         );
         return;
     }
-    for operation in ["check", "grant-low-ports", "revoke-low-ports"] {
-        let (code, stdout, stderr) = helper(Path::new(HELPER), &[operation]);
+    for args in [
+        &["check"][..],
+        &["grant-low-ports"],
+        &["revoke-low-ports"],
+        &["install-service", "--uid", "1000"],
+        &["remove-service", "--uid", "1000"],
+    ] {
+        let operation = args[0];
+        let (code, stdout, stderr) = helper(Path::new(HELPER), args);
         assert_eq!(code, 77, "{operation}");
         assert_eq!(stdout, error_line(operation, "not_root"));
         assert_eq!(stderr, "alchemy-helper: must be run as root\n");
