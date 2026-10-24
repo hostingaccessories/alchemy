@@ -11,9 +11,10 @@ use alchemy_api::apps::{
     SkipReason as WireSkip, SkippedApp, UnmanagedApp,
 };
 use alchemy_core::StackNameError;
-use alchemy_core::engine::{ContainerState, ContainerStatus, Containers};
+use alchemy_core::engine::{ContainerStatus, Containers, Intent, StopReason, summarize};
 use alchemy_core::stack::{
-    DirReport, DirState, Discovery, FoundStack, SkipReason, Skipped, StackStatus, stack_status,
+    DirReport, DirState, Discovery, FoundStack, ServiceRun, SkipReason, Skipped, StackStatus,
+    stack_status,
 };
 
 use crate::compose::{ComposeConfig, ConfigError};
@@ -132,6 +133,7 @@ fn app(
         images: None,
         services: Vec::new(),
         problems: Vec::new(),
+        stop_reason: StopReason::Unknown,
     };
     match inputs.configs.get(&stack.dir) {
         Some(ConfigOutcome::Ready(config)) => {
@@ -139,6 +141,12 @@ fn app(
             let expected: Vec<&str> = config.services.iter().map(|s| s.name.as_str()).collect();
             app.services = services(&expected, containers);
             app.status = status(&app.services, expected.len(), inputs.engine_ready);
+            app.stop_reason = reason(
+                &app.services,
+                expected.len(),
+                inputs.containers.intent(&config.name),
+                inputs.engine_ready,
+            );
             app.project = Some(config.name.clone());
             app.images = Some(config.images());
         }
@@ -187,6 +195,7 @@ fn app_container(container: &ContainerStatus) -> AppContainer {
         image: container.image.clone(),
         state: container.state,
         health: container.health,
+        stop_reason: container.stop_reason,
     }
 }
 
@@ -196,12 +205,29 @@ fn status(services: &[AppService], counted: usize, engine_ready: bool) -> StackS
     if !engine_ready {
         return StackStatus::Unknown;
     }
-    stack_status(services.iter().take(counted).map(|service| {
-        service
-            .containers
-            .iter()
-            .any(|c| c.state == ContainerState::Running)
-    }))
+    stack_status(
+        services.iter().take(counted).map(|service| {
+            ServiceRun::of(service.containers.iter().map(|c| (c.state, c.stop_reason)))
+        }),
+    )
+}
+
+/// The app's reason from the containers of the first `counted` services,
+/// as [`status`] counts them, and its project's last intent.
+fn reason(
+    services: &[AppService],
+    counted: usize,
+    intent: Option<&Intent>,
+    engine_ready: bool,
+) -> StopReason {
+    if !engine_ready {
+        return StopReason::Unknown;
+    }
+    let reasons = services
+        .iter()
+        .take(counted)
+        .flat_map(|service| service.containers.iter().map(|c| c.stop_reason));
+    summarize(reasons, intent)
 }
 
 fn mark_shared_projects(apps: &mut [App]) {
@@ -348,6 +374,8 @@ mod tests {
     use alchemy_core::engine::Health;
     use alchemy_core::stack::{EntryKind, FileInfo, ListedDir, ListedEntry, Listing, discover};
 
+    use alchemy_core::engine::ContainerState;
+
     use super::*;
     use crate::compose::ServiceConfig;
 
@@ -485,6 +513,62 @@ mod tests {
     }
 
     #[test]
+    fn finished_jobs_and_crashes_decide_status_and_reason() {
+        use alchemy_core::engine::{ContainerAction, ContainerEvent, IntentAction};
+        let found = discovery(&[("/srv/apps", &["blog"])]);
+        let configs: BTreeMap<PathBuf, ConfigOutcome> = [(
+            PathBuf::from("/srv/apps/blog"),
+            config("blog", &[("migrate", false), ("web", false)]),
+        )]
+        .into();
+        let died = |id: &str, code| {
+            let mut event = ContainerEvent::new(id, ContainerAction::Die);
+            event.exit_code = Some(code);
+            event
+        };
+        let both = || {
+            containers(vec![
+                container("1", "blog", "migrate", Running),
+                container("2", "blog", "web", Running),
+            ])
+        };
+
+        let mut finished = both();
+        finished.apply(&died("1", 0));
+        let app = list(&found, &configs, &finished, true).apps.remove(0);
+        assert_eq!(
+            app.status,
+            StackStatus::Running,
+            "a finished job is not missing"
+        );
+        assert_eq!(app.stop_reason, StopReason::Running);
+        assert_eq!(
+            app.services[0].containers[0].stop_reason,
+            StopReason::Finished
+        );
+
+        let mut crashed = both();
+        crashed.apply(&died("1", 0));
+        crashed.apply(&died("2", 1));
+        let app = list(&found, &configs, &crashed, true).apps.remove(0);
+        assert_eq!(app.status, StackStatus::Stopped);
+        assert_eq!(
+            app.stop_reason,
+            StopReason::Crashed {
+                exit_code: Some(1),
+                oom: false
+            }
+        );
+
+        let mut down = containers(vec![]);
+        down.set_intent("blog", Intent::new(IntentAction::Down, 1));
+        let app = list(&found, &configs, &down, true).apps.remove(0);
+        assert_eq!(app.stop_reason, StopReason::StoppedByAlchemy);
+        let app = list(&found, &configs, &down, false).apps.remove(0);
+        assert_eq!(app.stop_reason, StopReason::Unknown);
+    }
+
+    #[test]
     fn apps_carry_services_containers_and_image_source() {
         let found = discovery(&[("/srv/apps", &["blog"])]);
         let configs: BTreeMap<PathBuf, ConfigOutcome> = [(
@@ -527,6 +611,7 @@ mod tests {
                 image: Some("postgres:16".into()),
                 state: Running,
                 health: Some(Health::Healthy),
+                stop_reason: StopReason::Running,
             }
         );
         let unmanaged: Vec<_> = got.unmanaged.iter().map(|u| u.project.as_str()).collect();

@@ -13,7 +13,7 @@
 //! the people using Alchemy and safe to show as is.
 
 pub use alchemy_core::StackName;
-pub use alchemy_core::engine::{ContainerState, Health};
+pub use alchemy_core::engine::{ContainerState, Health, StopReason};
 pub use alchemy_core::stack::{ImageSource, StackStatus};
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +54,10 @@ pub struct App {
     pub services: Vec<AppService>,
     /// What is wrong with the app, worst first. Empty when nothing is.
     pub problems: Vec<AppProblem>,
+    /// Why it is or is not running: the most pressing of its containers'
+    /// reasons, such as a crash in one service while the others run.
+    #[serde(default)]
+    pub stop_reason: StopReason,
 }
 
 /// One service of an app and its containers.
@@ -78,6 +82,9 @@ pub struct AppContainer {
     pub state: ContainerState,
     /// Healthcheck result, if it has a healthcheck.
     pub health: Option<Health>,
+    /// Why it is or is not running.
+    #[serde(default)]
+    pub stop_reason: StopReason,
 }
 
 /// Something wrong with an app.

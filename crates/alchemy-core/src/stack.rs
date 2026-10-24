@@ -18,7 +18,7 @@ pub use discovery::{
     COMPOSE_FILES, DirReport, DirState, Discovery, EntryKind, FileInfo, FoundStack, ListedDir,
     ListedEntry, Listing, OVERRIDE_FILES, SkipReason, Skipped, WATCHED_FILES, discover,
 };
-pub use status::{ImageSource, StackStatus, stack_status};
+pub use status::{ImageSource, ServiceRun, StackStatus, stack_status};
 
 /// Maximum accepted stack name length, in bytes.
 const MAX_LEN: usize = 63;

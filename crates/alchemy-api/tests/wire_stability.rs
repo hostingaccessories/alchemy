@@ -417,6 +417,7 @@ fn blog() -> App {
                     image: Some("postgres:16".into()),
                     state: ContainerState::Running,
                     health: Some(Health::Healthy),
+                    stop_reason: StopReason::Running,
                 }],
             },
             AppService {
@@ -428,6 +429,10 @@ fn blog() -> App {
             kind: AppProblemKind::SharedProject,
             message: "x".into(),
         }],
+        stop_reason: StopReason::Crashed {
+            exit_code: Some(1),
+            oom: false,
+        },
     }
 }
 
@@ -435,8 +440,9 @@ const BLOG: &str = concat!(
     r#"{"name":"blog","status":"partial","dir":"/srv/apps/blog","root":"/srv/apps","#,
     r#""compose_file":"compose.yaml","project":"blog","images":"build","services":["#,
     r#"{"name":"db","containers":[{"id":"abc","name":"blog-db-1","image":"postgres:16","#,
-    r#""state":"running","health":"healthy"}]},{"name":"web","containers":[]}],"#,
-    r#""problems":[{"kind":"shared_project","message":"x"}]}"#,
+    r#""state":"running","health":"healthy","stop_reason":{"kind":"running"}}]},"#,
+    r#"{"name":"web","containers":[]}],"problems":[{"kind":"shared_project","message":"x"}],"#,
+    r#""stop_reason":{"kind":"crashed","exit_code":1,"oom":false}}"#,
 );
 
 #[test]
@@ -453,15 +459,19 @@ fn app() {
         images: None,
         services: vec![],
         problems: vec![],
+        stop_reason: StopReason::Unknown,
     };
+    let json = concat!(
+        r#"{"name":"new","status":"unknown","dir":"/srv/apps/new","root":"/srv/apps","#,
+        r#""compose_file":"docker-compose.yml","project":null,"images":null,"#,
+        r#""services":[],"problems":[]"#,
+    );
     assert_wire(
         &unread,
-        concat!(
-            r#"{"name":"new","status":"unknown","dir":"/srv/apps/new","root":"/srv/apps","#,
-            r#""compose_file":"docker-compose.yml","project":null,"images":null,"#,
-            r#""services":[],"problems":[]}"#,
-        ),
+        &format!(r#"{json},"stop_reason":{{"kind":"unknown"}}}}"#),
     );
+    let older: App = serde_json::from_str(&format!("{json}}}")).unwrap();
+    assert_eq!(older, unread, "a daemon without stop reasons");
 }
 
 #[test]
