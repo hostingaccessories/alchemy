@@ -6,7 +6,7 @@
 
 pub mod engine;
 pub mod metrics;
-mod stack;
+pub mod stack;
 
 pub use stack::{StackName, StackNameError};
 

@@ -1,9 +1,24 @@
-//! Compose stacks.
+//! Compose stacks: their names, where they live, and how they are doing.
+//!
+//! The UI and CLI call a stack an app. Everything here is a pure decision
+//! over plain values: the daemon lists directories and reads Compose's
+//! resolved configuration, then passes the results in.
+
+mod dirs;
+mod discovery;
+mod status;
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub use dirs::{MAX_EXTRA_DIRS, StackDirs, StackDirsError, default_stack_home};
+pub use discovery::{
+    COMPOSE_FILES, DirReport, DirState, Discovery, EntryKind, FileInfo, FoundStack, ListedDir,
+    ListedEntry, Listing, OVERRIDE_FILES, SkipReason, Skipped, WATCHED_FILES, discover,
+};
+pub use status::{ImageSource, StackStatus, stack_status};
 
 /// Maximum accepted stack name length, in bytes.
 const MAX_LEN: usize = 63;
