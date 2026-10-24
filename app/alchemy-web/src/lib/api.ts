@@ -280,6 +280,46 @@ export interface AppSettingsUpdate {
   extra: string[];
 }
 
+/** Mirrors `alchemy_api::apps::files::MAX_FILE_LEN`: the most bytes a compose file or `.env` holds. */
+export const MAX_FILE_LEN = 256 * 1024;
+
+/** Mirrors `alchemy_api::apps::files::NewApp`, the body of `POST /api/apps`. */
+export interface NewApp {
+  name: string;
+  /** A configured app folder as a full path, or `null` for the home. */
+  folder: string | null;
+  compose: string;
+  /** Saved as `.env`, readable by its owner alone; `null` writes none. */
+  env: string | null;
+  dry_run: boolean;
+}
+
+/** Mirrors `alchemy_api::apps::files::AppFileKind`, also the route's path segment. */
+export type AppFileKind = "compose" | "env";
+
+/** Mirrors `alchemy_api::apps::files::AppFile`, from `GET /api/apps/{name}/files/{kind}`. */
+export interface AppFile {
+  kind: AppFileKind;
+  /** Its name in the app's folder, such as `compose.yaml` or `.env`. */
+  name: string;
+  /** Empty when the file doesn't exist. */
+  content: string;
+  /** SHA-256 of the bytes in hex, sent back as `base_hash`; `null` when the file doesn't exist. */
+  hash: string | null;
+}
+
+/**
+ * Mirrors `alchemy_api::apps::files::AppFileUpdate`, the body of
+ * `PUT /api/apps/{name}/files/{kind}`. A `base_hash` that no longer matches
+ * the file on disk is refused with 409 `conflict`; Compose rejecting the
+ * content is 422 `invalid` with Compose's message.
+ */
+export interface AppFileUpdate {
+  content: string;
+  base_hash: string | null;
+  dry_run: boolean;
+}
+
 /** Mirrors `alchemy_api::logs::LogStream`; unknown outputs arrive as `other`. */
 export type LogStream = "stdout" | "stderr" | "other";
 
@@ -650,5 +690,10 @@ export const api = {
   cancelOperation: (id: string) =>
     request<OperationResponse>("POST", `/operations/${encodeURIComponent(id)}/cancel`),
   followOperation,
+  createApp: (app: NewApp) => request<App>("POST", "/apps", { body: app }),
+  appFile: (name: string, kind: AppFileKind, signal?: AbortSignal) =>
+    request<AppFile>("GET", `/apps/${encodeURIComponent(name)}/files/${kind}`, { signal }),
+  saveAppFile: (name: string, kind: AppFileKind, update: AppFileUpdate) =>
+    request<AppFile>("PUT", `/apps/${encodeURIComponent(name)}/files/${kind}`, { body: update }),
   subscribe,
 };
