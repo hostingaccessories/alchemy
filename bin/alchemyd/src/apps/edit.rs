@@ -1,21 +1,30 @@
 //! Creating apps and editing their files: [`AppEditor`].
 //!
 //! Nothing reaches an app folder until Compose has accepted it. Every
-//! write is staged in a hidden directory made inside the app folder it
-//! goes to, validated there with `docker compose config`, then moved into
-//! place with one rename on the same filesystem:
+//! write is staged in a hidden `.alchemy-tmp-*` directory that only its
+//! owner can open, made in the folder the write lands in, validated there
+//! with `docker compose config`, then moved into place with one rename on
+//! that folder's filesystem:
 //!
 //! - A new app is staged as `<folder>/.alchemy-tmp-<name>-XXXX/<name>`, so
 //!   Compose names the project as it will once in place, and renamed to
 //!   `<folder>/<name>` only if nothing is there yet. An existing folder is
 //!   never replaced, since it may hold data.
-//! - An edit stages the one file being edited and validates it against
-//!   the app's own folder, so relative paths, `env_file:` entries, and
-//!   override files resolve as they will. It is renamed over the live file
-//!   only if that file still has the hash the edit started from, checked
-//!   before staging and again after Compose has run. No other file in the
-//!   folder is touched, and a single rename cannot leave a mix of old and
-//!   new to roll back.
+//! - An edit stages the one file being edited inside the app's own folder,
+//!   as `<app>/.alchemy-tmp-<name>-XXXX/<file>`, so the rename over the
+//!   live file stays on the app folder's filesystem even when that folder
+//!   is a mount of its own, such as a ZFS dataset, a btrfs subvolume, or
+//!   a bind mount. It is validated against the app's folder, so relative
+//!   paths, `env_file:` entries, and override files resolve as they will.
+//!   It is renamed over the live file only if that file still has the
+//!   hash the edit started from, checked before staging and again after
+//!   Compose has run. No other file in the folder is touched, and a single
+//!   rename cannot leave a mix of old and new to roll back.
+//!
+//! Discovery skips hidden entries and watches only an app's compose and
+//! `.env` files, so a staging directory is never mistaken for an app or a
+//! change to one. It is removed once the write is done, whether it was
+//! saved, refused, or abandoned by a client that went away.
 //!
 //! Only apps in the app folders are edited, never unmanaged projects, and
 //! a symlinked folder or file is refused rather than followed. `.env` is
@@ -121,7 +130,6 @@ pub struct AppEditor {
 struct Target {
     kind: AppFileKind,
     name: String,
-    root: PathBuf,
     dir: PathBuf,
     file_name: String,
 }
@@ -135,9 +143,67 @@ impl Target {
 /// An edit staged and ready to validate.
 #[derive(Debug)]
 struct StagedEdit {
-    staging: PathBuf,
+    staging: Staging,
     staged: PathBuf,
     check: ComposeCheck,
+}
+
+/// A staging directory, removed by [`Self::remove`] once a write is done.
+///
+/// One dropped without being removed, as when a client goes away and its
+/// request is dropped mid-write, is removed in the background instead, so
+/// no path leaves a staging directory behind.
+#[derive(Debug)]
+struct Staging {
+    disk: Arc<dyn AppDisk>,
+    dir: PathBuf,
+    removed: bool,
+}
+
+impl Staging {
+    fn new(disk: Arc<dyn AppDisk>, dir: PathBuf) -> Self {
+        Self {
+            disk,
+            dir,
+            removed: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Remove it now, blocking.
+    fn remove_now(mut self) {
+        self.removed = true;
+        remove_logged(&*self.disk, &self.dir);
+    }
+
+    /// Remove it off the async runtime, and wait for that.
+    async fn remove(self) {
+        let _ = tokio::task::spawn_blocking(move || self.remove_now()).await;
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if self.removed {
+            return;
+        }
+        let (disk, dir) = (self.disk.clone(), std::mem::take(&mut self.dir));
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || remove_logged(&*disk, &dir));
+            }
+            Err(_) => remove_logged(&*disk, &dir),
+        }
+    }
+}
+
+fn remove_logged(disk: &dyn AppDisk, dir: &Path) {
+    if let Err(error) = disk.remove_staging(dir) {
+        tracing::warn!(%error, dir = %dir.display(), "removing a staging folder failed");
+    }
 }
 
 impl AppEditor {
@@ -200,10 +266,10 @@ impl AppEditor {
 
         let staged = {
             let (disk, target, update) = (self.disk.clone(), target.clone(), update.clone());
-            blocking(move || stage_edit(&*disk, &target, &update)).await??
+            blocking(move || stage_edit(&disk, &target, &update)).await??
         };
         let result = self.finish_edit(state, &target, &staged, &update).await;
-        self.remove_staging(staged.staging).await;
+        staged.staging.remove().await;
         result?;
         if !update.dry_run {
             tracing::info!(app = %target.name, file = %target.file_name, "saved app file");
@@ -224,8 +290,12 @@ impl AppEditor {
         staged: &StagedEdit,
         update: &Arc<AppFileUpdate>,
     ) -> Result<(), EditError> {
-        self.validate(state, &staged.check, &[(&staged.staging, &target.dir)])
-            .await?;
+        self.validate(
+            state,
+            &staged.check,
+            &[(staged.staging.path(), &target.dir)],
+        )
+        .await?;
         let (disk, target, staged_file, update) = (
             self.disk.clone(),
             target.clone(),
@@ -242,11 +312,16 @@ impl AppEditor {
                 keep_owner(&*disk, &staged_file, live, &target.file_name)?;
             }
             disk.rename_over(&staged_file, &target.live())
-                .map_err(EditError::io(format!(
-                    "Alchemy couldn't save {} in {}",
-                    target.file_name,
-                    target.dir.display()
-                )))
+                .map_err(|err| {
+                    rename_failed(
+                        err,
+                        format!(
+                            "Alchemy couldn't save {} in {}",
+                            target.file_name,
+                            target.dir.display()
+                        ),
+                    )
+                })
         })
         .await?
     }
@@ -287,14 +362,17 @@ impl AppEditor {
                 name.clone(),
             );
             let dry_run = new.dry_run;
-            blocking(move || begin_create(&*disk, &root, is_home, dry_run, &target, &name))
-                .await??
+            blocking(move || {
+                begin_create(&*disk, &root, is_home, dry_run, &target, &name)
+                    .map(|dir| Staging::new(disk, dir))
+            })
+            .await??
         };
-        let staged_app = staging.join(name.as_str());
+        let staged_app = staging.path().join(name.as_str());
         let result = self
-            .finish_create(state, &staging, &staged_app, &root, &target, &new)
+            .finish_create(state, staging.path(), &staged_app, &root, &target, &new)
             .await;
-        self.remove_staging(staging).await;
+        staging.remove().await;
         let config = result?;
         if !new.dry_run {
             tracing::info!(app = %name, dir = %target.display(), "created app");
@@ -334,7 +412,7 @@ impl AppEditor {
                 if err.kind() == io::ErrorKind::AlreadyExists {
                     exists(&to)
                 } else {
-                    EditError::io(format!("Alchemy couldn't create {}", to.display()))(err)
+                    rename_failed(err, format!("Alchemy couldn't create {}", to.display()))
                 }
             })
         })
@@ -363,18 +441,6 @@ impl AppEditor {
                 }))
             }
             Err(err) => Err(EditError::ComposeUnavailable(err.to_string())),
-        }
-    }
-
-    async fn remove_staging(&self, staging: PathBuf) {
-        let disk = self.disk.clone();
-        let removed = blocking(move || {
-            let result = disk.remove_staging(&staging);
-            (staging, result)
-        })
-        .await;
-        if let Ok((staging, Err(error))) = removed {
-            tracing::warn!(%error, dir = %staging.display(), "removing a staging folder failed");
         }
     }
 }
@@ -422,7 +488,6 @@ fn locate(state: &State, name: &str, kind: AppFileKind) -> Result<Target, EditEr
     Ok(Target {
         kind,
         name: name.to_owned(),
-        root,
         dir,
         file_name,
     })
@@ -506,24 +571,27 @@ fn check_base(
     }
 }
 
-/// Check the folder and the base hash, then stage the new content.
+/// Check the folder and the base hash, then stage the new content in a
+/// staging directory inside the app's folder, so saving it is a rename
+/// within that folder's filesystem.
 fn stage_edit(
-    disk: &dyn AppDisk,
+    disk: &Arc<dyn AppDisk>,
     target: &Target,
     update: &AppFileUpdate,
 ) -> Result<StagedEdit, EditError> {
-    check_dir(disk, target)?;
-    let live = read_live(disk, target)?;
+    check_dir(&**disk, target)?;
+    let live = read_live(&**disk, target)?;
     check_base(target, live.as_ref(), update.base_hash.as_deref())?;
     let name = StackName::new(target.name.as_str())
         .map_err(|_| EditError::AppNotFound(target.name.clone()))?;
     let staging = disk
-        .make_staging(&target.root, &staging_prefix(&name))
+        .make_staging(&target.dir, &staging_prefix(&name))
         .map_err(EditError::io(format!(
             "Alchemy couldn't make a temporary folder in {}",
-            target.root.display()
+            target.dir.display()
         )))?;
-    let staged = staging.join(&target.file_name);
+    let staging = Staging::new(disk.clone(), staging);
+    let staged = staging.path().join(&target.file_name);
     let mode = live.as_ref().map_or(target.kind.new_mode(), |file| {
         target.kind.replacement_mode(file.mode)
     });
@@ -533,7 +601,7 @@ fn stage_edit(
             "Alchemy couldn't write a copy of {}",
             target.file_name
         )))
-        .and_then(|()| edit_check(disk, target, &staged));
+        .and_then(|()| edit_check(&**disk, target, &staged));
     match checked {
         Ok(check) => Ok(StagedEdit {
             staging,
@@ -541,9 +609,7 @@ fn stage_edit(
             check,
         }),
         Err(err) => {
-            if let Err(error) = disk.remove_staging(&staging) {
-                tracing::warn!(%error, dir = %staging.display(), "removing a staging folder failed");
-            }
+            staging.remove_now();
             Err(err)
         }
     }
@@ -595,6 +661,19 @@ fn keep_owner(
         .map_err(EditError::io(format!(
             "Alchemy couldn't give the new {file_name} the same owner and group as the old one"
         )))
+}
+
+/// What a failed rename into place means. A rename that would cross
+/// filesystems is reported as such, since it means the folder changed
+/// under Alchemy, not that saving can work on a retry.
+fn rename_failed(err: io::Error, what: String) -> EditError {
+    if err.kind() == io::ErrorKind::CrossesDevices {
+        EditError::Conflict(format!(
+            "{what}: its temporary copy ended up on a different filesystem, so it couldn't be moved into place. Check that nothing is mounted inside the folder and try again."
+        ))
+    } else {
+        EditError::io(what)(err)
+    }
 }
 
 fn exists(target: &Path) -> EditError {
@@ -1099,9 +1178,68 @@ mod tests {
         assert_eq!(check.project().dir(), f.blog);
         assert_eq!(check.files().len(), 2);
         assert_eq!(check.files()[0].file_name().unwrap(), "compose.yaml");
-        assert_ne!(check.files()[0].parent().unwrap(), f.blog);
+        let staging = check.files()[0].parent().unwrap();
+        assert_eq!(staging.parent().unwrap(), f.blog);
         assert_eq!(check.files()[1], f.blog.join("compose.override.yaml"));
         assert_eq!(check.env_file(), None);
+    }
+
+    #[tokio::test]
+    async fn stages_an_edit_privately_inside_the_app_folder_unseen_by_discovery() {
+        use alchemy_core::stack::{ListedDir, discover};
+
+        use crate::apps::{AppFs as _, SystemFs};
+
+        type Seen = (PathBuf, u32, u32, Vec<String>, Vec<(String, Vec<String>)>);
+
+        let f = Fixture::new();
+        let base = f.read(AppFileKind::Compose).await.hash;
+        let seen: Arc<std::sync::Mutex<Option<Seen>>> = Arc::default();
+        f.validator.on_validate({
+            let (seen, home) = (seen.clone(), f.home.clone());
+            move |check| {
+                let staged = check.files()[0].clone();
+                let staging = staged.parent().unwrap().to_owned();
+                let found = discover(&[ListedDir {
+                    dir: home.clone(),
+                    listing: SystemFs.list(&home),
+                }]);
+                let stacks = found
+                    .stacks
+                    .iter()
+                    .map(|s| (s.name.to_string(), s.files.keys().cloned().collect()))
+                    .collect();
+                *seen.lock().unwrap() = Some((
+                    staging.clone(),
+                    mode(&staging),
+                    mode(&staged),
+                    entries(&staging),
+                    stacks,
+                ));
+            }
+        });
+        f.write(AppFileKind::Compose, COMPOSE, base).await.unwrap();
+
+        let (staging, dir_mode, file_mode, staged, stacks) = seen.lock().unwrap().take().unwrap();
+        assert_eq!(staging.parent().unwrap(), f.blog);
+        assert!(
+            staging
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".alchemy-tmp-blog-"),
+            "{}",
+            staging.display()
+        );
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o640);
+        assert_eq!(staged, ["compose.yaml"]);
+        assert_eq!(
+            stacks,
+            [("blog".to_owned(), vec!["compose.yaml".to_owned()])]
+        );
+        assert!(!staging.exists());
+        assert_eq!(entries(&f.blog), ["compose.yaml"]);
     }
 
     #[tokio::test]
@@ -1205,11 +1343,46 @@ mod tests {
         assert_eq!(entries(&f.home), ["blog"]);
     }
 
-    /// [`SystemDisk`], except that replacing a file always fails.
-    #[derive(Debug)]
-    struct NoReplace;
+    type RenameFault = dyn Fn(&Path, &Path) -> Option<io::Error> + Send + Sync;
 
-    impl AppDisk for NoReplace {
+    /// [`SystemDisk`], except that a rename fails with the error the fault
+    /// gives for it, if any.
+    struct Renames(Box<RenameFault>);
+
+    impl std::fmt::Debug for Renames {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Renames")
+        }
+    }
+
+    impl Renames {
+        fn failing(kind: io::ErrorKind) -> Arc<dyn AppDisk> {
+            Arc::new(Self(Box::new(move |_, _| Some(kind.into()))))
+        }
+
+        /// As if `mount` were a filesystem of its own: a rename into or out
+        /// of it fails with `EXDEV`.
+        fn mounted(mount: PathBuf) -> Arc<dyn AppDisk> {
+            Arc::new(Self(Box::new(move |from, to| {
+                (from.starts_with(&mount) != to.starts_with(&mount))
+                    .then(|| io::ErrorKind::CrossesDevices.into())
+            })))
+        }
+
+        fn rename(
+            &self,
+            from: &Path,
+            to: &Path,
+            rename: impl FnOnce() -> io::Result<()>,
+        ) -> io::Result<()> {
+            match (self.0)(from, to) {
+                Some(err) => Err(err),
+                None => rename(),
+            }
+        }
+    }
+
+    impl AppDisk for Renames {
         fn kind(&self, path: &Path) -> io::Result<Option<EntryKind>> {
             SystemDisk.kind(path)
         }
@@ -1234,11 +1407,11 @@ mod tests {
         fn set_owner(&self, path: &Path, uid: u32, gid: u32) -> io::Result<()> {
             SystemDisk.set_owner(path, uid, gid)
         }
-        fn rename_new(&self, _from: &Path, _to: &Path) -> io::Result<()> {
-            Err(io::Error::from_raw_os_error(18))
+        fn rename_new(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.rename(from, to, || SystemDisk.rename_new(from, to))
         }
-        fn rename_over(&self, _from: &Path, _to: &Path) -> io::Result<()> {
-            Err(io::Error::from_raw_os_error(18))
+        fn rename_over(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.rename(from, to, || SystemDisk.rename_over(from, to))
         }
         fn remove_staging(&self, dir: &Path) -> io::Result<()> {
             SystemDisk.remove_staging(dir)
@@ -1246,34 +1419,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_rename_changes_nothing_and_cleans_up() {
+    async fn saves_in_an_app_folder_that_is_a_mount_of_its_own() {
         let f = Fixture::new();
-        let editor = f.editor_on(Arc::new(NoReplace));
+        let editor = f.editor_on(Renames::mounted(f.blog.clone()));
         let base = f.read(AppFileKind::Compose).await.hash;
-        let update = AppFileUpdate {
-            content: "services: {}\n".into(),
-            base_hash: base,
-            dry_run: false,
-        };
-        let err = editor
-            .write(&f.state, "blog", AppFileKind::Compose, update)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, EditError::Io { .. }), "{err:?}");
-        assert!(
-            err.to_string()
-                .starts_with("Alchemy couldn't save compose.yaml in")
-        );
+        let edited = format!("{COMPOSE}    restart: always\n");
+        let updates = [
+            (AppFileKind::Compose, edited.clone(), base),
+            (AppFileKind::Env, "A=1\n".to_owned(), None),
+        ];
+        for (kind, content, base_hash) in updates {
+            let update = AppFileUpdate {
+                content,
+                base_hash,
+                dry_run: false,
+            };
+            editor
+                .write(&f.state, "blog", kind, update)
+                .await
+                .unwrap_or_else(|err| panic!("{kind:?}: {err}"));
+        }
         assert_eq!(
             fs::read_to_string(f.blog.join("compose.yaml")).unwrap(),
-            COMPOSE
+            edited
         );
-
-        let err = editor
-            .create(&f.state, new("shop", None))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, EditError::Io { .. }), "{err:?}");
+        assert_eq!(fs::read_to_string(f.blog.join(".env")).unwrap(), "A=1\n");
+        assert_eq!(entries(&f.blog), [".env", "compose.yaml"]);
         assert_eq!(entries(&f.home), ["blog"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_rename_changes_nothing_and_cleans_up() {
+        let cases = [
+            (io::ErrorKind::CrossesDevices, ErrorCode::Conflict),
+            (io::ErrorKind::PermissionDenied, ErrorCode::Internal),
+        ];
+        for (kind, want) in cases {
+            let f = Fixture::new();
+            let editor = f.editor_on(Renames::failing(kind));
+            let base = f.read(AppFileKind::Compose).await.hash;
+            let update = AppFileUpdate {
+                content: "services: {}\n".into(),
+                base_hash: base,
+                dry_run: false,
+            };
+            let err = editor
+                .write(&f.state, "blog", AppFileKind::Compose, update)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), want, "{kind:?}: {err}");
+            assert!(
+                err.to_string()
+                    .starts_with("Alchemy couldn't save compose.yaml in"),
+                "{err}"
+            );
+            assert!(!err.to_string().contains(".alchemy-tmp"), "{err}");
+            assert_eq!(
+                fs::read_to_string(f.blog.join("compose.yaml")).unwrap(),
+                COMPOSE
+            );
+            assert_eq!(entries(&f.blog), ["compose.yaml"], "{kind:?}");
+
+            let err = editor
+                .create(&f.state, new("shop", None))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), want, "{kind:?}: {err}");
+            assert_eq!(entries(&f.home), ["blog"], "{kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_staging_folder_is_removed_in_the_background() {
+        let f = Fixture::new();
+        let staging = SystemDisk
+            .make_staging(&f.blog, ".alchemy-tmp-blog-")
+            .unwrap();
+        drop(Staging::new(Arc::new(SystemDisk), staging.clone()));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while staging.exists() {
+            assert!(tokio::time::Instant::now() < deadline, "never removed");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(entries(&f.blog), ["compose.yaml"]);
     }
 }
