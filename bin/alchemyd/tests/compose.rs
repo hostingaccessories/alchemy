@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alchemyd::compose::{
-    CliComposeRunner, ComposeAction, ComposeError, ComposeProject, ComposeRunner,
+    CliComposeRunner, ComposeAction, ComposeCommand, ComposeError, ComposePlan, ComposeProject,
+    ComposeRunner, ImageSource,
 };
 use alchemyd::engine::Endpoint;
 
@@ -22,6 +23,10 @@ fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
+}
+
+fn plan(project: &ComposeProject, action: ComposeAction) -> ComposePlan {
+    ComposePlan::new(project, action, ImageSource::Registry)
 }
 
 /// The variables in `env` output, sorted, without the ones `/bin/sh` sets
@@ -73,29 +78,39 @@ exit 0"#,
     let project_dir = project.dir().display().to_string();
 
     let runner = CliComposeRunner::new(&docker, endpoint.clone()).unwrap();
-    runner.run(&project, ComposeAction::Up).await.unwrap();
-    runner.run(&project, ComposeAction::Down).await.unwrap();
+    runner
+        .run(&plan(&project, ComposeAction::Up))
+        .await
+        .unwrap();
+    runner
+        .run(&plan(&project, ComposeAction::Update))
+        .await
+        .unwrap();
     assert_eq!(
         std::fs::read_to_string(&log).unwrap(),
         format!(
             "DOCKER_HOST=unix:///run/user/1000/docker.sock\n\
-             [compose]\n[--project-directory]\n[{project_dir}]\n[up]\n[--detach]\n\n\
+             [compose]\n[--project-directory]\n[{project_dir}]\n[--progress]\n[json]\n[up]\n[--detach]\n\n\
              DOCKER_HOST=unix:///run/user/1000/docker.sock\n\
-             [compose]\n[--project-directory]\n[{project_dir}]\n[down]\n\n"
+             [compose]\n[--project-directory]\n[{project_dir}]\n[--progress]\n[json]\n[pull]\n\n\
+             DOCKER_HOST=unix:///run/user/1000/docker.sock\n\
+             [compose]\n[--project-directory]\n[{project_dir}]\n[--progress]\n[json]\n[up]\n[--detach]\n\n"
         )
     );
 
     match CliComposeRunner::new(&failing, endpoint.clone())
         .unwrap()
-        .run(&project, ComposeAction::Pull)
+        .run(&plan(&project, ComposeAction::Pull))
         .await
     {
         Err(ComposeError::Failed {
             action,
+            command,
             code,
             stderr,
         }) => {
             assert_eq!(action, ComposeAction::Pull);
+            assert_eq!(command, ComposeCommand::Pull);
             assert_eq!(code, Some(14));
             assert_eq!(stderr, "pulling...\nno such service: web");
         }
@@ -105,7 +120,7 @@ exit 0"#,
     assert!(matches!(
         CliComposeRunner::new(dir.path().join("missing"), endpoint.clone())
             .unwrap()
-            .run(&project, ComposeAction::Start)
+            .run(&plan(&project, ComposeAction::Start))
             .await,
         Err(ComposeError::Spawn { .. })
     ));
@@ -118,7 +133,7 @@ exit 0"#,
         CliComposeRunner::new(&slow, endpoint)
             .unwrap()
             .with_timeout(timeout)
-            .run(&project, ComposeAction::Restart)
+            .run(&plan(&project, ComposeAction::Restart))
             .await,
         Err(ComposeError::Timeout { action: ComposeAction::Restart, after }) if after == timeout
     ));
@@ -144,7 +159,7 @@ async fn passes_only_the_allowlisted_environment(
             ("DOCKER_HOST", "tcp://elsewhere:2375"),
             ("DOCKER_CONTEXT", "remote"),
         ])
-        .run(project, ComposeAction::Up)
+        .run(&plan(project, ComposeAction::Up))
         .await
         .unwrap();
     assert_eq!(
