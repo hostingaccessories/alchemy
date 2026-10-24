@@ -6,15 +6,16 @@
 //!
 //! `GET /api/engine` returns an [`EngineStatus`], re-exported from
 //! `alchemy-core` so the wire type and the domain type cannot drift.
-//! [`ContainerStatus`] and its [`StopReason`] are re-exported the same way
-//! for routes that show containers.
+//! [`ContainerStatus`], its [`StopReason`], and the [`PublishedPort`]s it
+//! holds are re-exported the same way for routes that show containers.
 //! `GET /api/metrics` returns a [`MetricsResponse`] and
 //! `GET /api/metrics/history` a [`MetricsHistory`], built from the
 //! resource-usage types in `alchemy_core::metrics`.
 //! `GET /api/events` streams [`ApiEvent`]s. The app routes and their
 //! types are in [`apps`], an app's log stream in [`logs`], the
-//! lifecycle operation routes in [`operations`], and signing in to the
-//! TCP listener in [`session`].
+//! lifecycle operation routes in [`operations`], signing in to the TCP
+//! listener in [`session`], the port registry in [`ports`], and
+//! `GET /api/network` in [`network`].
 //!
 //! The default build is pure. Enable the `socket` feature for the daemon
 //! socket path shared by `alchemyd` and its local clients, and the
@@ -27,11 +28,14 @@ pub use alchemy_core::engine::{
 pub use alchemy_core::metrics::{
     ContainerUsage, MachineUsage, MetricsPoint, MetricsRange, ProjectUsage,
 };
+pub use alchemy_core::ports::{PortRange, Protocol, PublishedPort};
 use serde::{Deserialize, Serialize, Serializer};
 
 pub mod apps;
 pub mod logs;
+pub mod network;
 pub mod operations;
+pub mod ports;
 pub mod session;
 #[cfg(feature = "socket")]
 mod socket;

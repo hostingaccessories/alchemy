@@ -6,10 +6,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use alchemy_core::engine::{
-    ContainerEvent, EngineFlavor, EngineProbe, EngineState, EngineStatus, SocketProbe, classify,
-    not_ready_flavor, reconnect_delay,
+    ContainerAction, ContainerEvent, EngineFlavor, EngineProbe, EngineState, EngineStatus,
+    SocketProbe, classify, not_ready_flavor, reconnect_delay,
 };
 use futures_util::StreamExt as _;
+use futures_util::future::{FusedFuture as _, FutureExt as _};
 use tokio::sync::watch;
 
 use super::{
@@ -209,6 +210,9 @@ where
 /// A listing says a container stopped but not how. Compose containers
 /// stopped with no exit known yet are inspected alongside the events, a
 /// few at a time, so each connection inspects a container at most once.
+///
+/// Events carry no ports, so a `start` or `restart` lists the containers
+/// again, one listing at a time, and takes only their ports from it.
 async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
     let mut events = api.events();
     let mut pending: Vec<ContainerEvent> = Vec::new();
@@ -252,12 +256,23 @@ async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
             (id, result)
         })
         .buffer_unordered(INSPECT_CONCURRENCY);
+    let relist = futures_util::future::Fuse::terminated();
+    tokio::pin!(relist);
+    let mut ports_stale = false;
     loop {
+        if ports_stale && relist.is_terminated() {
+            ports_stale = false;
+            relist.set(api.list_containers().fuse());
+        }
         tokio::select! {
             biased;
             item = events.next() => match item {
                 Some(Ok(event)) => {
                     delivered = true;
+                    ports_stale |= matches!(
+                        event.action,
+                        ContainerAction::Start | ContainerAction::Restart
+                    );
                     state.update_containers(|containers| containers.apply(&event));
                 }
                 Some(Err(error)) => {
@@ -268,6 +283,12 @@ async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
                     tracing::debug!("Docker event stream ended");
                     return Outcome::Disconnected { delivered };
                 }
+            },
+            listing = &mut relist, if !relist.is_terminated() => match listing {
+                Ok(listed) => {
+                    state.update_containers(|containers| containers.update_ports(listed));
+                }
+                Err(error) => tracing::debug!(error = %error, "listing Docker containers for ports failed"),
             },
             Some((id, result)) = inspections.next() => match result {
                 Ok(Some(exit)) => {

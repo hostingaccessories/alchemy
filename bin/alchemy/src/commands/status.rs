@@ -1,10 +1,12 @@
 //! `alchemy status`: whether alchemyd is reachable, which version it runs,
-//! and whether Docker is ready.
+//! whether Docker is ready, and whether Docker's networks overlap the home
+//! network.
 
 use std::io::Write;
 use std::path::Path;
 
 use alchemy_api::ApiEvent;
+use alchemy_api::network::{NetworkReport, NetworkWarning};
 use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
 
 use crate::context::Context;
@@ -36,11 +38,16 @@ pub(crate) async fn run<D: Daemon, W: Write>(
         return watch(ctx, &daemon).await;
     }
     let engine = ctx.get::<EngineStatus>("/api/engine").await?;
-    print_status(ctx, &daemon, &engine)
+    let network = ctx.get::<NetworkReport>("/api/network").await.ok();
+    for line in status_lines(&daemon, ctx.socket(), &engine, network.as_ref(), ctx.json()) {
+        ctx.out().line(line)?;
+    }
+    Ok(())
 }
 
 /// Follow the engine status, printing the engine line again only when it
-/// changes, or every update with `--json`.
+/// changes, or every update with `--json`. Network warnings are left to
+/// `alchemy status` without `--watch`.
 async fn watch<D: Daemon, W: Write>(
     ctx: &mut Context<D, W>,
     daemon: &DaemonInfo,
@@ -56,9 +63,11 @@ async fn watch<D: Daemon, W: Write>(
         };
         let line = engine_line(&engine);
         if last_line.is_none() {
-            print_status(ctx, daemon, &engine)?;
+            for line in status_lines(daemon, ctx.socket(), &engine, None, ctx.json()) {
+                ctx.out().line(line)?;
+            }
         } else if ctx.json() {
-            let json = status_json(daemon, ctx.socket(), &engine);
+            let json = status_json(daemon, ctx.socket(), &engine, None);
             ctx.out().line(json)?;
         } else if last_line.as_ref() != Some(&line) {
             ctx.out().line(&line)?;
@@ -67,30 +76,47 @@ async fn watch<D: Daemon, W: Write>(
     }
 }
 
-fn print_status<D: Daemon, W: Write>(
-    ctx: &mut Context<D, W>,
-    daemon: &DaemonInfo,
-    engine: &EngineStatus,
-) -> Result<(), ClientError> {
-    for line in status_lines(daemon, ctx.socket(), engine, ctx.json()) {
-        ctx.out().line(line)?;
-    }
-    Ok(())
-}
-
-/// What `alchemy status` prints: the daemon and engine lines, or one JSON
-/// object.
+/// What `alchemy status` prints: the daemon and engine lines, then any
+/// network warnings, or one JSON object.
 pub(crate) fn status_lines(
     daemon: &DaemonInfo,
     socket: &Path,
     engine: &EngineStatus,
+    network: Option<&NetworkReport>,
     json: bool,
 ) -> Vec<String> {
     if json {
-        vec![status_json(daemon, socket, engine)]
-    } else {
-        vec![daemon_line(daemon, socket), engine_line(engine)]
+        return vec![status_json(daemon, socket, engine, network)];
     }
+    let mut lines = vec![daemon_line(daemon, socket), engine_line(engine)];
+    if let Some(network) = network {
+        lines.extend(warning_lines(&network.warnings));
+    }
+    lines
+}
+
+/// Each warning as `Warning: ...`, followed by its fix, indented. A fix
+/// already shown for an earlier warning is not repeated.
+pub(crate) fn warning_lines(warnings: &[NetworkWarning]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut shown: Vec<&str> = Vec::new();
+    for warning in warnings {
+        lines.push(format!("Warning: {}", warning.message));
+        let Some(fix) = warning.fix.as_deref() else {
+            continue;
+        };
+        if shown.contains(&fix) {
+            lines.push("  Fix: the same as above.".to_owned());
+            continue;
+        }
+        shown.push(fix);
+        let mut fix_lines = fix.lines();
+        if let Some(first) = fix_lines.next() {
+            lines.push(format!("  Fix: {first}"));
+        }
+        lines.extend(fix_lines.map(|line| format!("  {line}")));
+    }
+    lines
 }
 
 /// The first line of `alchemy status`.
@@ -129,15 +155,27 @@ pub(crate) fn engine_line(engine: &EngineStatus) -> String {
     }
 }
 
-/// The `--json` object: the daemon, its socket, and the engine status.
-pub(crate) fn status_json(daemon: &DaemonInfo, socket: &Path, engine: &EngineStatus) -> String {
-    serde_json::json!({
+/// The `--json` object: the daemon, its socket, the engine status, and
+/// the network report, when there is one.
+pub(crate) fn status_json(
+    daemon: &DaemonInfo,
+    socket: &Path,
+    engine: &EngineStatus,
+    network: Option<&NetworkReport>,
+) -> String {
+    let mut json = serde_json::json!({
         "daemon": daemon.version,
         "protocol": daemon.api,
         "socket": socket,
         "engine": engine,
-    })
-    .to_string()
+    });
+    if let (Some(network), Some(object)) = (network, json.as_object_mut()) {
+        object.insert(
+            "network".to_owned(),
+            serde_json::to_value(network).unwrap_or_default(),
+        );
+    }
+    json.to_string()
 }
 
 fn product(engine: &EngineStatus) -> &'static str {
@@ -183,6 +221,8 @@ fn ready_line(engine: &EngineStatus) -> String {
     clippy::indexing_slicing
 )]
 mod tests {
+    use alchemy_api::network::NetworkWarningKind;
+
     use super::*;
     use crate::daemon::Method;
     use crate::daemon::fake::{FAKE_SOCKET, FakeDaemon, sse};
@@ -297,6 +337,7 @@ mod tests {
             &daemon,
             Path::new("/run/alchemyd.sock"),
             &engine,
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -332,6 +373,7 @@ mod tests {
     }
 
     const ENGINE: &str = "/api/engine";
+    const NETWORK: &str = "/api/network";
 
     struct Run {
         result: Result<(), ClientError>,
@@ -355,22 +397,105 @@ mod tests {
             .collect()
     }
 
+    fn warning(kind: NetworkWarningKind, message: &str, fix: Option<&str>) -> NetworkWarning {
+        NetworkWarning {
+            kind,
+            message: message.into(),
+            fix: fix.map(str::to_owned),
+            subnet: None,
+            host: None,
+            host_subnet: None,
+            network: None,
+        }
+    }
+
+    fn overlapping() -> NetworkReport {
+        NetworkReport {
+            engine_ready: true,
+            warnings: vec![
+                warning(
+                    NetworkWarningKind::BridgeOverlap,
+                    "Docker's default bridge network (172.17.0.0/16) overlaps your local network 172.17.0.0/16.",
+                    Some("Add these settings:\n{\n  \"bip\": \"172.18.0.1/24\"\n}"),
+                ),
+                warning(
+                    NetworkWarningKind::PoolOverlap,
+                    "Docker's address pool 172.17.0.0/16 overlaps your local network 172.17.0.0/16.",
+                    Some("Add these settings:\n{\n  \"bip\": \"172.18.0.1/24\"\n}"),
+                ),
+                warning(
+                    NetworkWarningKind::CreateFailed,
+                    "Alchemy couldn't create its network alchemy.",
+                    None,
+                ),
+            ],
+            ..NetworkReport::default()
+        }
+    }
+
+    #[test]
+    fn warnings_print_each_fix_once() {
+        assert_eq!(
+            warning_lines(&overlapping().warnings),
+            [
+                "Warning: Docker's default bridge network (172.17.0.0/16) overlaps your local network 172.17.0.0/16.",
+                "  Fix: Add these settings:",
+                "  {",
+                "    \"bip\": \"172.18.0.1/24\"",
+                "  }",
+                "Warning: Docker's address pool 172.17.0.0/16 overlaps your local network 172.17.0.0/16.",
+                "  Fix: the same as above.",
+                "Warning: Alchemy couldn't create its network alchemy.",
+            ]
+        );
+        assert_eq!(warning_lines(&[]), Vec::<String>::new());
+    }
+
     #[tokio::test]
     async fn status_prints_the_daemon_and_the_engine() {
         let fake = FakeDaemon::new()
             .version("1.2.3", 1)
-            .ok(Method::GET, ENGINE, &ready());
+            .ok(Method::GET, ENGINE, &ready())
+            .ok(Method::GET, NETWORK, &NetworkReport::default());
         let run = run_with(fake, false, false).await;
         run.result.unwrap();
         assert_eq!(run.out, format!("{DAEMON_LINE}\n{READY_LINE}\n"));
-        assert_eq!(run.requests, ["GET /api/version", "GET /api/engine"]);
+        assert_eq!(
+            run.requests,
+            ["GET /api/version", "GET /api/engine", "GET /api/network"]
+        );
+    }
+
+    #[tokio::test]
+    async fn status_prints_network_warnings() {
+        let fake = FakeDaemon::new()
+            .version("1.2.3", 1)
+            .ok(Method::GET, ENGINE, &ready())
+            .ok(Method::GET, NETWORK, &overlapping());
+        let run = run_with(fake, false, false).await;
+        run.result.unwrap();
+        let lines: Vec<&str> = run.out.lines().collect();
+        assert_eq!(lines[..2], [DAEMON_LINE, READY_LINE]);
+        assert_eq!(lines[2..], warning_lines(&overlapping().warnings));
+    }
+
+    #[tokio::test]
+    async fn status_skips_network_warnings_an_older_daemon_lacks() {
+        let fake = FakeDaemon::new()
+            .version("1.2.3", 1)
+            .ok(Method::GET, ENGINE, &ready())
+            .error(Method::GET, NETWORK, 404, "not_found", "not found");
+        let run = run_with(fake, false, false).await;
+        run.result.unwrap();
+        assert_eq!(run.out, format!("{DAEMON_LINE}\n{READY_LINE}\n"));
     }
 
     #[tokio::test]
     async fn status_json_prints_one_object() {
         let fake = FakeDaemon::new()
             .version("1.2.3", 1)
-            .ok(Method::GET, ENGINE, &ready());
+            .ok(Method::GET, ENGINE, &ready())
+            .ok(Method::GET, NETWORK, &overlapping());
         let run = run_with(fake, true, false).await;
         run.result.unwrap();
         assert_eq!(
@@ -380,6 +505,7 @@ mod tests {
                 "protocol": 1,
                 "socket": FAKE_SOCKET,
                 "engine": serde_json::to_value(ready()).unwrap(),
+                "network": serde_json::to_value(overlapping()).unwrap(),
             })]
         );
     }

@@ -9,6 +9,7 @@
     clippy::indexing_slicing
 )]
 
+use std::collections::BTreeMap;
 use std::future::{Future, ready};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -19,10 +20,12 @@ use alchemy_core::engine::{
     ContainerAction, ContainerEvent, ContainerState, ContainerStatus, Containers, EngineFlavor,
     EngineState, EngineStatus, Health, InspectedExit, StopReason, reconnect_delay,
 };
+use alchemy_core::network::Ipv4Net;
+use alchemy_core::ports::{Protocol, PublishedPort};
 use alchemyd::engine::{
-    ApiError, BollardApi, CliError, Connector, DockerApi, DockerCli, Endpoint, EngineMonitor,
-    EngineSource, EngineVersion, HostEnv, HostProbe, Os, POLL_INTERVAL, ProcessDockerCli,
-    SocketConnect, SystemProbe,
+    AddressPool, ApiError, BollardApi, CliError, Connector, DockerApi, DockerCli, Endpoint,
+    EngineMonitor, EngineSource, EngineVersion, HostEnv, HostProbe, NetworkSpec, Os, POLL_INTERVAL,
+    ProcessDockerCli, SocketConnect, SystemProbe,
 };
 use alchemyd::{Deps, State};
 use futures_util::{Stream, StreamExt as _};
@@ -34,6 +37,8 @@ const VERSION_JSON: &str = r#"{"Platform":{"Name":"Docker Desktop 4.34.2 (167172
 
 const CONTAINERS_JSON: &str = r#"[
   {"Id":"abc","Names":["/blog-db-1"],"Image":"postgres:16","State":"running","Status":"Up 2 minutes (healthy)",
+   "Ports":[{"IP":"0.0.0.0","PrivatePort":5432,"PublicPort":5432,"Type":"tcp"},
+            {"IP":"::","PrivatePort":5432,"PublicPort":5432,"Type":"tcp"},{"PrivatePort":8008,"Type":"tcp"}],
    "Labels":{"com.docker.compose.project":"blog","com.docker.compose.service":"db"},
    "Health":{"Status":"healthy","FailingStreak":0}},
   {"Id":"def","Names":["/scratch"],"Image":"alpine","State":"exited","Status":"Exited (0)","Labels":{}}
@@ -42,6 +47,23 @@ const CONTAINERS_JSON: &str = r#"[
 const INSPECT_JSON: &str = r#"{"Id":"def","Name":"/scratch","RestartCount":2,
   "State":{"Status":"exited","Running":false,"OOMKilled":true,"ExitCode":137,
    "StartedAt":"2024-05-01T12:00:00Z","FinishedAt":"2024-05-01T12:00:01.5Z"}}"#;
+
+const NETWORKS_JSON: &str = r#"[
+  {"Name":"bridge","Id":"n0","Driver":"bridge","IPAM":{"Driver":"default","Options":null,
+   "Config":[{"Subnet":"172.17.0.0/16","Gateway":"172.17.0.1"}]},"Labels":{}},
+  {"Name":"blog_default","Id":"n1","Driver":"bridge","IPAM":{"Driver":"default","Options":null,
+   "Config":[{"Subnet":"172.18.0.0/16","Gateway":"172.18.0.1"},{"Subnet":"fd00:1::/64"}]},
+   "Labels":{"com.docker.compose.network":"default","com.docker.compose.project":"blog"}},
+  {"Name":"host","Id":"n2","Driver":"host","IPAM":{"Driver":"default","Options":null,"Config":null},"Labels":{}}
+]"#;
+
+const BRIDGE_JSON: &str = r#"{"Name":"bridge","Id":"n0","Driver":"bridge","EnableIPv4":true,
+  "IPAM":{"Driver":"default","Options":null,"Config":[{"Subnet":"172.17.0.0/16","Gateway":"172.17.0.1"}]},
+  "Options":{"com.docker.network.bridge.default_bridge":"true"},"Labels":{},"Containers":{}}"#;
+
+const INFO_JSON: &str = r#"{"ID":"x","Containers":2,"DefaultAddressPools":[{"Base":"10.10.0.0/16","Size":24},{"Base":"fd00::/56","Size":64}]}"#;
+
+const NETWORK_CREATED_JSON: &str = r#"{"Id":"n9","Warning":""}"#;
 
 const EVENTS_JSON: &str = concat!(
     r#"{"Type":"network","Action":"connect","Actor":{"ID":"net1","Attributes":{"name":"bridge"}},"time":1}"#,
@@ -73,6 +95,7 @@ fn unversioned(target: &str) -> &str {
 struct FakeEngine {
     socket: PathBuf,
     requests: Arc<Mutex<Vec<String>>>,
+    bodies: Arc<Mutex<Vec<String>>>,
     _dir: tempfile::TempDir,
 }
 
@@ -82,13 +105,16 @@ impl FakeEngine {
         let socket = dir.path().join("docker.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&requests);
+        let body_log = Arc::clone(&bodies);
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
                 let log = Arc::clone(&log);
+                let body_log = Arc::clone(&body_log);
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 1024];
@@ -99,7 +125,29 @@ impl FakeEngine {
                         }
                         buf.extend_from_slice(&chunk[..n]);
                     }
-                    let head = String::from_utf8_lossy(&buf);
+                    let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().ok())?
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < end + length {
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    if length > 0 {
+                        body_log
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&buf[end..]).into_owned());
+                    }
                     let target = head
                         .split_whitespace()
                         .nth(1)
@@ -113,6 +161,10 @@ impl FakeEngine {
                         "/containers/json" => ("200 OK", CONTAINERS_JSON),
                         "/containers/def/json" => ("200 OK", INSPECT_JSON),
                         "/events" => ("200 OK", EVENTS_JSON),
+                        "/networks" => ("200 OK", NETWORKS_JSON),
+                        "/networks/bridge" => ("200 OK", BRIDGE_JSON),
+                        "/networks/create" => ("201 Created", NETWORK_CREATED_JSON),
+                        "/info" => ("200 OK", INFO_JSON),
                         _ => ("404 Not Found", r#"{"message":"page not found"}"#),
                     };
                     let response = format!(
@@ -127,6 +179,7 @@ impl FakeEngine {
         Self {
             socket,
             requests,
+            bodies,
             _dir: dir,
         }
     }
@@ -138,6 +191,10 @@ impl FakeEngine {
 
     fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
+    }
+
+    fn bodies(&self) -> Vec<String> {
+        self.bodies.lock().unwrap().clone()
     }
 }
 
@@ -178,7 +235,15 @@ async fn bollard_api_lists_all_containers() {
     );
     assert_eq!(db.project.as_deref(), Some("blog"));
     assert_eq!(db.service.as_deref(), Some("db"));
+    assert_eq!(
+        db.ports,
+        [
+            PublishedPort::new(Protocol::Tcp, Some("5432".parse().unwrap()))
+                .with_target(Some("5432".parse().unwrap()))
+        ]
+    );
     assert_eq!(containers[1].state, ContainerState::Exited);
+    assert_eq!(containers[1].ports, [] as [PublishedPort; 0]);
     assert_eq!(containers[1].health, None);
     let requests = engine.requests();
     assert_eq!(requests.len(), 1);
@@ -210,6 +275,100 @@ async fn bollard_api_inspects_how_a_container_exited() {
     );
     let requests = engine.requests();
     assert_eq!(unversioned(&requests[0]), "/containers/def/json");
+}
+
+fn net(cidr: &str) -> Ipv4Net {
+    cidr.parse().unwrap()
+}
+
+#[tokio::test]
+async fn bollard_api_lists_networks() {
+    let engine = FakeEngine::start();
+    let networks = engine.api().list_networks().await.unwrap();
+    let got: Vec<_> = networks
+        .iter()
+        .map(|n| (n.name.as_str(), n.subnets.clone(), n.project.as_deref()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("bridge", vec![net("172.17.0.0/16")], None),
+            ("blog_default", vec![net("172.18.0.0/16")], Some("blog")),
+            ("host", vec![], None),
+        ]
+    );
+    assert_eq!(networks[1].driver.as_deref(), Some("bridge"));
+    assert_eq!(
+        networks[1]
+            .labels
+            .get("com.docker.compose.network")
+            .map(String::as_str),
+        Some("default")
+    );
+    let requests = engine.requests();
+    assert_eq!(unversioned(&requests[0]), "/networks", "{requests:?}");
+}
+
+#[tokio::test]
+async fn bollard_api_creates_a_bridge_network() {
+    let engine = FakeEngine::start();
+    let id = engine
+        .api()
+        .create_network(NetworkSpec {
+            name: "alchemy".into(),
+            subnet: net("10.200.0.0/24"),
+            labels: BTreeMap::from([("com.alchemy.managed".to_owned(), "true".to_owned())]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(id, "n9");
+    let requests = engine.requests();
+    assert_eq!(unversioned(&requests[0]), "/networks/create");
+    let body: serde_json::Value = serde_json::from_str(&engine.bodies()[0]).unwrap();
+    assert_eq!(body["Name"], "alchemy");
+    assert_eq!(body["Driver"], "bridge");
+    assert_eq!(body["IPAM"]["Config"][0]["Subnet"], "10.200.0.0/24");
+    assert_eq!(body["Labels"]["com.alchemy.managed"], "true");
+}
+
+#[tokio::test]
+async fn bollard_api_reads_the_bridge_subnet_and_address_pools() {
+    let engine = FakeEngine::start();
+    let api = engine.api();
+    assert_eq!(api.bridge_subnets().await.unwrap(), [net("172.17.0.0/16")]);
+    assert_eq!(
+        api.address_pools().await.unwrap(),
+        [AddressPool {
+            base: net("10.10.0.0/16"),
+            size: 24
+        }]
+    );
+    let requests: Vec<_> = engine
+        .requests()
+        .iter()
+        .map(|r| unversioned(r).to_owned())
+        .collect();
+    assert_eq!(requests, ["/networks/bridge", "/info"]);
+}
+
+#[tokio::test]
+async fn default_network_calls_report_nothing() {
+    let api = ScriptedApi(SharedHost::default());
+    assert_eq!(api.list_networks().await.unwrap(), []);
+    assert_eq!(api.bridge_subnets().await.unwrap(), []);
+    assert_eq!(api.address_pools().await.unwrap(), []);
+    let refused = api
+        .create_network(NetworkSpec {
+            name: "alchemy".into(),
+            subnet: net("10.200.0.0/24"),
+            labels: BTreeMap::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, ApiError::Server { status: 501, .. }),
+        "{refused:?}"
+    );
 }
 
 #[tokio::test]
@@ -713,6 +872,43 @@ async fn monitor_moves_from_not_running_through_starting_to_ready() {
     let containers =
         containers_until(&run.state, |c| has_state(c, "abc", ContainerState::Exited)).await;
     assert_eq!(containers.len(), 1);
+
+    run.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitor_learns_ports_of_containers_started_after_the_listing() {
+    let (host, monitor) = scripted_monitor(&unix(SOCKET));
+    ready_host(&host);
+    host.lock().unwrap().containers =
+        vec![ContainerStatus::new("db", "db", ContainerState::Running)];
+    let run = spawn_monitor(monitor);
+    containers_until(&run.state, |c| !c.is_empty()).await;
+
+    let mut web = ContainerStatus::new("web", "web", ContainerState::Running);
+    web.ports = vec![PublishedPort::new(
+        Protocol::Tcp,
+        Some("8080".parse().unwrap()),
+    )];
+    host.lock().unwrap().containers.push(web.clone());
+    send(&host, ContainerEvent::new("web", ContainerAction::Start));
+    let containers = containers_until(&run.state, |c| {
+        c.get("web").is_some_and(|w| !w.ports.is_empty())
+    })
+    .await;
+    assert_eq!(containers.get("web").unwrap().ports, web.ports);
+    assert_eq!(
+        containers.get("db").unwrap().ports,
+        [] as [PublishedPort; 0]
+    );
+
+    send(&host, ContainerEvent::new("web", ContainerAction::Die));
+    let containers =
+        containers_until(&run.state, |c| has_state(c, "web", ContainerState::Exited)).await;
+    assert_eq!(
+        containers.get("web").unwrap().ports,
+        [] as [PublishedPort; 0]
+    );
 
     run.stop().await;
 }

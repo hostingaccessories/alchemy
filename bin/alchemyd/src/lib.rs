@@ -13,8 +13,12 @@
 //! It talks to the Docker engine through [`engine`], finds the user's
 //! Compose stacks through [`apps`], samples resource usage through
 //! [`metrics`], reads app logs through [`logs`], runs lifecycle actions
-//! on apps through [`operations`], keeps what it learns in [`State`], and
-//! persists settings, history, and stop [`intent`] in a [`store::Store`].
+//! on apps through [`operations`], reads the host's own subnets, routes,
+//! and listeners through [`network`], lists and reserves host ports
+//! through [`ports`], checks Docker's networks against the host's and
+//! keeps its own `alchemy` network through [`subnets`], keeps what it
+//! learns in [`State`], and persists settings, history, and stop
+//! [`intent`] in a [`store::Store`].
 
 pub mod apps;
 pub mod auth;
@@ -26,12 +30,15 @@ pub mod http;
 pub mod intent;
 pub mod logs;
 pub mod metrics;
+pub mod network;
 pub mod operations;
+pub mod ports;
 mod secure_fs;
 pub mod session;
 pub mod socket;
 mod state;
 pub mod store;
+pub mod subnets;
 mod web;
 
 pub use state::State;
@@ -43,14 +50,18 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use crate::apps::{AppEditor, AppsDeps};
 use crate::engine::{EngineMonitor, EngineSource, SystemConnector, SystemProbe};
 use crate::logs::{SharedLogSource, SystemLogs};
 use crate::metrics::{Collector, MetricsSource, SystemMetrics};
+use crate::network::{FakeNetwork, SharedNetwork, SystemNetwork};
 use crate::operations::{OperationRunner, Operations, SystemRunner};
+use crate::ports::PortRegistry;
 use crate::session::{Auth, TokenFile};
 use crate::store::{SharedStore, SqliteStore, StateLock};
+use crate::subnets::{FakeDaemonConfig, FakeEngineNetworks, SubnetsDeps};
 
 /// Default HTTP listen address. Loopback only: the TCP listener's token
 /// keeps out other processes and users on this machine, but there is no
@@ -88,6 +99,11 @@ pub struct Deps<E, M = SystemMetrics> {
     pub runner: Arc<dyn OperationRunner>,
     /// Creates apps and edits their files for the API.
     pub editor: Arc<AppEditor>,
+    /// Where the host's LAN subnets, routes, and listeners are read.
+    pub network: SharedNetwork,
+    /// Where Docker's networks and `daemon.json` are read, and the
+    /// `alchemy` network is created.
+    pub subnets: SubnetsDeps,
 }
 
 impl<E> Deps<E> {
@@ -104,8 +120,11 @@ impl<E> Deps<E> {
     /// without running anything. The editor writes to the real
     /// filesystem but validates with a
     /// [`FakeComposeValidator`](compose::FakeComposeValidator) that
-    /// accepts everything. Use [`Self::with_apps`],
-    /// [`Self::with_runner`], and [`Self::with_editor`] to change them.
+    /// accepts everything. The host network is a
+    /// [`FakeNetwork`] with nothing on it, and Docker's networks are a
+    /// [`FakeEngineNetworks`] with none and no `daemon.json`. Use
+    /// [`Self::with_apps`], [`Self::with_runner`], [`Self::with_editor`],
+    /// [`Self::with_network`], and [`Self::with_subnets`] to change them.
     pub fn new(engine: E) -> Self {
         Self {
             state: State::new(),
@@ -122,6 +141,11 @@ impl<E> Deps<E> {
                 Arc::new(apps::SystemDisk),
                 Arc::new(compose::FakeComposeValidator::new()),
             )),
+            network: Arc::new(FakeNetwork::new()),
+            subnets: SubnetsDeps::new(
+                Arc::new(FakeEngineNetworks::new()),
+                Arc::new(FakeDaemonConfig::new()),
+            ),
         }
     }
 }
@@ -137,6 +161,8 @@ impl<E, M> Deps<E, M> {
             logs: self.logs,
             runner: self.runner,
             editor: self.editor,
+            network: self.network,
+            subnets: self.subnets,
         }
     }
 
@@ -167,16 +193,32 @@ impl<E, M> Deps<E, M> {
         self.editor = Arc::new(editor);
         self
     }
+
+    /// Read the host's subnets, routes, and listeners from `network`.
+    #[must_use]
+    pub fn with_network(mut self, network: SharedNetwork) -> Self {
+        self.network = network;
+        self
+    }
+
+    /// Read Docker's networks and `daemon.json` through `subnets`.
+    #[must_use]
+    pub fn with_subnets(mut self, subnets: SubnetsDeps) -> Self {
+        self.subnets = subnets;
+        self
+    }
 }
 
 impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
-    /// The real engine monitor, apps task, and `docker compose` for this
-    /// host.
+    /// The real engine monitor, apps task, `docker compose`, host
+    /// network, and Docker networks for this host.
     pub fn system() -> Self {
         Self::new(EngineMonitor::system())
             .with_apps(AppsDeps::system())
             .with_runner(Arc::new(SystemRunner::new()))
             .with_editor(AppEditor::system())
+            .with_network(Arc::new(SystemNetwork::new()))
+            .with_subnets(SubnetsDeps::system())
     }
 }
 
@@ -192,11 +234,12 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::
 /// directory fails startup before it touches anything; the lock is held
 /// until this returns. The state database in it is then opened, created,
 /// or migrated; a corrupt or too-new one fails startup before either
-/// listener is bound. The engine task, the metrics collector, and the
-/// apps task run alongside the listeners. An engine that is absent or
-/// broken never fails startup; it only shows up in the engine status.
-/// Neither does a missing or unreadable app folder, which shows up in the
-/// app list.
+/// listener is bound. The engine task, the metrics collector, the apps
+/// task, and the network check run alongside the listeners. An engine
+/// that is absent or broken never fails startup; it only shows up in the
+/// engine status. Neither does a missing or unreadable app folder, which
+/// shows up in the app list, nor a network that overlaps, which shows up
+/// in `GET /api/network`.
 ///
 /// Once both listeners are bound, and before either serves a request, a
 /// new TCP token is written to [`alchemy_api::TCP_TOKEN_FILE`] in the
@@ -222,10 +265,8 @@ pub async fn run_with(
         ),
     }
 
-    let operations = Operations::new(deps.runner, deps.state.clone(), store.clone());
-    if let Err(error) = operations.recover().await {
-        tracing::warn!(%error, "cannot tidy the operation history");
-    }
+    let ports = PortRegistry::new(deps.state.clone(), store.clone(), deps.network.clone());
+    let operations = recovered_operations(deps.runner, &deps.state, &store, &ports).await;
 
     let (socket_listener, socket_file) = socket::bind(&config.socket)
         .with_context(|| format!("binding API socket {}", config.socket.display()))?;
@@ -244,20 +285,19 @@ pub async fn run_with(
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let engine_task = tokio::spawn(deps.engine.run(deps.state.clone(), shutdown_rx.clone()));
-    let metrics_task = tokio::spawn(
-        Collector::new(deps.metrics, deps.state.clone(), store.clone()).run(shutdown_rx.clone()),
-    );
-    let apps_task = tokio::spawn(apps::run(
+    let background = spawn_background(
+        deps.engine,
+        deps.metrics,
         deps.apps,
-        deps.state.clone(),
-        store.clone(),
-        shutdown_rx.clone(),
-    ));
+        (deps.subnets, deps.network.clone()),
+        &deps.state,
+        &store,
+        &shutdown_rx,
+    );
     let socket_task = tokio::spawn(
         axum::serve(
             socket_listener,
-            http::with_editor(
+            with_handlers(
                 http::api_router(
                     deps.state.clone(),
                     store.clone(),
@@ -266,7 +306,8 @@ pub async fn run_with(
                     operations.clone(),
                     auth.clone(),
                 ),
-                deps.editor.clone(),
+                &deps.editor,
+                &ports,
             ),
         )
         .with_graceful_shutdown(stopped(shutdown_rx.clone()))
@@ -275,7 +316,7 @@ pub async fn run_with(
     let http_task = tokio::spawn(
         axum::serve(
             http_listener,
-            http::with_editor(
+            with_handlers(
                 http::router(
                     deps.state,
                     store,
@@ -287,7 +328,8 @@ pub async fn run_with(
                     deps.logs,
                     operations.clone(),
                 ),
-                deps.editor,
+                &deps.editor,
+                &ports,
             ),
         )
         .with_graceful_shutdown(stopped(shutdown_rx))
@@ -298,19 +340,90 @@ pub async fn run_with(
     shutdown_tx.send_replace(true);
     operations.shutdown().await;
 
-    let engine_result = engine_task.await;
-    let metrics_result = metrics_task.await;
-    let apps_result = apps_task.await;
+    let mut background_results = Vec::with_capacity(background.len());
+    for (name, task) in background {
+        background_results.push((name, task.await));
+    }
     let socket_result = socket_task.await;
     let http_result = http_task.await;
     drop(token_file);
     drop(socket_file);
-    engine_result.context("engine task failed")?;
-    metrics_result.context("metrics task failed")?;
-    apps_result.context("apps task failed")?;
+    for (name, result) in background_results {
+        result.with_context(|| format!("{name} task failed"))?;
+    }
     socket_result.context("API socket task failed")??;
     http_result.context("HTTP task failed")??;
     Ok(())
+}
+
+/// The daemon's operations, with what a daemon that stopped mid-run left
+/// running marked interrupted.
+async fn recovered_operations(
+    runner: Arc<dyn OperationRunner>,
+    state: &State,
+    store: &SharedStore,
+    ports: &PortRegistry,
+) -> Operations {
+    let operations = Operations::new(runner, state.clone(), store.clone(), ports.clone());
+    if let Err(error) = operations.recover().await {
+        tracing::warn!(%error, "cannot tidy the operation history");
+    }
+    operations
+}
+
+/// Give `router` the app editor and the port registry its routes use.
+fn with_handlers(
+    router: axum::Router,
+    editor: &Arc<AppEditor>,
+    ports: &PortRegistry,
+) -> axum::Router {
+    http::with_ports(http::with_editor(router, editor.clone()), ports.clone())
+}
+
+/// Start the tasks that keep `state` current, each with its name: the
+/// engine monitor, the metrics collector, the apps task, and the network
+/// check, which reads the host through `subnets.1`.
+fn spawn_background(
+    engine: impl EngineSource,
+    metrics: impl MetricsSource,
+    apps: AppsDeps,
+    subnets: (SubnetsDeps, SharedNetwork),
+    state: &State,
+    store: &SharedStore,
+    shutdown: &watch::Receiver<bool>,
+) -> [(&'static str, JoinHandle<()>); 4] {
+    let (subnets, network) = subnets;
+    [
+        (
+            "engine",
+            tokio::spawn(engine.run(state.clone(), shutdown.clone())),
+        ),
+        (
+            "metrics",
+            tokio::spawn(
+                Collector::new(metrics, state.clone(), store.clone()).run(shutdown.clone()),
+            ),
+        ),
+        (
+            "apps",
+            tokio::spawn(apps::run(
+                apps,
+                state.clone(),
+                store.clone(),
+                shutdown.clone(),
+            )),
+        ),
+        (
+            "network check",
+            tokio::spawn(subnets::run(
+                subnets,
+                network,
+                state.clone(),
+                store.clone(),
+                shutdown.clone(),
+            )),
+        ),
+    ]
 }
 
 fn warn_if_exposed(listen: SocketAddr) {

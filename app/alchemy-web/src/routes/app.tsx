@@ -151,6 +151,10 @@ function problemTitle(kind: App["problems"][number]["kind"]): string {
       return "Alchemy couldn't check this app";
     case "shared_project":
       return "Another app uses the same name in Compose";
+    case "network_overlap":
+      return "One of this app's networks overlaps your network";
+    case "port_conflict":
+      return "A port this app publishes is already taken";
     default:
       return "Something is wrong with this app";
   }

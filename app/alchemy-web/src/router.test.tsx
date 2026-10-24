@@ -6,6 +6,7 @@ import { FakeEventSource, renderAt } from "./test/render.tsx";
 /** What the stubbed daemon answers, by URL; anything else gets the version. */
 const ANSWERS: Record<string, unknown> = {
   "/api/apps": { apps: [], unmanaged: [], dirs: [] },
+  "/api/ports": { ports: [], warnings: [] },
   "/api/settings/apps": {
     home: "/home/me/Alchemy/apps",
     default_home: "/home/me/Alchemy/apps",

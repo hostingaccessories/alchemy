@@ -72,8 +72,8 @@ pub struct Cli {
 /// Top-level subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Show whether alchemyd is reachable, which version it runs, and
-    /// whether Docker is ready.
+    /// Show whether alchemyd is reachable, which version it runs, whether
+    /// Docker is ready, and whether its networks overlap the local network.
     Status(commands::status::Args),
 
     /// Work with apps: the Compose projects Alchemy runs, found in the app
@@ -207,12 +207,7 @@ pub async fn run_with<W: Write, P: Prompt>(
                 app::cancel::run(&mut context(out, app::cancel::NAME)?, args).await
             }
         },
-        Command::Machine(args) => match args.command {
-            machine::Verb::Stats(args) => {
-                let mut context = context(out, machine::stats::NAME)?;
-                machine::stats::run(&mut context, args).await
-            }
-        },
+        Command::Machine(args) => run_machine(args.command, |name| context(out, name)).await,
         Command::Settings(args) => match args.command {
             settings::Verb::Show(args) => {
                 settings::show::run(&mut context(out, settings::show::NAME)?, args).await
@@ -227,6 +222,22 @@ pub async fn run_with<W: Write, P: Prompt>(
         Command::SafetyProbe(args) => {
             let mut context = context(out, commands::safety_probe::NAME)?;
             commands::safety_probe::run(&mut context, prompt, args).await
+        }
+    }
+}
+
+/// Run the `alchemy machine` verb `verb` in the context `context` makes
+/// for the command named.
+async fn run_machine<W: Write>(
+    verb: machine::Verb,
+    context: impl FnOnce(&'static str) -> Result<Context<HttpDaemon, W>, ClientError>,
+) -> Result<(), ClientError> {
+    match verb {
+        machine::Verb::Stats(args) => {
+            machine::stats::run(&mut context(machine::stats::NAME)?, args).await
+        }
+        machine::Verb::Ports(args) => {
+            machine::ports::run(&mut context(machine::ports::NAME)?, args).await
         }
     }
 }

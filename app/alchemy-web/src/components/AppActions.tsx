@@ -7,6 +7,7 @@ import {
   type App,
   type Operation,
   type OutputLine,
+  type PortConflict,
   api,
 } from "../lib/api.ts";
 import { liveQueries, showOperation } from "../lib/queries.ts";
@@ -54,13 +55,23 @@ const DONE: Record<Action, string> = {
 
 const PRIMARY: Action[] = ["start", "stop", "restart", "update"];
 
+/** The actions alchemyd checks the app's host ports for before running. */
+const PORT_CHECKED: ReadonlySet<Action> = new Set(["up", "start", "restart", "update"]);
+
+/** An action refused because ports it needs are taken. */
+interface PortRefusal {
+  action: Action;
+  conflicts: PortConflict[];
+}
+
 /**
  * An app's lifecycle actions and the progress of its latest one. Start,
  * Stop, Restart, and Update are always shown; the rest sit under More actions,
  * and Take down asks first. Only one action runs on an app at a time, so
  * the buttons wait while one does. Progress comes from the live
  * `operations` event, whichever client started it; raw output from the
- * operation's own stream, folded under each step.
+ * operation's own stream, folded under each step. An action refused because
+ * the app's ports are taken offers Start anyway under Advanced.
  */
 export function AppActions({ app }: { app: App }) {
   const client = useQueryClient();
@@ -68,18 +79,30 @@ export function AppActions({ app }: { app: App }) {
   const latest = operations.data?.operations.find((op) => op.app === app.name);
   const running = latest?.state === "running";
   const [error, setError] = useState<string | null>(null);
+  const [portRefusal, setPortRefusal] = useState<PortRefusal | null>(null);
 
   const start = useMutation({
-    mutationFn: (action: Action) => api.startAction(app.name, { action }),
-    onMutate: () => setError(null),
+    mutationFn: ({ action, force }: { action: Action; force?: boolean }) =>
+      api.startAction(app.name, force ? { action, force } : { action }),
+    onMutate: () => {
+      setError(null);
+      setPortRefusal(null);
+    },
     onSuccess: ({ operation }) => showOperation(client, operation),
-    onError: (err) => setError(err instanceof ApiError ? err.message : "Something went wrong."),
+    onError: async (err, { action }) => {
+      setError(err instanceof ApiError ? err.message : "Something went wrong.");
+      if (err instanceof ApiError && err.code === "conflict" && PORT_CHECKED.has(action)) {
+        const plan = await api.actionPlan(app.name, action).catch(() => null);
+        const conflicts = plan?.conflicts ?? [];
+        if (conflicts.length > 0) setPortRefusal({ action, conflicts });
+      }
+    },
   });
 
   const unreadable = app.project === null;
   const busy = running || start.isPending;
   const disabled = unreadable || busy;
-  const run = (action: Action) => start.mutate(action);
+  const run = (action: Action) => start.mutate({ action });
 
   return (
     <section aria-labelledby="actions" className="flex flex-col gap-3">
@@ -125,14 +148,31 @@ export function AppActions({ app }: { app: App }) {
             }
             confirmLabel="Take down"
             onConfirm={async () => {
-              await start.mutateAsync("down");
+              await start.mutateAsync({ action: "down" });
             }}
           />
         </div>
       </Advanced>
       {error && (
         <div role="alert">
-          <Notice tone="error" title={error} />
+          <Notice tone="error" title={error}>
+            {portRefusal && (
+              <Advanced>
+                <p>
+                  Start anyway runs it regardless. Docker still refuses a port that is really in
+                  use, so the app may not start.
+                </p>
+                <div>
+                  <Button
+                    disabled={disabled}
+                    onClick={() => start.mutate({ action: portRefusal.action, force: true })}
+                  >
+                    Start anyway
+                  </Button>
+                </div>
+              </Advanced>
+            )}
+          </Notice>
         </div>
       )}
       {latest && <OperationProgress key={latest.id} operation={latest} />}

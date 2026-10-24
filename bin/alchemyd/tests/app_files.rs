@@ -206,7 +206,7 @@ async fn creates_an_app_and_edits_its_files_without_overwriting_a_hand_edit() {
 
     validator.answer(FakeConfig::Config(ComposeConfig {
         name: "blog".into(),
-        services: vec![],
+        ..ComposeConfig::default()
     }));
     let by_hand = format!("{COMPOSE}# edited by hand\n");
     std::fs::write(blog.join("compose.yaml"), &by_hand).unwrap();

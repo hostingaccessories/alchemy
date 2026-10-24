@@ -231,6 +231,41 @@ async fn status_json_adds_the_engine() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn status_explains_networks_that_overlap_the_lan() {
+    use std::sync::Arc;
+
+    use alchemyd::network::FakeNetwork;
+
+    let host = FakeNetwork::new();
+    host.set_lan_subnets(vec!["192.168.0.0/16".parse().unwrap()]);
+    let daemon =
+        Daemon::start_with(ready_desktop(), |deps| deps.with_network(Arc::new(host))).await;
+    let mut network = daemon.state.watch_network();
+    tokio::time::timeout(DEADLINE, network.wait_for(|r| r.engine_ready))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let out = run(cli(&daemon.socket, false, false)).await.unwrap();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines[2],
+        "Warning: Docker's address pool 192.168.0.0/16 overlaps your local network 192.168.0.0/16, so a new network may be given addresses that hide devices on it."
+    );
+    assert_eq!(
+        lines[3],
+        "  Fix: In Docker Desktop, open Settings, then Docker Engine, add these settings to the JSON there, and select Apply & restart:"
+    );
+    assert!(out.contains("\"default-address-pools\""), "{out}");
+
+    let out = run(cli(&daemon.socket, true, false)).await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(json["network"]["alchemy"]["state"], "ready");
+    assert_eq!(json["network"]["warnings"][0]["kind"], "pool_overlap");
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn status_watch_prints_a_line_per_change_until_the_daemon_stops() {
     let daemon = Daemon::start(EngineStatus::new(EngineState::NotRunning)).await;
     let mut watch = Watch::start(cli(&daemon.socket, false, true));
@@ -349,6 +384,173 @@ async fn machine_and_app_stats_show_the_daemons_latest_sample() {
 
     let err = run(parse(&["app", "stats", "my-blog"])).await.unwrap_err();
     assert_eq!(err.to_string(), "alchemyd: no app is named \"my-blog\"");
+
+    daemon.stop().await;
+}
+
+/// Starts a daemon whose `blog` declares 8080 and runs it, whose `wiki`
+/// declares 3000 and is stopped, with 8443 reserved for `proxy` and
+/// `nc -l 9000` listening.
+async fn ports_daemon(home: &Path) -> Daemon {
+    use std::sync::Arc;
+
+    use alchemy_core::engine::{ContainerState, ContainerStatus};
+    use alchemy_core::ports::{Listener, PortRange, Protocol, PublishedPort};
+    use alchemyd::apps::{AppsDeps, SystemFs};
+    use alchemyd::compose::{ComposeConfig, FakeComposeConfig, FakeConfig, ServiceConfig};
+    use alchemyd::network::FakeNetwork;
+    use alchemyd::store::{PortReservation, SharedStore, SqliteStore};
+
+    let tcp = |port: u16| PublishedPort::new(Protocol::Tcp, PortRange::single(port).ok());
+    let config = FakeComposeConfig::new();
+    for (app, service, port) in [("blog", "web", 8080), ("wiki", "app", 3000)] {
+        std::fs::create_dir(home.join(app)).unwrap();
+        std::fs::write(home.join(app).join("compose.yaml"), "services: {}\n").unwrap();
+        config.set(
+            home.join(app),
+            FakeConfig::Config(ComposeConfig {
+                name: app.into(),
+                services: vec![ServiceConfig {
+                    name: service.into(),
+                    ports: vec![tcp(port)],
+                    ..ServiceConfig::default()
+                }],
+                ..ComposeConfig::default()
+            }),
+        );
+    }
+    let network = FakeNetwork::new();
+    network.set_listeners(vec![Listener {
+        protocol: Protocol::Tcp,
+        addr: "0.0.0.0".parse().unwrap(),
+        port: 9000,
+        process: Some("nc".into()),
+        pid: Some(4242),
+    }]);
+    let home = home.to_owned();
+    let daemon = Daemon::start_with(EngineStatus::new(EngineState::Ready), |deps| {
+        deps.with_apps(
+            AppsDeps::new(Arc::new(SystemFs), Arc::new(config), Some(home))
+                .with_scan_interval(Duration::from_millis(20)),
+        )
+        .with_network(Arc::new(network))
+    })
+    .await;
+
+    let mut web = ContainerStatus::new("abc", "blog-web-1", ContainerState::Running);
+    web.project = Some("blog".into());
+    web.service = Some("web".into());
+    web.ports = vec![tcp(8080)];
+    daemon.state.update_containers(|c| c.replace_all([web]));
+    let store: SharedStore = Arc::new(
+        SqliteStore::open(&daemon.socket.parent().unwrap().join("state"))
+            .await
+            .unwrap(),
+    );
+    store
+        .add_port_reservation(PortReservation {
+            owner: "proxy".into(),
+            port: 8443,
+            protocol: Protocol::Tcp,
+            host_ip: None,
+            created: 1,
+        })
+        .await
+        .unwrap();
+    let mut listed = daemon.state.watch_apps();
+    tokio::time::timeout(
+        DEADLINE,
+        listed
+            .wait_for(|list| list.apps.len() == 2 && list.apps.iter().all(|a| a.project.is_some())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    daemon
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn machine_ports_lists_every_port_and_its_holder() {
+    let apps = tempfile::tempdir().unwrap();
+    let daemon = ports_daemon(&apps.path().canonicalize().unwrap()).await;
+    let socket = daemon.socket.to_str().unwrap();
+    let parse = |args: &[&str]| {
+        let mut argv = vec!["alchemy", "--socket", socket];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).unwrap()
+    };
+
+    let out = run(parse(&["machine", "ports"])).await.unwrap();
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        [
+            "PORT      ADDRESS  STATUS    HELD BY",
+            "3000/tcp  *        declared  service app of app wiki",
+            "8080/tcp  *        in use    service web of app blog",
+            "8443/tcp  *        reserved  a reservation for proxy",
+            "9000/tcp  0.0.0.0  in use    another program (nc, pid 4242)",
+        ]
+    );
+
+    let out = run(parse(&["machine", "ports", "--json"])).await.unwrap();
+    assert_eq!(out.lines().count(), 1, "{out}");
+    let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        json["ports"][3]["holder"],
+        serde_json::json!({"kind": "program", "process": "nc", "pid": 4242})
+    );
+    assert_eq!(json["warnings"], serde_json::json!([]));
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starting_an_app_whose_port_is_taken_names_the_holder_until_forced() {
+    use alchemy_core::engine::{ContainerState, ContainerStatus};
+    use alchemy_core::ports::{PortRange, Protocol, PublishedPort};
+
+    let apps = tempfile::tempdir().unwrap();
+    let daemon = ports_daemon(&apps.path().canonicalize().unwrap()).await;
+    let mut pihole = ContainerStatus::new("def", "pihole", ContainerState::Running);
+    pihole.ports = vec![PublishedPort::new(
+        Protocol::Tcp,
+        PortRange::single(3000).ok(),
+    )];
+    daemon.state.update_containers(|c| {
+        let all: Vec<ContainerStatus> = c.iter().cloned().chain([pihole]).collect();
+        c.replace_all(all)
+    });
+    let socket = daemon.socket.clone();
+    let taken = "Port 3000/tcp for service app is in use by container pihole.";
+
+    let err = run_args(&socket, &["app", "up", "wiki"]).await.unwrap_err();
+    assert_eq!(err.kind(), "daemon", "{err}");
+    assert_eq!(
+        err.to_string(),
+        format!("alchemyd: {taken} Free that port, or force up to start wiki anyway.")
+    );
+
+    let out = run_args(&socket, &["app", "start", "wiki", "--dry-run"])
+        .await
+        .unwrap();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines[1..],
+        [
+            format!("port taken: {taken}").as_str(),
+            "would refuse to start wiki while its ports are taken; --force goes ahead anyway",
+        ],
+        "{out}"
+    );
+
+    let out = run_args(&socket, &["app", "up", "wiki", "--force"])
+        .await
+        .unwrap();
+    assert_eq!(out, "wiki is up\n");
+    let out = run_args(&socket, &["app", "restart", "blog"])
+        .await
+        .unwrap();
+    assert_eq!(out, "restarted blog\n", "blog's own port never stops it");
 
     daemon.stop().await;
 }

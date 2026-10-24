@@ -7,16 +7,18 @@
 //! serializes every write through the one connection, and needs no lock.
 //! The thread exits, closing the database, once every handle is dropped.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alchemy_core::engine::{Intent, IntentAction};
+use alchemy_core::ports::Protocol;
 use futures_util::future::BoxFuture;
 use rusqlite::{Connection, ErrorCode, OptionalExtension as _};
 use tokio::sync::{mpsc, oneshot};
 
 use super::migrations::{self, MIGRATIONS, MigrateError};
-use super::{DB_FILE, MetricRow, OperationRow, Store, StoreError};
+use super::{DB_FILE, MetricRow, OperationRow, PortReservation, Store, StoreError};
 use crate::secure_fs;
 
 /// How long a statement waits on a lock held by another connection, such
@@ -309,6 +311,104 @@ impl Store for SqliteStore {
             Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
         }))
     }
+
+    fn add_port_reservation(
+        &self,
+        reservation: PortReservation,
+    ) -> BoxFuture<'_, Result<bool, StoreError>> {
+        Box::pin(self.call(move |conn| {
+            let host_ip = reservation.host_ip_key();
+            let added = conn.execute(
+                "INSERT INTO port_reservations (port, protocol, host_ip, owner, created)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (port, protocol, host_ip) DO NOTHING",
+                (
+                    reservation.port,
+                    reservation.protocol.as_str(),
+                    host_ip,
+                    reservation.owner,
+                    reservation.created,
+                ),
+            )?;
+            Ok(added > 0)
+        }))
+    }
+
+    fn port_reservations(&self) -> BoxFuture<'_, Result<Vec<PortReservation>, StoreError>> {
+        Box::pin(async move {
+            let rows = self
+                .call(|conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT port, protocol, host_ip, owner, created FROM port_reservations
+                         ORDER BY port, protocol, host_ip",
+                    )?;
+                    stmt.query_map([], |row| {
+                        Ok(ReservationRow {
+                            port: row.get(0)?,
+                            protocol: row.get(1)?,
+                            host_ip: row.get(2)?,
+                            owner: row.get(3)?,
+                            created: row.get(4)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                })
+                .await?;
+            Ok(rows.into_iter().filter_map(known_reservation).collect())
+        })
+    }
+
+    fn remove_port_reservations<'a>(
+        &'a self,
+        owner: &'a str,
+    ) -> BoxFuture<'a, Result<u64, StoreError>> {
+        let owner = owner.to_owned();
+        Box::pin(self.call(move |conn| {
+            let deleted =
+                conn.execute("DELETE FROM port_reservations WHERE owner = ?1", [owner])?;
+            Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
+        }))
+    }
+}
+
+struct ReservationRow {
+    port: u16,
+    protocol: String,
+    host_ip: String,
+    owner: String,
+    created: i64,
+}
+
+/// A newer alchemyd may reserve ports for protocols this build does not
+/// know.
+fn known_reservation(row: ReservationRow) -> Option<PortReservation> {
+    let Ok(protocol) = row.protocol.parse::<Protocol>() else {
+        tracing::warn!(
+            port = row.port,
+            protocol = row.protocol,
+            "skipping a port reservation with an unknown protocol"
+        );
+        return None;
+    };
+    let host_ip = if row.host_ip.is_empty() {
+        None
+    } else if let Ok(ip) = row.host_ip.parse::<IpAddr>() {
+        Some(ip)
+    } else {
+        tracing::warn!(
+            port = row.port,
+            host_ip = row.host_ip,
+            "skipping a port reservation with an unreadable address"
+        );
+        return None;
+    };
+    Some(PortReservation {
+        owner: row.owner,
+        port: row.port,
+        protocol,
+        host_ip,
+        created: row.created,
+    })
 }
 
 type IntentRow = (String, String, i64);
@@ -491,5 +591,30 @@ mod tests {
         let err = SqliteStore::open(tmp.path()).await.unwrap_err();
         assert!(matches!(err, StoreError::Corrupt { .. }), "{err:?}");
         assert_eq!(std::fs::read(&path).unwrap(), vec![0x5a; 8192]);
+    }
+
+    #[tokio::test]
+    async fn skips_reservations_this_build_cannot_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(tmp.path()).await.unwrap();
+        store
+            .call(|conn| {
+                conn.execute_batch(
+                    "INSERT INTO port_reservations VALUES (80, 'sctp', '', 'future', 1);
+                     INSERT INTO port_reservations VALUES (81, 'tcp', 'nowhere', 'broken', 1);
+                     INSERT INTO port_reservations VALUES (82, 'tcp', '', 'proxy', 1);",
+                )
+            })
+            .await
+            .unwrap();
+        let shared: SharedStore = Arc::new(store);
+        let owners: Vec<String> = shared
+            .port_reservations()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.owner)
+            .collect();
+        assert_eq!(owners, ["proxy"]);
     }
 }

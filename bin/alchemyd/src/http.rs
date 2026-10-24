@@ -5,7 +5,8 @@
 //! which streams an app's [`LogEvent`]s. The app routes are described in
 //! [`alchemy_api::apps`], and the lifecycle operation routes, whose
 //! `/api/operations/{id}/events` streams too, in
-//! [`alchemy_api::operations`]. On the TCP listener ([`router`])
+//! [`alchemy_api::operations`]. `/api/network` returns the latest
+//! [`NetworkReport`]. On the TCP listener ([`router`])
 //! everything else is served from the embedded web UI build with an
 //! `index.html` fallback for client-side routing; on the Unix socket
 //! ([`api_router`]) everything else is a JSON 404.
@@ -19,9 +20,11 @@
 //!
 //! Creating apps and editing their files needs an [`AppEditor`], which
 //! [`with_editor`] adds to either router; without one those routes answer
-//! 503.
+//! 503. So does `/api/ports` without the [`PortRegistry`] that
+//! [`with_ports`] adds.
 
 mod app_files;
+mod ports;
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -30,6 +33,7 @@ use std::time::Duration;
 
 use alchemy_api::apps::{App, AppList, AppSettings, AppSettingsUpdate};
 use alchemy_api::logs::LogEvent;
+use alchemy_api::network::NetworkReport;
 use alchemy_api::operations::{
     Action, ActionRequest, OperationEvent, OperationList, OperationResponse,
 };
@@ -61,6 +65,7 @@ use crate::guard::{self, Refusal, TAURI_ORIGINS};
 use crate::logs::{self, LogQuery, LogsRefusal, SharedLogSource};
 use crate::metrics::Scope;
 use crate::operations::{CancelError, Operations, StartError};
+use crate::ports::PortRegistry;
 use crate::session::Auth;
 use crate::store::SharedStore;
 
@@ -228,6 +233,11 @@ pub fn with_editor(router: Router, editor: Arc<AppEditor>) -> Router {
     router.layer(Extension(editor))
 }
 
+/// Give `router`'s `/api/ports` route `registry` to list ports from.
+pub fn with_ports(router: Router, registry: PortRegistry) -> Router {
+    router.layer(Extension(registry))
+}
+
 /// Wrap `routes` the way the Unix socket serves them: the content-type
 /// check alone, since no browser can reach the socket.
 pub fn socket_checks(routes: Router) -> Router {
@@ -274,6 +284,8 @@ fn api(
                 .layer(app_files::body_limit()),
         )
         .route("/settings/apps", get(app_settings).put(set_app_settings))
+        .route("/ports", get(ports::list))
+        .route("/network", get(network))
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found)
         .with_state(Api {
@@ -465,6 +477,10 @@ async fn version() -> Json<VersionResponse> {
 
 async fn engine(extract::State(state): extract::State<State>) -> Json<EngineStatus> {
     Json(state.engine())
+}
+
+async fn network(extract::State(state): extract::State<State>) -> Json<NetworkReport> {
+    Json(state.network())
 }
 
 /// `?app=NAME` or `?project=NAME` on the metrics routes.
@@ -797,7 +813,7 @@ async fn plan_action(
         Err(rejection) => return bad_query(&rejection),
     };
     match action {
-        Ok(action) => match operations.plan(&name, action) {
+        Ok(action) => match operations.plan(&name, action).await {
             Ok(plan) => Json(plan).into_response(),
             Err(error) => start_refused(&error),
         },
@@ -1042,7 +1058,12 @@ mod tests {
         runner: crate::compose::FakeComposeRunner,
         store: SharedStore,
     ) -> Operations {
-        Operations::new(Arc::new(runner), state.clone(), store)
+        let ports = crate::ports::PortRegistry::new(
+            state.clone(),
+            store.clone(),
+            Arc::new(crate::network::FakeNetwork::new()),
+        );
+        Operations::new(Arc::new(runner), state.clone(), store, ports)
     }
 
     /// The daemon's router with only the engine topic on `/api/events`, so
@@ -1127,6 +1148,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ports_need_a_registry() {
+        let (status, body) = get_json("/api/ports").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "internal");
+    }
+
+    #[tokio::test]
     async fn version_reports_crate_version() {
         let (status, body) = get_json("/api/version").await;
         assert_eq!(status, StatusCode::OK);
@@ -1144,6 +1172,27 @@ mod tests {
         let (status, body) = get_json_from(state, "/api/engine").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::to_value(&ready).unwrap());
+    }
+
+    #[tokio::test]
+    async fn network_reports_the_latest_check() {
+        let (status, body) = get_json("/api/network").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::to_value(alchemy_api::network::NetworkReport::default()).unwrap()
+        );
+
+        let state = State::new();
+        let report = alchemy_api::network::NetworkReport {
+            engine_ready: true,
+            lan: vec!["10.0.1.0/24".parse().unwrap()],
+            ..alchemy_api::network::NetworkReport::default()
+        };
+        state.set_network(report.clone());
+        let (status, body) = get_json_from(state, "/api/network").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::to_value(&report).unwrap());
     }
 
     #[tokio::test]
@@ -2027,6 +2076,8 @@ mod tests {
                 StatusCode::UNAUTHORIZED,
             ),
             (Method::GET, "/api/events", None, StatusCode::UNAUTHORIZED),
+            (Method::GET, "/api/network", None, StatusCode::UNAUTHORIZED),
+            (Method::GET, "/api/network", token.clone(), StatusCode::OK),
             (Method::GET, "/api/session", None, StatusCode::UNAUTHORIZED),
             (Method::POST, "/api/health", None, StatusCode::UNAUTHORIZED),
             (Method::GET, "/api/nope", None, StatusCode::UNAUTHORIZED),

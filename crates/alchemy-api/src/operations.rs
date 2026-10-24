@@ -4,10 +4,14 @@
 //!   answers 202 with an [`OperationResponse`] for the operation it
 //!   started. It is 404 [`ErrorCode::AppNotFound`] for an unknown app, and
 //!   409 [`ErrorCode::Conflict`] while another operation runs on the app,
-//!   before Compose has read it, while Docker is not running, or when
-//!   another app shares its Compose project and `force` is not set.
+//!   before Compose has read it, while Docker is not running, or, unless
+//!   `force` is set, when another app shares its Compose project or when
+//!   `up`, `start`, `restart`, or `update` would publish a host port that
+//!   something else holds. The port refusal names each port and its
+//!   holder.
 //! - `GET /api/apps/{name}/plan?action=ACTION` returns the [`ActionPlan`]
-//!   that action would run, changing nothing.
+//!   that action would run, changing nothing, with the port conflicts
+//!   that would refuse it.
 //! - `GET /api/operations` returns an [`OperationList`] of recent
 //!   operations, newest first; `?app=NAME` keeps one app's.
 //! - `GET /api/operations/{id}` returns one [`Operation`], or 404
@@ -31,13 +35,16 @@ pub use alchemy_core::operation::{
 };
 use serde::{Deserialize, Serialize, Serializer};
 
+use crate::ports::PortConflict;
+
 /// The body of `POST /api/apps/{name}/actions`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionRequest {
     /// What to do.
     pub action: Action,
     /// Go ahead even though another app shares this app's Compose project,
-    /// so the action reaches that app's containers too.
+    /// so the action reaches that app's containers too, or a host port the
+    /// app publishes is taken.
     #[serde(default)]
     pub force: bool,
 }
@@ -66,6 +73,11 @@ pub struct ActionPlan {
     pub action: Action,
     /// The steps, in the order they would run.
     pub steps: Vec<PlannedStep>,
+    /// The host ports the app publishes that something else holds now,
+    /// which refuse the action unless it is forced. Only `up`, `start`,
+    /// `restart`, and `update` check ports. Left out when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<PortConflict>,
 }
 
 /// One step of an [`ActionPlan`].

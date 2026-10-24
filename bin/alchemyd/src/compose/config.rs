@@ -8,10 +8,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fmt;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use alchemy_core::network::Ipv4Net;
+use alchemy_core::ports::{PortRange, Protocol, PublishedPort};
 use futures_util::future::BoxFuture;
 use rustix::process::Signal;
 use serde::Deserialize;
@@ -26,21 +29,45 @@ use crate::engine::{
 };
 
 /// What Alchemy uses from a project's resolved configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ComposeConfig {
     /// The project name Compose resolved.
     pub name: String,
     /// The services enabled without any profile, by name.
     pub services: Vec<ServiceConfig>,
+    /// The networks its services use, by key. Compose leaves out the ones
+    /// no service uses.
+    pub networks: Vec<NetworkConfig>,
 }
 
 /// One service of a [`ComposeConfig`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServiceConfig {
     /// The service name.
     pub name: String,
     /// Whether it has a `build:` section.
     pub builds: bool,
+    /// The ports it publishes on the host, in the order Compose lists
+    /// them. One with no `published` port is ephemeral.
+    pub ports: Vec<PublishedPort>,
+    /// The keys of the [`ComposeConfig::networks`] it joins, sorted. Empty
+    /// for a service with a `network_mode`.
+    pub networks: Vec<String>,
+}
+
+/// One network of a [`ComposeConfig`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkConfig {
+    /// The key services refer to it by, such as `default`.
+    pub key: String,
+    /// The name Docker knows it by, such as `blog_default`.
+    pub name: String,
+    /// Whether it is created outside the project, so Compose only joins
+    /// it.
+    pub external: bool,
+    /// The IPv4 subnets its `ipam` config asks for. Empty when Docker
+    /// picks one from its address pools.
+    pub subnets: Vec<Ipv4Net>,
 }
 
 #[derive(Deserialize)]
@@ -48,16 +75,187 @@ struct RawConfig {
     name: String,
     #[serde(default)]
     services: BTreeMap<String, RawService>,
+    #[serde(default)]
+    networks: BTreeMap<String, Lenient<Option<RawNetwork>>>,
 }
 
 #[derive(Deserialize)]
 struct RawService {
     #[serde(default)]
     build: Option<IgnoredAny>,
+    #[serde(default)]
+    ports: Option<Lenient<Vec<Lenient<RawPort>>>>,
+    #[serde(default)]
+    networks: Option<Lenient<RawServiceNetworks>>,
+}
+
+/// A value Alchemy reads if it can and skips if it can't, so a shape it
+/// doesn't expect never makes the whole configuration unreadable.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Lenient<T> {
+    Read(T),
+    Skipped(IgnoredAny),
+}
+
+impl<T> Lenient<T> {
+    fn ok(self) -> Option<T> {
+        match self {
+            Self::Read(value) => Some(value),
+            Self::Skipped(_) => None,
+        }
+    }
+}
+
+/// One entry of a service's `ports`, in the long syntax Compose prints
+/// every port in.
+#[derive(Deserialize)]
+struct RawPort {
+    #[serde(default)]
+    target: Option<RawPorts>,
+    #[serde(default)]
+    published: Option<RawPorts>,
+    #[serde(default)]
+    host_ip: Option<String>,
+    #[serde(default)]
+    protocol: Option<String>,
+}
+
+/// A port or range, which Compose prints as a string and older versions
+/// as a number.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawPorts {
+    Number(u32),
+    Text(String),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawServiceNetworks {
+    Map(BTreeMap<String, serde_json::Value>),
+    List(Vec<String>),
+}
+
+#[derive(Default, Deserialize)]
+struct RawNetwork {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    external: Option<RawExternal>,
+    #[serde(default)]
+    ipam: Option<Lenient<RawIpam>>,
+}
+
+/// `external: true`, or the older `external: {name: ...}`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawExternal {
+    Flag(bool),
+    Named(IgnoredAny),
+}
+
+#[derive(Deserialize)]
+struct RawIpam {
+    #[serde(default)]
+    config: Option<Vec<Lenient<RawIpamPool>>>,
+}
+
+#[derive(Deserialize)]
+struct RawIpamPool {
+    #[serde(default)]
+    subnet: Option<String>,
+}
+
+impl RawPorts {
+    fn range(&self) -> Option<PortRange> {
+        match self {
+            Self::Number(n) => PortRange::single(u16::try_from(*n).ok()?).ok(),
+            Self::Text(text) => text.trim().parse().ok(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Text(text) if text.trim().is_empty())
+    }
+}
+
+impl RawPort {
+    /// The port, or `None` if Docker could not publish it as read: an
+    /// unknown protocol such as `sctp`, or an unreadable port or address.
+    fn published(self) -> Option<PublishedPort> {
+        let protocol = match self.protocol.as_deref().map(str::trim) {
+            None | Some("") => Protocol::Tcp,
+            Some(other) => other.parse().ok()?,
+        };
+        let host_ip = match self.host_ip.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(ip) => Some(parse_host_ip(ip)?),
+        };
+        let published = match self.published {
+            None => None,
+            Some(ports) if ports.is_empty() => None,
+            Some(ports) => Some(ports.range()?),
+        };
+        let target = match self.target {
+            None => None,
+            Some(ports) => Some(ports.range()?),
+        };
+        Some(
+            PublishedPort::new(protocol, published)
+                .with_host_ip(host_ip)
+                .with_target(target),
+        )
+    }
+}
+
+/// A host IP as Compose prints it, with or without IPv6 brackets.
+fn parse_host_ip(ip: &str) -> Option<IpAddr> {
+    let bare = ip
+        .strip_prefix('[')
+        .and_then(|ip| ip.strip_suffix(']'))
+        .unwrap_or(ip);
+    bare.parse().ok()
+}
+
+impl RawServiceNetworks {
+    fn keys(self) -> Vec<String> {
+        let mut keys = match self {
+            Self::Map(map) => map.into_keys().collect(),
+            Self::List(list) => list,
+        };
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+}
+
+impl RawNetwork {
+    fn config(self, key: String) -> NetworkConfig {
+        NetworkConfig {
+            name: self.name.unwrap_or_else(|| key.clone()),
+            external: matches!(
+                self.external,
+                Some(RawExternal::Flag(true) | RawExternal::Named(_))
+            ),
+            subnets: self
+                .ipam
+                .and_then(Lenient::ok)
+                .and_then(|ipam| ipam.config)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|pool| pool.ok()?.subnet?.trim().parse().ok())
+                .collect(),
+            key,
+        }
+    }
 }
 
 impl ComposeConfig {
     /// Parse the output of `docker compose config --format json`.
+    ///
+    /// A port, network, or `ipam` entry in a shape Alchemy can't read is
+    /// left out rather than failing the whole configuration.
     pub fn parse(json: &[u8]) -> Result<Self, serde_json::Error> {
         let raw: RawConfig = serde_json::from_slice(json)?;
         Ok(Self {
@@ -68,7 +266,24 @@ impl ComposeConfig {
                 .map(|(name, service)| ServiceConfig {
                     name,
                     builds: service.build.is_some(),
+                    ports: service
+                        .ports
+                        .and_then(Lenient::ok)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|port| port.ok()?.published())
+                        .collect(),
+                    networks: service
+                        .networks
+                        .and_then(Lenient::ok)
+                        .map(RawServiceNetworks::keys)
+                        .unwrap_or_default(),
                 })
+                .collect(),
+            networks: raw
+                .networks
+                .into_iter()
+                .map(|(key, network)| network.ok().flatten().unwrap_or_default().config(key))
                 .collect(),
         })
     }
@@ -378,9 +593,10 @@ impl FakeComposeConfig {
                     .iter()
                     .map(|s| ServiceConfig {
                         name: (*s).to_owned(),
-                        builds: false,
+                        ..ServiceConfig::default()
                     })
                     .collect(),
+                ..ComposeConfig::default()
             }),
         );
     }
@@ -475,6 +691,238 @@ mod tests {
                 "{json}"
             );
         }
+    }
+
+    /// What Compose 5.5 prints for a project using every port syntax,
+    /// trimmed to the fields read here. The compose file was:
+    ///
+    /// ```yaml
+    /// services:
+    ///   web:
+    ///     ports:
+    ///       - "8080:80"
+    ///       - "127.0.0.1:8443:443/tcp"
+    ///       - "53:53/udp"
+    ///       - "9000-9001:9000-9001"
+    ///       - "3000"
+    ///       - "[::1]:6000:6000"
+    ///       - "8000-8005:80"
+    ///       - "127.0.0.1::81"
+    ///       - {target: 5000, published: "5001", host_ip: 0.0.0.0, protocol: udp, mode: host}
+    ///     networks: [front, back, outside]
+    ///   db:
+    ///     networks: {back: {ipv4_address: 10.99.0.10}}
+    ///   plain: {}
+    /// networks:
+    ///   front: {}
+    ///   back:
+    ///     ipam:
+    ///       config: [{subnet: 10.99.0.0/24, gateway: 10.99.0.1}, {subnet: "fd00:99::/64"}]
+    ///   outside: {external: true, name: shared_net}
+    /// ```
+    const PORTS_AND_NETWORKS: &str = r#"{
+      "name": "fixture",
+      "networks": {
+        "back": {"name": "fixture_back", "ipam": {"driver": "default", "config": [
+          {"subnet": "10.99.0.0/24", "gateway": "10.99.0.1"}, {"subnet": "fd00:99::/64"}]}},
+        "default": {"name": "fixture_default", "ipam": {}},
+        "front": {"name": "fixture_front", "ipam": {}},
+        "outside": {"name": "shared_net", "ipam": {}, "external": true}
+      },
+      "services": {
+        "db": {"command": null, "image": "postgres",
+          "networks": {"back": {"aliases": ["database"], "ipv4_address": "10.99.0.10"}}},
+        "plain": {"command": null, "expose": ["6379"], "image": "redis", "networks": {"default": null}},
+        "web": {"command": null, "image": "nginx",
+          "networks": {"back": null, "front": null, "outside": {}},
+          "ports": [
+            {"mode": "ingress", "target": 80, "published": "8080", "protocol": "tcp"},
+            {"mode": "ingress", "host_ip": "127.0.0.1", "target": 443, "published": "8443", "protocol": "tcp"},
+            {"mode": "ingress", "target": 53, "published": "53", "protocol": "udp"},
+            {"mode": "ingress", "target": 9000, "published": "9000", "protocol": "tcp"},
+            {"mode": "ingress", "target": 9001, "published": "9001", "protocol": "tcp"},
+            {"mode": "ingress", "target": 3000, "protocol": "tcp"},
+            {"mode": "ingress", "host_ip": "::1", "target": 6000, "published": "6000", "protocol": "tcp"},
+            {"mode": "ingress", "target": 80, "published": "8000-8005", "protocol": "tcp"},
+            {"mode": "ingress", "host_ip": "127.0.0.1", "target": 81, "protocol": "tcp"},
+            {"mode": "host", "host_ip": "0.0.0.0", "target": 5000, "published": "5001", "protocol": "udp"}
+          ]}
+      }
+    }"#;
+
+    fn port(spec: &str) -> PublishedPort {
+        let (rest, protocol) = spec.rsplit_once('/').unwrap();
+        let (host, target) = rest.rsplit_once("->").unwrap();
+        let (ip, published) = match host.rsplit_once('|') {
+            Some((ip, published)) => (Some(ip.parse().unwrap()), published),
+            None => (None, host),
+        };
+        PublishedPort::new(
+            protocol.parse().unwrap(),
+            (!published.is_empty()).then(|| published.parse().unwrap()),
+        )
+        .with_host_ip(ip)
+        .with_target(Some(target.parse().unwrap()))
+    }
+
+    fn service<'a>(config: &'a ComposeConfig, name: &str) -> &'a ServiceConfig {
+        config.services.iter().find(|s| s.name == name).unwrap()
+    }
+
+    #[test]
+    fn parses_published_ports() {
+        let config = ComposeConfig::parse(PORTS_AND_NETWORKS.as_bytes()).unwrap();
+        assert_eq!(
+            service(&config, "web").ports,
+            [
+                port("8080->80/tcp"),
+                port("127.0.0.1|8443->443/tcp"),
+                port("53->53/udp"),
+                port("9000->9000/tcp"),
+                port("9001->9001/tcp"),
+                port("->3000/tcp"),
+                port("::1|6000->6000/tcp"),
+                port("8000-8005->80/tcp"),
+                port("127.0.0.1|->81/tcp"),
+                port("0.0.0.0|5001->5000/udp"),
+            ]
+        );
+        assert!(service(&config, "web").ports[5].is_ephemeral());
+        assert_eq!(service(&config, "db").ports, []);
+        assert_eq!(
+            service(&config, "plain").ports,
+            [],
+            "expose publishes nothing"
+        );
+    }
+
+    #[test]
+    fn parses_networks_and_their_subnets() {
+        let config = ComposeConfig::parse(PORTS_AND_NETWORKS.as_bytes()).unwrap();
+        let joined: Vec<_> = config
+            .services
+            .iter()
+            .map(|s| (s.name.as_str(), s.networks.clone()))
+            .collect();
+        assert_eq!(
+            joined,
+            [
+                ("db", vec!["back".to_owned()]),
+                ("plain", vec!["default".to_owned()]),
+                (
+                    "web",
+                    vec!["back".to_owned(), "front".to_owned(), "outside".to_owned()]
+                ),
+            ]
+        );
+        let network = |key: &str, name: &str, external: bool, subnets: &[&str]| NetworkConfig {
+            key: key.into(),
+            name: name.into(),
+            external,
+            subnets: subnets.iter().map(|s| s.parse().unwrap()).collect(),
+        };
+        assert_eq!(
+            config.networks,
+            [
+                network("back", "fixture_back", false, &["10.99.0.0/24"]),
+                network("default", "fixture_default", false, &[]),
+                network("front", "fixture_front", false, &[]),
+                network("outside", "shared_net", true, &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_each_port_field_leniently() {
+        let cases: [(&str, Option<&str>); 14] = [
+            (r#"{"target":80,"published":"8080"}"#, Some("8080->80/tcp")),
+            (r#"{"target":80,"published":8080}"#, Some("8080->80/tcp")),
+            (
+                r#"{"target":"80","published":"8080","protocol":"UDP"}"#,
+                Some("8080->80/udp"),
+            ),
+            (r#"{"target":80,"published":""}"#, Some("->80/tcp")),
+            (r#"{"target":80,"published":null}"#, Some("->80/tcp")),
+            (
+                r#"{"target":80,"published":"8080","host_ip":""}"#,
+                Some("8080->80/tcp"),
+            ),
+            (
+                r#"{"target":80,"published":"8080","host_ip":"[::]"}"#,
+                Some("::|8080->80/tcp"),
+            ),
+            (
+                r#"{"target":80,"published":"8080","protocol":""}"#,
+                Some("8080->80/tcp"),
+            ),
+            (
+                r#"{"target":80,"published":"8080","protocol":"sctp"}"#,
+                None,
+            ),
+            (r#"{"target":80,"published":"0"}"#, None),
+            (r#"{"target":80,"published":"9-1"}"#, None),
+            (r#"{"target":80,"published":70000}"#, None),
+            (
+                r#"{"target":80,"published":"8080","host_ip":"localhost"}"#,
+                None,
+            ),
+            (r#""8080:80""#, None),
+        ];
+        for (raw, want) in cases {
+            let json = format!(r#"{{"name":"a","services":{{"web":{{"ports":[{raw}]}}}}}}"#);
+            let config = ComposeConfig::parse(json.as_bytes()).unwrap();
+            assert_eq!(
+                config.services[0].ports,
+                want.map(port).into_iter().collect::<Vec<_>>(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_networks_leniently() {
+        let json = br#"{
+            "name": "a",
+            "networks": {
+                "old": {"external": {"name": "legacy"}},
+                "bare": null,
+                "odd": {"ipam": {"config": [{"subnet": "nope"}, {"subnet": "10.1.0.0/16"}, 7]}},
+                "weird": {"ipam": "x"},
+                "broken": 5
+            },
+            "services": {
+                "list": {"networks": ["b", "a", "b"]},
+                "bad": {"networks": 3, "ports": "x"}
+            }
+        }"#;
+        let config = ComposeConfig::parse(json).unwrap();
+        let summary: Vec<_> = config
+            .networks
+            .iter()
+            .map(|n| {
+                (
+                    n.key.as_str(),
+                    n.name.as_str(),
+                    n.external,
+                    n.subnets
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("bare", "bare", false, vec![]),
+                ("broken", "broken", false, vec![]),
+                ("odd", "odd", false, vec!["10.1.0.0/16".to_owned()]),
+                ("old", "old", true, vec![]),
+                ("weird", "weird", false, vec![]),
+            ]
+        );
+        assert_eq!(service(&config, "list").networks, ["a", "b"]);
+        assert_eq!(service(&config, "bad").networks, [] as [String; 0]);
     }
 
     #[test]

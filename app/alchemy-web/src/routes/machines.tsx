@@ -4,7 +4,9 @@ import { useState } from "react";
 
 import { EngineStatusView } from "../components/EngineStatus.tsx";
 import { Loading } from "../components/Loading.tsx";
+import { NetworkWarnings } from "../components/NetworkWarnings.tsx";
 import { PageHeader } from "../components/PageHeader.tsx";
+import { PortsSection } from "../components/Ports.tsx";
 import { AppUsageTable, MachineUsageView, RangePicker } from "../components/Usage.tsx";
 import { type MetricsRange, api } from "../lib/api.ts";
 import { useDaemonConnection } from "../lib/live.tsx";
@@ -40,8 +42,10 @@ function MachinesPage() {
         ) : (
           <p className="text-muted">Docker status appears once alchemyd is reachable.</p>
         )}
+        {online && <NetworkWarnings />}
       </section>
       {online && <Usage />}
+      {online && <PortsSection />}
     </div>
   );
 }

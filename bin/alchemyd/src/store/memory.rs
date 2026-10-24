@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use alchemy_core::engine::Intent;
 use futures_util::future::BoxFuture;
 
-use super::{MetricRow, OperationRow, Store, StoreError};
+use super::{MetricRow, OperationRow, PortReservation, Store, StoreError};
 
 /// A [`Store`] that keeps everything in memory and forgets it on drop.
 #[derive(Debug, Default)]
@@ -15,7 +15,10 @@ pub struct MemoryStore {
     metrics: Mutex<BTreeMap<(i64, i64), String>>,
     intents: Mutex<BTreeMap<String, Intent>>,
     operations: Mutex<BTreeMap<String, OperationRow>>,
+    reservations: Mutex<BTreeMap<ReservationKey, PortReservation>>,
 }
+
+type ReservationKey = (u16, &'static str, String);
 
 impl MemoryStore {
     /// An empty store.
@@ -43,6 +46,14 @@ impl MemoryStore {
 
     fn operations(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, OperationRow>> {
         self.operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn reservation_map(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<ReservationKey, PortReservation>> {
+        self.reservations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -215,6 +226,37 @@ impl Store for MemoryStore {
                 operations.remove(id);
             }
             Ok(u64::try_from(old.len()).unwrap_or(u64::MAX))
+        })
+    }
+
+    fn add_port_reservation(
+        &self,
+        reservation: PortReservation,
+    ) -> BoxFuture<'_, Result<bool, StoreError>> {
+        Box::pin(async move {
+            let mut map = self.reservation_map();
+            let key = reservation.key();
+            if map.contains_key(&key) {
+                return Ok(false);
+            }
+            map.insert(key, reservation);
+            Ok(true)
+        })
+    }
+
+    fn port_reservations(&self) -> BoxFuture<'_, Result<Vec<PortReservation>, StoreError>> {
+        Box::pin(async move { Ok(self.reservation_map().values().cloned().collect()) })
+    }
+
+    fn remove_port_reservations<'a>(
+        &'a self,
+        owner: &'a str,
+    ) -> BoxFuture<'a, Result<u64, StoreError>> {
+        Box::pin(async move {
+            let mut map = self.reservation_map();
+            let before = map.len();
+            map.retain(|_, r| r.owner != owner);
+            Ok(u64::try_from(before - map.len()).unwrap_or(u64::MAX))
         })
     }
 }

@@ -67,6 +67,19 @@ pub const MIGRATIONS: &[Migration] = &[
           CREATE INDEX operations_by_app ON operations (app, started_at, id);
           CREATE INDEX operations_by_state ON operations (state);",
     },
+    Migration {
+        version: 5,
+        name: "port_reservations",
+        sql: "CREATE TABLE port_reservations (
+            port     INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+            protocol TEXT NOT NULL,
+            host_ip  TEXT NOT NULL, -- empty for every address
+            owner    TEXT NOT NULL,
+            created  INTEGER NOT NULL,
+            PRIMARY KEY (port, protocol, host_ip)
+          ) STRICT;
+          CREATE INDEX port_reservations_by_owner ON port_reservations (owner);",
+    },
 ];
 
 /// The schema version this build migrates databases to.
@@ -217,7 +230,13 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         apply(&mut conn, MIGRATIONS).unwrap();
         let tables = tables(&conn);
-        for table in ["settings", "metrics", "intents", "operations"] {
+        for table in [
+            "settings",
+            "metrics",
+            "intents",
+            "operations",
+            "port_reservations",
+        ] {
             assert!(tables.contains(&table.to_owned()), "{table}");
         }
     }

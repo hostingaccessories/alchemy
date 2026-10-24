@@ -1,14 +1,18 @@
 //! Live daemon state, written by background tasks such as the engine
 //! monitor and read by both front doors.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alchemy_api::MetricsResponse;
 use alchemy_api::OperationList;
 use alchemy_api::apps::{AppList, AppSettings};
+use alchemy_api::network::NetworkReport;
 use alchemy_core::engine::{Containers, EngineState, EngineStatus};
 use tokio::sync::watch;
 
+use crate::apps::ConfigOutcome;
 use crate::logs::LogStreams;
 
 /// The daemon's live state. Cheap to clone: every clone shares the same
@@ -29,10 +33,12 @@ struct Inner {
     containers: watch::Sender<Containers>,
     metrics: watch::Sender<MetricsResponse>,
     apps: watch::Sender<AppList>,
+    app_configs: watch::Sender<BTreeMap<PathBuf, ConfigOutcome>>,
     app_settings: watch::Sender<AppSettings>,
     app_rescans: watch::Sender<u64>,
     app_scans: watch::Sender<u64>,
     operations: watch::Sender<OperationList>,
+    network: watch::Sender<NetworkReport>,
     log_streams: LogStreams,
 }
 
@@ -50,6 +56,7 @@ impl State {
                     ..MetricsResponse::default()
                 }),
                 apps: watch::Sender::new(AppList::default()),
+                app_configs: watch::Sender::new(BTreeMap::new()),
                 app_settings: watch::Sender::new(AppSettings {
                     home: None,
                     default_home: None,
@@ -58,6 +65,7 @@ impl State {
                 app_rescans: watch::Sender::new(0),
                 app_scans: watch::Sender::new(0),
                 operations: watch::Sender::new(OperationList::default()),
+                network: watch::Sender::new(NetworkReport::default()),
                 log_streams: LogStreams::default(),
             }),
         }
@@ -149,6 +157,25 @@ impl State {
         send_if_changed(&self.inner.apps, apps)
     }
 
+    /// What reading each app's configuration last came to, by app
+    /// folder: the ports and networks Compose declared, without running
+    /// Compose again.
+    pub fn app_configs(&self) -> BTreeMap<PathBuf, ConfigOutcome> {
+        self.inner.app_configs.borrow().clone()
+    }
+
+    /// What reading the configuration of the app in `dir` last came to,
+    /// or `None` if it has not been read.
+    pub fn app_config(&self, dir: &Path) -> Option<ConfigOutcome> {
+        self.inner.app_configs.borrow().get(dir).cloned()
+    }
+
+    /// Replace every app's configuration outcome. Returns whether they
+    /// changed.
+    pub fn set_app_configs(&self, configs: BTreeMap<PathBuf, ConfigOutcome>) -> bool {
+        send_if_changed(&self.inner.app_configs, configs)
+    }
+
     /// The app folder settings in effect.
     pub fn app_settings(&self) -> AppSettings {
         self.inner.app_settings.borrow().clone()
@@ -219,6 +246,24 @@ impl State {
     /// changed; subscribers are only notified if they did.
     pub fn set_operations(&self, operations: OperationList) -> bool {
         send_if_changed(&self.inner.operations, operations)
+    }
+
+    /// The latest check of Docker's networks against the host's.
+    pub fn network(&self) -> NetworkReport {
+        self.inner.network.borrow().clone()
+    }
+
+    /// Subscribe to changes to [`Self::network`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_network(&self) -> watch::Receiver<NetworkReport> {
+        self.inner.network.subscribe()
+    }
+
+    /// Replace the network check. Returns whether it changed; subscribers
+    /// are only notified if it did.
+    pub fn set_network(&self, network: NetworkReport) -> bool {
+        send_if_changed(&self.inner.network, network)
     }
 
     /// The log streams open on either listener, held to

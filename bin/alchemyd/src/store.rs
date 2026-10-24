@@ -12,7 +12,8 @@
 //! `store.put_metric_points(step, &points)` for metrics history, and
 //! `store.put_operation(&operation)` and `store.operations(app, limit)`
 //! for operation history. Intents go through [`crate::intent`], which
-//! also updates the live state.
+//! also updates the live state. Port reservations are made through
+//! [`crate::ports::PortRegistry`], which picks a free port first.
 
 mod dir;
 mod memory;
@@ -23,12 +24,14 @@ pub use dir::{DB_FILE, LOCK_FILE, STATE_DIR_ENV, StateLock, default_state_dir, l
 pub use memory::MemoryStore;
 pub use sqlite::SqliteStore;
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use alchemy_core::engine::Intent;
 use alchemy_core::metrics::MetricsPoint;
 use alchemy_core::operation::{Operation, OperationState};
+use alchemy_core::ports::{PortRange, Protocol, PublishedPort, Reservation};
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -118,6 +121,23 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// Delete all but the newest `keep` operations, returning how many
     /// went.
     fn prune_operations(&self, keep: usize) -> BoxFuture<'_, Result<u64, StoreError>>;
+
+    /// Store `reservation`, returning `false` without storing it when
+    /// its port, protocol, and address are already reserved.
+    fn add_port_reservation(
+        &self,
+        reservation: PortReservation,
+    ) -> BoxFuture<'_, Result<bool, StoreError>>;
+
+    /// Every port reservation, by port, protocol, then address. A row
+    /// whose protocol or address this build cannot read is left out.
+    fn port_reservations(&self) -> BoxFuture<'_, Result<Vec<PortReservation>, StoreError>>;
+
+    /// Delete every reservation held by `owner`, returning how many went.
+    fn remove_port_reservations<'a>(
+        &'a self,
+        owner: &'a str,
+    ) -> BoxFuture<'a, Result<u64, StoreError>>;
 }
 
 /// One stored operation: the columns it is looked up by, and the whole
@@ -146,6 +166,44 @@ pub struct MetricRow {
     pub ts: i64,
     /// The point, as JSON.
     pub data: String,
+}
+
+/// One host port set aside for `owner`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortReservation {
+    /// What the port is reserved for, such as an app name or `proxy`.
+    pub owner: String,
+    /// The port.
+    pub port: u16,
+    /// Its protocol.
+    pub protocol: Protocol,
+    /// The address it is reserved on, or `None` for every address.
+    pub host_ip: Option<IpAddr>,
+    /// When it was reserved, in Unix seconds.
+    pub created: i64,
+}
+
+impl PortReservation {
+    /// The reservation as the port registry merges it.
+    pub fn reservation(&self) -> Reservation {
+        Reservation {
+            owner: self.owner.clone(),
+            port: PublishedPort::new(self.protocol, PortRange::single(self.port).ok())
+                .with_host_ip(self.host_ip),
+        }
+    }
+
+    /// The `host_ip` column: the address as text, or empty for every
+    /// address, since SQLite lets `NULL`s repeat in a primary key.
+    fn host_ip_key(&self) -> String {
+        self.host_ip.map(|ip| ip.to_string()).unwrap_or_default()
+    }
+
+    /// The order both stores list reservations in, and the key that must
+    /// be unique.
+    fn key(&self) -> (u16, &'static str, String) {
+        (self.port, self.protocol.as_str(), self.host_ip_key())
+    }
 }
 
 impl dyn Store {
@@ -584,6 +642,74 @@ mod tests {
         operations_behave(Arc::new(SqliteStore::open(tmp.path()).await.unwrap())).await;
         let reopened: SharedStore = Arc::new(SqliteStore::open(tmp.path()).await.unwrap());
         assert_eq!(reopened.operations(None, 10).await.unwrap().len(), 2);
+    }
+
+    fn reserved(
+        owner: &str,
+        port: u16,
+        protocol: Protocol,
+        host_ip: Option<&str>,
+    ) -> PortReservation {
+        PortReservation {
+            owner: owner.into(),
+            port,
+            protocol,
+            host_ip: host_ip.map(|ip| ip.parse().unwrap()),
+            created: 1_000,
+        }
+    }
+
+    /// Every store behaves the same: one reservation per port, protocol,
+    /// and address, listed in that order, and released by owner.
+    async fn reservations_behave(store: SharedStore) {
+        assert_eq!(store.port_reservations().await.unwrap(), []);
+        let proxy_http = reserved("proxy", 8080, Protocol::Tcp, None);
+        let proxy_dns = reserved("proxy", 8080, Protocol::Udp, None);
+        let blog_local = reserved("blog", 8080, Protocol::Tcp, Some("127.0.0.1"));
+        let wiki = reserved("wiki", 443, Protocol::Tcp, Some("::1"));
+        for r in [&proxy_http, &proxy_dns, &blog_local, &wiki] {
+            assert!(
+                store.add_port_reservation(r.clone()).await.unwrap(),
+                "{r:?}"
+            );
+        }
+        let taken = reserved("other", 8080, Protocol::Tcp, None);
+        assert!(!store.add_port_reservation(taken).await.unwrap());
+        assert_eq!(
+            store.port_reservations().await.unwrap(),
+            [
+                wiki.clone(),
+                proxy_http.clone(),
+                blog_local.clone(),
+                proxy_dns.clone()
+            ]
+        );
+        assert_eq!(
+            proxy_http.reservation().port.to_string(),
+            "8080/tcp",
+            "every address"
+        );
+        assert_eq!(
+            blog_local.reservation().port.to_string(),
+            "127.0.0.1:8080/tcp"
+        );
+
+        assert_eq!(store.remove_port_reservations("proxy").await.unwrap(), 2);
+        assert_eq!(store.remove_port_reservations("nobody").await.unwrap(), 0);
+        assert_eq!(store.port_reservations().await.unwrap(), [wiki, blog_local]);
+    }
+
+    #[tokio::test]
+    async fn memory_store_reservations() {
+        reservations_behave(Arc::new(MemoryStore::new())).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_reservations() {
+        let tmp = tempfile::tempdir().unwrap();
+        reservations_behave(Arc::new(SqliteStore::open(tmp.path()).await.unwrap())).await;
+        let reopened: SharedStore = Arc::new(SqliteStore::open(tmp.path()).await.unwrap());
+        assert_eq!(reopened.port_reservations().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

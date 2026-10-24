@@ -62,6 +62,65 @@ export interface ContainerStatus {
   health: Health | null;
   /** Absent from a daemon older than stop reasons; treat as `unknown`. */
   stop_reason?: StopReason;
+  /** Host ports it publishes while running. Absent when there are none. */
+  ports?: PublishedPort[];
+}
+
+/** Mirrors `alchemy_api::Protocol`. */
+export type Protocol = "tcp" | "udp";
+
+/**
+ * Mirrors `alchemy_api::PublishedPort`. Ports are text: `8080` or a range
+ * such as `8000-8010`. `host_ip` null means every address; `published`
+ * null is an ephemeral port Docker picks at start.
+ */
+export interface PublishedPort {
+  protocol: Protocol;
+  host_ip: string | null;
+  published: string | null;
+  target: string | null;
+}
+
+/**
+ * Mirrors `alchemy_api::ports::PortSource`: reserved by Alchemy, declared by
+ * a stopped app's Compose file, or held right now.
+ */
+export type PortSource = "reserved" | "declared" | "live";
+
+/**
+ * Mirrors `alchemy_api::ports::PortHolder`. A `program`'s process and pid
+ * are null when the OS doesn't reveal them.
+ */
+export type PortHolder =
+  | { kind: "app"; app: string; service: string }
+  | { kind: "container"; name: string }
+  | { kind: "reservation"; owner: string }
+  | { kind: "program"; process: string | null; pid: number | null };
+
+/** Mirrors `alchemy_api::ports::PortClaim`. */
+export interface PortClaim {
+  port: PublishedPort;
+  holder: PortHolder;
+  source: PortSource;
+}
+
+/**
+ * Mirrors `alchemy_api::ports::PortConflict`: a port an app wants that
+ * something else holds, from {@link ActionPlan.conflicts}.
+ */
+export interface PortConflict {
+  service: string;
+  wanted: PublishedPort;
+  claim: PortClaim;
+  /** A plain sentence naming the port and its holder. */
+  message: string;
+}
+
+/** Mirrors `alchemy_api::ports::PortList`, from `GET /api/ports`. */
+export interface PortList {
+  ports: PortClaim[];
+  /** What alchemyd couldn't find out, as sentences. Empty when complete. */
+  warnings: string[];
 }
 
 /**
@@ -201,7 +260,13 @@ export interface AppService {
 }
 
 /** Mirrors `alchemy_api::apps::AppProblemKind`; unknown kinds arrive as `other`. */
-export type AppProblemKind = "compose_error" | "compose_unavailable" | "shared_project" | "other";
+export type AppProblemKind =
+  | "compose_error"
+  | "compose_unavailable"
+  | "shared_project"
+  | "network_overlap"
+  | "port_conflict"
+  | "other";
 
 /** Mirrors `alchemy_api::apps::AppProblem`. `message` is safe to show as is. */
 export interface AppProblem {
@@ -423,8 +488,28 @@ export interface Operation {
 /** Mirrors `alchemy_api::operations::ActionRequest`, the body of `POST /api/apps/{name}/actions`. */
 export interface ActionRequest {
   action: Action;
-  /** Go ahead even though another app shares this app's Compose project. */
+  /**
+   * Go ahead even though another app shares this app's Compose project, or
+   * a host port the app publishes is taken.
+   */
   force?: boolean;
+}
+
+/** Mirrors `alchemy_api::operations::PlannedStep`. */
+export interface PlannedStep {
+  command: StepCommand;
+  label: string;
+  /** The whole command line, starting with `docker`. */
+  argv: string[];
+}
+
+/** Mirrors `alchemy_api::operations::ActionPlan`, from `GET /api/apps/{name}/plan?action=ACTION`. */
+export interface ActionPlan {
+  app: string;
+  action: Action;
+  steps: PlannedStep[];
+  /** Ports that refuse the action unless forced. Absent when there are none. */
+  conflicts?: PortConflict[];
 }
 
 /** Mirrors `alchemy_api::operations::OperationResponse`. */
@@ -540,6 +625,77 @@ export interface ErrorResponse {
 }
 
 /** An HTTP method {@link request} sends. */
+/** Mirrors `alchemy_api::network::AddressPool`: `base` is CIDR text, `size` a prefix length. */
+export interface AddressPool {
+  base: string;
+  size: number;
+}
+
+/** Mirrors `alchemy_api::network::PoolsSource`; unknown sources arrive as `unknown`. */
+export type PoolsSource = "engine" | "daemon_json" | "defaults" | "unknown";
+
+/** Mirrors `alchemy_api::network::DockerNetwork`. Subnets are CIDR text. */
+export interface DockerNetwork {
+  name: string;
+  driver: string | null;
+  subnets: string[];
+  project: string | null;
+  /** Whether Alchemy created it. */
+  managed: boolean;
+}
+
+/** Mirrors `alchemy_api::network::AlchemyNetworkState`; unknown states arrive as `other`. */
+export type AlchemyNetworkState = "pending" | "ready" | "overlapping" | "unavailable" | "other";
+
+/** Mirrors `alchemy_api::network::AlchemyNetwork`: Alchemy's own shared network. */
+export interface AlchemyNetwork {
+  name: string;
+  state: AlchemyNetworkState;
+  subnet: string | null;
+}
+
+/** Mirrors `alchemy_api::network::NetworkWarningKind`; unknown kinds arrive as `other`. */
+export type NetworkWarningKind =
+  | "bridge_overlap"
+  | "pool_overlap"
+  | "network_overlap"
+  | "alchemy_network_overlap"
+  | "no_free_subnet"
+  | "create_failed"
+  | "host_unreadable"
+  | "engine_unreadable"
+  | "other";
+
+/**
+ * Mirrors `alchemy_api::network::NetworkWarning`. `message` and `fix` are
+ * safe to show as is; `fix` may span lines, such as a `daemon.json` fragment.
+ */
+export interface NetworkWarning {
+  kind: NetworkWarningKind;
+  message: string;
+  fix: string | null;
+  subnet: string | null;
+  host: "lan" | "route" | null;
+  host_subnet: string | null;
+  network: string | null;
+}
+
+/**
+ * Mirrors `alchemy_api::network::NetworkReport`, returned by `GET /api/network`.
+ * Subnets are CIDR text. Docker's side is empty while `engine_ready` is false.
+ */
+export interface NetworkReport {
+  engine_ready: boolean;
+  lan: string[];
+  routes: string[];
+  bridge: string | null;
+  pools: AddressPool[];
+  pools_source: PoolsSource;
+  networks: DockerNetwork[];
+  alchemy: AlchemyNetwork;
+  warnings: NetworkWarning[];
+}
+
 export type Method = "GET" | "POST" | "PUT" | "DELETE";
 
 /** `ApiError.status` when no response arrived at all. */
@@ -747,6 +903,7 @@ export const api = {
     const query = new URLSearchParams({ range, ...filter });
     return request<MetricsHistory>("GET", `/metrics/history?${query.toString()}`, { signal });
   },
+  ports: (signal?: AbortSignal) => request<PortList>("GET", "/ports", { signal }),
   apps: (signal?: AbortSignal) => request<AppList>("GET", "/apps", { signal }),
   app: (name: string, signal?: AbortSignal) =>
     request<App>("GET", `/apps/${encodeURIComponent(name)}`, { signal }),
@@ -755,7 +912,14 @@ export const api = {
     request<AppSettings>("PUT", "/settings/apps", { body: update }),
   startAction: (name: string, body: ActionRequest) =>
     request<OperationResponse>("POST", `/apps/${encodeURIComponent(name)}/actions`, { body }),
+  actionPlan: (name: string, action: Action, signal?: AbortSignal) =>
+    request<ActionPlan>(
+      "GET",
+      `/apps/${encodeURIComponent(name)}/plan?action=${encodeURIComponent(action)}`,
+      { signal },
+    ),
   operations: (signal?: AbortSignal) => request<OperationList>("GET", "/operations", { signal }),
+  network: (signal?: AbortSignal) => request<NetworkReport>("GET", "/network", { signal }),
   cancelOperation: (id: string) =>
     request<OperationResponse>("POST", `/operations/${encodeURIComponent(id)}/cancel`),
   followOperation,
