@@ -6,6 +6,7 @@
 
 pub mod engine;
 pub mod logs;
+pub mod mdns;
 pub mod metrics;
 pub mod network;
 pub mod operation;
