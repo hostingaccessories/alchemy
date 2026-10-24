@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Release build smoke test: build the web UI and release binaries, run
-# alchemyd on a throwaway socket and port, and check the daemon, embedded
-# UI, CLI, and helper end to end.
+# alchemyd on a throwaway socket, port, and state directory, and check the
+# daemon, embedded UI, CLI, and helper end to end.
 #
 # Usage: scripts/release-smoke.sh
 #   SMOKE_PORT  HTTP port for the test daemon (default 17240)
@@ -32,6 +32,7 @@ done
 
 tmp="$(mktemp -d)"
 socket="${tmp}/alchemyd.sock"
+state_dir="${tmp}/state"
 daemon_pid=""
 events_pid=""
 watch_pid=""
@@ -52,7 +53,7 @@ trap cleanup EXIT
 
 log "Starting alchemyd on ${base}"
 "${bin}/alchemyd" --listen "127.0.0.1:${port}" --socket "$socket" \
-  >"${tmp}/alchemyd.log" 2>&1 &
+  --state-dir "$state_dir" >"${tmp}/alchemyd.log" 2>&1 &
 daemon_pid=$!
 
 ready=""
@@ -68,6 +69,14 @@ if [[ -z "$ready" ]]; then
   cat "${tmp}/alchemyd.log" >&2
   fail "alchemyd did not become healthy"
 fi
+
+log "Checking the state database"
+db="${state_dir}/alchemy.db"
+[[ -f "$db" ]] || fail "alchemyd did not create ${db}"
+db_mode="$(stat -c '%a' "$db" 2>/dev/null || stat -f '%Lp' "$db")"
+dir_mode="$(stat -c '%a' "$state_dir" 2>/dev/null || stat -f '%Lp' "$state_dir")"
+[[ "$db_mode" == 600 ]] || fail "${db} has mode ${db_mode}, expected 600"
+[[ "$dir_mode" == 700 ]] || fail "${state_dir} has mode ${dir_mode}, expected 700"
 
 log "Checking /api/health"
 health="$(curl -fsS "${base}/api/health")"
@@ -174,5 +183,27 @@ watch_pid=""
 [[ "$code" -eq 69 ]] || fail "status --watch exited ${code}, expected 69: $(cat "${tmp}/watch.err")"
 grep -q 'alchemyd closed the connection' "${tmp}/watch.err" \
   || fail "status --watch did not report the disconnect: $(cat "${tmp}/watch.err")"
+
+log "Checking alchemyd refuses a corrupt state database"
+bad_state="${tmp}/bad-state"
+mkdir -p "$bad_state"
+head -c 8192 /dev/zero | tr '\0' 'Z' >"${bad_state}/alchemy.db"
+"${bin}/alchemyd" --listen "127.0.0.1:${port}" --socket "${tmp}/bad.sock" \
+  --state-dir "$bad_state" >"${tmp}/bad.log" 2>&1 &
+daemon_pid=$!
+for _ in $(seq 1 50); do
+  kill -0 "$daemon_pid" 2>/dev/null || break
+  sleep 0.2
+done
+kill -0 "$daemon_pid" 2>/dev/null && fail "alchemyd started on a corrupt state database"
+set +e
+wait "$daemon_pid"
+code=$?
+set -e
+daemon_pid=""
+[[ "$code" -ne 0 ]] || fail "alchemyd exited 0 on a corrupt state database"
+grep -q 'corrupt or not a SQLite database' "${tmp}/bad.log" \
+  || fail "alchemyd did not explain the corrupt database: $(cat "${tmp}/bad.log")"
+[[ ! -e "${tmp}/bad.sock" ]] || fail "alchemyd bound its socket before refusing the database"
 
 log "Release smoke test passed"
