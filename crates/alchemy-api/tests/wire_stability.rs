@@ -901,3 +901,70 @@ fn operations_event() {
         &format!(r#"{{"event":"operations","data":{{"operations":[{UPDATE}]}}}}"#),
     );
 }
+
+
+#[test]
+fn new_app() {
+    use alchemy_api::apps::files::NewApp;
+    assert_wire(
+        &NewApp {
+            name: "blog".into(),
+            folder: Some("/opt/stacks".into()),
+            compose: "services: {}\n".into(),
+            env: Some("A=1\n".into()),
+            dry_run: true,
+        },
+        r#"{"name":"blog","folder":"/opt/stacks","compose":"services: {}\n","env":"A=1\n","dry_run":true}"#,
+    );
+    assert_eq!(
+        serde_json::from_str::<NewApp>(r#"{"name":"blog","compose":"x"}"#).unwrap(),
+        NewApp {
+            name: "blog".into(),
+            folder: None,
+            compose: "x".into(),
+            env: None,
+            dry_run: false,
+        }
+    );
+}
+
+#[test]
+fn app_files() {
+    use alchemy_api::apps::files::{AppFile, AppFileKind, AppFileUpdate};
+    assert_wire(&AppFileKind::Compose, r#""compose""#);
+    assert_wire(&AppFileKind::Env, r#""env""#);
+    assert_wire(
+        &AppFile {
+            kind: AppFileKind::Compose,
+            name: "compose.yaml".into(),
+            content: "services: {}\n".into(),
+            hash: Some("ab12".into()),
+        },
+        r#"{"kind":"compose","name":"compose.yaml","content":"services: {}\n","hash":"ab12"}"#,
+    );
+    assert_wire(
+        &AppFile {
+            kind: AppFileKind::Env,
+            name: ".env".into(),
+            content: String::new(),
+            hash: None,
+        },
+        r#"{"kind":"env","name":".env","content":"","hash":null}"#,
+    );
+    assert_wire(
+        &AppFileUpdate {
+            content: "A=2\n".into(),
+            base_hash: Some("ab12".into()),
+            dry_run: false,
+        },
+        r#"{"content":"A=2\n","base_hash":"ab12","dry_run":false}"#,
+    );
+    assert_eq!(
+        serde_json::from_str::<AppFileUpdate>(r#"{"content":""}"#).unwrap(),
+        AppFileUpdate {
+            content: String::new(),
+            base_hash: None,
+            dry_run: false,
+        }
+    );
+}

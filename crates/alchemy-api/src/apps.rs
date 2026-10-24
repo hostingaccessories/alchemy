@@ -7,14 +7,18 @@
 //! - `GET /api/settings/apps` returns [`AppSettings`]; `PUT` takes an
 //!   [`AppSettingsUpdate`] and returns the new [`AppSettings`], or 422
 //!   [`ErrorCode::Invalid`](crate::ErrorCode::Invalid).
+//! - Creating an app and editing its files are described in [`files`].
 //!
 //! An app is a Compose stack: a folder holding a compose file inside one
 //! of the app folders. Every human-readable `message` here is written for
 //! the people using Alchemy and safe to show as is.
 
+pub mod files;
+
 pub use alchemy_core::StackName;
 pub use alchemy_core::engine::{ContainerState, Health, StopReason};
 pub use alchemy_core::stack::{ImageSource, StackStatus};
+pub use files::{AppFile, AppFileKind, AppFileUpdate, NewApp};
 use serde::{Deserialize, Serialize};
 
 /// Every app, every running Compose project that is not one, and how each
