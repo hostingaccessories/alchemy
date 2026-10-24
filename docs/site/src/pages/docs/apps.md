@@ -377,6 +377,10 @@ are untouched, and you lose only the settings and history. To keep it
 somewhere else, start alchemyd with `--state-dir PATH` or set
 `ALCHEMY_STATE_DIR`.
 
+Only one alchemyd can use a state folder at a time. A second one started
+on the same folder refuses to start and says another alchemyd is already
+using it.
+
 ## Using docker compose by hand
 
 Alchemy is meant to be easy to step around. Because it never passes `-p`

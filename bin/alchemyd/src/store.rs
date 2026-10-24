@@ -19,7 +19,7 @@ mod memory;
 mod migrations;
 mod sqlite;
 
-pub use dir::{DB_FILE, STATE_DIR_ENV, default_state_dir};
+pub use dir::{DB_FILE, LOCK_FILE, STATE_DIR_ENV, StateLock, default_state_dir, lock_state_dir};
 pub use memory::MemoryStore;
 pub use sqlite::SqliteStore;
 
@@ -298,6 +298,12 @@ pub enum StoreError {
         /// The underlying error.
         #[source]
         source: std::io::Error,
+    },
+    /// Another daemon holds the state directory's lock.
+    #[error("another alchemyd is already using the state directory {path}; stop it first")]
+    InUse {
+        /// The state directory.
+        path: PathBuf,
     },
     /// The file is not a SQLite database, or SQLite found it damaged.
     #[error(

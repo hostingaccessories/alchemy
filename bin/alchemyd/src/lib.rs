@@ -50,7 +50,7 @@ use crate::logs::{SharedLogSource, SystemLogs};
 use crate::metrics::{Collector, MetricsSource, SystemMetrics};
 use crate::operations::{OperationRunner, Operations, SystemRunner};
 use crate::session::{Auth, TokenFile};
-use crate::store::{SharedStore, SqliteStore};
+use crate::store::{SharedStore, SqliteStore, StateLock};
 
 /// Default HTTP listen address. Loopback only: the TCP listener's token
 /// keeps out other processes and users on this machine, but there is no
@@ -187,8 +187,10 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::
 
 /// [`run`] with injected dependencies, such as a fake engine in tests.
 ///
-/// The state database in `config.state_dir` is opened, created, or
-/// migrated first; a corrupt or too-new one fails startup before either
+/// `config.state_dir` is locked first, so a second daemon on the same
+/// directory fails startup before it touches anything; the lock is held
+/// until this returns. The state database in it is then opened, created,
+/// or migrated; a corrupt or too-new one fails startup before either
 /// listener is bound. The engine task, the metrics collector, and the
 /// apps task run alongside the listeners. An engine that is absent or
 /// broken never fails startup; it only shows up in the engine status.
@@ -208,9 +210,7 @@ pub async fn run_with(
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
     warn_if_exposed(config.listen);
-    let sqlite = SqliteStore::open(&config.state_dir)
-        .await
-        .context("opening the state database")?;
+    let (_state_lock, sqlite) = open_state(&config.state_dir).await?;
     let db = sqlite.path().to_owned();
     let store: SharedStore = Arc::new(sqlite);
     match intent::load(&*store, &deps.state).await {
@@ -319,6 +319,16 @@ fn warn_if_exposed(listen: SocketAddr) {
             "HTTP API is bound to a non-loopback address, where its token travels in the clear"
         );
     }
+}
+
+/// Lock `state_dir`, then open its database. The database is never opened
+/// while another daemon holds the directory.
+async fn open_state(state_dir: &Path) -> anyhow::Result<(StateLock, SqliteStore)> {
+    let lock = store::lock_state_dir(state_dir).context("locking the state directory")?;
+    let sqlite = SqliteStore::open(state_dir)
+        .await
+        .context("opening the state database")?;
+    Ok((lock, sqlite))
 }
 
 /// The address `listener` is bound to, and a new token for it, written to

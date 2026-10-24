@@ -65,7 +65,11 @@ The state directory is `$XDG_STATE_HOME/alchemy` (else
 on macOS. It holds `alchemy.db`, the daemon's SQLite database of the app
 folder settings, operation and metrics history, and stop intents, and
 `tcp-token`, which signs clients in to the TCP port
-([Signing in to the TCP port](#signing-in-to-the-tcp-port)). The directory is `0700` and the database and token `0600`. A
+([Signing in to the TCP port](#signing-in-to-the-tcp-port)). The directory is `0700` and the database and token `0600`. One
+daemon owns a state directory: at startup, before opening the database,
+alchemyd takes an exclusive `flock` on `alchemyd.lock` in it, and a second
+daemon on the same directory fails at once, naming it. The OS drops the
+lock when the daemon exits, so a leftover file is harmless. A
 database that is corrupt, or was written by a newer alchemyd, stops startup
 with a message saying so; move it aside to start fresh. Point
 `--state-dir` at a temporary directory to run a throwaway daemon. The schema
@@ -601,6 +605,8 @@ checks:
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
 - `alchemy-helper` refuses to run without root;
+- a second daemon on the same state directory refuses to start, before
+  binding its socket, and the first keeps serving;
 - the daemon shuts down cleanly on `SIGTERM` and removes its socket and
   token;
 - the daemon refuses a corrupt state database before binding its socket.

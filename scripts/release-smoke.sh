@@ -36,10 +36,14 @@ state_dir="${tmp}/state"
 daemon_pid=""
 events_pid=""
 watch_pid=""
+second_pid=""
 
 cleanup() {
   if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
     kill -KILL "$daemon_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$second_pid" ]] && kill -0 "$second_pid" 2>/dev/null; then
+    kill -KILL "$second_pid" 2>/dev/null || true
   fi
   if [[ -n "$events_pid" ]] && kill -0 "$events_pid" 2>/dev/null; then
     kill -KILL "$events_pid" 2>/dev/null || true
@@ -240,6 +244,28 @@ if [[ "$(id -u)" -ne 0 ]]; then
 else
   log "Running as root; skipping"
 fi
+
+log "Checking a second alchemyd refuses the same state directory"
+"${bin}/alchemyd" --listen "127.0.0.1:$((port + 1))" --socket "${tmp}/second.sock" \
+  --state-dir "$state_dir" >"${tmp}/second.log" 2>&1 &
+second_pid=$!
+for _ in $(seq 1 50); do
+  kill -0 "$second_pid" 2>/dev/null || break
+  sleep 0.2
+done
+kill -0 "$second_pid" 2>/dev/null && fail "a second alchemyd started on the same state directory"
+set +e
+wait "$second_pid"
+code=$?
+set -e
+second_pid=""
+[[ "$code" -ne 0 ]] || fail "a second alchemyd exited 0 on the same state directory"
+grep -q "another alchemyd is already using the state directory ${state_dir}" "${tmp}/second.log" \
+  || fail "the second alchemyd did not explain the refusal: $(cat "${tmp}/second.log")"
+[[ ! -e "${tmp}/second.sock" ]] || fail "the second alchemyd bound its socket before refusing"
+[[ "$(cat "$token_file")" == "$token" ]] || fail "the second alchemyd replaced the TCP token"
+curl -fsS -H "$bearer" "${base}/api/engine" >/dev/null \
+  || fail "the first alchemyd stopped answering after the second was refused"
 
 log "Stopping alchemyd"
 kill -TERM "$daemon_pid"
