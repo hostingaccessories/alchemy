@@ -64,12 +64,18 @@ fn invalid_arguments_are_usage_errors() {
         &["install-service", "--uid", "0"],
         &["install-service", "--uid", "alice"],
         &["remove-service", "--uid", "-1"],
+        &["open-firewall"],
+        &["open-firewall", "--proxy-ports", "22-8999"],
+        &["close-firewall", "--proxy-ports", "8999-8100"],
+        &["open-firewall", "--proxy-ports", "8100-8999\n"],
     ] {
         let (code, stdout, stderr) = helper(Path::new(HELPER), args);
         assert_eq!(code, 64, "{args:?}");
         assert_eq!(stdout, usage, "{args:?}");
         assert!(
-            stderr.contains("alchemy-helper") || stderr.contains("--uid"),
+            stderr.contains("alchemy-helper")
+                || stderr.contains("--uid")
+                || stderr.contains("--proxy-ports"),
             "{args:?}: {stderr}"
         );
     }
@@ -85,7 +91,9 @@ fn help_and_version_print_to_stdout() {
     );
     let (code, stdout, _) = helper(Path::new(HELPER), &["--help"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("grant-low-ports"), "{stdout}");
+    for operation in ["grant-low-ports", "open-firewall", "close-firewall"] {
+        assert!(stdout.contains(operation), "{stdout}");
+    }
 }
 
 #[test]
@@ -98,12 +106,15 @@ fn every_operation_needs_root() {
         );
         return;
     }
+    let ports = ["--proxy-ports", "8100-8999"];
     for args in [
         &["check"][..],
         &["grant-low-ports"],
         &["revoke-low-ports"],
         &["install-service", "--uid", "1000"],
         &["remove-service", "--uid", "1000"],
+        &["open-firewall", ports[0], ports[1]],
+        &["close-firewall", ports[0], ports[1]],
     ] {
         let operation = args[0];
         let (code, stdout, stderr) = helper(Path::new(HELPER), args);
