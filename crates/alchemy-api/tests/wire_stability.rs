@@ -17,6 +17,7 @@ use alchemy_api::operations::{
     Action, ActionPlan, ActionRequest, Operation, OperationEvent, OperationList, OperationResponse,
     OperationState, OutputLine, PlannedStep, Step, StepCommand, StepState,
 };
+use alchemy_api::session::{LaunchResponse, SessionAuth, SessionResponse};
 use alchemy_api::{
     API_VERSION, ApiEvent, ContainerStatus, ContainerUsage, EngineFlavor, EngineState,
     EngineStatus, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, MachineUsage,
@@ -73,6 +74,7 @@ fn error_codes() {
         (ErrorCode::MethodNotAllowed, r#""method_not_allowed""#),
         (ErrorCode::BadRequest, r#""bad_request""#),
         (ErrorCode::Forbidden, r#""forbidden""#),
+        (ErrorCode::Unauthorized, r#""unauthorized""#),
         (
             ErrorCode::UnsupportedMediaType,
             r#""unsupported_media_type""#,
@@ -967,4 +969,30 @@ fn app_files() {
             dry_run: false,
         }
     );
+}
+
+#[test]
+fn launch_response() {
+    assert_wire(
+        &LaunchResponse {
+            code: "c0de".into(),
+            url: "http://127.0.0.1:7240/login?code=c0de".into(),
+            expires_in: 60,
+        },
+        r#"{"code":"c0de","url":"http://127.0.0.1:7240/login?code=c0de","expires_in":60}"#,
+    );
+}
+
+#[test]
+fn session_response() {
+    for (auth, json) in [
+        (SessionAuth::Socket, r#"{"auth":"socket"}"#),
+        (SessionAuth::Token, r#"{"auth":"token"}"#),
+        (SessionAuth::Cookie, r#"{"auth":"cookie"}"#),
+        (SessionAuth::Unknown, r#"{"auth":"unknown"}"#),
+    ] {
+        assert_wire(&SessionResponse { auth }, json);
+    }
+    let future: SessionResponse = serde_json::from_str(r#"{"auth":"passkey"}"#).unwrap();
+    assert_eq!(future.auth, SessionAuth::Unknown);
 }

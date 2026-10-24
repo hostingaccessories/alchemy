@@ -14,8 +14,9 @@ serde        = { workspace = true }
 rustix       = { workspace = true, optional = true }
 
 [features]
-default = []
-socket  = ["dep:rustix"]
+default   = []
+socket    = ["dep:rustix"]
+state-dir = []
 
 [dev-dependencies]
 serde_json = { workspace = true }

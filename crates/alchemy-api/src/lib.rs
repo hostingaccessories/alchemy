@@ -12,11 +12,14 @@
 //! `GET /api/metrics/history` a [`MetricsHistory`], built from the
 //! resource-usage types in `alchemy_core::metrics`.
 //! `GET /api/events` streams [`ApiEvent`]s. The app routes and their
-//! types are in [`apps`], an app's log stream in [`logs`], and the
-//! lifecycle operation routes in [`operations`].
+//! types are in [`apps`], an app's log stream in [`logs`], the
+//! lifecycle operation routes in [`operations`], and signing in to the
+//! TCP listener in [`session`].
 //!
 //! The default build is pure. Enable the `socket` feature for the daemon
-//! socket path shared by `alchemyd` and its local clients.
+//! socket path shared by `alchemyd` and its local clients, and the
+//! `state-dir` feature for the state directory and the TCP token file in
+//! it, shared by `alchemyd` and the desktop shell.
 
 pub use alchemy_core::engine::{
     ContainerStatus, EngineFlavor, EngineState, EngineStatus, StopReason,
@@ -29,14 +32,19 @@ use serde::{Deserialize, Serialize, Serializer};
 pub mod apps;
 pub mod logs;
 pub mod operations;
+pub mod session;
 #[cfg(feature = "socket")]
 mod socket;
+#[cfg(feature = "state-dir")]
+mod state_dir;
 
 pub use apps::AppList;
 pub use operations::OperationList;
 
 #[cfg(feature = "socket")]
 pub use socket::{SOCKET_ENV, SOCKET_FILE, default_socket_path, runtime_dir};
+#[cfg(feature = "state-dir")]
+pub use state_dir::{STATE_DIR_ENV, TCP_TOKEN_FILE, default_state_dir, tcp_token_path};
 
 /// Path prefix for every API route.
 pub const API_PREFIX: &str = "/api";
@@ -109,6 +117,10 @@ pub enum ErrorCode {
     /// The daemon refused the request as unsafe, such as one from another
     /// web origin or for a host name it does not answer to.
     Forbidden,
+    /// The request needs signing in and carried no valid credential: on
+    /// the TCP listener, neither the daemon's token as a bearer token nor
+    /// a session cookie. See [`session`].
+    Unauthorized,
     /// The request body is not in a media type the route accepts.
     UnsupportedMediaType,
     /// The request conflicts with current state, such as an operation

@@ -486,6 +486,7 @@ export type ErrorCode =
   | "method_not_allowed"
   | "bad_request"
   | "forbidden"
+  | "unauthorized"
   | "unsupported_media_type"
   | "conflict"
   | "invalid"
@@ -494,6 +495,21 @@ export type ErrorCode =
   | "busy"
   | "internal"
   | "unknown";
+
+/**
+ * Mirrors `alchemy_api::session::SessionAuth`: how a request was let in. A
+ * kind this build doesn't know arrives as `unknown`.
+ */
+export type SessionAuth = "socket" | "token" | "cookie" | "unknown";
+
+/**
+ * Mirrors `alchemy_api::session::SessionResponse`, returned by
+ * `GET /api/session`. On the TCP port it answers 401 `unauthorized` until the
+ * browser has signed in with `alchemy open` or the shell sends the token.
+ */
+export interface SessionResponse {
+  auth: SessionAuth;
+}
 
 /** Mirrors `alchemy_api::ErrorResponse`, the body of every `/api` error. */
 export interface ErrorResponse {

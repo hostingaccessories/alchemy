@@ -17,7 +17,7 @@ name = "alchemyd"
 path = "src/lib.rs"
 
 [dependencies]
-alchemy-api        = { workspace = true, features = ["socket"] }
+alchemy-api        = { workspace = true, features = ["socket", "state-dir"] }
 alchemy-core       = { workspace = true }
 anyhow             = { workspace = true }
 axum               = { workspace = true }
