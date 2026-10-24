@@ -151,7 +151,7 @@ fn decode<T: DeserializeOwned>(body: Result<Bytes, BytesRejection>) -> Result<T,
 fn refused(err: &EditError) -> Response {
     let status = match err {
         EditError::AppNotFound(_) => StatusCode::NOT_FOUND,
-        EditError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        EditError::Invalid(_) | EditError::ComposeFile(_) => StatusCode::UNPROCESSABLE_ENTITY,
         EditError::Conflict(_) => StatusCode::CONFLICT,
         EditError::ComposeUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,

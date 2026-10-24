@@ -16,6 +16,8 @@
 //!   is a mount of its own, such as a ZFS dataset, a btrfs subvolume, or
 //!   a bind mount. It is validated against the app's folder, so relative
 //!   paths, `env_file:` entries, and override files resolve as they will.
+//!   When `.env` sets `COMPOSE_FILE`, the file edited is the first it
+//!   lists, validated together with the rest.
 //!   It is renamed over the live file only if that file still has the
 //!   hash the edit started from, checked before staging and again after
 //!   Compose has run. No other file in the folder is touched, and a single
@@ -44,8 +46,9 @@ use alchemy_api::apps::{
 };
 use alchemy_core::StackName;
 use alchemy_core::stack::{
-    ENV_FILE, EntryKind, FileContentError, MAX_FILE_LEN, NEW_COMPOSE_FILE, OVERRIDE_FILES,
-    StackDirs, check_content, create_root, scrub, staging_prefix,
+    ComposeFileError, ENV_FILE, EntryKind, FileContentError, MAX_FILE_LEN, NEW_COMPOSE_FILE,
+    OVERRIDE_FILES, StackDirs, check_content, compose_file_args, compose_file_entries, create_root,
+    edited_compose_file, scrub, staging_prefix,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Mutex;
@@ -73,6 +76,11 @@ pub enum EditError {
     /// changed since it was read.
     #[error("{0}")]
     Conflict(String),
+    /// `COMPOSE_FILE` in the app's `.env` can't be followed, or doesn't
+    /// list the file being edited, so Alchemy can't validate the edit
+    /// against the files Compose uses.
+    #[error("{0}")]
+    ComposeFile(ComposeFileError),
     /// Compose could not be run to validate the file.
     #[error("Alchemy couldn't run Docker Compose to check the file: {0}")]
     ComposeUnavailable(String),
@@ -92,7 +100,7 @@ impl EditError {
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::AppNotFound(_) => ErrorCode::AppNotFound,
-            Self::Invalid(_) => ErrorCode::Invalid,
+            Self::Invalid(_) | Self::ComposeFile(_) => ErrorCode::Invalid,
             Self::Conflict(_) => ErrorCode::Conflict,
             Self::ComposeUnavailable(_) | Self::Io { .. } => ErrorCode::Internal,
         }
@@ -145,6 +153,7 @@ impl Target {
 /// An edit staged and ready to validate.
 #[derive(Debug)]
 struct StagedEdit {
+    target: Target,
     staging: Staging,
     staged: PathBuf,
     check: ComposeCheck,
@@ -275,6 +284,7 @@ impl AppEditor {
         let disk = self.disk.clone();
         let read = blocking(move || {
             check_dir(&*disk, &target)?;
+            let (target, _) = compose_files(&*disk, target)?;
             read_live(&*disk, &target).map(|live| (target, live))
         })
         .await?;
@@ -301,18 +311,19 @@ impl AppEditor {
         update: AppFileUpdate,
     ) -> Result<AppFile, EditError> {
         let target = locate(state, name, kind)?;
-        check_content(kind, update.content.as_bytes())
-            .map_err(|err| EditError::Invalid(format!("{} {err}", target.file_name)))?;
         let _writing = self.writing.lock().await;
         let update = Arc::new(update);
 
         let staged = {
-            let (disk, target, update) = (self.disk.clone(), target.clone(), update.clone());
-            blocking(move || stage_edit(&disk, &target, &update)).await??
+            let (disk, update) = (self.disk.clone(), update.clone());
+            blocking(move || stage_edit(&disk, target, &update)).await??
         };
-        let result = self.finish_edit(state, &target, &staged, &update).await;
+        let result = self
+            .finish_edit(state, &staged.target, &staged, &update)
+            .await;
         staged.staging.remove().await;
         result?;
+        let target = staged.target;
         if !update.dry_run {
             tracing::info!(app = %target.name, file = %target.file_name, "saved app file");
             state.rescan_apps();
@@ -515,7 +526,8 @@ fn managed_dirs(settings: &AppSettings) -> Option<StackDirs> {
 }
 
 /// Find `kind` of the app named `name`: an app in the list, whose folder
-/// is `<root>/<name>` and whose root is still an app folder.
+/// is `<root>/<name>` and whose root is still an app folder. The compose
+/// file is the one discovery found, until [`compose_files`] reads `.env`.
 fn locate(state: &State, name: &str, kind: AppFileKind) -> Result<Target, EditError> {
     let apps = state.apps();
     let app = super::find(&apps, name).ok_or_else(|| EditError::AppNotFound(name.to_owned()))?;
@@ -555,6 +567,44 @@ fn check_dir(disk: &dyn AppDisk, target: &Target) -> Result<(), EditError> {
             target.dir.display()
         ))(err)),
     }
+}
+
+/// For a compose file, the files `COMPOSE_FILE` in the app's `.env` lists,
+/// if it sets one, with `target` moved to the first of them: the file
+/// Compose reads first, as it does when run in the folder. A `.env` that
+/// is not a regular file is refused, since Compose would follow it and
+/// Alchemy does not.
+fn compose_files(
+    disk: &dyn AppDisk,
+    mut target: Target,
+) -> Result<(Target, Option<Vec<PathBuf>>), EditError> {
+    if target.kind != AppFileKind::Compose {
+        return Ok((target, None));
+    }
+    let unknown = |why: &dyn std::fmt::Display| {
+        EditError::Invalid(format!(
+            "{ENV_FILE} in {} {why}, so Alchemy can't tell which compose files Compose uses; edit them by hand.",
+            target.dir.display()
+        ))
+    };
+    let read = disk
+        .read(&target.dir.join(ENV_FILE), MAX_FILE_LEN)
+        .map_err(EditError::io(format!(
+            "Alchemy couldn't read {ENV_FILE} in {}",
+            target.dir.display()
+        )))?;
+    let bytes = match read {
+        ReadOutcome::Missing => return Ok((target, None)),
+        ReadOutcome::Linked => return Err(unknown(&"is a symlink")),
+        ReadOutcome::NotRegular => return Err(unknown(&"isn't a regular file")),
+        ReadOutcome::File(file) => file.bytes,
+    };
+    let text = check_content(AppFileKind::Env, &bytes).map_err(|err| unknown(&err))?;
+    let entries = compose_file_entries(text).map_err(EditError::ComposeFile)?;
+    if let Some(entries) = &entries {
+        target.file_name = edited_compose_file(entries).map_err(EditError::ComposeFile)?;
+    }
+    Ok((target, entries))
 }
 
 /// The live file, or `None` for a missing `.env`.
@@ -616,17 +666,20 @@ fn check_base(
     }
 }
 
-/// Check the folder and the base hash, then stage the new content in a
-/// staging directory inside the app's folder, so saving it is a rename
-/// within that folder's filesystem.
+/// Check the folder, the content, and the base hash, then stage the new
+/// content in a staging directory inside the app's folder, so saving it is
+/// a rename within that folder's filesystem.
 fn stage_edit(
     disk: &Arc<dyn AppDisk>,
-    target: &Target,
+    target: Target,
     update: &AppFileUpdate,
 ) -> Result<StagedEdit, EditError> {
-    check_dir(&**disk, target)?;
-    let live = read_live(&**disk, target)?;
-    check_base(target, live.as_ref(), update.base_hash.as_deref())?;
+    check_dir(&**disk, &target)?;
+    let (target, entries) = compose_files(&**disk, target)?;
+    check_content(target.kind, update.content.as_bytes())
+        .map_err(|err| EditError::Invalid(format!("{} {err}", target.file_name)))?;
+    let live = read_live(&**disk, &target)?;
+    check_base(&target, live.as_ref(), update.base_hash.as_deref())?;
     let name = StackName::new(target.name.as_str())
         .map_err(|_| EditError::AppNotFound(target.name.clone()))?;
     let staging = disk
@@ -646,9 +699,10 @@ fn stage_edit(
             "Alchemy couldn't write a copy of {}",
             target.file_name
         )))
-        .and_then(|()| edit_check(&**disk, target, &staged));
+        .and_then(|()| edit_check(&**disk, &target, &staged, entries.as_deref()));
     match checked {
         Ok(check) => Ok(StagedEdit {
+            target,
             staging,
             staged,
             check,
@@ -660,31 +714,43 @@ fn stage_edit(
     }
 }
 
-/// What to validate for an edit: the app's folder with the staged compose
-/// file and the app's override, or with the staged `.env`.
+/// What to validate for an edit: the app's folder with the staged `.env`,
+/// or with the compose files Compose would read there and the staged
+/// compose file in place of the live one. Those are the `entries` of
+/// `COMPOSE_FILE` in `.env` if it sets one, and the compose file and the
+/// app's override if not.
+///
+/// A staged `.env` replaces the live one with `--env-file`, so a
+/// `COMPOSE_FILE` in it is honoured by Compose itself.
 fn edit_check(
     disk: &dyn AppDisk,
     target: &Target,
     staged: &Path,
+    entries: Option<&[PathBuf]>,
 ) -> Result<ComposeCheck, EditError> {
     let invalid = |e: crate::compose::ComposeProjectError| {
         EditError::Invalid(format!("Alchemy can't use this folder: {e}"))
     };
     let check = ComposeCheck::new(ComposeProject::new(&target.dir).map_err(invalid)?);
-    match target.kind {
-        AppFileKind::Env => check.with_env_file(staged).map_err(invalid),
-        AppFileKind::Compose => {
-            let mut check = check.with_file(staged).map_err(invalid)?;
-            if let Some(over) = OVERRIDE_FILES
-                .iter()
-                .map(|name| target.dir.join(name))
-                .find(|path| matches!(disk.kind(path), Ok(Some(EntryKind::File))))
-            {
-                check = check.with_file(over).map_err(invalid)?;
-            }
-            Ok(check)
+    let files = match (target.kind, entries) {
+        (AppFileKind::Env, _) => return check.with_env_file(staged).map_err(invalid),
+        (AppFileKind::Compose, Some(entries)) => {
+            compose_file_args(entries, &target.dir, &target.file_name, staged)
+                .map_err(EditError::ComposeFile)?
         }
-    }
+        (AppFileKind::Compose, None) => std::iter::once(staged.to_owned())
+            .chain(
+                OVERRIDE_FILES
+                    .iter()
+                    .map(|name| target.dir.join(name))
+                    .find(|path| matches!(disk.kind(path), Ok(Some(EntryKind::File)))),
+            )
+            .collect(),
+    };
+    files
+        .into_iter()
+        .try_fold(check, ComposeCheck::with_file)
+        .map_err(invalid)
 }
 
 /// Keep the live file's owner and group on its replacement. A group the
@@ -1268,6 +1334,7 @@ mod tests {
             fs::read_to_string(f.blog.join("real.env")).unwrap(),
             "A=1\n"
         );
+        fs::remove_file(f.blog.join(".env")).unwrap();
 
         fs::write(f.blog.join("compose.yaml"), b"x: \xff").unwrap();
         let err = editor
@@ -1333,6 +1400,131 @@ mod tests {
         assert_eq!(staging.parent().unwrap(), f.blog);
         assert_eq!(check.files()[1], f.blog.join("compose.override.yaml"));
         assert_eq!(check.env_file(), None);
+    }
+
+    #[tokio::test]
+    async fn edits_validate_against_the_files_compose_file_in_env_lists() {
+        let cases: [(&str, &str, &[&str]); 3] = [
+            (
+                "COMPOSE_FILE=compose.yaml:compose.prod.yaml\n",
+                "compose.yaml",
+                &["<staged>", "compose.prod.yaml"],
+            ),
+            (
+                "export COMPOSE_FILE='./base.yaml;compose.yaml' # main\nCOMPOSE_PATH_SEPARATOR=;\n",
+                "base.yaml",
+                &["<staged>", "compose.yaml"],
+            ),
+            (
+                "A=1\n",
+                "compose.yaml",
+                &["<staged>", "compose.override.yaml"],
+            ),
+        ];
+        for (env, edited, want) in cases {
+            let f = Fixture::new();
+            for name in ["compose.prod.yaml", "compose.override.yaml", "base.yaml"] {
+                fs::write(f.blog.join(name), format!("# {name}\n{COMPOSE}")).unwrap();
+            }
+            fs::write(f.blog.join(".env"), env).unwrap();
+            let before = f.read(AppFileKind::Compose).await;
+            assert_eq!(before.name, edited, "{env:?}");
+            let live = fs::read_to_string(f.blog.join(edited)).unwrap();
+            assert_eq!(before.content, live, "{env:?}");
+            let saved = f
+                .write(AppFileKind::Compose, "services: {}\n", before.hash)
+                .await
+                .unwrap();
+            assert_eq!(saved.name, edited, "{env:?}");
+            assert_eq!(
+                fs::read_to_string(f.blog.join(edited)).unwrap(),
+                "services: {}\n",
+                "{env:?}"
+            );
+            let check = &f.validator.checks()[0];
+            let staged = &check.files()[0];
+            assert_eq!(staged.file_name().unwrap(), edited, "{env:?}");
+            assert_eq!(staged.parent().unwrap().parent().unwrap(), f.blog);
+            let files: Vec<PathBuf> = want
+                .iter()
+                .map(|name| match *name {
+                    "<staged>" => staged.clone(),
+                    name => f.blog.join(name),
+                })
+                .collect();
+            assert_eq!(check.files(), files, "{env:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_to_edit_when_compose_file_in_env_cant_be_followed() {
+        let cases = [
+            ("F=compose.yaml\nCOMPOSE_FILE=${F}\n", "uses a variable"),
+            ("COMPOSE_FILE=\"$F\"\n", "uses a variable"),
+            ("COMPOSE_FILE='compose.yaml\n", "isn't closed"),
+            (
+                "COMPOSE_FILE=/etc/compose.yaml\n",
+                "/etc/compose.yaml, which isn't",
+            ),
+            (
+                "COMPOSE_FILE=sub/compose.yaml\n",
+                "sub/compose.yaml, which isn't",
+            ),
+            (
+                "COMPOSE_FILE=../blog2/compose.yaml:compose.yaml\n",
+                "../blog2/compose.yaml, which isn't",
+            ),
+            ("COMPOSE_FILE=compose.yaml::x.yaml\n", "empty entry"),
+        ];
+        for (env, want) in cases {
+            let f = Fixture::new();
+            fs::write(f.blog.join(".env"), env).unwrap();
+            let err = f
+                .editor()
+                .read(&f.state, "blog", AppFileKind::Compose)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(want), "{env:?}: {err}");
+            let base = Some(content_hash(COMPOSE.as_bytes()));
+            let err = f
+                .write(AppFileKind::Compose, "services: {}\n", base)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Invalid, "{env:?}: {err}");
+            assert!(err.to_string().contains(want), "{env:?}: {err}");
+            assert_eq!(
+                fs::read_to_string(f.blog.join("compose.yaml")).unwrap(),
+                COMPOSE
+            );
+            assert_eq!(f.validator.checks(), [], "{env:?}");
+            assert_eq!(entries(&f.blog), [".env", "compose.yaml"], "{env:?}");
+        }
+
+        let f = Fixture::new();
+        fs::write(f.blog.join("real.env"), "COMPOSE_FILE=compose.yaml\n").unwrap();
+        symlink(f.blog.join("real.env"), f.blog.join(".env")).unwrap();
+        let err = f
+            .editor()
+            .read(&f.state, "blog", AppFileKind::Compose)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_env_edit_leaves_compose_file_to_compose() {
+        let f = Fixture::new();
+        fs::write(f.blog.join("compose.prod.yaml"), COMPOSE).unwrap();
+        f.write(
+            AppFileKind::Env,
+            "COMPOSE_FILE=compose.yaml:compose.prod.yaml\n",
+            None,
+        )
+        .await
+        .unwrap();
+        let check = &f.validator.checks()[0];
+        assert_eq!(check.files(), [] as [PathBuf; 0]);
+        assert_eq!(check.env_file().unwrap().file_name().unwrap(), ".env");
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@
 //! over plain values: the daemon lists directories and reads Compose's
 //! resolved configuration, then passes the results in.
 
+mod compose_file;
 mod dirs;
 mod discovery;
 mod files;
@@ -14,6 +15,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use compose_file::{
+    COMPOSE_FILE_VAR, COMPOSE_PATH_SEPARATOR_VAR, ComposeFileError, DEFAULT_PATH_SEPARATOR,
+    compose_file_args, compose_file_entries, edited_compose_file,
+};
 pub use dirs::{MAX_EXTRA_DIRS, StackDirs, StackDirsError, default_stack_home};
 pub use discovery::{
     COMPOSE_FILES, DirReport, DirState, Discovery, EntryKind, FileInfo, FoundStack, ListedDir,

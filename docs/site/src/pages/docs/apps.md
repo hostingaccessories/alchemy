@@ -211,6 +211,10 @@ the question, `--dry-run` saves nothing).
   `alchemy app edit --force` saves your version over the change instead.
 - **Only that file is replaced,** in one step, keeping its permissions. A
   `.env` written by Alchemy is always readable by you alone (`0600`).
+- **`COMPOSE_FILE` in `.env` is followed.** The compose file you edit is
+  the first one it lists, and Compose checks it together with the rest. That
+  first file must sit in the app's folder, and `COMPOSE_FILE` can't use
+  `$VARIABLES`; otherwise edit the files by hand.
 - **Saving doesn't restart anything.** Run **Update** or **Create and
   start** to apply the change.
 - Each file can be up to 256 KiB of text. Apps whose folder or file is a
