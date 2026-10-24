@@ -109,6 +109,29 @@ impl<D: Daemon, W: Write> Context<D, W> {
         decode(&reply.body)
     }
 
+    /// Send `body` as JSON to `path` with `method` and decode the JSON
+    /// answer. A 409 `conflict` or 422 `invalid` comes back as
+    /// [`Sent::Refused`] for the command to act on; any other error status
+    /// is a [`ClientError`], as with [`Self::get`].
+    pub(crate) async fn send<B: Serialize, T: DeserializeOwned>(
+        &mut self,
+        method: Method,
+        path: &str,
+        body: &B,
+    ) -> Result<Sent<T>, ClientError> {
+        let daemon = self.daemon_info().await?.version.clone();
+        let body = serde_json::to_vec(body).map_err(|e| ProtocolError::Http(e.to_string()))?;
+        let reply = self.daemon.request(method, path, Some(&body)).await?;
+        if matches!(reply.status, 409 | 422) {
+            let refusal = error_reply(&reply)?;
+            if matches!(refusal.code, ErrorCode::Conflict | ErrorCode::Invalid) {
+                return Ok(Sent::Refused(refusal));
+            }
+        }
+        accept(&reply, &daemon, self.command)?;
+        decode(&reply.body).map(Sent::Done)
+    }
+
     /// Follow [`EVENTS_PATH`]. A refusal comes back as a [`ClientError`].
     pub(crate) async fn events(&mut self) -> Result<Subscription<D::Events>, ClientError> {
         self.stream(EVENTS_PATH)
@@ -134,6 +157,15 @@ impl<D: Daemon, W: Write> Context<D, W> {
 /// Decode the JSON `data` of a raw event as `T`.
 pub(crate) fn decode_data<T: DeserializeOwned>(raw: &SseEvent) -> Result<T, ClientError> {
     decode(raw.data.as_bytes())
+}
+
+/// What [`Context::send`] came to.
+#[derive(Debug)]
+pub(crate) enum Sent<T> {
+    /// The daemon did it and answered with this.
+    Done(T),
+    /// The daemon refused it as a `conflict` or as `invalid`.
+    Refused(ErrorResponse),
 }
 
 /// The events from [`Context::events`], decoded.

@@ -6,6 +6,7 @@
 pub mod commands;
 mod context;
 mod daemon;
+pub mod editor;
 mod error;
 mod output;
 pub mod prompt;
@@ -23,6 +24,7 @@ use clap::{Parser, Subcommand};
 use crate::commands::{app, completions, generate_man, machine, settings, status, version};
 use crate::context::Context;
 use crate::daemon::HttpDaemon;
+use crate::editor::TerminalEditor;
 use crate::output::Output;
 use crate::prompt::{Prompt, TtyPrompt};
 use crate::target::{Sources, Target};
@@ -145,6 +147,14 @@ pub async fn run_with<W: Write, P: Prompt>(
             }
             app::Verb::Logs(args) => {
                 app::logs::run(&mut context(out, app::logs::NAME)?, args).await
+            }
+            app::Verb::Create(args) => {
+                let mut context = context(out, app::create::NAME)?;
+                app::create::run(&mut context, prompt, args).await
+            }
+            app::Verb::Edit(args) => {
+                let mut context = context(out, app::edit::NAME)?;
+                app::edit::run(&mut context, prompt, &mut TerminalEditor, args).await
             }
             app::Verb::Stats(args) => {
                 let mut context = context(out, app::stats::NAME)?;

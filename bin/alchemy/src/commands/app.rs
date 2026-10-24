@@ -5,6 +5,8 @@
 //! adding its module and a [`Verb`] variant.
 
 pub mod action;
+pub mod create;
+pub mod edit;
 pub mod list;
 pub mod logs;
 pub mod show;
@@ -108,6 +110,26 @@ pub enum Verb {
     /// event is one line on stdout. Ctrl-C stops watching, but alchemyd
     /// carries on with it.
     Update(action::Args),
+
+    /// Create an app from a compose file, validated by Compose first.
+    ///
+    /// The app gets its own folder, named after it, in the home folder or
+    /// the app folder given with --folder, holding compose.yaml and, with
+    /// --env-file, a .env readable by you alone. Nothing is written unless
+    /// Compose accepts the files, and an existing folder is never replaced.
+    /// With --dry-run, alchemyd only validates them. --force has nothing to
+    /// override here.
+    Create(create::Args),
+
+    /// Edit an app's compose file, or its .env with --env, in your editor.
+    ///
+    /// Opens a private copy in $VISUAL or $EDITOR (vi if neither is set).
+    /// When you quit, Compose checks it; if it is rejected, the editor
+    /// opens again with Compose's message on top. Quitting without a change
+    /// saves nothing. Once Compose accepts it, alchemy asks before saving,
+    /// and alchemyd replaces only that file, and only if nobody changed it
+    /// on disk in the meantime. With --dry-run, nothing is saved.
+    Edit(edit::Args),
 }
 
 /// Parse an app name as Compose would accept it, in the CLI's words.

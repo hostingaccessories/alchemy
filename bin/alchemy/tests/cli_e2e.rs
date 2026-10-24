@@ -1097,3 +1097,63 @@ async fn lifecycle_actions_run_in_the_daemon_and_follow_to_the_end() {
 
     daemon.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn app_create_validates_then_creates_and_never_replaces() {
+    let daemon = Daemon::start(EngineStatus::new(EngineState::Ready)).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let home = root.join("apps");
+    let shop = home.join("shop");
+    let compose = root.join("compose.yaml");
+    let env = root.join("app.env");
+    std::fs::write(&compose, "services: {}\n").unwrap();
+    std::fs::write(&env, "SECRET=1\n").unwrap();
+    let (home_str, compose_str, env_str) = (
+        home.to_str().unwrap(),
+        compose.to_str().unwrap(),
+        env.to_str().unwrap(),
+    );
+    run_args(&daemon.socket, &["settings", "set", "app-home", home_str])
+        .await
+        .unwrap();
+    let create = ["app", "create", "shop", "--file", compose_str];
+
+    let out = run_args(&daemon.socket, &[&create[..], &["--dry-run"]].concat())
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        format!(
+            "would create shop in {}\nCompose project shop, with no services\n",
+            shop.display()
+        )
+    );
+    assert!(!home.exists());
+
+    let err = run_args(&daemon.socket, &create).await.unwrap_err();
+    assert_eq!(err.exit_code(), 3, "{err}");
+
+    let args = [&create[..], &["--yes", "--env-file", env_str]].concat();
+    let out = run_args(&daemon.socket, &args).await.unwrap();
+    assert!(
+        out.starts_with(&format!("created shop in {}", shop.display())),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(shop.join("compose.yaml")).unwrap(),
+        "services: {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(shop.join(".env")).unwrap(),
+        "SECRET=1\n"
+    );
+
+    let err = run_args(&daemon.socket, &[&create[..], &["--yes"]].concat())
+        .await
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert!(err.to_string().contains("already exists"), "{err}");
+
+    daemon.stop().await;
+}

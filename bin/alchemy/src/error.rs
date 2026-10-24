@@ -144,6 +144,12 @@ pub enum ClientError {
     /// The async runtime could not start.
     #[error("cannot start the async runtime: {0}")]
     Runtime(#[source] std::io::Error),
+    /// The text editor could not be run, or failed.
+    #[error("cannot edit the file: {0}")]
+    Editor(String),
+    /// A local file could not be read or written.
+    #[error("{0}")]
+    File(String),
 }
 
 /// Why an exchange with alchemyd failed below the API.
@@ -194,7 +200,11 @@ impl ClientError {
             | Self::Unexpected(_)
             | Self::DaemonTooOld { .. } => Exit::Protocol,
             Self::Output(_) => Exit::Io,
-            Self::Daemon(_) | Self::Runtime(_) | Self::OperationFailed { .. } => Exit::Failure,
+            Self::Daemon(_)
+            | Self::Runtime(_)
+            | Self::OperationFailed { .. }
+            | Self::Editor(_)
+            | Self::File(_) => Exit::Failure,
             Self::Usage { .. } | Self::RemoteDaemon { .. } | Self::InvalidTarget { .. } => {
                 Exit::Usage
             }
@@ -228,6 +238,8 @@ impl ClientError {
             Self::Interrupted => "interrupted",
             Self::Runtime(_) => "runtime",
             Self::OperationFailed { .. } => "operation_failed",
+            Self::Editor(_) => "editor",
+            Self::File(_) => "file",
         }
     }
 
@@ -255,13 +267,15 @@ impl ClientError {
                 "forward the remote socket over SSH and pass the local end with --socket"
             }
             Self::ConfirmationRequired { .. } => "pass --yes to go ahead without a prompt",
+            Self::Editor(_) => "set VISUAL or EDITOR to the editor you use",
             Self::Daemon(_)
             | Self::Output(_)
             | Self::InvalidTarget { .. }
             | Self::Declined { .. }
             | Self::Interrupted
             | Self::Runtime(_)
-            | Self::OperationFailed { .. } => return None,
+            | Self::OperationFailed { .. }
+            | Self::File(_) => return None,
         };
         Some(hint.to_owned())
     }
@@ -542,6 +556,20 @@ mod tests {
                 1,
                 "runtime",
                 "cannot start the async runtime: boom".into(),
+                None,
+            ),
+            (
+                ClientError::Editor("the editor exited with exit status: 1".into()),
+                1,
+                "editor",
+                "cannot edit the file: the editor exited with exit status: 1".into(),
+                Some("set VISUAL or EDITOR to the editor you use"),
+            ),
+            (
+                ClientError::File("cannot read compose.yaml: not found".into()),
+                1,
+                "file",
+                "cannot read compose.yaml: not found".into(),
                 None,
             ),
         ];
