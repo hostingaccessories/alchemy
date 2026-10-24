@@ -1065,6 +1065,42 @@ async fn monitor_learns_addresses_of_containers_connected_after_the_listing() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn monitor_lists_again_when_a_connect_comes_before_the_listing_shows_it() {
+    let (host, monitor) = scripted_monitor(&unix(SOCKET));
+    ready_host(&host);
+    host.lock().unwrap().containers =
+        vec![ContainerStatus::new("web", "web", ContainerState::Running)];
+    let run = spawn_monitor(monitor);
+    containers_until(&run.state, |c| !c.is_empty()).await;
+
+    send(
+        &host,
+        ContainerEvent::new("web", ContainerAction::NetworkConnect),
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        run.state
+            .containers()
+            .get("web")
+            .unwrap()
+            .networks
+            .is_empty(),
+        "the first listing doesn't show it yet"
+    );
+    let mut web = ContainerStatus::new("web", "web", ContainerState::Running);
+    web.networks
+        .insert("alchemy".to_owned(), "10.200.0.3".parse().unwrap());
+    host.lock().unwrap().containers = vec![web.clone()];
+    let containers = containers_until(&run.state, |c| {
+        c.get("web").is_some_and(|w| !w.networks.is_empty())
+    })
+    .await;
+    assert_eq!(containers.get("web").unwrap().networks, web.networks);
+
+    run.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn monitor_reconnects_and_resyncs_when_the_stream_drops() {
     let (host, monitor) = scripted_monitor(&unix(SOCKET));
     ready_host(&host);

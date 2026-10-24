@@ -1,13 +1,16 @@
 //! The task that keeps the engine and container parts of [`State`]
 //! current.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use alchemy_core::engine::{
-    ContainerAction, ContainerEvent, EngineFlavor, EngineProbe, EngineState, EngineStatus,
-    SocketProbe, classify, not_ready_flavor, reconnect_delay,
+    ContainerAction, ContainerEvent, ContainerState, ContainerStatus, Containers, EngineFlavor,
+    EngineProbe, EngineState, EngineStatus, SocketProbe, classify, not_ready_flavor,
+    reconnect_delay,
 };
 use futures_util::StreamExt as _;
 use futures_util::future::{FusedFuture as _, FutureExt as _};
@@ -25,6 +28,14 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Stopped containers inspected at once after a listing.
 const INSPECT_CONCURRENCY: usize = 4;
+
+/// How many more times the containers are listed when a running
+/// container's network `connect` or `disconnect` isn't in the listing
+/// yet. Docker sends the event before its listing shows the change.
+const NETWORK_RELISTS: u32 = 5;
+
+/// The wait before the first of [`NETWORK_RELISTS`], doubled each time.
+const NETWORK_RELIST_DELAY: Duration = Duration::from_millis(100);
 
 /// Something that keeps the engine and container parts of [`State`]
 /// current until shutdown.
@@ -224,7 +235,10 @@ where
 ///
 /// Events carry no ports or addresses, so a `start`, `restart`, or network
 /// `connect` or `disconnect` lists the containers again, one listing at a
-/// time, and takes only their ports and addresses from it.
+/// time, and takes only their ports and addresses from it. A running
+/// container whose addresses that listing doesn't change after a network
+/// event is listed again up to [`NETWORK_RELISTS`] times, since the event
+/// can come before the listing shows it.
 async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
     let mut events = api.events();
     let mut pending: Vec<ContainerEvent> = Vec::new();
@@ -270,24 +284,19 @@ async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
         .buffer_unordered(INSPECT_CONCURRENCY);
     let relist = futures_util::future::Fuse::terminated();
     tokio::pin!(relist);
-    let mut listing_stale = false;
+    let mut relists = Relists::default();
     loop {
-        if listing_stale && relist.is_terminated() {
-            listing_stale = false;
-            relist.set(api.list_containers().fuse());
+        if relist.is_terminated()
+            && let Some(delay) = relists.start()
+        {
+            relist.set(list_after(api, delay).fuse());
         }
         tokio::select! {
             biased;
             item = events.next() => match item {
                 Some(Ok(event)) => {
                     delivered = true;
-                    listing_stale |= matches!(
-                        event.action,
-                        ContainerAction::Start
-                            | ContainerAction::Restart
-                            | ContainerAction::NetworkConnect
-                            | ContainerAction::NetworkDisconnect
-                    );
+                    relists.event(&event);
                     state.update_containers(|containers| containers.apply(&event));
                 }
                 Some(Err(error)) => {
@@ -301,7 +310,9 @@ async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
             },
             listing = &mut relist, if !relist.is_terminated() => match listing {
                 Ok(listed) => {
+                    let before = relists.addresses(&state.containers());
                     state.update_containers(|containers| containers.update_listed(listed));
+                    relists.listed(&before, &state.containers());
                 }
                 Err(error) => tracing::debug!(error = %error, "listing Docker containers again failed"),
             },
@@ -313,6 +324,96 @@ async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
                 Err(error) => tracing::debug!(error = %error, id, "inspecting a stopped container failed"),
             },
         }
+    }
+}
+
+async fn list_after(
+    api: &impl DockerApi,
+    delay: Duration,
+) -> Result<Vec<ContainerStatus>, ApiError> {
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    api.list_containers().await
+}
+
+type Addresses = BTreeMap<String, Ipv4Addr>;
+
+/// When [`follow`] lists the containers again, and which network changes
+/// it is still waiting to see.
+#[derive(Debug, Default)]
+struct Relists {
+    due: bool,
+    delay: Duration,
+    retries: u32,
+    joining: BTreeSet<String>,
+    checking: BTreeSet<String>,
+}
+
+impl Relists {
+    /// Note `event`: a start, restart, or network change makes a listing
+    /// due at once.
+    fn event(&mut self, event: &ContainerEvent) {
+        let network = matches!(
+            event.action,
+            ContainerAction::NetworkConnect | ContainerAction::NetworkDisconnect
+        );
+        if network {
+            self.joining.insert(event.id.clone());
+            self.retries = 0;
+        }
+        if network
+            || matches!(
+                event.action,
+                ContainerAction::Start | ContainerAction::Restart
+            )
+        {
+            self.due = true;
+            self.delay = Duration::ZERO;
+        }
+    }
+
+    /// The wait before the next listing, when one is due.
+    fn start(&mut self) -> Option<Duration> {
+        if !self.due {
+            return None;
+        }
+        self.due = false;
+        self.checking = std::mem::take(&mut self.joining);
+        Some(self.delay)
+    }
+
+    /// The addresses of each running container the listing in progress
+    /// should change.
+    fn addresses(&self, containers: &Containers) -> Vec<(String, Addresses)> {
+        self.checking
+            .iter()
+            .filter_map(|id| containers.get(id))
+            .filter(|c| c.state == ContainerState::Running)
+            .map(|c| (c.id.clone(), c.networks.clone()))
+            .collect()
+    }
+
+    /// After a listing: if a container in `before` is still running with
+    /// the same addresses, list again after a growing wait, up to
+    /// [`NETWORK_RELISTS`] times.
+    fn listed(&mut self, before: &[(String, Addresses)], containers: &Containers) {
+        let unchanged: Vec<String> = before
+            .iter()
+            .filter(|(id, addresses)| {
+                containers
+                    .get(id)
+                    .is_some_and(|c| c.state == ContainerState::Running && c.networks == *addresses)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if unchanged.is_empty() || self.retries >= NETWORK_RELISTS {
+            return;
+        }
+        self.delay = NETWORK_RELIST_DELAY.saturating_mul(1 << self.retries);
+        self.retries += 1;
+        self.joining.extend(unchanged);
+        self.due = true;
     }
 }
 
@@ -426,6 +527,74 @@ impl Backoff {
 )]
 mod tests {
     use super::*;
+
+    fn containers(list: &[(&str, ContainerState, Option<&str>)]) -> Containers {
+        let mut containers = Containers::new();
+        containers.replace_all(list.iter().map(|&(id, state, ip)| {
+            let mut c = ContainerStatus::new(id, id, state);
+            if let Some(ip) = ip {
+                c.networks.insert("alchemy".into(), ip.parse().unwrap());
+            }
+            c
+        }));
+        containers
+    }
+
+    #[test]
+    fn relists_at_once_on_starts_and_network_changes_only() {
+        let cases = [
+            (ContainerAction::Start, true),
+            (ContainerAction::Restart, true),
+            (ContainerAction::NetworkConnect, true),
+            (ContainerAction::NetworkDisconnect, true),
+            (ContainerAction::Create, false),
+            (ContainerAction::Stop, false),
+            (ContainerAction::Die, false),
+        ];
+        for (action, due) in cases {
+            let mut relists = Relists::default();
+            relists.event(&ContainerEvent::new("a", action));
+            assert_eq!(relists.start(), due.then_some(Duration::ZERO), "{action:?}");
+            assert_eq!(relists.start(), None, "{action:?}: once");
+        }
+    }
+
+    #[test]
+    fn relists_again_until_a_network_change_shows() {
+        let running = ContainerState::Running;
+        let stale = containers(&[("a", running, None)]);
+        let mut relists = Relists::default();
+        relists.event(&ContainerEvent::new("a", ContainerAction::NetworkConnect));
+        let mut waits = Vec::new();
+        while let Some(delay) = relists.start() {
+            waits.push(delay.as_millis());
+            let before = relists.addresses(&stale);
+            relists.listed(&before, &stale);
+        }
+        assert_eq!(waits, [0, 100, 200, 400, 800, 1600], "gives up after five");
+
+        let mut relists = Relists::default();
+        relists.event(&ContainerEvent::new("a", ContainerAction::NetworkConnect));
+        assert_eq!(relists.start(), Some(Duration::ZERO));
+        let before = relists.addresses(&stale);
+        relists.listed(&before, &stale);
+        assert_eq!(relists.start(), Some(Duration::from_millis(100)));
+        let before = relists.addresses(&stale);
+        relists.listed(&before, &containers(&[("a", running, Some("10.0.0.2"))]));
+        assert_eq!(relists.start(), None, "the address showed");
+
+        relists.event(&ContainerEvent::new("a", ContainerAction::Start));
+        relists.event(&ContainerEvent::new("b", ContainerAction::NetworkConnect));
+        assert_eq!(relists.start(), Some(Duration::ZERO));
+        let created = containers(&[("a", running, None), ("b", ContainerState::Created, None)]);
+        let before = relists.addresses(&created);
+        relists.listed(&before, &created);
+        assert_eq!(
+            relists.start(),
+            None,
+            "a container that isn't running has no address to wait for"
+        );
+    }
 
     #[test]
     fn backoff_grows_while_streams_deliver_nothing() {
