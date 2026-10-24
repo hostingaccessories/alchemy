@@ -1,131 +1,13 @@
 //! What each action runs: a plan of one or more `docker compose` steps.
 
 use std::ffi::OsString;
-use std::fmt;
-use std::str::FromStr;
 
+pub use alchemy_core::operation::{
+    Action as ComposeAction, StepCommand as ComposeCommand, UnknownAction,
+};
 pub use alchemy_core::stack::ImageSource;
 
 use super::ComposeProject;
-
-/// A lifecycle action on a Compose project.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ComposeAction {
-    /// Create and start every service, detached.
-    Up,
-    /// Stop and remove containers and networks. Volumes are kept.
-    Down,
-    /// Start existing containers.
-    Start,
-    /// Stop running containers without removing them.
-    Stop,
-    /// Restart every service.
-    Restart,
-    /// Pull every service's image.
-    Pull,
-    /// Build every service that has a `build:` section.
-    Build,
-    /// Fetch or rebuild images, then recreate what changed. There is no
-    /// image rollback.
-    Update,
-}
-
-impl ComposeAction {
-    /// Every action, in the order the UI lists them.
-    pub const ALL: [Self; 8] = [
-        Self::Up,
-        Self::Down,
-        Self::Start,
-        Self::Stop,
-        Self::Restart,
-        Self::Pull,
-        Self::Build,
-        Self::Update,
-    ];
-
-    /// The action's name, such as `up`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Up => "up",
-            Self::Down => "down",
-            Self::Start => "start",
-            Self::Stop => "stop",
-            Self::Restart => "restart",
-            Self::Pull => "pull",
-            Self::Build => "build",
-            Self::Update => "update",
-        }
-    }
-}
-
-impl fmt::Display for ComposeAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// A name that is not a [`ComposeAction`].
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unknown compose action {name:?}")]
-pub struct UnknownAction {
-    /// The rejected name.
-    pub name: String,
-}
-
-impl FromStr for ComposeAction {
-    type Err = UnknownAction;
-
-    fn from_str(name: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|action| action.as_str() == name)
-            .ok_or_else(|| UnknownAction {
-                name: name.to_owned(),
-            })
-    }
-}
-
-/// A `docker compose` subcommand that a [`ComposeStep`] runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ComposeCommand {
-    /// `up`
-    Up,
-    /// `down`
-    Down,
-    /// `start`
-    Start,
-    /// `stop`
-    Stop,
-    /// `restart`
-    Restart,
-    /// `pull`
-    Pull,
-    /// `build`
-    Build,
-}
-
-impl ComposeCommand {
-    /// The subcommand, such as `up`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Up => "up",
-            Self::Down => "down",
-            Self::Start => "start",
-            Self::Stop => "stop",
-            Self::Restart => "restart",
-            Self::Pull => "pull",
-            Self::Build => "build",
-        }
-    }
-}
-
-impl fmt::Display for ComposeCommand {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
 
 /// One `docker compose` run within a [`ComposePlan`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
