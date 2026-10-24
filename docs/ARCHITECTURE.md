@@ -26,8 +26,8 @@ Everything below follows from the line at the top of this page.
    `alchemy_api`'s socket module, the private
    `runtime_dir_from(xdg, temp, uid)` decides the path; `runtime_dir()`
    reads the environment and calls it.
-4. **Binaries are thin.** `alchemyd` and `alchemy` are a library plus a small
-   `main.rs`. `main` parses arguments, sets up logging and the runtime, and
+4. **Binaries are thin.** `alchemyd`, `alchemy`, and `alchemy-helper` are a
+   library plus a small `main.rs`. `main` parses arguments, sets up logging and the runtime, and
    calls into the library. Interesting logic belongs in a crate with tests.
 5. **The daemon is the single source of truth.** `alchemyd` owns all runtime
    state. The CLI, web UI, and desktop shell are clients and never
