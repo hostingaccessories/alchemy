@@ -135,6 +135,8 @@ async function errorMessage(res: Response): Promise<string> {
 /**
  * Send one request to `/api{path}` and return the JSON response, or
  * `undefined` for `204 No Content`. `body`, when given, is sent as JSON.
+ * Every method but `GET` declares `content-type: application/json`, body or
+ * not, because alchemyd refuses a mutating request without it (415).
  * Rejects with an {@link ApiError} for every failure except an abort, which
  * rejects with the `AbortError` unchanged.
  */
@@ -144,8 +146,10 @@ export async function request<T>(
   { body, signal }: RequestOptions = {},
 ): Promise<T> {
   const init: RequestInit = { method, signal };
-  if (body !== undefined) {
+  if (method !== "GET") {
     init.headers = { "content-type": "application/json" };
+  }
+  if (body !== undefined) {
     init.body = JSON.stringify(body);
   }
 

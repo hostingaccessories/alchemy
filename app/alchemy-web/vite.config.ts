@@ -12,7 +12,12 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     proxy: {
-      "/api": daemon,
+      /**
+       * Keep the browser's `Host` (`localhost:5173`) rather than the
+       * shorthand's rewrite to the daemon's, so it still matches `Origin`
+       * and alchemyd treats mutating requests as same-origin.
+       */
+      "/api": { target: daemon, changeOrigin: false },
     },
   },
   test: {

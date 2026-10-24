@@ -64,6 +64,17 @@ describe("request", () => {
     });
   });
 
+  it.each(["POST", "PUT", "DELETE"] as const)("sends %s without a body as JSON", async (method) => {
+    const fetch = vi.fn(async () => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetch);
+    await request(method, "/things/1");
+    expect(fetch).toHaveBeenCalledWith("/api/things/1", {
+      method,
+      signal: undefined,
+      headers: { "content-type": "application/json" },
+    });
+  });
+
   it("resolves to undefined for 204 No Content", async () => {
     vi.stubGlobal("fetch", async () => new Response(null, { status: 204 }));
     await expect(request("DELETE", "/things/1")).resolves.toBeUndefined();
