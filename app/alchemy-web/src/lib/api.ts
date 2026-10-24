@@ -272,6 +272,7 @@ export type AppProblemKind =
   | "shared_project"
   | "network_overlap"
   | "port_conflict"
+  | "route"
   | "other";
 
 /** Mirrors `alchemy_api::apps::AppProblem`. `message` is safe to show as is. */
@@ -297,6 +298,32 @@ export interface App {
   problems: AppProblem[];
   /** The most pressing of its containers' reasons. Absent from an older daemon. */
   stop_reason?: StopReason;
+  /**
+   * Where to open the app through Alchemy's proxy, best first. Absent when it
+   * has no route; a `route` problem then says why.
+   */
+  addresses?: AppAddress[];
+}
+
+/** Mirrors `alchemy_api::apps::AddressKind`; unknown kinds arrive as `other`. */
+export type AddressKind = "host" | "port" | "other";
+
+/** Mirrors `alchemy_api::apps::AddressState`; unknown states arrive as `other`. */
+export type AddressState = "ready" | "pending" | "not_running" | "unavailable" | "other";
+
+/**
+ * Mirrors `alchemy_api::apps::AppAddress`: one web address of an app, such as
+ * `http://blog.localhost/` (`host`) or `http://192.168.1.20:8100/` (`port`).
+ * `message` says why it doesn't answer and is safe to show as is.
+ */
+export interface AppAddress {
+  kind: AddressKind;
+  url: string;
+  state: AddressState;
+  /** The service and container port requests go to. */
+  service: string;
+  port: number;
+  message: string | null;
 }
 
 /** Mirrors `alchemy_api::apps::UnmanagedApp`. */
@@ -700,6 +727,37 @@ export interface NetworkReport {
   networks: DockerNetwork[];
   alchemy: AlchemyNetwork;
   warnings: NetworkWarning[];
+  /** The web address proxy. Absent from an older daemon. */
+  proxy?: ProxyReport;
+}
+
+/** Mirrors `alchemy_api::network::ListenerState`; unknown states arrive as `other`. */
+export type ListenerState = "off" | "listening" | "unavailable" | "other";
+
+/** Mirrors `alchemy_api::network::Reachability`; unknown values arrive as `other`. */
+export type Reachability = "container_ip" | "published_only" | "other";
+
+/**
+ * Mirrors `alchemy_api::network::ProxyListener`. `message` and `fix` are safe
+ * to show as is.
+ */
+export interface ProxyListener {
+  port: number;
+  /** The app it serves, or `null` for the Host listener on port 80. */
+  app: string | null;
+  state: ListenerState;
+  message: string | null;
+  fix: string | null;
+}
+
+/** Mirrors `alchemy_api::network::ProxyReport`. */
+export interface ProxyReport {
+  /** `null` until the engine has been ready. */
+  reachability: Reachability | null;
+  /** Port 80, which routes `<app>.localhost`; `off` while no app has a hostname. */
+  host: ProxyListener;
+  /** Each app's own proxy port, ascending. */
+  ports: ProxyListener[];
 }
 
 export type Method = "GET" | "POST" | "PUT" | "DELETE";

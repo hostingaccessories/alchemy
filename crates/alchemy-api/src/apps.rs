@@ -62,6 +62,66 @@ pub struct App {
     /// reasons, such as a crash in one service while the others run.
     #[serde(default)]
     pub stop_reason: StopReason,
+    /// Where to open the app in a browser through Alchemy's proxy, best
+    /// first. Empty, and left off the wire, when the app has no route;
+    /// a [`AppProblemKind::Route`] problem then says why, if something
+    /// can be done about it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<AppAddress>,
+}
+
+/// One web address of an app, served by Alchemy's proxy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppAddress {
+    /// How the proxy tells this app's requests apart.
+    pub kind: AddressKind,
+    /// The URL to open, such as `http://blog.localhost/` or
+    /// `http://192.168.1.20:8100/`.
+    pub url: String,
+    /// Whether it answers right now.
+    pub state: AddressState,
+    /// The service requests go to.
+    pub service: String,
+    /// The container port requests go to.
+    pub port: u16,
+    /// Why it doesn't answer, when `state` is not `ready`.
+    pub message: Option<String>,
+}
+
+/// The kinds of [`AppAddress`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AddressKind {
+    /// A hostname such as `blog.localhost`, routed by the `Host` header
+    /// on port 80.
+    Host,
+    /// The app's own proxy port on every address of this machine, so it
+    /// works from other devices on the network.
+    Port,
+    /// A kind this build does not know.
+    #[serde(other)]
+    Other,
+}
+
+/// Whether an [`AppAddress`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AddressState {
+    /// Requests reach the app.
+    Ready,
+    /// The app is running but can't be reached yet, such as while Alchemy
+    /// attaches it to its network or opens the port.
+    Pending,
+    /// The app isn't running, so the proxy answers that it's stopped.
+    NotRunning,
+    /// The proxy can't listen on this address's port, such as port 80
+    /// without permission.
+    Unavailable,
+    /// A state this build does not know.
+    #[serde(other)]
+    Other,
 }
 
 /// One service of an app and its containers.
@@ -118,6 +178,9 @@ pub enum AppProblemKind {
     NetworkOverlap,
     /// A port the app publishes is already in use or reserved.
     PortConflict,
+    /// The app can't be given a web address, or only part of one; the
+    /// message says what to add to its compose file.
+    Route,
     /// A kind this build does not know.
     #[serde(other)]
     Other,

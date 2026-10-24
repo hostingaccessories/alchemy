@@ -918,6 +918,7 @@ fn new_app(name: StackName, root: &Path, dir: &Path, config: &ComposeConfig) -> 
             .collect(),
         problems: Vec::new(),
         stop_reason: StopReason::default(),
+        addresses: Vec::new(),
     }
 }
 

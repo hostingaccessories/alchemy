@@ -139,6 +139,7 @@ fn app(
         services: Vec::new(),
         problems: Vec::new(),
         stop_reason: StopReason::Unknown,
+        addresses: Vec::new(),
     };
     match inputs.configs.get(&stack.dir) {
         Some(ConfigOutcome::Ready(config)) => {

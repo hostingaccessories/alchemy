@@ -4,7 +4,9 @@
 //! routes the daemon sees, Docker's bridge, address pools, and networks,
 //! Alchemy's own [`AlchemyNetwork`], and a [`NetworkWarning`] for each
 //! overlap, with the fix spelled out. The daemon refreshes it in the
-//! background, so it may be up to half a minute old.
+//! background, so it may be up to half a minute old. Its
+//! [`ProxyReport`] says what the web address proxy listens on, such as
+//! whether port 80 could be opened, and is always current.
 //!
 //! Every human-readable `message` and `fix` here is written for the people
 //! using Alchemy and safe to show as is.
@@ -36,6 +38,10 @@ pub struct NetworkReport {
     pub alchemy: AlchemyNetwork,
     /// What overlaps or went wrong, worst first. Empty when nothing did.
     pub warnings: Vec<NetworkWarning>,
+    /// The web address proxy. Defaults to an idle one when an older daemon
+    /// leaves it out.
+    #[serde(default)]
+    pub proxy: ProxyReport,
 }
 
 impl Default for NetworkReport {
@@ -55,6 +61,99 @@ impl Default for NetworkReport {
                 subnet: None,
             },
             warnings: Vec::new(),
+            proxy: ProxyReport::default(),
+        }
+    }
+}
+
+/// What the web address proxy listens on and how it reaches apps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyReport {
+    /// How the proxy reaches apps' containers, or `None` until the engine
+    /// has been ready.
+    pub reachability: Option<Reachability>,
+    /// The Host listener, port 80, which routes `<app>.localhost`. It is
+    /// `off` while no app has a hostname.
+    pub host: ProxyListener,
+    /// Each app's own proxy port, ascending.
+    pub ports: Vec<ProxyListener>,
+}
+
+impl Default for ProxyReport {
+    /// An idle proxy: nothing routed and nothing open.
+    fn default() -> Self {
+        Self {
+            reachability: None,
+            host: ProxyListener {
+                port: HOST_PORT,
+                app: None,
+                state: ListenerState::Off,
+                message: None,
+                fix: None,
+            },
+            ports: Vec::new(),
+        }
+    }
+}
+
+/// The port the proxy routes hostnames on.
+pub const HOST_PORT: u16 = 80;
+
+/// One port the proxy listens on, or wants to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyListener {
+    /// The port.
+    pub port: u16,
+    /// The app it serves, or `None` for the Host listener.
+    pub app: Option<String>,
+    /// Whether it is open.
+    pub state: ListenerState,
+    /// Why it isn't open, when `state` is `unavailable`, and what still
+    /// works.
+    pub message: Option<String>,
+    /// What to do about it, when the user can do something.
+    pub fix: Option<String>,
+}
+
+/// The state of a [`ProxyListener`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ListenerState {
+    /// Not wanted, since no route needs it.
+    Off,
+    /// Accepting connections.
+    Listening,
+    /// Wanted but couldn't be opened, such as port 80 without permission
+    /// or a port another program holds. It is tried again when the
+    /// routes change.
+    Unavailable,
+    /// A state this build does not know.
+    #[serde(other)]
+    Other,
+}
+
+/// How the proxy reaches apps' containers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Reachability {
+    /// Through container IPs on the `alchemy` network, so ports that
+    /// aren't published work too. A native Linux engine.
+    ContainerIp,
+    /// Only through ports published on this machine, as with Docker
+    /// Desktop or rootless Docker.
+    PublishedOnly,
+    /// A way this build does not know.
+    #[serde(other)]
+    Other,
+}
+
+impl From<alchemy_core::route::Reachability> for Reachability {
+    fn from(reach: alchemy_core::route::Reachability) -> Self {
+        match reach {
+            alchemy_core::route::Reachability::ContainerIp => Self::ContainerIp,
+            alchemy_core::route::Reachability::PublishedOnly => Self::PublishedOnly,
         }
     }
 }

@@ -181,6 +181,7 @@ pub(crate) mod tests {
             ],
             problems: vec![],
             stop_reason: StopReason::Unknown,
+            addresses: vec![],
         }
     }
 

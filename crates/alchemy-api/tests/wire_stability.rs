@@ -9,9 +9,9 @@
 )]
 
 use alchemy_api::apps::{
-    App, AppContainer, AppDir, AppDirState, AppList, AppProblem, AppProblemKind, AppService,
-    AppSettings, AppSettingsUpdate, ContainerState, Health, ImageSource, SkipReason, SkippedApp,
-    StackName, StackStatus, UnmanagedApp,
+    AddressKind, AddressState, App, AppAddress, AppContainer, AppDir, AppDirState, AppList,
+    AppProblem, AppProblemKind, AppService, AppSettings, AppSettingsUpdate, ContainerState, Health,
+    ImageSource, SkipReason, SkippedApp, StackName, StackStatus, UnmanagedApp,
 };
 use alchemy_api::operations::{
     Action, ActionPlan, ActionRequest, Operation, OperationEvent, OperationList, OperationResponse,
@@ -568,6 +568,7 @@ fn blog() -> App {
             exit_code: Some(1),
             oom: false,
         },
+        addresses: vec![],
     }
 }
 
@@ -595,6 +596,7 @@ fn app() {
         services: vec![],
         problems: vec![],
         stop_reason: StopReason::Unknown,
+        addresses: vec![],
     };
     let json = concat!(
         r#"{"name":"new","status":"unknown","dir":"/srv/apps/new","root":"/srv/apps","#,
@@ -607,6 +609,64 @@ fn app() {
     );
     let older: App = serde_json::from_str(&format!("{json}}}")).unwrap();
     assert_eq!(older, unread, "a daemon without stop reasons");
+}
+
+#[test]
+fn app_addresses() {
+    let mut app = blog();
+    app.addresses = vec![
+        AppAddress {
+            kind: AddressKind::Host,
+            url: "http://blog.localhost/".into(),
+            state: AddressState::Unavailable,
+            service: "web".into(),
+            port: 80,
+            message: Some("m".into()),
+        },
+        AppAddress {
+            kind: AddressKind::Port,
+            url: "http://192.168.1.20:8100/".into(),
+            state: AddressState::Ready,
+            service: "web".into(),
+            port: 80,
+            message: None,
+        },
+    ];
+    let json = format!(
+        "{},{}}}",
+        BLOG.strip_suffix('}').unwrap(),
+        concat!(
+            r#""addresses":[{"kind":"host","url":"http://blog.localhost/","state":"unavailable","#,
+            r#""service":"web","port":80,"message":"m"},{"kind":"port","#,
+            r#""url":"http://192.168.1.20:8100/","state":"ready","service":"web","port":80,"#,
+            r#""message":null}]"#,
+        )
+    );
+    assert_wire(&app, &json);
+}
+
+#[test]
+fn address_enums() {
+    for (kind, want) in [
+        (AddressKind::Host, r#""host""#),
+        (AddressKind::Port, r#""port""#),
+        (AddressKind::Other, r#""other""#),
+    ] {
+        assert_wire(&kind, want);
+    }
+    for (state, want) in [
+        (AddressState::Ready, r#""ready""#),
+        (AddressState::Pending, r#""pending""#),
+        (AddressState::NotRunning, r#""not_running""#),
+        (AddressState::Unavailable, r#""unavailable""#),
+        (AddressState::Other, r#""other""#),
+    ] {
+        assert_wire(&state, want);
+    }
+    let future: AddressKind = serde_json::from_str(r#""mdns""#).unwrap();
+    assert_eq!(future, AddressKind::Other);
+    let future: AddressState = serde_json::from_str(r#""sleeping""#).unwrap();
+    assert_eq!(future, AddressState::Other);
 }
 
 #[test]
@@ -1263,6 +1323,7 @@ fn network_problem_kinds() {
     for (kind, want) in [
         (AppProblemKind::NetworkOverlap, r#""network_overlap""#),
         (AppProblemKind::PortConflict, r#""port_conflict""#),
+        (AppProblemKind::Route, r#""route""#),
     ] {
         assert_wire(&kind, want);
     }
@@ -1275,8 +1336,9 @@ fn net(cidr: &str) -> alchemy_api::network::Ipv4Net {
 #[test]
 fn network_report() {
     use alchemy_api::network::{
-        AddressPool, AlchemyNetwork, AlchemyNetworkState, DockerNetwork, HostSide, NetworkReport,
-        NetworkWarning, NetworkWarningKind, PoolsSource,
+        AddressPool, AlchemyNetwork, AlchemyNetworkState, DockerNetwork, HostSide, ListenerState,
+        NetworkReport, NetworkWarning, NetworkWarningKind, PoolsSource, ProxyListener, ProxyReport,
+        Reachability,
     };
     let report = NetworkReport {
         engine_ready: true,
@@ -1306,6 +1368,23 @@ fn network_report() {
             host_subnet: Some(net("192.168.0.0/16")),
             network: None,
         }],
+        proxy: ProxyReport {
+            reachability: Some(Reachability::ContainerIp),
+            host: ProxyListener {
+                port: 80,
+                app: None,
+                state: ListenerState::Unavailable,
+                message: Some("m".into()),
+                fix: Some("f".into()),
+            },
+            ports: vec![ProxyListener {
+                port: 8100,
+                app: Some("blog".into()),
+                state: ListenerState::Listening,
+                message: None,
+                fix: None,
+            }],
+        },
     };
     assert_wire(
         &report,
@@ -1317,17 +1396,49 @@ fn network_report() {
             r#""alchemy":{"name":"alchemy","state":"ready","subnet":"172.18.0.0/24"},"#,
             r#""warnings":[{"kind":"pool_overlap","message":"m","fix":"f","#,
             r#""subnet":"192.168.0.0/16","host":"lan","host_subnet":"192.168.0.0/16","#,
-            r#""network":null}]}"#,
+            r#""network":null}],"proxy":{"reachability":"container_ip","#,
+            r#""host":{"port":80,"app":null,"state":"unavailable","message":"m","fix":"f"},"#,
+            r#""ports":[{"port":8100,"app":"blog","state":"listening","message":null,"#,
+            r#""fix":null}]}}"#,
         ),
+    );
+    let older = concat!(
+        r#"{"engine_ready":false,"lan":[],"routes":[],"bridge":null,"pools":[],"#,
+        r#""pools_source":"unknown","networks":[],"#,
+        r#""alchemy":{"name":"alchemy","state":"pending","subnet":null},"warnings":[]"#,
     );
     assert_wire(
         &NetworkReport::default(),
-        concat!(
-            r#"{"engine_ready":false,"lan":[],"routes":[],"bridge":null,"pools":[],"#,
-            r#""pools_source":"unknown","networks":[],"#,
-            r#""alchemy":{"name":"alchemy","state":"pending","subnet":null},"warnings":[]}"#,
+        &format!(
+            r#"{older},"proxy":{{"reachability":null,"host":{{"port":80,"app":null,"state":"off","message":null,"fix":null}},"ports":[]}}}}"#
         ),
     );
+    let older: NetworkReport = serde_json::from_str(&format!("{older}}}")).unwrap();
+    assert_eq!(older, NetworkReport::default(), "a daemon without a proxy");
+}
+
+#[test]
+fn proxy_enums() {
+    use alchemy_api::network::{ListenerState, Reachability};
+    for (state, want) in [
+        (ListenerState::Off, r#""off""#),
+        (ListenerState::Listening, r#""listening""#),
+        (ListenerState::Unavailable, r#""unavailable""#),
+        (ListenerState::Other, r#""other""#),
+    ] {
+        assert_wire(&state, want);
+    }
+    for (reach, want) in [
+        (Reachability::ContainerIp, r#""container_ip""#),
+        (Reachability::PublishedOnly, r#""published_only""#),
+        (Reachability::Other, r#""other""#),
+    ] {
+        assert_wire(&reach, want);
+    }
+    let future: ListenerState = serde_json::from_str(r#""draining""#).unwrap();
+    assert_eq!(future, ListenerState::Other);
+    let future: Reachability = serde_json::from_str(r#""tunnel""#).unwrap();
+    assert_eq!(future, Reachability::Other);
 }
 
 #[test]
