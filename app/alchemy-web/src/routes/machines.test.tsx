@@ -1,4 +1,4 @@
-import { act, cleanup, screen, within } from "@testing-library/react";
+import { act, cleanup, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -13,6 +13,10 @@ import type {
   NetworkReport,
   NetworkSettings,
   NetworkWarning,
+  Privilege,
+  PrivilegeAction,
+  PrivilegeChange,
+  PrivilegeList,
   ProxyListener,
 } from "../lib/api.ts";
 import { FakeEventSource, renderAt } from "../test/render.tsx";
@@ -72,6 +76,38 @@ let settingsPuts: unknown[] = [];
 
 /** Whether the stubbed `PUT /api/settings/network` fails. */
 let settingsPutFails = false;
+
+function privilege(action: PrivilegeAction, extra: Partial<Privilege> = {}): Privilege {
+  return {
+    action,
+    state: "not_needed",
+    reason: null,
+    message: null,
+    command: null,
+    restarts: action === "low_ports",
+    last: null,
+    ...extra,
+  };
+}
+
+const NOTHING_NEEDED: PrivilegeList = {
+  privileges: [privilege("low_ports"), privilege("firewall"), privilege("system_service")],
+};
+
+/** What the stubbed `GET /api/machine/privileges` answers. */
+let privilegeList: PrivilegeList = NOTHING_NEEDED;
+
+/** Every `POST /api/machine/privileges/{action}`, as its path and body, in order. */
+let privilegePosts: { url: string; body: unknown }[] = [];
+
+/** The stubbed answers to the next POSTs, in order; then `unchanged`. */
+let privilegeAnswers: { status: number; body: unknown }[] = [];
+
+/** Whether the stubbed daemon predates `/api/machine/privileges` but reports the rest. */
+let noPrivileges = false;
+
+/** Whether the stubbed daemon refuses everything but its version as signed out. */
+let signedOut = false;
 
 const GIB = 1024 ** 3;
 
@@ -152,6 +188,11 @@ beforeEach(() => {
   networkSettings = { mdns: true };
   settingsPuts = [];
   settingsPutFails = false;
+  privilegeList = NOTHING_NEEDED;
+  privilegePosts = [];
+  privilegeAnswers = [];
+  noPrivileges = false;
+  signedOut = false;
   FakeEventSource.instances = [];
   vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal(
@@ -160,12 +201,18 @@ beforeEach(() => {
       if (!daemonUp) {
         throw new TypeError("connection refused");
       }
+      if (signedOut && url !== "/api/version") {
+        return new Response(JSON.stringify({ error: "not signed in", code: "unauthorized" }), {
+          status: 401,
+        });
+      }
       if (
-        oldDaemon &&
-        (url.startsWith("/api/metrics") ||
-          url === "/api/ports" ||
-          url === "/api/network" ||
-          url === "/api/settings/network")
+        ((oldDaemon || noPrivileges) && url.startsWith("/api/machine/")) ||
+        (oldDaemon &&
+          (url.startsWith("/api/metrics") ||
+            url === "/api/ports" ||
+            url === "/api/network" ||
+            url === "/api/settings/network"))
       ) {
         return new Response(JSON.stringify({ error: "not found", code: "not_found" }), {
           status: 404,
@@ -207,6 +254,25 @@ beforeEach(() => {
       }
       if (url === "/api/settings/network") {
         return new Response(JSON.stringify(networkSettings), { status: 200 });
+      }
+      if (url === "/api/machine/privileges") {
+        return new Response(JSON.stringify(privilegeList), { status: 200 });
+      }
+      if (url.startsWith("/api/machine/privileges/") && init?.method === "POST") {
+        privilegePosts.push({
+          url,
+          body: typeof init.body === "string" ? JSON.parse(init.body) : null,
+        });
+        const answer = privilegeAnswers.shift() ?? {
+          status: 200,
+          body: {
+            outcome: "unchanged",
+            command: null,
+            message: null,
+            privilege: privilege("other"),
+          },
+        };
+        return new Response(JSON.stringify(answer.body), { status: answer.status });
       }
       if (url.startsWith("/api/metrics/history?")) {
         historyRequests.push(url);
@@ -783,5 +849,360 @@ describe("Machines", () => {
     expect(within(alert).getByText("Couldn't change local names")).toBeTruthy();
     expect(within(alert).getByText("the settings store is read-only")).toBeTruthy();
     expect((toggle as HTMLInputElement).checked).toBe(true);
+  });
+});
+
+describe("Privileges", () => {
+  const helper = "/home/me/alchemy/target/release/alchemy-helper";
+  const grantLine = `sudo ${helper} grant-low-ports`;
+  const revokeLine = `sudo ${helper} revoke-low-ports`;
+  const terminal = (line: string) => ({ argv: line.split(" "), line });
+
+  function list(...privileges: Privilege[]): PrivilegeList {
+    const byAction = new Map(privileges.map((p) => [p.action, p]));
+    return {
+      privileges: NOTHING_NEEDED.privileges.map((p) => byAction.get(p.action) ?? p),
+    };
+  }
+
+  function answer(status: number, change: Partial<PrivilegeChange>) {
+    privilegeAnswers.push({
+      status,
+      body: {
+        outcome: "unchanged",
+        command: null,
+        message: null,
+        privilege: privilege("low_ports"),
+        ...change,
+      },
+    });
+  }
+
+  /** Send a `privileges` event and wait for it to render. */
+  async function sendPrivileges(update: PrivilegeList) {
+    await act(async () => {
+      source().emit("privileges", JSON.stringify(update));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+
+  async function row(name: string) {
+    await screen.findByRole("heading", { name: "Privileges" });
+    return screen.findByRole("group", { name });
+  }
+
+  it("lists each action and its state", async () => {
+    await renderOnline();
+    expect(
+      within(await row("Port 80")).getByText("Alchemy can use port 80 without extra permission"),
+    ).toBeTruthy();
+    expect(within(await row("Firewall")).getByText("No firewall needs opening")).toBeTruthy();
+    expect(
+      within(await row("System service")).getByText("alchemyd doesn't need a system service"),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Allow|Open|Install|Remove|Close/ })).toBeNull();
+  });
+
+  it("shows nothing about privileges when alchemyd is too old to report them", async () => {
+    oldDaemon = true;
+    await renderOnline();
+    expect(await screen.findByText(/doesn't report usage/)).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Privileges" })).toBeNull();
+  });
+
+  it("asks for the system prompt, waits while it's up, and says when it was cancelled", async () => {
+    privilegeList = list(privilege("low_ports", { state: "needed" }));
+    answer(202, { outcome: "pending", privilege: privilege("low_ports", { state: "pending" }) });
+    await renderOnline();
+    const port = await row("Port 80");
+    expect(within(port).getByText("Alchemy needs permission to use port 80")).toBeTruthy();
+    expect(within(port).getByText(/which signs this browser out/)).toBeTruthy();
+
+    await userEvent.setup().click(within(port).getByRole("button", { name: "Allow port 80" }));
+    expect(privilegePosts).toEqual([
+      { url: "/api/machine/privileges/low_ports", body: { grant: true } },
+    ]);
+    await sendPrivileges(list(privilege("low_ports", { state: "pending" })));
+    expect(within(port).getByText("Waiting for you to answer the system prompt…")).toBeTruthy();
+    expect(within(port).getByRole("img", { name: "In progress" })).toBeTruthy();
+    expect(within(port).queryByRole("button")).toBeNull();
+
+    await sendPrivileges(
+      list(
+        privilege("low_ports", {
+          state: "needed",
+          last: { grant: true, result: "cancelled", message: null, at: 1 },
+        }),
+      ),
+    );
+    expect(within(port).getByText("The last try was cancelled at the system prompt.")).toBeTruthy();
+    expect(within(port).getByRole("button", { name: "Allow port 80" })).toBeTruthy();
+  });
+
+  it("says why the last try failed", async () => {
+    privilegeList = list(
+      privilege("firewall", {
+        state: "needed",
+        last: { grant: true, result: "failed", message: "alchemy-helper: ufw exited 1", at: 1 },
+      }),
+    );
+    await renderOnline();
+    const firewall = await row("Firewall");
+    expect(
+      within(firewall).getByText("The firewall may block other devices from your apps"),
+    ).toBeTruthy();
+    expect(
+      within(firewall).getByText("The last try failed: alchemy-helper: ufw exited 1"),
+    ).toBeTruthy();
+    expect(within(firewall).getByRole("button", { name: "Open the firewall" })).toBeTruthy();
+  });
+
+  it("shows the command to run when there's no prompt, and tries again", async () => {
+    privilegeList = list(
+      privilege("low_ports", {
+        state: "needs_terminal",
+        reason: "untrusted_helper",
+        message: `alchemy-helper isn't installed safely: ${helper} is owned by UID 501, not root.`,
+        command: terminal(grantLine),
+      }),
+    );
+    for (let i = 0; i < 2; i++) {
+      answer(200, {
+        outcome: "needs_terminal",
+        command: terminal(grantLine),
+        message: "alchemy-helper isn't installed safely.",
+      });
+    }
+    await renderOnline();
+    const port = await row("Port 80");
+    expect(within(port).getByText("Alchemy needs permission to use port 80")).toBeTruthy();
+    expect(within(port).getByText(/isn't installed safely: /)).toBeTruthy();
+    expect(port.querySelector("pre")?.textContent).toBe(grantLine);
+    expect(within(port).getByRole("button", { name: "Copy command" })).toBeTruthy();
+    expect(within(port).queryByRole("button", { name: "Allow port 80" })).toBeNull();
+
+    const user = userEvent.setup();
+    await user.click(within(port).getByRole("button", { name: "Try again" }));
+    await act(async () => {});
+    expect(within(port).queryByText(/doesn't see the change yet/)).toBeNull();
+    await user.click(within(port).getByRole("button", { name: "Try again" }));
+    expect(await within(port).findByText(/doesn't see the change yet/)).toBeTruthy();
+    expect(privilegePosts.map((p) => p.body)).toEqual([{ grant: true }, { grant: true }]);
+  });
+
+  it("restarts alchemyd for a change made in a terminal, then reconnects", async () => {
+    privilegeList = list(privilege("low_ports", { state: "needs_restart" }));
+    answer(202, { outcome: "restarting", privilege: privilege("low_ports", { state: "pending" }) });
+    await renderOnline();
+    const port = await row("Port 80");
+    expect(within(port).getByText("Port 80 is allowed once alchemyd restarts")).toBeTruthy();
+    await userEvent.setup().click(within(port).getByRole("button", { name: "Restart alchemyd" }));
+    expect(privilegePosts).toEqual([
+      { url: "/api/machine/privileges/low_ports", body: { grant: true } },
+    ]);
+    await sendPrivileges(list(privilege("low_ports", { state: "pending" })));
+    expect(
+      within(await row("Port 80")).getByText("Restarting alchemyd to put the change in effect…"),
+    ).toBeTruthy();
+
+    daemonUp = false;
+    dispatch("error");
+    expect(
+      await screen.findByText("alchemyd is restarting to put the change in effect…"),
+    ).toBeTruthy();
+    expect(screen.queryByText("Alchemy can't reach alchemyd")).toBeNull();
+
+    daemonUp = true;
+    privilegeList = list(privilege("low_ports", { state: "granted" }));
+    dispatch("open");
+    await screen.findByText("alchemyd 9.9.9");
+    await sendPrivileges(privilegeList);
+    expect(within(await row("Port 80")).getByText("Alchemy can use port 80")).toBeTruthy();
+    expect(screen.queryByText("alchemyd is restarting to put the change in effect…")).toBeNull();
+  });
+
+  it("calls a prompted change that succeeded a restart, before alchemyd goes", async () => {
+    privilegeList = list(privilege("low_ports", { state: "needed" }));
+    await renderOnline();
+    await row("Port 80");
+    await sendPrivileges(
+      list(
+        privilege("low_ports", {
+          state: "pending",
+          last: { grant: true, result: "done", message: null, at: 1 },
+        }),
+      ),
+    );
+    expect(
+      within(await row("Port 80")).getByText("Restarting alchemyd to put the change in effect…"),
+    ).toBeTruthy();
+    daemonUp = false;
+    dispatch("error");
+    expect(
+      await screen.findByText("alchemyd is restarting to put the change in effect…"),
+    ).toBeTruthy();
+  });
+
+  it("tells a browser to sign in again after the restart", async () => {
+    privilegeList = list(privilege("low_ports", { state: "needs_restart" }));
+    answer(202, { outcome: "restarting", privilege: privilege("low_ports", { state: "pending" }) });
+    await renderOnline();
+    await userEvent
+      .setup()
+      .click(within(await row("Port 80")).getByRole("button", { name: "Restart alchemyd" }));
+    await act(async () => {});
+    signedOut = true;
+    dispatch("error");
+    const alert = await screen.findByRole("alert");
+    expect(
+      within(alert).getByText(
+        "alchemyd restarted to put the change in effect, so you're signed out",
+      ),
+    ).toBeTruthy();
+    expect(within(alert).getByText("alchemy open")).toBeTruthy();
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "Privileges" })).toBeNull());
+  });
+
+  it("undoes a granted action, through a terminal when it has to", async () => {
+    privilegeList = list(privilege("low_ports", { state: "granted" }));
+    answer(200, {
+      outcome: "needs_terminal",
+      command: terminal(revokeLine),
+      message: "No polkit agent answered.",
+    });
+    answer(202, { outcome: "restarting", privilege: privilege("low_ports", { state: "pending" }) });
+    await renderOnline();
+    const port = await row("Port 80");
+    expect(within(port).getByText("Alchemy can use port 80")).toBeTruthy();
+    const user = userEvent.setup();
+    await user.click(within(port).getByRole("button", { name: "Remove port 80 access" }));
+    expect(await within(port).findByText("No polkit agent answered.")).toBeTruthy();
+    expect(port.querySelector("pre")?.textContent).toBe(revokeLine);
+    expect(within(port).queryByRole("button", { name: "Remove port 80 access" })).toBeNull();
+
+    await user.click(within(port).getByRole("button", { name: "Try again" }));
+    expect(privilegePosts.map((p) => p.body)).toEqual([{ grant: false }, { grant: false }]);
+    await waitFor(() => expect(port.querySelector("pre")).toBeNull());
+  });
+
+  it("explains an action that can't be done", async () => {
+    privilegeList = list(
+      privilege("low_ports", {
+        state: "unsupported",
+        reason: "nosuid_mount",
+        message: "alchemyd is on a filesystem mounted nosuid.",
+      }),
+    );
+    await renderOnline();
+    const port = await row("Port 80");
+    expect(within(port).getByText("Alchemy can't be allowed port 80 on this machine")).toBeTruthy();
+    expect(within(port).getByText("alchemyd is on a filesystem mounted nosuid.")).toBeTruthy();
+    expect(within(port).queryByRole("button")).toBeNull();
+  });
+
+  it("says when alchemyd refused the change", async () => {
+    privilegeList = list(privilege("firewall", { state: "needed" }));
+    privilegeAnswers.push({
+      status: 422,
+      body: { error: "raw nftables rules are never edited", code: "unsupported" },
+    });
+    await renderOnline();
+    const firewall = await row("Firewall");
+    await userEvent
+      .setup()
+      .click(within(firewall).getByRole("button", { name: "Open the firewall" }));
+    const alert = await within(firewall).findByRole("alert");
+    expect(within(alert).getByText("Alchemy couldn't make the change")).toBeTruthy();
+    expect(within(alert).getByText("raw nftables rules are never edited")).toBeTruthy();
+    expect(privilegePosts).toEqual([
+      { url: "/api/machine/privileges/firewall", body: { grant: true } },
+    ]);
+  });
+
+  const denied: ProxyListener = {
+    port: 80,
+    app: null,
+    state: "unavailable",
+    message:
+      "Alchemy doesn't have permission to listen on port 80, so addresses like http://<app>.localhost don't work.",
+    fix: "Allow Alchemy to use port 80 with `alchemy machine privileges grant low-ports`, or from the machine page.",
+    privilege: "low_ports",
+  };
+
+  function warnings() {
+    return screen.findByRole("group", { name: "Web address warnings" });
+  }
+
+  it("offers Allow port 80 on the port 80 warning instead of a command", async () => {
+    network = { ...clear, proxy: { reachability: "container_ip", host: denied, ports: [] } };
+    privilegeList = list(privilege("low_ports", { state: "needed" }));
+    answer(202, { outcome: "pending", privilege: privilege("low_ports", { state: "pending" }) });
+    await renderOnline();
+    const group = await warnings();
+    expect(within(group).getByText("Addresses on port 80 don't work")).toBeTruthy();
+    expect(within(group).getByText(/doesn't have permission to listen on port 80/)).toBeTruthy();
+    const allow = await within(group).findByRole("button", { name: "Allow port 80" });
+    expect(within(group).queryByText(/alchemy machine privileges/)).toBeNull();
+    expect(within(group).queryByRole("button", { name: "Copy command" })).toBeNull();
+
+    await userEvent.setup().click(allow);
+    expect(privilegePosts).toEqual([
+      { url: "/api/machine/privileges/low_ports", body: { grant: true } },
+    ]);
+    await sendPrivileges(list(privilege("low_ports", { state: "pending" })));
+    expect(within(group).getByText("Waiting for you to answer the system prompt…")).toBeTruthy();
+    expect(
+      within(await row("Port 80")).getByText("Waiting for you to answer the system prompt…"),
+    ).toBeTruthy();
+  });
+
+  it("shows the command on the port 80 warning when there's no prompt", async () => {
+    network = { ...clear, proxy: { reachability: "container_ip", host: denied, ports: [] } };
+    privilegeList = list(
+      privilege("low_ports", {
+        state: "needs_terminal",
+        reason: "untrusted_helper",
+        message: "alchemy-helper isn't installed safely.",
+        command: terminal(grantLine),
+      }),
+    );
+    await renderOnline();
+    const group = await warnings();
+    expect((await within(group).findByText(grantLine)).tagName).toBe("PRE");
+    expect(within(group).getByRole("button", { name: "Try again" })).toBeTruthy();
+    expect(within(group).queryByRole("button", { name: "Allow port 80" })).toBeNull();
+  });
+
+  it("keeps the fix's command when alchemyd can't report privileges", async () => {
+    network = { ...clear, proxy: { reachability: "container_ip", host: denied, ports: [] } };
+    noPrivileges = true;
+    await renderOnline();
+    const group = await warnings();
+    expect(within(group).getByText("alchemy machine privileges grant low-ports").tagName).toBe(
+      "CODE",
+    );
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(within(group).queryByRole("button", { name: "Allow port 80" })).toBeNull();
+  });
+
+  it("refetches the web address report when the privileges change", async () => {
+    network = { ...clear, proxy: { reachability: "container_ip", host: denied, ports: [] } };
+    privilegeList = list(privilege("low_ports", { state: "needed" }));
+    await renderOnline();
+    await warnings();
+    network = {
+      ...clear,
+      proxy: {
+        reachability: "container_ip",
+        host: { ...denied, state: "listening", message: null, fix: null, privilege: null },
+        ports: [],
+      },
+    };
+    await sendPrivileges(list(privilege("low_ports", { state: "granted" })));
+    await waitFor(() =>
+      expect(screen.queryByRole("group", { name: "Web address warnings" })).toBeNull(),
+    );
   });
 });
