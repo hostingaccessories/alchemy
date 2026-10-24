@@ -8,7 +8,11 @@
 //! Compose file publishes is [`PortSource::Declared`]. Any other program
 //! listening on the host is a [`PortHolder::Program`], named when the OS
 //! says which one.
+//!
+//! A [`PortConflict`] is a port an app wants that something else holds,
+//! as `GET /api/apps/{name}/plan` lists it.
 
+use crate::PublishedPort;
 pub use alchemy_core::ports::{PortClaim, PortHolder, PortSource};
 use serde::{Deserialize, Serialize};
 
@@ -24,4 +28,29 @@ pub struct PortList {
     /// complete.
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+/// A port an app wants that something else holds, as an
+/// [`ActionPlan`](crate::operations::ActionPlan) lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortConflict {
+    /// The service that wants the port.
+    pub service: String,
+    /// The port it wants.
+    pub wanted: PublishedPort,
+    /// What holds it now: only live and reserved claims block a start.
+    pub claim: PortClaim,
+    /// A plain sentence naming the port and its holder, safe to show.
+    pub message: String,
+}
+
+impl From<&alchemy_core::ports::PortConflict> for PortConflict {
+    fn from(conflict: &alchemy_core::ports::PortConflict) -> Self {
+        Self {
+            service: conflict.service.clone(),
+            wanted: conflict.wanted,
+            claim: conflict.claim.clone(),
+            message: conflict.to_string(),
+        }
+    }
 }

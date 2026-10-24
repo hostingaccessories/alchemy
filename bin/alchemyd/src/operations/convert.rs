@@ -5,6 +5,7 @@
 use alchemy_api::operations::{ActionPlan, PlannedStep};
 use alchemy_core::StackName;
 use alchemy_core::operation::{BuildLog, BuildStep, Progress, ResourceState, step_label};
+use alchemy_core::ports::PortConflict;
 
 use crate::compose::{
     BuildVertex, ComposeError, ComposeEvent, ComposePlan, OutputLine, ProgressEvent,
@@ -114,8 +115,8 @@ pub fn failure_message(error: &ComposeError) -> String {
 }
 
 /// `plan` for `app` as clients see it, each step's command line starting
-/// with `docker`.
-pub fn action_plan(app: StackName, plan: &ComposePlan) -> ActionPlan {
+/// with `docker`, with the port `conflicts` that would refuse it.
+pub fn action_plan(app: StackName, plan: &ComposePlan, conflicts: &[PortConflict]) -> ActionPlan {
     let action = plan.action();
     ActionPlan {
         app,
@@ -135,6 +136,7 @@ pub fn action_plan(app: StackName, plan: &ComposePlan) -> ActionPlan {
                     .collect(),
             })
             .collect(),
+        conflicts: conflicts.iter().map(Into::into).collect(),
     }
 }
 
@@ -328,7 +330,7 @@ mod tests {
     fn plans_start_with_docker() {
         let project = ComposeProject::new("/srv/my apps/blog").unwrap();
         let plan = ComposePlan::new(&project, ComposeAction::Update, ImageSource::Registry);
-        let got = action_plan(StackName::new("blog").unwrap(), &plan);
+        let got = action_plan(StackName::new("blog").unwrap(), &plan, &[]);
         assert_eq!(got.action, ComposeAction::Update);
         assert_eq!(
             got.steps

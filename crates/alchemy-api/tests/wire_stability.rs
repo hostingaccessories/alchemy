@@ -993,11 +993,53 @@ fn action_plan() {
                     "down".into(),
                 ],
             }],
+            conflicts: Vec::new(),
         },
         concat!(
             r#"{"app":"blog","action":"down","steps":[{"command":"down","#,
             r#""label":"Removing the app's containers","argv":["docker","compose","#,
             r#""--project-directory","/srv/apps/blog","--progress","json","down"]}]}"#,
+        ),
+    );
+}
+
+#[test]
+fn action_plan_with_port_conflicts() {
+    use alchemy_api::ports::{PortClaim, PortConflict, PortHolder, PortSource};
+    use alchemy_api::{Protocol, PublishedPort};
+    let tcp = PublishedPort::new(Protocol::Tcp, Some("8080".parse().unwrap()));
+    assert_wire(
+        &ActionPlan {
+            app: StackName::new("wiki").unwrap(),
+            action: Action::Up,
+            steps: vec![PlannedStep {
+                command: StepCommand::Up,
+                label: "Starting the app".into(),
+                argv: vec!["docker".into(), "compose".into(), "up".into()],
+            }],
+            conflicts: vec![PortConflict {
+                service: "app".into(),
+                wanted: tcp.with_target(Some("80".parse().unwrap())),
+                claim: PortClaim {
+                    port: tcp,
+                    holder: PortHolder::App {
+                        app: "blog".into(),
+                        service: "web".into(),
+                    },
+                    source: PortSource::Live,
+                },
+                message: "Port 8080/tcp for service app is in use by service web of app blog."
+                    .into(),
+            }],
+        },
+        concat!(
+            r#"{"app":"wiki","action":"up","steps":[{"command":"up","#,
+            r#""label":"Starting the app","argv":["docker","compose","up"]}],"#,
+            r#""conflicts":[{"service":"app","#,
+            r#""wanted":{"protocol":"tcp","host_ip":null,"published":"8080","target":"80"},"#,
+            r#""claim":{"port":{"protocol":"tcp","host_ip":null,"published":"8080","target":null},"#,
+            r#""holder":{"kind":"app","app":"blog","service":"web"},"source":"live"},"#,
+            r#""message":"Port 8080/tcp for service app is in use by service web of app blog."}]}"#,
         ),
     );
 }

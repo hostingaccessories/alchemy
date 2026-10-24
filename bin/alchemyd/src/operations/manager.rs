@@ -14,6 +14,7 @@ use alchemy_core::engine::EngineState;
 use alchemy_core::operation::{
     Action, OUTPUT_LINES, Operation, OperationState, Outcome, OutputBuffer, Tracker, intent_action,
 };
+use alchemy_core::ports::{PortConflict, find_conflicts};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -27,6 +28,7 @@ use crate::compose::{
     ComposeStep, cancellation,
 };
 use crate::engine::Endpoint;
+use crate::ports::PortRegistry;
 use crate::store::{SharedStore, StoreError};
 
 /// How long a finished operation, and its output, stays in memory.
@@ -78,6 +80,16 @@ pub enum StartError {
         project: String,
         /// The action asked for.
         action: Action,
+    },
+    /// A host port the app publishes is held by something else.
+    #[error("{}", port_conflict_message(name, *action, conflicts))]
+    PortConflict {
+        /// The app.
+        name: String,
+        /// The action asked for.
+        action: Action,
+        /// Each port the app wants and what holds it, at least one.
+        conflicts: Vec<PortConflict>,
     },
     /// Another operation is running on the app.
     #[error("{name} is busy with another operation ({operation}); wait for it to finish")]
@@ -153,6 +165,7 @@ struct Inner {
     runner: Arc<dyn OperationRunner>,
     state: State,
     store: SharedStore,
+    ports: PortRegistry,
     entries: Mutex<BTreeMap<String, Entry>>,
     tasks: Mutex<JoinSet<()>>,
     closed: AtomicBool,
@@ -182,13 +195,20 @@ struct Prepared {
 
 impl Operations {
     /// Operations run through `runner` on the apps in `state`, stored in
-    /// `store`.
-    pub fn new(runner: Arc<dyn OperationRunner>, state: State, store: SharedStore) -> Self {
+    /// `store`, checking the host ports an app publishes against `ports`
+    /// before starting it.
+    pub fn new(
+        runner: Arc<dyn OperationRunner>,
+        state: State,
+        store: SharedStore,
+        ports: PortRegistry,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 runner,
                 state,
                 store,
+                ports,
                 entries: Mutex::new(BTreeMap::new()),
                 tasks: Mutex::new(JoinSet::new()),
                 closed: AtomicBool::new(false),
@@ -218,7 +238,7 @@ impl Operations {
 
     /// Start `action` on the app named `name` and return the operation,
     /// running. `force` goes ahead when another app shares its Compose
-    /// project.
+    /// project, or when a host port the app publishes is taken.
     pub async fn start(
         &self,
         name: &str,
@@ -231,6 +251,16 @@ impl Operations {
                 name: name.to_owned(),
                 action,
             });
+        }
+        if !force {
+            let conflicts = self.port_conflicts(&prepared.app, action).await;
+            if !conflicts.is_empty() {
+                return Err(StartError::PortConflict {
+                    name: name.to_owned(),
+                    action,
+                    conflicts,
+                });
+            }
         }
         let commands: Vec<_> = prepared
             .plan
@@ -291,10 +321,38 @@ impl Operations {
     }
 
     /// The plan `action` would run on the app named `name`, changing
-    /// nothing.
-    pub fn plan(&self, name: &str, action: Action) -> Result<ActionPlan, StartError> {
+    /// nothing, with the port conflicts that would refuse it.
+    pub async fn plan(&self, name: &str, action: Action) -> Result<ActionPlan, StartError> {
         let prepared = self.prepare(name, action, true)?;
-        Ok(convert::action_plan(prepared.app, &prepared.plan))
+        let conflicts = self.port_conflicts(&prepared.app, action).await;
+        Ok(convert::action_plan(
+            prepared.app,
+            &prepared.plan,
+            &conflicts,
+        ))
+    }
+
+    /// The host ports `app` publishes, read from its cached Compose
+    /// configuration, that something else holds now, when `action`
+    /// starts containers.
+    ///
+    /// A registry that cannot be read finds none, so a broken state
+    /// database never stops an app starting: Docker still refuses a port
+    /// that is really taken.
+    async fn port_conflicts(&self, app: &StackName, action: Action) -> Vec<PortConflict> {
+        if !starts_containers(action) {
+            return Vec::new();
+        }
+        match self.inner.ports.gather().await {
+            Ok(gathered) => {
+                let claims = gathered.input.merge();
+                find_conflicts(app.as_str(), &gathered.input.declared, &claims)
+            }
+            Err(error) => {
+                tracing::warn!(%error, %app, "cannot check the app's ports before starting it");
+                Vec::new()
+            }
+        }
     }
 
     fn prepare(&self, name: &str, action: Action, force: bool) -> Result<Prepared, StartError> {
@@ -637,6 +695,29 @@ impl Follower {
     }
 }
 
+/// Whether `action` can bind host ports, so its ports are checked first.
+fn starts_containers(action: Action) -> bool {
+    matches!(
+        action,
+        Action::Up | Action::Start | Action::Restart | Action::Update
+    )
+}
+
+/// [`StartError::PortConflict`]'s message: each conflict's sentence, then
+/// how to go ahead anyway.
+fn port_conflict_message(name: &str, action: Action, conflicts: &[PortConflict]) -> String {
+    let mut message: Vec<String> = conflicts.iter().map(ToString::to_string).collect();
+    let ports = if conflicts.len() == 1 {
+        "that port"
+    } else {
+        "those ports"
+    };
+    message.push(format!(
+        "Free {ports}, or force {action} to start {name} anyway."
+    ));
+    message.join(" ")
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -659,14 +740,22 @@ fn now_secs() -> i64 {
     clippy::indexing_slicing
 )]
 mod tests {
+    use std::path::PathBuf;
+
     use alchemy_api::AppList;
     use alchemy_api::apps::App;
-    use alchemy_core::engine::{EngineStatus, IntentAction};
+    use alchemy_core::engine::{ContainerState, ContainerStatus, EngineStatus, IntentAction};
     use alchemy_core::operation::{StepCommand, StepState};
+    use alchemy_core::ports::{Listener, PortRange, Protocol, PublishedPort};
 
     use super::*;
-    use crate::compose::{ComposeAction, FakeComposeRunner, FakeOutcome, FakeScript, Stream};
-    use crate::store::MemoryStore;
+    use crate::apps::ConfigOutcome;
+    use crate::compose::{
+        ComposeAction, ComposeConfig, FakeComposeRunner, FakeOutcome, FakeScript, ServiceConfig,
+        Stream,
+    };
+    use crate::network::FakeNetwork;
+    use crate::store::{MemoryStore, PortReservation};
 
     fn app(name: &str, project: Option<&str>, problems: &serde_json::Value) -> App {
         serde_json::from_value(serde_json::json!({
@@ -684,6 +773,13 @@ mod tests {
     }
 
     fn setup(runner: FakeComposeRunner) -> (Operations, State, SharedStore) {
+        setup_with(runner, &FakeNetwork::new())
+    }
+
+    fn setup_with(
+        runner: FakeComposeRunner,
+        network: &FakeNetwork,
+    ) -> (Operations, State, SharedStore) {
         let state = State::new();
         state.set_engine(EngineStatus::new(EngineState::Ready));
         state.set_apps(AppList {
@@ -699,8 +795,55 @@ mod tests {
             ..AppList::default()
         });
         let store: SharedStore = Arc::new(MemoryStore::new());
-        let ops = Operations::new(Arc::new(runner), state.clone(), store.clone());
+        let ports = PortRegistry::new(state.clone(), store.clone(), Arc::new(network.clone()));
+        let ops = Operations::new(Arc::new(runner), state.clone(), store.clone(), ports);
         (ops, state, store)
+    }
+
+    fn tcp(port: u16) -> PublishedPort {
+        PublishedPort::new(Protocol::Tcp, PortRange::single(port).ok())
+    }
+
+    fn declares(project: &str, service: &str, ports: &[u16]) -> ConfigOutcome {
+        ConfigOutcome::Ready(ComposeConfig {
+            name: project.into(),
+            services: vec![ServiceConfig {
+                name: service.into(),
+                ports: ports.iter().copied().map(tcp).collect(),
+                ..ServiceConfig::default()
+            }],
+            ..ComposeConfig::default()
+        })
+    }
+
+    /// `blog` running `web` on 8080; `wiki`, stopped, wanting 8080 and
+    /// 9000 for `app`; `docs`, stopped, wanting 9100 for `web`.
+    fn with_ports(state: &State) {
+        let mut list = state.apps();
+        list.apps
+            .push(app("wiki", Some("wiki"), &serde_json::json!([])));
+        list.apps
+            .push(app("docs", Some("docs"), &serde_json::json!([])));
+        state.set_app_configs(BTreeMap::from([
+            (
+                PathBuf::from("/srv/apps/blog"),
+                declares("blog", "web", &[8080]),
+            ),
+            (
+                PathBuf::from("/srv/apps/wiki"),
+                declares("wiki", "app", &[8080, 9000]),
+            ),
+            (
+                PathBuf::from("/srv/apps/docs"),
+                declares("docs", "web", &[9100]),
+            ),
+        ]));
+        state.set_apps(list);
+        let mut web = ContainerStatus::new("abc", "blog-web-1", ContainerState::Running);
+        web.project = Some("blog".into());
+        web.service = Some("web".into());
+        web.ports = vec![tcp(8080)];
+        state.update_containers(|c| c.replace_all([web]));
     }
 
     async fn follow_to_end(ops: &Operations, id: &str) -> Vec<OperationEvent> {
@@ -805,6 +948,90 @@ mod tests {
             matches!(error, StartError::DockerNotReady { .. }),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_start_on_a_taken_port_unless_forced() {
+        let (ops, state, _) = setup(FakeComposeRunner::new());
+        with_ports(&state);
+        let taken = "Port 8080/tcp for service app is in use by service web of app blog.";
+        let cases: [(&str, Action, bool, Option<&str>); 9] = [
+            ("wiki", Action::Up, false, Some(taken)),
+            ("wiki", Action::Start, false, Some(taken)),
+            ("wiki", Action::Restart, false, Some(taken)),
+            ("wiki", Action::Update, false, Some(taken)),
+            ("wiki", Action::Stop, false, None),
+            ("wiki", Action::Pull, false, None),
+            ("wiki", Action::Up, true, None),
+            ("blog", Action::Restart, false, None),
+            ("docs", Action::Up, false, None),
+        ];
+        for (name, action, force, want) in cases {
+            match (ops.start(name, action, force).await, want) {
+                (Ok(op), None) => {
+                    let done = last_done(&follow_to_end(&ops, &op.id).await).clone();
+                    assert_eq!(done.state, OperationState::Succeeded, "{name} {action}");
+                }
+                (Err(StartError::PortConflict { conflicts, .. }), Some(want)) => {
+                    assert_eq!(conflicts.len(), 1, "{name} {action}");
+                    assert_eq!(conflicts[0].to_string(), want, "{name} {action}");
+                }
+                (got, _) => panic!("{name} {action} force {force}: {got:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn names_every_holder_of_a_taken_port() {
+        let network = FakeNetwork::new();
+        network.set_listeners(vec![Listener {
+            protocol: Protocol::Tcp,
+            addr: "0.0.0.0".parse().unwrap(),
+            port: 9100,
+            process: Some("nc".into()),
+            pid: Some(42),
+        }]);
+        let (ops, state, store) = setup_with(FakeComposeRunner::new(), &network);
+        with_ports(&state);
+        store
+            .add_port_reservation(PortReservation {
+                owner: "proxy".into(),
+                port: 9000,
+                protocol: Protocol::Tcp,
+                host_ip: None,
+                created: 1,
+            })
+            .await
+            .unwrap();
+
+        let error = ops.start("wiki", Action::Up, false).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Port 8080/tcp for service app is in use by service web of app blog. \
+             Port 9000/tcp for service app is reserved for proxy. \
+             Free those ports, or force up to start wiki anyway."
+        );
+        let error = ops.start("docs", Action::Start, false).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Port 9100/tcp for service web is in use by another program (nc, pid 42). \
+             Free that port, or force start to start docs anyway."
+        );
+
+        let plan = ops.plan("wiki", Action::Up).await.unwrap();
+        assert_eq!(
+            plan.conflicts
+                .iter()
+                .map(|c| c.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Port 8080/tcp for service app is in use by service web of app blog.",
+                "Port 9000/tcp for service app is reserved for proxy.",
+            ]
+        );
+        assert_eq!(ops.plan("wiki", Action::Down).await.unwrap().conflicts, []);
+        assert_eq!(ops.plan("blog", Action::Up).await.unwrap().conflicts, []);
+        assert_eq!(ops.recent(None, 10).await.unwrap(), []);
     }
 
     #[tokio::test]
@@ -920,12 +1147,12 @@ mod tests {
     async fn plans_without_running() {
         let runner = FakeComposeRunner::new();
         let (ops, _, _) = setup(runner.clone());
-        let plan = ops.plan("twin", Action::Update).unwrap();
+        let plan = ops.plan("twin", Action::Update).await.unwrap();
         assert_eq!(plan.steps.len(), 3);
         assert_eq!(plan.steps[0].argv[0], "docker");
         assert_eq!(runner.runs(), []);
         assert!(matches!(
-            ops.plan("nope", Action::Up),
+            ops.plan("nope", Action::Up).await,
             Err(StartError::AppNotFound { .. })
         ));
     }

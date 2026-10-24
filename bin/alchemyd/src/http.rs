@@ -813,7 +813,7 @@ async fn plan_action(
         Err(rejection) => return bad_query(&rejection),
     };
     match action {
-        Ok(action) => match operations.plan(&name, action) {
+        Ok(action) => match operations.plan(&name, action).await {
             Ok(plan) => Json(plan).into_response(),
             Err(error) => start_refused(&error),
         },
@@ -1058,7 +1058,12 @@ mod tests {
         runner: crate::compose::FakeComposeRunner,
         store: SharedStore,
     ) -> Operations {
-        Operations::new(Arc::new(runner), state.clone(), store)
+        let ports = crate::ports::PortRegistry::new(
+            state.clone(),
+            store.clone(),
+            Arc::new(crate::network::FakeNetwork::new()),
+        );
+        Operations::new(Arc::new(runner), state.clone(), store, ports)
     }
 
     /// The daemon's router with only the engine topic on `/api/events`, so

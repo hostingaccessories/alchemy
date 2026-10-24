@@ -30,7 +30,8 @@ pub struct Args {
     pub name: String,
 
     /// The shared safety flags. `--force` acts on an app that shares its
-    /// Compose project with another app.
+    /// Compose project with another app, and starts one whose host ports
+    /// something else holds.
     #[command(flatten)]
     pub safety: Safety,
 }
@@ -81,7 +82,7 @@ pub(crate) async fn run<D: Daemon, W: Write, P: Prompt>(
     if mode == Mode::DryRun {
         let path = format!("/api/apps/{app}/plan?action={action}");
         let plan = ctx.get::<ActionPlan>(&path).await?;
-        for line in plan_lines(&plan, ctx.json()) {
+        for line in plan_lines(&plan, ctx.json(), args.safety.force) {
             ctx.out().line(line)?;
         }
         return Ok(());
@@ -251,19 +252,33 @@ pub(crate) fn failed_message(op: &Operation) -> String {
     }
 }
 
-/// What `--dry-run` prints: each command line alchemyd would run, or with
-/// `json`, `{"dry_run":true,"plan":<ActionPlan>}`.
-pub(crate) fn plan_lines(plan: &ActionPlan, json: bool) -> Vec<String> {
+/// What `--dry-run` prints: each command line alchemyd would run, then
+/// each port that is taken and, unless `force`, that alchemyd would refuse
+/// because of them. With `json`, `{"dry_run":true,"plan":<ActionPlan>}`.
+pub(crate) fn plan_lines(plan: &ActionPlan, json: bool, force: bool) -> Vec<String> {
     if json {
         return vec![serde_json::json!({ "dry_run": true, "plan": plan }).to_string()];
     }
-    plan.steps
+    let mut lines: Vec<String> = plan
+        .steps
         .iter()
         .map(|step| {
             let argv: Vec<String> = step.argv.iter().map(|arg| shell_quote(arg)).collect();
             format!("would run: {}", argv.join(" "))
         })
-        .collect()
+        .collect();
+    lines.extend(
+        plan.conflicts
+            .iter()
+            .map(|conflict| format!("port taken: {}", conflict.message)),
+    );
+    if !force && !plan.conflicts.is_empty() {
+        lines.push(format!(
+            "would refuse to {} {} while its ports are taken; --force goes ahead anyway",
+            plan.action, plan.app
+        ));
+    }
+    lines
 }
 
 /// `arg` as a POSIX shell would need it to be typed.
@@ -288,6 +303,8 @@ fn shell_quote(arg: &str) -> String {
 )]
 mod tests {
     use alchemy_api::operations::{PlannedStep, Step, StepCommand};
+    use alchemy_api::ports::{PortClaim, PortConflict, PortHolder, PortSource};
+    use alchemy_api::{Protocol, PublishedPort};
     use alchemy_core::StackName;
 
     use super::*;
@@ -433,18 +450,66 @@ mod tests {
                 .map(String::from)
                 .to_vec(),
             }],
+            conflicts: Vec::new(),
         }
+    }
+
+    fn conflicted() -> ActionPlan {
+        let tcp = PublishedPort::new(Protocol::Tcp, Some("8080".parse().unwrap()));
+        ActionPlan {
+            action: Action::Up,
+            conflicts: vec![PortConflict {
+                service: "app".into(),
+                wanted: tcp,
+                claim: PortClaim {
+                    port: tcp,
+                    holder: PortHolder::App {
+                        app: "wiki".into(),
+                        service: "web".into(),
+                    },
+                    source: PortSource::Live,
+                },
+                message: "Port 8080/tcp for service app is in use by service web of app wiki."
+                    .into(),
+            }],
+            ..plan()
+        }
+    }
+
+    #[test]
+    fn plans_print_taken_ports_and_whether_they_refuse() {
+        let taken =
+            "port taken: Port 8080/tcp for service app is in use by service web of app wiki.";
+        let cases: [(bool, &[&str]); 2] = [
+            (
+                false,
+                &[
+                    taken,
+                    "would refuse to up blog while its ports are taken; --force goes ahead anyway",
+                ],
+            ),
+            (true, &[taken]),
+        ];
+        for (force, want) in cases {
+            let lines = plan_lines(&conflicted(), false, force);
+            assert!(lines[0].starts_with("would run: "), "{lines:?}");
+            assert_eq!(&lines[1..], want, "force: {force}");
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(&plan_lines(&conflicted(), true, false)[0]).unwrap();
+        assert_eq!(json["plan"]["conflicts"][0]["service"], "app");
     }
 
     #[test]
     fn plans_print_as_shell_command_lines() {
         assert_eq!(
-            plan_lines(&plan(), false),
+            plan_lines(&plan(), false, false),
             [
                 r"would run: docker compose --project-directory '/srv/my apps/it'\''s' --progress json down"
             ]
         );
-        let json: serde_json::Value = serde_json::from_str(&plan_lines(&plan(), true)[0]).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&plan_lines(&plan(), true, false)[0]).unwrap();
         assert_eq!(json["dry_run"], true);
         assert_eq!(json["plan"]["action"], "down");
         assert_eq!(shell_quote(""), "''");

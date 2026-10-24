@@ -504,6 +504,57 @@ async fn machine_ports_lists_every_port_and_its_holder() {
     daemon.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn starting_an_app_whose_port_is_taken_names_the_holder_until_forced() {
+    use alchemy_core::engine::{ContainerState, ContainerStatus};
+    use alchemy_core::ports::{PortRange, Protocol, PublishedPort};
+
+    let apps = tempfile::tempdir().unwrap();
+    let daemon = ports_daemon(&apps.path().canonicalize().unwrap()).await;
+    let mut pihole = ContainerStatus::new("def", "pihole", ContainerState::Running);
+    pihole.ports = vec![PublishedPort::new(
+        Protocol::Tcp,
+        PortRange::single(3000).ok(),
+    )];
+    daemon.state.update_containers(|c| {
+        let all: Vec<ContainerStatus> = c.iter().cloned().chain([pihole]).collect();
+        c.replace_all(all)
+    });
+    let socket = daemon.socket.clone();
+    let taken = "Port 3000/tcp for service app is in use by container pihole.";
+
+    let err = run_args(&socket, &["app", "up", "wiki"]).await.unwrap_err();
+    assert_eq!(err.kind(), "daemon", "{err}");
+    assert_eq!(
+        err.to_string(),
+        format!("alchemyd: {taken} Free that port, or force up to start wiki anyway.")
+    );
+
+    let out = run_args(&socket, &["app", "start", "wiki", "--dry-run"])
+        .await
+        .unwrap();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines[1..],
+        [
+            format!("port taken: {taken}").as_str(),
+            "would refuse to start wiki while its ports are taken; --force goes ahead anyway",
+        ],
+        "{out}"
+    );
+
+    let out = run_args(&socket, &["app", "up", "wiki", "--force"])
+        .await
+        .unwrap();
+    assert_eq!(out, "wiki is up\n");
+    let out = run_args(&socket, &["app", "restart", "blog"])
+        .await
+        .unwrap();
+    assert_eq!(out, "restarted blog\n", "blog's own port never stops it");
+
+    daemon.stop().await;
+}
+
 #[tokio::test]
 async fn version_reports_alchemy_and_the_daemon() {
     let daemon = Daemon::start(EngineStatus::new(EngineState::Starting)).await;

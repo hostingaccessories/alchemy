@@ -265,12 +265,9 @@ pub async fn run_with(
         ),
     }
 
-    let operations = Operations::new(deps.runner, deps.state.clone(), store.clone());
-    if let Err(error) = operations.recover().await {
-        tracing::warn!(%error, "cannot tidy the operation history");
-    }
-
     let ports = PortRegistry::new(deps.state.clone(), store.clone(), deps.network.clone());
+    let operations = recovered_operations(deps.runner, &deps.state, &store, &ports).await;
+
     let (socket_listener, socket_file) = socket::bind(&config.socket)
         .with_context(|| format!("binding API socket {}", config.socket.display()))?;
     let http_listener = tokio::net::TcpListener::bind(config.listen)
@@ -357,6 +354,21 @@ pub async fn run_with(
     socket_result.context("API socket task failed")??;
     http_result.context("HTTP task failed")??;
     Ok(())
+}
+
+/// The daemon's operations, with what a daemon that stopped mid-run left
+/// running marked interrupted.
+async fn recovered_operations(
+    runner: Arc<dyn OperationRunner>,
+    state: &State,
+    store: &SharedStore,
+    ports: &PortRegistry,
+) -> Operations {
+    let operations = Operations::new(runner, state.clone(), store.clone(), ports.clone());
+    if let Err(error) = operations.recover().await {
+        tracing::warn!(%error, "cannot tidy the operation history");
+    }
+    operations
 }
 
 /// Give `router` the app editor and the port registry its routes use.
