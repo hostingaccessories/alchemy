@@ -6,12 +6,18 @@
 //!
 //! `GET /api/engine` returns an [`EngineStatus`], re-exported from
 //! `alchemy-core` so the wire type and the domain type cannot drift.
+//! `GET /api/metrics` returns a [`MetricsResponse`] and
+//! `GET /api/metrics/history` a [`MetricsHistory`], built from the
+//! resource-usage types in `alchemy_core::metrics`.
 //! `GET /api/events` streams [`ApiEvent`]s.
 //!
 //! The default build is pure. Enable the `socket` feature for the daemon
 //! socket path shared by `alchemyd` and its local clients.
 
 pub use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
+pub use alchemy_core::metrics::{
+    ContainerUsage, MachineUsage, MetricsPoint, MetricsRange, ProjectUsage,
+};
 use serde::{Deserialize, Serialize, Serializer};
 
 #[cfg(feature = "socket")]
@@ -108,6 +114,51 @@ pub enum ErrorCode {
     Unknown,
 }
 
+/// `GET /api/metrics`, and the `metrics` event: the latest usage of the
+/// machine, each Compose project, and each running container.
+///
+/// With `?project=NAME`, only that project's totals and containers, and no
+/// machine figures. A project with no running containers has none of
+/// either.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MetricsResponse {
+    /// When the figures were sampled, in Unix seconds, or `None` before
+    /// the first sample.
+    pub at: Option<i64>,
+    /// Seconds between samples.
+    pub interval: u32,
+    /// Whether containers run in a virtual machine, as with Docker Desktop
+    /// or on macOS. The machine figures are then the host Alchemy runs
+    /// on, not that VM, and container CPU is a share of the VM.
+    pub containers_in_vm: bool,
+    /// The machine, or `None` before the first sample or if it could not
+    /// be read.
+    pub machine: Option<MachineUsage>,
+    /// Each Compose project's containers added up, by name.
+    pub projects: Vec<ProjectUsage>,
+    /// Each running container, by name.
+    pub containers: Vec<ContainerUsage>,
+}
+
+/// `GET /api/metrics/history?range=24h[&project=NAME]`: stored usage over
+/// a range, oldest first.
+///
+/// Points are [`step`](Self::step) seconds apart where data exists; a
+/// longer gap means nothing was recorded, and clients draw it as a gap.
+/// With `project`, points hold only that project's totals and containers,
+/// and no machine figures.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricsHistory {
+    /// The range asked for; `1h` when none was.
+    pub range: MetricsRange,
+    /// Seconds per point.
+    pub step: u32,
+    /// The project asked for, if any.
+    pub project: Option<String>,
+    /// Every stored point in the range, oldest first.
+    pub points: Vec<MetricsPoint>,
+}
+
 /// One message on the `GET /api/events` server-sent event stream.
 ///
 /// Each variant is sent as an SSE frame whose `event:` field is
@@ -118,11 +169,14 @@ pub enum ErrorCode {
 /// Not `#[non_exhaustive]`, so the daemon's SSE mapping must handle every
 /// variant. Adding one is still additive on the wire: clients ignore event
 /// names they do not know.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum ApiEvent {
     /// The engine status, sent once on connect and again on every change.
     Engine(EngineStatus),
+    /// The latest usage, as `GET /api/metrics` returns it, sent once on
+    /// connect and again after every sample.
+    Metrics(MetricsResponse),
 }
 
 impl ApiEvent {
@@ -130,6 +184,7 @@ impl ApiEvent {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Engine(_) => "engine",
+            Self::Metrics(_) => "metrics",
         }
     }
 
@@ -147,6 +202,7 @@ impl Serialize for EventData<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self.0 {
             ApiEvent::Engine(status) => status.serialize(serializer),
+            ApiEvent::Metrics(metrics) => metrics.serialize(serializer),
         }
     }
 }

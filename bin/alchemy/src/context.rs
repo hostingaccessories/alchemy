@@ -4,7 +4,9 @@
 use std::io::Write;
 use std::path::Path;
 
-use alchemy_api::{ApiEvent, EngineStatus, ErrorCode, ErrorResponse, VersionResponse};
+use alchemy_api::{
+    ApiEvent, EngineStatus, ErrorCode, ErrorResponse, MetricsResponse, VersionResponse,
+};
 use serde::de::DeserializeOwned;
 
 use crate::daemon::{Daemon, DaemonInfo, EventStream, Method, Opened, Reply};
@@ -114,6 +116,9 @@ impl<S: EventStream> Subscription<S> {
 pub(crate) fn decode_event(raw: &SseEvent) -> Result<Option<ApiEvent>, ClientError> {
     match raw.event.as_str() {
         "engine" => decode::<EngineStatus>(raw.data.as_bytes()).map(|e| Some(ApiEvent::Engine(e))),
+        "metrics" => {
+            decode::<MetricsResponse>(raw.data.as_bytes()).map(|m| Some(ApiEvent::Metrics(m)))
+        }
         _ => Ok(None),
     }
 }
@@ -398,7 +403,13 @@ mod tests {
 
     #[test]
     fn decode_event_knows_every_api_event_name() {
-        let events = [ApiEvent::Engine(engine(EngineState::Starting))];
+        let events = [
+            ApiEvent::Engine(engine(EngineState::Starting)),
+            ApiEvent::Metrics(MetricsResponse {
+                interval: 60,
+                ..MetricsResponse::default()
+            }),
+        ];
         for event in events {
             let raw = SseEvent {
                 event: event.name().to_owned(),

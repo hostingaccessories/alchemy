@@ -9,8 +9,9 @@
 )]
 
 use alchemy_api::{
-    API_VERSION, ApiEvent, EngineFlavor, EngineState, EngineStatus, ErrorCode, ErrorResponse,
-    HealthResponse, HealthStatus, VersionResponse,
+    API_VERSION, ApiEvent, ContainerUsage, EngineFlavor, EngineState, EngineStatus, ErrorCode,
+    ErrorResponse, HealthResponse, HealthStatus, MachineUsage, MetricsHistory, MetricsPoint,
+    MetricsRange, MetricsResponse, ProjectUsage, VersionResponse,
 };
 
 fn assert_wire<T>(value: &T, json: &str)
@@ -153,5 +154,161 @@ fn api_event() {
             r#""engine_version":null,"api_version":null,"compose_version":null,"#,
             r#""desktop_version":null,"endpoint":null}}"#,
         ),
+    );
+}
+
+fn machine() -> MachineUsage {
+    MachineUsage {
+        cpu: Some(12.5),
+        cpu_max: None,
+        cpus: 8,
+        load: Some([0.5, 0.25, 0.75]),
+        memory_used: 4_000,
+        memory_total: 16_000,
+        swap_used: 0,
+        swap_total: 2_000,
+        disk_used: Some(100),
+        disk_total: Some(1_000),
+        disk_read: Some(1.5),
+        disk_write: None,
+        net_rx: Some(10.5),
+        net_tx: Some(2.5),
+    }
+}
+
+fn container() -> ContainerUsage {
+    ContainerUsage {
+        id: "abc".into(),
+        name: "web-app-1".into(),
+        project: Some("web".into()),
+        service: Some("app".into()),
+        cpu: Some(3.5),
+        cpu_max: Some(9.5),
+        memory: 500,
+        memory_max: Some(600),
+        net_rx: Some(1.5),
+        net_tx: None,
+        block_read: None,
+        block_write: Some(0.5),
+    }
+}
+
+fn project() -> ProjectUsage {
+    ProjectUsage {
+        name: "web".into(),
+        containers: 1,
+        cpu: Some(3.5),
+        memory: 500,
+        net_rx: Some(1.5),
+        net_tx: None,
+    }
+}
+
+const MACHINE_JSON: &str = concat!(
+    r#"{"cpu":12.5,"cpu_max":null,"cpus":8,"load":[0.5,0.25,0.75],"#,
+    r#""memory_used":4000,"memory_total":16000,"swap_used":0,"swap_total":2000,"#,
+    r#""disk_used":100,"disk_total":1000,"disk_read":1.5,"disk_write":null,"#,
+    r#""net_rx":10.5,"net_tx":2.5}"#,
+);
+
+const CONTAINER_JSON: &str = concat!(
+    r#"{"id":"abc","name":"web-app-1","project":"web","service":"app","#,
+    r#""cpu":3.5,"cpu_max":9.5,"memory":500,"memory_max":600,"#,
+    r#""net_rx":1.5,"net_tx":null,"block_read":null,"block_write":0.5}"#,
+);
+
+const PROJECT_JSON: &str =
+    r#"{"name":"web","containers":1,"cpu":3.5,"memory":500,"net_rx":1.5,"net_tx":null}"#;
+
+#[test]
+fn metrics_usage() {
+    assert_wire(&machine(), MACHINE_JSON);
+    assert_wire(&container(), CONTAINER_JSON);
+    assert_wire(&project(), PROJECT_JSON);
+}
+
+#[test]
+fn metrics_response() {
+    assert_wire(
+        &MetricsResponse {
+            at: None,
+            interval: 60,
+            containers_in_vm: false,
+            machine: None,
+            projects: vec![],
+            containers: vec![],
+        },
+        r#"{"at":null,"interval":60,"containers_in_vm":false,"machine":null,"projects":[],"containers":[]}"#,
+    );
+    assert_wire(
+        &MetricsResponse {
+            at: Some(1_700_000_000),
+            interval: 60,
+            containers_in_vm: true,
+            machine: Some(machine()),
+            projects: vec![project()],
+            containers: vec![container()],
+        },
+        &format!(
+            r#"{{"at":1700000000,"interval":60,"containers_in_vm":true,"machine":{MACHINE_JSON},"projects":[{PROJECT_JSON}],"containers":[{CONTAINER_JSON}]}}"#
+        ),
+    );
+}
+
+#[test]
+fn metrics_history() {
+    assert_wire(
+        &MetricsHistory {
+            range: MetricsRange::Day,
+            step: 1200,
+            project: Some("web".into()),
+            points: vec![MetricsPoint {
+                t: 1_200,
+                machine: None,
+                projects: vec![project()],
+                containers: vec![container()],
+            }],
+        },
+        &format!(
+            r#"{{"range":"24h","step":1200,"project":"web","points":[{{"t":1200,"machine":null,"projects":[{PROJECT_JSON}],"containers":[{CONTAINER_JSON}]}}]}}"#
+        ),
+    );
+}
+
+#[test]
+fn metrics_ranges() {
+    let ranges = [
+        (MetricsRange::Hour, r#""1h""#),
+        (MetricsRange::HalfDay, r#""12h""#),
+        (MetricsRange::Day, r#""24h""#),
+        (MetricsRange::Week, r#""7d""#),
+        (MetricsRange::Month, r#""30d""#),
+    ];
+    for (range, want) in ranges {
+        assert_wire(&range, want);
+    }
+}
+
+#[test]
+fn metrics_event() {
+    let event = ApiEvent::Metrics(MetricsResponse {
+        at: Some(60),
+        interval: 60,
+        containers_in_vm: false,
+        machine: None,
+        projects: vec![],
+        containers: vec![],
+    });
+    assert_eq!(event.name(), "metrics");
+    assert_wire(
+        &event,
+        concat!(
+            r#"{"event":"metrics","data":{"at":60,"interval":60,"containers_in_vm":false,"#,
+            r#""machine":null,"projects":[],"containers":[]}}"#,
+        ),
+    );
+    assert_eq!(
+        serde_json::to_string(&event.data()).unwrap(),
+        r#"{"at":60,"interval":60,"containers_in_vm":false,"machine":null,"projects":[],"containers":[]}"#
     );
 }

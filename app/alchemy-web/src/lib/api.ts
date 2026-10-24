@@ -34,10 +34,101 @@ export interface EngineStatus {
 }
 
 /**
+ * Mirrors `alchemy_api::MachineUsage`. CPU is a percentage of the whole
+ * machine, rates are bytes per second, and sizes are bytes. `null` means not
+ * measured, never zero. On macOS this is the Mac, not Docker Desktop's VM.
+ */
+export interface MachineUsage {
+  cpu: number | null;
+  /** The highest `cpu` within a rolled-up point. */
+  cpu_max: number | null;
+  cpus: number;
+  /** The 1, 5, and 15 minute load averages, where the OS has them. */
+  load: [number, number, number] | null;
+  memory_used: number;
+  memory_total: number;
+  swap_used: number;
+  swap_total: number;
+  disk_used: number | null;
+  disk_total: number | null;
+  disk_read: number | null;
+  disk_write: number | null;
+  net_rx: number | null;
+  net_tx: number | null;
+}
+
+/** Mirrors `alchemy_api::ContainerUsage`. CPU is a share of the whole engine host. */
+export interface ContainerUsage {
+  id: string;
+  name: string;
+  project: string | null;
+  service: string | null;
+  cpu: number | null;
+  cpu_max: number | null;
+  memory: number;
+  memory_max: number | null;
+  net_rx: number | null;
+  net_tx: number | null;
+  block_read: number | null;
+  block_write: number | null;
+}
+
+/** Mirrors `alchemy_api::ProjectUsage`: one Compose project (an app) added up. */
+export interface ProjectUsage {
+  name: string;
+  containers: number;
+  cpu: number | null;
+  memory: number;
+  net_rx: number | null;
+  net_tx: number | null;
+}
+
+/**
+ * Mirrors `alchemy_api::MetricsResponse`, returned by `GET /api/metrics` and
+ * sent as the `metrics` event after every sample.
+ */
+export interface MetricsResponse {
+  /** Unix seconds of the sample, or `null` before the first. */
+  at: number | null;
+  /** Seconds between samples. */
+  interval: number;
+  /** Containers run in a VM (Docker Desktop, macOS): machine figures are the host, not the VM. */
+  containers_in_vm: boolean;
+  machine: MachineUsage | null;
+  projects: ProjectUsage[];
+  containers: ContainerUsage[];
+}
+
+/** Mirrors `alchemy_api::MetricsRange`. */
+export type MetricsRange = "1h" | "12h" | "24h" | "7d" | "30d";
+
+/** Mirrors `alchemy_api::MetricsPoint`. `t` is Unix seconds. */
+export interface MetricsPoint {
+  t: number;
+  machine: MachineUsage | null;
+  projects: ProjectUsage[];
+  containers: ContainerUsage[];
+}
+
+/**
+ * Mirrors `alchemy_api::MetricsHistory`, returned by
+ * `GET /api/metrics/history`. Points more than one `step` apart have a gap
+ * between them, which charts draw as a gap.
+ */
+export interface MetricsHistory {
+  range: MetricsRange;
+  step: number;
+  project: string | null;
+  points: MetricsPoint[];
+}
+
+/**
  * Mirrors `alchemy_api::ApiEvent`: one message on `GET /api/events`. The SSE
  * `event:` field is `event`, and its `data:` field is `data` as JSON.
  */
-export type ApiEvent = { event: "engine"; data: EngineStatus };
+export type ApiEvent =
+  | { event: "engine"; data: EngineStatus }
+  | { event: "metrics"; data: MetricsResponse };
 
 /** Every SSE event name the daemon sends. */
 export type ApiEventName = ApiEvent["event"];
@@ -46,7 +137,7 @@ export type ApiEventName = ApiEvent["event"];
 export type ApiEventData<K extends ApiEventName> = Extract<ApiEvent, { event: K }>["data"];
 
 /** One key per event name, so adding an {@link ApiEvent} variant fails to compile until listed. */
-const EVENT_NAMES: { [K in ApiEventName]: K } = { engine: "engine" };
+const EVENT_NAMES: { [K in ApiEventName]: K } = { engine: "engine", metrics: "metrics" };
 
 /** The event names {@link subscribe} listens for. Others are ignored. */
 export const API_EVENT_NAMES: readonly ApiEventName[] = Object.values(EVENT_NAMES);
@@ -237,5 +328,11 @@ export const api = {
   health: (signal?: AbortSignal) => request<HealthResponse>("GET", "/health", { signal }),
   version: (signal?: AbortSignal) => request<VersionResponse>("GET", "/version", { signal }),
   engine: (signal?: AbortSignal) => request<EngineStatus>("GET", "/engine", { signal }),
+  metrics: (signal?: AbortSignal) => request<MetricsResponse>("GET", "/metrics", { signal }),
+  metricsHistory: (range: MetricsRange, project?: string, signal?: AbortSignal) => {
+    const query = new URLSearchParams({ range });
+    if (project !== undefined) query.set("project", project);
+    return request<MetricsHistory>("GET", `/metrics/history?${query.toString()}`, { signal });
+  },
   subscribe,
 };

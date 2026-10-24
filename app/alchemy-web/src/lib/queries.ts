@@ -39,6 +39,11 @@ export const liveQueries = {
     queryFn: ({ signal }) => api.engine(signal),
     staleTime: Infinity,
   }),
+  metrics: queryOptions({
+    queryKey: ["metrics"],
+    queryFn: ({ signal }) => api.metrics(signal),
+    staleTime: Infinity,
+  }),
 } satisfies { [K in ApiEventName]: LiveQuery<K> };
 
 /**
