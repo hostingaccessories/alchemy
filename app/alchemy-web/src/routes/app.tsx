@@ -197,7 +197,25 @@ const ADDRESS_STATES: Record<AppAddress["state"], string> = {
   other: "Unknown",
 };
 
-/** Each web address, best first, saying why one doesn't answer. */
+/**
+ * Where a ready address works: `.localhost` and loopback addresses only on
+ * this computer, any other, such as `<app>.local` or the LAN IP, from other
+ * devices on the network too.
+ */
+function addressReach(url: string): string {
+  const host = addressUrl(url)?.hostname ?? "";
+  const local =
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.startsWith("127.") ||
+    host === "[::1]";
+  return local ? "On this computer only" : "From any device on your network";
+}
+
+/**
+ * Each web address, best first, saying where one works or why it doesn't
+ * answer.
+ */
 function Addresses({ app }: { app: App }) {
   const addresses = app.addresses ?? [];
   if (addresses.length === 0) {
@@ -220,11 +238,11 @@ function Addresses({ app }: { app: App }) {
               {address.url}
             </AddressLink>
           )}
-          {address.state !== "ready" && (
-            <span className="text-muted">
-              {address.message ?? ADDRESS_STATES[address.state] ?? ADDRESS_STATES.other}
-            </span>
-          )}
+          <span className="text-muted">
+            {address.state === "ready"
+              ? addressReach(address.url)
+              : (address.message ?? ADDRESS_STATES[address.state] ?? ADDRESS_STATES.other)}
+          </span>
         </li>
       ))}
     </ul>
