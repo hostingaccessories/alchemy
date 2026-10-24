@@ -8,6 +8,7 @@ import { LocalNames } from "../components/LocalNames.tsx";
 import { NetworkWarnings } from "../components/NetworkWarnings.tsx";
 import { PageHeader } from "../components/PageHeader.tsx";
 import { PortsSection } from "../components/Ports.tsx";
+import { PrivilegesSection } from "../components/Privileges.tsx";
 import { ProxyWarnings } from "../components/ProxyWarnings.tsx";
 import { AppUsageTable, MachineUsageView, RangePicker } from "../components/Usage.tsx";
 import { type MetricsRange, api } from "../lib/api.ts";
@@ -47,6 +48,7 @@ function MachinesPage() {
         {online && <NetworkWarnings />}
         {online && <ProxyWarnings />}
       </section>
+      {online && <PrivilegesSection />}
       {online && <LocalNames />}
       {online && <Usage />}
       {online && <PortsSection />}

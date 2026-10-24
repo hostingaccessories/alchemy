@@ -23,6 +23,7 @@ const ANSWERS: Record<string, unknown> = {
       ports: [],
     },
   },
+  "/api/machine/privileges": { privileges: [] },
   "/api/settings/apps": {
     home: "/home/me/Alchemy/apps",
     default_home: "/home/me/Alchemy/apps",
