@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use alchemy_core::engine::{EngineState, EngineStatus};
+use alchemy_core::engine::{
+    ContainerState, ContainerStatus, EngineState, EngineStatus, Intent, IntentAction, StopReason,
+};
 use alchemyd::engine::EngineSource;
 use alchemyd::store::{DB_FILE, SharedStore, SqliteStore};
 use alchemyd::{Config, Deps, State};
@@ -55,9 +57,14 @@ fn mode(path: &Path) -> u32 {
 
 /// Run the daemon until its socket appears, then shut it down.
 async fn run_until_listening(config: Config) {
+    run_until_listening_with(config, Deps::new(FixedEngine)).await;
+}
+
+/// [`run_until_listening`] with the daemon's state and engine given.
+async fn run_until_listening_with(config: Config, deps: Deps<FixedEngine>) {
     let socket: PathBuf = config.socket.clone();
     let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let daemon = tokio::spawn(alchemyd::run_with(config, Deps::new(FixedEngine), async {
+    let daemon = tokio::spawn(alchemyd::run_with(config, deps, async {
         let _ = stop_rx.await;
     }));
     tokio::time::timeout(TIMEOUT, async {
@@ -106,6 +113,28 @@ async fn daemon_keeps_existing_settings() {
             .unwrap()
             .as_deref(),
         Some("/srv/apps")
+    );
+}
+
+#[tokio::test]
+async fn daemon_restores_stop_intents_on_start() {
+    let (_dir, config) = config();
+    let down = Intent::new(IntentAction::Down, 1_000);
+    {
+        let store: SharedStore = Arc::new(SqliteStore::open(&config.state_dir).await.unwrap());
+        store.record_intent("blog", down).await.unwrap();
+    }
+    let deps = Deps::new(FixedEngine);
+    let state = deps.state.clone();
+    run_until_listening_with(config, deps).await;
+
+    assert_eq!(state.containers().intent("blog"), Some(&down));
+    let mut stopped = ContainerStatus::new("abc", "blog-web-1", ContainerState::Exited);
+    stopped.project = Some("blog".into());
+    state.update_containers(|c| c.replace_all([stopped]));
+    assert_eq!(
+        state.containers().get("abc").unwrap().stop_reason,
+        StopReason::StoppedByAlchemy
     );
 }
 

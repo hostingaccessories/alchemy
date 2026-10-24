@@ -44,6 +44,15 @@ pub const MIGRATIONS: &[Migration] = &[
             PRIMARY KEY (step, ts)
           ) STRICT, WITHOUT ROWID;",
     },
+    Migration {
+        version: 3,
+        name: "intents",
+        sql: "CREATE TABLE intents (
+            project TEXT PRIMARY KEY NOT NULL,
+            action  TEXT NOT NULL,
+            at      INTEGER NOT NULL
+          ) STRICT;",
+    },
 ];
 
 /// The schema version this build migrates databases to.
@@ -194,7 +203,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         apply(&mut conn, MIGRATIONS).unwrap();
         let tables = tables(&conn);
-        for table in ["settings", "metrics"] {
+        for table in ["settings", "metrics", "intents"] {
             assert!(tables.contains(&table.to_owned()), "{table}");
         }
     }

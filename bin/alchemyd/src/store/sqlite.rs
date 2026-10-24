@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use alchemy_core::engine::{Intent, IntentAction};
 use futures_util::future::BoxFuture;
 use rusqlite::{Connection, ErrorCode, OptionalExtension as _};
 use tokio::sync::{mpsc, oneshot};
@@ -194,6 +195,68 @@ impl Store for SqliteStore {
             Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
         }))
     }
+
+    fn record_intent<'a>(
+        &'a self,
+        project: &'a str,
+        intent: Intent,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        let project = project.to_owned();
+        Box::pin(self.call(move |conn| {
+            conn.execute(
+                "INSERT INTO intents (project, action, at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (project) DO UPDATE SET action = excluded.action, at = excluded.at",
+                (project, intent.action.as_str(), intent.at),
+            )
+            .map(drop)
+        }))
+    }
+
+    fn intent<'a>(&'a self, project: &'a str) -> BoxFuture<'a, Result<Option<Intent>, StoreError>> {
+        let project = project.to_owned();
+        Box::pin(async move {
+            let row = self
+                .call(move |conn| {
+                    conn.query_row(
+                        "SELECT project, action, at FROM intents WHERE project = ?1",
+                        [project],
+                        intent_row,
+                    )
+                    .optional()
+                })
+                .await?;
+            Ok(row.and_then(known_intent).map(|(_, intent)| intent))
+        })
+    }
+
+    fn intents(&self) -> BoxFuture<'_, Result<Vec<(String, Intent)>, StoreError>> {
+        Box::pin(async move {
+            let rows = self
+                .call(|conn| {
+                    let mut stmt =
+                        conn.prepare("SELECT project, action, at FROM intents ORDER BY project")?;
+                    stmt.query_map([], intent_row)?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .await?;
+            Ok(rows.into_iter().filter_map(known_intent).collect())
+        })
+    }
+}
+
+type IntentRow = (String, String, i64);
+
+fn intent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IntentRow> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+}
+
+/// A newer alchemyd may record actions this build does not know.
+fn known_intent((project, action, at): IntentRow) -> Option<(String, Intent)> {
+    let Some(known) = IntentAction::parse(&action) else {
+        tracing::warn!(project, action, "skipping an intent with an unknown action");
+        return None;
+    };
+    Some((project, Intent::new(known, at)))
 }
 
 fn open_connection(dir: &Path, path: &Path) -> Result<Connection, StoreError> {

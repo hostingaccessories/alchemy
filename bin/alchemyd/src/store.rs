@@ -1,5 +1,5 @@
-//! Persistent daemon state: settings and metrics history now, and later
-//! operation history and stop intent.
+//! Persistent daemon state: settings, metrics history, and stop intent
+//! now, and later operation history.
 //!
 //! Everything goes through the [`Store`] trait. The daemon runs on
 //! [`SqliteStore`], a SQLite database in the per-user state directory
@@ -9,7 +9,8 @@
 //! Handlers hold the store as a [`SharedStore`] and use the typed accessors
 //! on `dyn Store`: `store.setting::<T>(key)` and `store.set_setting(key, &value)`
 //! for settings, and `store.metric_points(step, from, to)` and
-//! `store.put_metric_points(step, &points)` for metrics history.
+//! `store.put_metric_points(step, &points)` for metrics history. Intents
+//! go through [`crate::intent`], which also updates the live state.
 
 mod dir;
 mod memory;
@@ -23,6 +24,7 @@ pub use sqlite::SqliteStore;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use alchemy_core::engine::Intent;
 use alchemy_core::metrics::MetricsPoint;
 use futures_util::future::BoxFuture;
 use serde::Serialize;
@@ -74,6 +76,21 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// Delete the rows of tier `step` older than `before`, returning how
     /// many went.
     fn prune_metrics(&self, step: i64, before: i64) -> BoxFuture<'_, Result<u64, StoreError>>;
+
+    /// Store `intent` as the last action Alchemy asked of Compose project
+    /// `project`, replacing any earlier one.
+    fn record_intent<'a>(
+        &'a self,
+        project: &'a str,
+        intent: Intent,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// The last intent stored for `project`.
+    fn intent<'a>(&'a self, project: &'a str) -> BoxFuture<'a, Result<Option<Intent>, StoreError>>;
+
+    /// Every stored intent, by project name. A row whose action this
+    /// build does not know is left out.
+    fn intents(&self) -> BoxFuture<'_, Result<Vec<(String, Intent)>, StoreError>>;
 }
 
 /// One stored metrics point: its tier's step in seconds, its Unix
@@ -350,6 +367,37 @@ mod tests {
             reopened.metric_times(60, 0, 1_000).await.unwrap(),
             [180, 240, 300]
         );
+    }
+
+    /// Every store keeps one intent per project, the latest.
+    async fn intents_behave(store: SharedStore) {
+        use alchemy_core::engine::IntentAction;
+        assert_eq!(store.intent("blog").await.unwrap(), None);
+        assert_eq!(store.intents().await.unwrap(), Vec::new());
+        let stop = Intent::new(IntentAction::Stop, 1_000);
+        let up = Intent::new(IntentAction::Up, 2_000);
+        let down = Intent::new(IntentAction::Down, 3_000);
+        store.record_intent("blog", stop).await.unwrap();
+        store.record_intent("shop", up).await.unwrap();
+        store.record_intent("blog", down).await.unwrap();
+        assert_eq!(store.intent("blog").await.unwrap(), Some(down));
+        assert_eq!(
+            store.intents().await.unwrap(),
+            [("blog".to_owned(), down), ("shop".to_owned(), up)]
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_store_intents() {
+        intents_behave(Arc::new(MemoryStore::new())).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_intents() {
+        let tmp = tempfile::tempdir().unwrap();
+        intents_behave(Arc::new(SqliteStore::open(tmp.path()).await.unwrap())).await;
+        let reopened: SharedStore = Arc::new(SqliteStore::open(tmp.path()).await.unwrap());
+        assert_eq!(reopened.intents().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

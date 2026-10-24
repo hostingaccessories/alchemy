@@ -11,8 +11,8 @@
 //!
 //! It talks to the Docker engine through [`engine`], finds the user's
 //! Compose stacks through [`apps`], samples resource usage through
-//! [`metrics`], keeps what it learns in [`State`], and
-//! persists settings and history in a [`store::Store`].
+//! [`metrics`], keeps what it learns in [`State`], and persists
+//! settings, history, and stop [`intent`] in a [`store::Store`].
 
 pub mod apps;
 pub mod compose;
@@ -20,6 +20,7 @@ pub mod engine;
 pub mod events;
 pub mod guard;
 pub mod http;
+pub mod intent;
 pub mod metrics;
 mod secure_fs;
 pub mod socket;
@@ -154,6 +155,13 @@ pub async fn run_with(
         .context("opening the state database")?;
     let db = sqlite.path().to_owned();
     let store: SharedStore = Arc::new(sqlite);
+    match intent::load(&*store, &deps.state).await {
+        Ok(count) => tracing::debug!(count, "stop intents loaded"),
+        Err(error) => tracing::warn!(
+            %error,
+            "cannot read stop intents; apps Alchemy stopped may show as stopped outside it"
+        ),
+    }
 
     let (socket_listener, socket_file) = socket::bind(&config.socket)
         .with_context(|| format!("binding API socket {}", config.socket.display()))?;

@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use alchemy_core::engine::Intent;
 use futures_util::future::BoxFuture;
 
 use super::{MetricRow, Store, StoreError};
@@ -12,6 +13,7 @@ use super::{MetricRow, Store, StoreError};
 pub struct MemoryStore {
     settings: Mutex<BTreeMap<String, serde_json::Value>>,
     metrics: Mutex<BTreeMap<(i64, i64), String>>,
+    intents: Mutex<BTreeMap<String, Intent>>,
 }
 
 impl MemoryStore {
@@ -28,6 +30,12 @@ impl MemoryStore {
 
     fn metrics(&self) -> std::sync::MutexGuard<'_, BTreeMap<(i64, i64), String>> {
         self.metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn intent_map(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Intent>> {
+        self.intents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -111,6 +119,31 @@ impl Store for MemoryStore {
                 metrics.remove(key);
             }
             Ok(u64::try_from(old.len()).unwrap_or(u64::MAX))
+        })
+    }
+
+    fn record_intent<'a>(
+        &'a self,
+        project: &'a str,
+        intent: Intent,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            self.intent_map().insert(project.to_owned(), intent);
+            Ok(())
+        })
+    }
+
+    fn intent<'a>(&'a self, project: &'a str) -> BoxFuture<'a, Result<Option<Intent>, StoreError>> {
+        Box::pin(async move { Ok(self.intent_map().get(project).copied()) })
+    }
+
+    fn intents(&self) -> BoxFuture<'_, Result<Vec<(String, Intent)>, StoreError>> {
+        Box::pin(async move {
+            Ok(self
+                .intent_map()
+                .iter()
+                .map(|(project, intent)| (project.clone(), *intent))
+                .collect())
         })
     }
 }
