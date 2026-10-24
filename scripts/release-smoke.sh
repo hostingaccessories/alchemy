@@ -309,10 +309,12 @@ kill -0 "$watch_pid" 2>/dev/null || fail "status --watch exited early: $(cat "${
 log "Checking alchemy-helper refuses non-root"
 if [[ "$(id -u)" -ne 0 ]]; then
   set +e
-  "${bin}/alchemy-helper" check 2>/dev/null
+  helper_out="$("${bin}/alchemy-helper" check 2>/dev/null)"
   code=$?
   set -e
   [[ "$code" -eq 77 ]] || fail "alchemy-helper check exited ${code}, expected 77"
+  [[ "$helper_out" == '{"result":"error","operation":"check","error":"not_root"}' ]] \
+    || fail "alchemy-helper check printed: ${helper_out}"
 else
   log "Running as root; skipping"
 fi
