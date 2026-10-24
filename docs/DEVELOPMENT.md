@@ -223,10 +223,66 @@ the collector in `bin/alchemyd/src/metrics/`.
 event; `GET /api/metrics/history?range=24h` is one tier's points. Both
 take `project=NAME` for one Compose project's figures. `alchemy machine
 stats` and `alchemy app stats NAME` print them, and the Machines page
-charts them. Until app discovery lands, an app is a Compose project name.
+charts them. An app's figures are its Compose project's, the `project`
+in its entry from `/api/apps`.
 
 ```sh
 curl --unix-socket /run/user/1000/alchemy/alchemyd.sock 'http://alchemyd/api/metrics/history?range=24h&project=blog'
+```
+
+### Apps
+
+An app is a folder holding a compose file inside one of the app folders.
+The home, `~/Alchemy/apps` unless chosen otherwise, is searched first and
+is where new apps will go; other folders, such as an existing `/opt/stacks`,
+are searched after it in order. Both are settings in the state database,
+changed with `PUT /api/settings/apps`, `alchemy settings set app-home
+PATH|default`, `alchemy settings set app-folders [PATH]...`, or the
+Settings page. Paths must be full paths.
+
+Discovery only reads. It never creates, changes, or removes anything in
+an app folder, and never creates the home either: a missing home is
+reported as normal until the first app is added, which creates it. The
+rules, decided in `alchemy_core::stack::discover` over a directory
+listing:
+
+- The compose file is the first of `compose.yaml`, `compose.yml`,
+  `docker-compose.yaml`, `docker-compose.yml` that exists, as Compose
+  picks it. If that one is a symlink, or not a regular file, the folder is
+  skipped rather than falling back to a later name, so Alchemy and a
+  hand-run `docker compose` always read the same file.
+- The app's name is the folder's name. A folder that is a symlink, or whose
+  name isn't a valid app name (`[a-z0-9][a-z0-9_-]*`, at most 63
+  characters), is skipped. So is a name already found in an earlier
+  folder: the first folder wins.
+- Skipped folders are reported in `dirs[].skipped` of `/api/apps`, by
+  `alchemy app list`, and on the Apps page. Hidden folders, files, and
+  folders without a compose file are ignored without a report.
+
+The daemon lists the folders every 5 seconds and runs `docker compose
+--project-directory DIR config --format json` for an app only when it is
+new or its compose file, overrides, or `.env` changed (by size and
+modification time), at most 4 at a time, to learn the project name Compose
+resolves (folder name, `name:`, or `COMPOSE_PROJECT_NAME`) and whether any
+service builds. Saving the settings lists and reads everything again at
+once. Containers are matched to apps by their
+`com.docker.compose.project` label; Compose projects that match no app are
+listed read-only as unmanaged, with the folder from their
+`com.docker.compose.project.working_dir` label.
+
+An app's status is `running` when every service Compose lists has a
+running container, `partial` when some do, `stopped` when none do, and
+`unknown` while Docker isn't ready or Compose can't read the app (the
+reason is in `problems`). `GET /api/apps` is the whole list, also sent as
+the `apps` event; `GET /api/apps/NAME` is one app, or 404
+`app_not_found`. `alchemy app list` and `alchemy app show NAME` print
+them. The code is in `bin/alchemyd/src/apps/`.
+
+```sh
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/apps
+curl --unix-socket /run/user/1000/alchemy/alchemyd.sock -X PUT \
+  -H 'Content-Type: application/json' -d '{"home":null,"extra":["/opt/stacks"]}' \
+  http://alchemyd/api/settings/apps
 ```
 
 ### Web UI in debug vs release
@@ -489,7 +545,9 @@ status and a body or raw server-sent events, and has the real
 - `ctx.daemon_info()` is the daemon's version and API version, from a
   `GET /api/version` handshake that the first request performs once.
 - `ctx.get::<T>(path)` sends `GET path` and decodes the JSON body as `T`,
-  an `alchemy-api` type.
+  an `alchemy-api` type. `ctx.put::<B, T>(path, &body)` sends `body` as
+  JSON the same way; every request but `GET` declares
+  `Content-Type: application/json`, as alchemyd requires.
 - `ctx.events()` follows `GET /api/events` and returns a `Subscription`.
   Its `next()` gives the next `ApiEvent`, skipping event names this build
   doesn't know, and `Ok(None)` when the daemon ends the stream; a command
