@@ -8,6 +8,11 @@
     clippy::indexing_slicing
 )]
 
+use alchemy_api::apps::{
+    App, AppContainer, AppDir, AppDirState, AppList, AppProblem, AppProblemKind, AppService,
+    AppSettings, AppSettingsUpdate, ContainerState, Health, ImageSource, SkipReason, SkippedApp,
+    StackName, StackStatus, UnmanagedApp,
+};
 use alchemy_api::{
     API_VERSION, ApiEvent, ContainerUsage, EngineFlavor, EngineState, EngineStatus, ErrorCode,
     ErrorResponse, HealthResponse, HealthStatus, MachineUsage, MetricsHistory, MetricsPoint,
@@ -69,6 +74,7 @@ fn error_codes() {
         ),
         (ErrorCode::Conflict, r#""conflict""#),
         (ErrorCode::Invalid, r#""invalid""#),
+        (ErrorCode::AppNotFound, r#""app_not_found""#),
         (ErrorCode::Internal, r#""internal""#),
         (ErrorCode::Unknown, r#""unknown""#),
     ];
@@ -310,5 +316,238 @@ fn metrics_event() {
     assert_eq!(
         serde_json::to_string(&event.data()).unwrap(),
         r#"{"at":60,"interval":60,"containers_in_vm":false,"machine":null,"projects":[],"containers":[]}"#
+    );
+}
+
+fn blog() -> App {
+    App {
+        name: StackName::new("blog").unwrap(),
+        status: StackStatus::Partial,
+        dir: "/srv/apps/blog".into(),
+        root: "/srv/apps".into(),
+        compose_file: "compose.yaml".into(),
+        project: Some("blog".into()),
+        images: Some(ImageSource::Build),
+        services: vec![
+            AppService {
+                name: "db".into(),
+                containers: vec![AppContainer {
+                    id: "abc".into(),
+                    name: "blog-db-1".into(),
+                    image: Some("postgres:16".into()),
+                    state: ContainerState::Running,
+                    health: Some(Health::Healthy),
+                }],
+            },
+            AppService {
+                name: "web".into(),
+                containers: vec![],
+            },
+        ],
+        problems: vec![AppProblem {
+            kind: AppProblemKind::SharedProject,
+            message: "x".into(),
+        }],
+    }
+}
+
+const BLOG: &str = concat!(
+    r#"{"name":"blog","status":"partial","dir":"/srv/apps/blog","root":"/srv/apps","#,
+    r#""compose_file":"compose.yaml","project":"blog","images":"build","services":["#,
+    r#"{"name":"db","containers":[{"id":"abc","name":"blog-db-1","image":"postgres:16","#,
+    r#""state":"running","health":"healthy"}]},{"name":"web","containers":[]}],"#,
+    r#""problems":[{"kind":"shared_project","message":"x"}]}"#,
+);
+
+#[test]
+fn app() {
+    assert_wire(&blog(), BLOG);
+
+    let unread = App {
+        name: StackName::new("new").unwrap(),
+        status: StackStatus::Unknown,
+        dir: "/srv/apps/new".into(),
+        root: "/srv/apps".into(),
+        compose_file: "docker-compose.yml".into(),
+        project: None,
+        images: None,
+        services: vec![],
+        problems: vec![],
+    };
+    assert_wire(
+        &unread,
+        concat!(
+            r#"{"name":"new","status":"unknown","dir":"/srv/apps/new","root":"/srv/apps","#,
+            r#""compose_file":"docker-compose.yml","project":null,"images":null,"#,
+            r#""services":[],"problems":[]}"#,
+        ),
+    );
+}
+
+#[test]
+fn app_names_are_validated_on_decode() {
+    let bad = BLOG.replace(r#""name":"blog""#, r#""name":"../etc""#);
+    assert!(serde_json::from_str::<App>(&bad).is_err());
+}
+
+fn app_list() -> AppList {
+    AppList {
+        apps: vec![blog()],
+        unmanaged: vec![UnmanagedApp {
+            project: "legacy".into(),
+            dir: Some("/home/me/legacy".into()),
+            status: StackStatus::Running,
+            services: vec![],
+        }],
+        dirs: vec![
+            AppDir {
+                path: "/srv/apps".into(),
+                home: true,
+                state: AppDirState::Ok,
+                message: None,
+                skipped: vec![SkippedApp {
+                    name: "My App".into(),
+                    path: "/srv/apps/My App".into(),
+                    reason: SkipReason::InvalidName,
+                    message: "y".into(),
+                }],
+            },
+            AppDir {
+                path: "/opt/stacks".into(),
+                home: false,
+                state: AppDirState::Missing,
+                message: Some("z".into()),
+                skipped: vec![],
+            },
+        ],
+    }
+}
+
+const APP_LIST_TAIL: &str = concat!(
+    r#""unmanaged":[{"project":"legacy","dir":"/home/me/legacy","status":"running","#,
+    r#""services":[]}],"dirs":[{"path":"/srv/apps","home":true,"state":"ok","message":null,"#,
+    r#""skipped":[{"name":"My App","path":"/srv/apps/My App","reason":"invalid_name","#,
+    r#""message":"y"}]},{"path":"/opt/stacks","home":false,"state":"missing","#,
+    r#""message":"z","skipped":[]}]}"#,
+);
+
+#[test]
+fn app_list_and_event() {
+    let json = format!(r#"{{"apps":[{BLOG}],{APP_LIST_TAIL}"#);
+    assert_wire(&app_list(), &json);
+    assert_wire(
+        &AppList::default(),
+        r#"{"apps":[],"unmanaged":[],"dirs":[]}"#,
+    );
+
+    let event = ApiEvent::Apps(app_list());
+    assert_eq!(event.name(), "apps");
+    assert_wire(&event, &format!(r#"{{"event":"apps","data":{json}}}"#));
+    assert_eq!(serde_json::to_string(&event.data()).unwrap(), json);
+}
+
+#[test]
+fn app_enums() {
+    for (status, want) in [
+        (StackStatus::Running, r#""running""#),
+        (StackStatus::Partial, r#""partial""#),
+        (StackStatus::Stopped, r#""stopped""#),
+        (StackStatus::Unknown, r#""unknown""#),
+    ] {
+        assert_wire(&status, want);
+    }
+    for (images, want) in [
+        (ImageSource::Registry, r#""registry""#),
+        (ImageSource::Build, r#""build""#),
+    ] {
+        assert_wire(&images, want);
+    }
+    for (kind, want) in [
+        (AppProblemKind::ComposeError, r#""compose_error""#),
+        (
+            AppProblemKind::ComposeUnavailable,
+            r#""compose_unavailable""#,
+        ),
+        (AppProblemKind::SharedProject, r#""shared_project""#),
+        (AppProblemKind::Other, r#""other""#),
+    ] {
+        assert_wire(&kind, want);
+    }
+    for (state, want) in [
+        (AppDirState::Ok, r#""ok""#),
+        (AppDirState::Missing, r#""missing""#),
+        (AppDirState::NotADirectory, r#""not_a_directory""#),
+        (AppDirState::Unreadable, r#""unreadable""#),
+        (AppDirState::Other, r#""other""#),
+    ] {
+        assert_wire(&state, want);
+    }
+    for (reason, want) in [
+        (SkipReason::InvalidName, r#""invalid_name""#),
+        (SkipReason::Duplicate, r#""duplicate""#),
+        (SkipReason::LinkedComposeFile, r#""linked_compose_file""#),
+        (
+            SkipReason::ComposeFileNotRegular,
+            r#""compose_file_not_regular""#,
+        ),
+        (SkipReason::LinkedFolder, r#""linked_folder""#),
+        (SkipReason::Other, r#""other""#),
+    ] {
+        assert_wire(&reason, want);
+    }
+}
+
+#[test]
+fn unknown_app_enum_values_decode_as_a_fallback() {
+    let from_the_future = r#""from_the_future""#;
+    assert_eq!(
+        serde_json::from_str::<StackStatus>(from_the_future).unwrap(),
+        StackStatus::Unknown
+    );
+    assert_eq!(
+        serde_json::from_str::<AppProblemKind>(from_the_future).unwrap(),
+        AppProblemKind::Other
+    );
+    assert_eq!(
+        serde_json::from_str::<AppDirState>(from_the_future).unwrap(),
+        AppDirState::Other
+    );
+    assert_eq!(
+        serde_json::from_str::<SkipReason>(from_the_future).unwrap(),
+        SkipReason::Other
+    );
+}
+
+#[test]
+fn app_settings() {
+    assert_wire(
+        &AppSettings {
+            home: Some("/home/me/Alchemy/apps".into()),
+            default_home: Some("/home/me/Alchemy/apps".into()),
+            extra: vec!["/opt/stacks".into()],
+        },
+        r#"{"home":"/home/me/Alchemy/apps","default_home":"/home/me/Alchemy/apps","extra":["/opt/stacks"]}"#,
+    );
+    assert_wire(
+        &AppSettings {
+            home: None,
+            default_home: None,
+            extra: vec![],
+        },
+        r#"{"home":null,"default_home":null,"extra":[]}"#,
+    );
+    assert_wire(
+        &AppSettingsUpdate {
+            home: Some("/srv/apps".into()),
+            extra: vec!["/opt/stacks".into()],
+        },
+        r#"{"home":"/srv/apps","extra":["/opt/stacks"]}"#,
+    );
+    assert_eq!(
+        serde_json::from_str::<AppSettingsUpdate>("{}").unwrap(),
+        AppSettingsUpdate {
+            home: None,
+            extra: vec![],
+        }
     );
 }

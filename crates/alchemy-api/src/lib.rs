@@ -9,7 +9,8 @@
 //! `GET /api/metrics` returns a [`MetricsResponse`] and
 //! `GET /api/metrics/history` a [`MetricsHistory`], built from the
 //! resource-usage types in `alchemy_core::metrics`.
-//! `GET /api/events` streams [`ApiEvent`]s.
+//! `GET /api/events` streams [`ApiEvent`]s. The app routes and their
+//! types are in [`apps`].
 //!
 //! The default build is pure. Enable the `socket` feature for the daemon
 //! socket path shared by `alchemyd` and its local clients.
@@ -20,8 +21,11 @@ pub use alchemy_core::metrics::{
 };
 use serde::{Deserialize, Serialize, Serializer};
 
+pub mod apps;
 #[cfg(feature = "socket")]
 mod socket;
+
+pub use apps::AppList;
 
 #[cfg(feature = "socket")]
 pub use socket::{SOCKET_ENV, SOCKET_FILE, default_socket_path, runtime_dir};
@@ -105,6 +109,8 @@ pub enum ErrorCode {
     /// The request was well formed but its content failed validation, such
     /// as a compose file Compose rejects.
     Invalid,
+    /// No app has the requested name.
+    AppNotFound,
     /// The daemon failed while handling a valid request.
     Internal,
     /// A code this build does not know, sent by a newer daemon, or no code
@@ -177,6 +183,8 @@ pub enum ApiEvent {
     /// The latest usage, as `GET /api/metrics` returns it, sent once on
     /// connect and again after every sample.
     Metrics(MetricsResponse),
+    /// Every app, sent once on connect and again on every change.
+    Apps(AppList),
 }
 
 impl ApiEvent {
@@ -185,6 +193,7 @@ impl ApiEvent {
         match self {
             Self::Engine(_) => "engine",
             Self::Metrics(_) => "metrics",
+            Self::Apps(_) => "apps",
         }
     }
 
@@ -203,6 +212,7 @@ impl Serialize for EventData<'_> {
         match self.0 {
             ApiEvent::Engine(status) => status.serialize(serializer),
             ApiEvent::Metrics(metrics) => metrics.serialize(serializer),
+            ApiEvent::Apps(apps) => apps.serialize(serializer),
         }
     }
 }

@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::Path;
 
 use alchemy_api::{
-    ApiEvent, EngineStatus, ErrorCode, ErrorResponse, MetricsResponse, VersionResponse,
+    ApiEvent, AppList, EngineStatus, ErrorCode, ErrorResponse, MetricsResponse, VersionResponse,
 };
 use serde::de::DeserializeOwned;
 
@@ -119,6 +119,7 @@ pub(crate) fn decode_event(raw: &SseEvent) -> Result<Option<ApiEvent>, ClientErr
         "metrics" => {
             decode::<MetricsResponse>(raw.data.as_bytes()).map(|m| Some(ApiEvent::Metrics(m)))
         }
+        "apps" => decode::<AppList>(raw.data.as_bytes()).map(|a| Some(ApiEvent::Apps(a))),
         _ => Ok(None),
     }
 }
@@ -409,6 +410,7 @@ mod tests {
                 interval: 60,
                 ..MetricsResponse::default()
             }),
+            ApiEvent::Apps(AppList::default()),
         ];
         for event in events {
             let raw = SseEvent {

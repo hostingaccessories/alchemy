@@ -396,6 +396,7 @@ mod tests {
                 "metrics",
                 r#"{"at":null,"interval":60,"containers_in_vm":false,"machine":null,"projects":[],"containers":[]}"#,
             )),
+            Ok(sse("apps", r#"{"apps":[],"unmanaged":[],"dirs":[]}"#)),
             engine_event(&api_only),
             engine_event(&ready()),
         ]);
