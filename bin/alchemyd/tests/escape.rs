@@ -1,7 +1,8 @@
 //! The escape hatch, against the real Docker engine: an app Alchemy
 //! started is the same Compose project a hand-run `docker compose` in its
-//! folder sees, stops, and starts again once the daemon is gone, whether
-//! the project is named after the folder or by a top-level `name:`.
+//! folder sees, stops, and starts again once the daemon is gone. One app
+//! is written by hand and named after its folder; the other is created
+//! through `POST /api/apps` with a top-level `name:`.
 //!
 //! Ignored by default because it needs Docker with Compose v2 and
 //! `busybox:1.37` (pulled if missing). Run it with
@@ -22,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alchemyd::Deps;
-use alchemyd::apps::{AppsDeps, SystemFs};
+use alchemyd::apps::{AppEditor, AppsDeps, SystemFs};
 use alchemyd::compose::CliComposeConfig;
 use alchemyd::engine::EngineMonitor;
 use alchemyd::operations::SystemRunner;
@@ -229,8 +230,8 @@ struct Daemon {
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
-/// alchemyd with the real engine monitor, `docker compose config`, and
-/// `docker compose` runner, with `apps` as its app home.
+/// alchemyd with the real engine monitor, `docker compose config`, app
+/// editor, and `docker compose` runner, with `apps` as its app home.
 fn start(root: &Path, apps: &Path) -> Daemon {
     let socket = root.join("alchemyd.sock");
     let deps = Deps::new(EngineMonitor::system())
@@ -242,7 +243,8 @@ fn start(root: &Path, apps: &Path) -> Daemon {
             )
             .with_scan_interval(Duration::from_millis(200)),
         )
-        .with_runner(Arc::new(SystemRunner::new()));
+        .with_runner(Arc::new(SystemRunner::new()))
+        .with_editor(AppEditor::system());
     let (stop, stop_rx) = oneshot::channel::<()>();
     let task = tokio::spawn(alchemyd::run_with(
         alchemyd::Config {
@@ -297,13 +299,14 @@ async fn docker_compose_by_hand_targets_the_project_alchemy_runs() {
         (plain.clone(), plain.clone(), None),
         (named.clone(), renamed.clone(), Some(renamed.as_str())),
     ];
-    for (app, _, name) in &cases {
-        std::fs::create_dir_all(apps.join(app)).unwrap();
-        std::fs::write(apps.join(app).join("compose.yaml"), compose_file(*name)).unwrap();
-    }
+    std::fs::create_dir_all(apps.join(&plain)).unwrap();
+    std::fs::write(apps.join(&plain).join("compose.yaml"), compose_file(None)).unwrap();
     let _cleanup = Cleanup(cases.iter().map(|(app, _, _)| apps.join(app)).collect());
 
     let daemon = start(&root, &apps);
+    let create = serde_json::json!({"name": named, "compose": compose_file(Some(&renamed))});
+    let (status, body) = call(&daemon.socket, "POST", "/api/apps", &create.to_string()).await;
+    assert_eq!(status, 201, "create {named}: {body}");
     let mut started = Vec::new();
     for (app, project, _) in &cases {
         let listed = wait_for_app(&daemon.socket, app, "read by Compose", |a| {
