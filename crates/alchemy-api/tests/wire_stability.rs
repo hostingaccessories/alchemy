@@ -187,6 +187,86 @@ fn container_status_ports() {
 }
 
 #[test]
+fn port_list() {
+    use alchemy_api::ports::{PortClaim, PortHolder, PortList, PortSource};
+    use alchemy_api::{Protocol, PublishedPort};
+    let tcp = |port: &str| PublishedPort::new(Protocol::Tcp, Some(port.parse().unwrap()));
+    let list = PortList {
+        ports: vec![
+            PortClaim {
+                port: tcp("80").with_target(Some("8080".parse().unwrap())),
+                holder: PortHolder::App {
+                    app: "blog".into(),
+                    service: "web".into(),
+                },
+                source: PortSource::Live,
+            },
+            PortClaim {
+                port: tcp("3000"),
+                holder: PortHolder::App {
+                    app: "wiki".into(),
+                    service: "app".into(),
+                },
+                source: PortSource::Declared,
+            },
+            PortClaim {
+                port: tcp("5000"),
+                holder: PortHolder::Container {
+                    name: "pihole".into(),
+                },
+                source: PortSource::Live,
+            },
+            PortClaim {
+                port: tcp("8443").with_host_ip(Some("127.0.0.1".parse().unwrap())),
+                holder: PortHolder::Reservation {
+                    owner: "proxy".into(),
+                },
+                source: PortSource::Reserved,
+            },
+            PortClaim {
+                port: tcp("9000"),
+                holder: PortHolder::Program {
+                    process: Some("nc".into()),
+                    pid: Some(42),
+                },
+                source: PortSource::Live,
+            },
+            PortClaim {
+                port: PublishedPort::new(Protocol::Udp, Some("53".parse().unwrap()))
+                    .with_host_ip(Some("::".parse().unwrap())),
+                holder: PortHolder::Program {
+                    process: None,
+                    pid: None,
+                },
+                source: PortSource::Live,
+            },
+        ],
+        warnings: vec!["alchemyd can't tell which programs are listening".into()],
+    };
+    assert_wire(
+        &list,
+        concat!(
+            r#"{"ports":["#,
+            r#"{"port":{"protocol":"tcp","host_ip":null,"published":"80","target":"8080"},"#,
+            r#""holder":{"kind":"app","app":"blog","service":"web"},"source":"live"},"#,
+            r#"{"port":{"protocol":"tcp","host_ip":null,"published":"3000","target":null},"#,
+            r#""holder":{"kind":"app","app":"wiki","service":"app"},"source":"declared"},"#,
+            r#"{"port":{"protocol":"tcp","host_ip":null,"published":"5000","target":null},"#,
+            r#""holder":{"kind":"container","name":"pihole"},"source":"live"},"#,
+            r#"{"port":{"protocol":"tcp","host_ip":"127.0.0.1","published":"8443","target":null},"#,
+            r#""holder":{"kind":"reservation","owner":"proxy"},"source":"reserved"},"#,
+            r#"{"port":{"protocol":"tcp","host_ip":null,"published":"9000","target":null},"#,
+            r#""holder":{"kind":"program","process":"nc","pid":42},"source":"live"},"#,
+            r#"{"port":{"protocol":"udp","host_ip":"::","published":"53","target":null},"#,
+            r#""holder":{"kind":"program","process":null,"pid":null},"source":"live"}],"#,
+            r#""warnings":["alchemyd can't tell which programs are listening"]}"#,
+        ),
+    );
+    let bare: PortList = serde_json::from_str(r#"{"ports":[]}"#).unwrap();
+    assert_eq!(bare, PortList::default(), "warnings default to none");
+}
+
+#[test]
 fn stop_reasons() {
     let reasons = [
         (StopReason::Running, r#"{"kind":"running"}"#),
