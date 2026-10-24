@@ -116,15 +116,20 @@ jobs:
           HOME_NET_SKIP_BUILD: "1"
         run: scripts/home-network.sh
 
-      # Reuses the smoke test's release build; grants port 80 with setcap.
-      - name: Web-address test
+      # Reuses the smoke test's release build. Port 80 is reached only
+      # through alchemy-helper: target/ isn't root-owned, so alchemyd answers
+      # needs_terminal and the script runs the sudo command itself, then
+      # alchemyd re-execs with the same PID. It revokes and checks port 80 is
+      # refused again.
+      - name: Web-address and privileged helper test
         if: runner.os == 'Linux'
         env:
           WEB_ADDR_SKIP_BUILD: "1"
-          WEB_ADDR_SETCAP: "1"
+          WEB_ADDR_GRANT: "1"
         run: scripts/web-address.sh
 
-      # Reuses the smoke test's release build; grants port 80 with setcap.
+      # Reuses the smoke test's release build; grants port 80 through
+      # alchemy-helper.
       # Runs last: it installs avahi-daemon, which the steps above don't
       # expect.
       - name: mDNS test
@@ -132,7 +137,7 @@ jobs:
         timeout-minutes: 10
         env:
           MDNS_SKIP_BUILD: "1"
-          MDNS_SETCAP: "1"
+          MDNS_GRANT: "1"
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 \
             install -y --no-install-recommends avahi-daemon avahi-utils libnss-mdns
