@@ -257,7 +257,8 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::
 /// directory fails startup before it touches anything; the lock is held
 /// until this returns. The state database in it is then opened, created,
 /// or migrated; a corrupt or too-new one fails startup before either
-/// listener is bound. The engine task, the metrics collector, the apps
+/// listener is bound, and the app settings in it are loaded into the
+/// state before anything is served. The engine task, the metrics collector, the apps
 /// task, the network check, the web address proxy, and the routing task
 /// that feeds it run alongside the listeners. An engine
 /// that is absent or broken never fails startup; it only shows up in the
@@ -282,6 +283,7 @@ pub async fn run_with(
     let db = sqlite.path().to_owned();
     let store: SharedStore = Arc::new(sqlite);
     load_intents(&store, &deps.state).await;
+    apps::load_settings(&deps.apps, &deps.state, &store).await;
 
     let ports = PortRegistry::new(deps.state.clone(), store.clone(), deps.network.clone());
     let operations = recovered_operations(deps.runner, &deps.state, &store, &ports).await;
