@@ -237,13 +237,28 @@ else
     || fail "the proxy port ${proxy_port} did not explain the app is stopped: $(cat "${tmp}/stopped.html")"
   # A program bound to 127.0.0.1:80 shadows alchemyd's 0.0.0.0:80 there,
   # so ask on the LAN address the app's own URL names when it has one.
-  smoke_url="$(curl -fsS --unix-socket "$socket" http://localhost/api/apps \
-    | jq -r '.apps[] | select(.name == "smokeweb") | .addresses[]? | select(.kind == "port") | .url')"
+  # http://smokeweb.local:<port>/ is a port address too; skip it.
+  smoke_json="$(curl -fsS --unix-socket "$socket" http://localhost/api/apps \
+    | jq -c '.apps[] | select(.name == "smokeweb")')"
+  smoke_url="$(jq -r '.addresses[]? | select(.kind == "port" and (.url | test("\\.local[:/]") | not)) | .url' <<<"$smoke_json")"
   lan_host="${smoke_url#http://}"
   lan_host="${lan_host%%:*}"
   [[ -n "$lan_host" ]] || fail "smokeweb has no port address"
+  log "Checking local names are on and smokeweb has a .local address"
+  mdns="$(curl -fsS --unix-socket "$socket" http://localhost/api/network | jq -c .mdns)" \
+    || fail "GET /api/network on ${socket} failed"
+  [[ "$(jq -r .state <<<"$mdns")" != off ]] || fail "local names are off by default: ${mdns}"
+  if [[ "$lan_host" != 127.0.0.1 ]]; then
+    jq -e --arg url "http://smokeweb.local:${proxy_port}/" '.addresses | any(.url == $url)' <<<"$smoke_json" >/dev/null \
+      || fail "smokeweb has no address http://smokeweb.local:${proxy_port}/: $(jq -c .addresses <<<"$smoke_json")"
+  fi
   host_state="$(jq -r .proxy.host.state <<<"$network")"
   if [[ "$host_state" == listening ]]; then
+    local_code="$(curl -sS -o "${tmp}/local.html" -w '%{http_code}' -H 'Host: smokeweb.local' "http://${lan_host}:80/")" \
+      || fail "GET with Host smokeweb.local on ${lan_host}:80 failed"
+    if [[ "$local_code" != 503 ]] || ! grep -qF "This app isn't running." "${tmp}/local.html"; then
+      fail "Host smokeweb.local on ${lan_host}:80 did not reach smokeweb (${local_code}): $(head -c 200 "${tmp}/local.html")"
+    fi
     for name in nope.localhost localhost "127.0.0.1:${port}"; do
       unknown_code="$(curl -sS -o "${tmp}/unknown.html" -w '%{http_code}' \
         -H "Host: ${name}" -H "$bearer" "http://${lan_host}:80/api/health")" \

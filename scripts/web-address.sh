@@ -2,8 +2,9 @@
 # Web-address test (Linux only): run alchemyd against the real Docker
 # engine, bring up an app whose compose file publishes no ports, and check
 # that the app answers through its reserved proxy port and, when alchemyd
-# can bind port 80, through http://<app>.localhost, and that each answer
-# came from the app's container over the `alchemy` network.
+# can bind port 80, through Host: <app>.localhost and <app>.local, and that
+# each answer came from the app's container over the `alchemy` network.
+# Resolving .local names is scripts/mdns.sh's job; this only routes them.
 #
 # It brings up and removes a Compose project named `webaddr`, and alchemyd
 # tries to listen on port 80 and creates the `alchemy` network if it is
@@ -168,13 +169,16 @@ wait_for "Compose to read app ${app}" ".apps | any(.name == \"${app}\" and (.ser
 log "Bringing up ${app}"
 alchemy app up "$app" >"${tmp}/up.txt" 2>&1 || { cat "${tmp}/up.txt" >&2; die "alchemy app up ${app} failed"; }
 
+# The IP:port address; http://<app>.local:<port>/ is a port address too.
+ip_port='select(.kind == "port" and (.url | test("\\.local[:/]") | not))'
+
 wait_for "a ready port address for ${app}" \
-  ".apps[] | select(.name == \"${app}\") | .addresses // [] | any(.kind == \"port\" and .state == \"ready\")" \
+  ".apps[] | select(.name == \"${app}\") | .addresses // [] | any(${ip_port} | .state == \"ready\")" \
   /api/apps
 app_json="$(jq -c ".apps[] | select(.name == \"${app}\")" <<<"$answer")"
 jq -e '.problems | length == 0' <<<"$app_json" >/dev/null \
   || die "${app} has problems: $(jq -c .problems <<<"$app_json")"
-port_url="$(jq -r '.addresses[] | select(.kind == "port") | .url' <<<"$app_json")"
+port_url="$(jq -r ".addresses[] | ${ip_port} | .url" <<<"$app_json")"
 proxy_port="${port_url##*:}"
 proxy_port="${proxy_port%/}"
 if ! [[ "$proxy_port" =~ ^[0-9]+$ ]] || ((proxy_port < 8100 || proxy_port > 8999)); then
@@ -182,6 +186,8 @@ if ! [[ "$proxy_port" =~ ^[0-9]+$ ]] || ((proxy_port < 8100 || proxy_port > 8999
 fi
 jq -e --arg url "$port_url" '.addresses[] | select(.url == $url) | .service == "web" and .port == 80' \
   <<<"$app_json" >/dev/null || die "${port_url} does not go to port 80 of service web: ${app_json}"
+jq -e --arg url "http://${app}.local:${proxy_port}/" '.addresses | any(.url == $url and .kind == "port")' \
+  <<<"$app_json" >/dev/null || die "${app} has no address http://${app}.local:${proxy_port}/: ${app_json}"
 
 api /api/ports | jq -e --arg owner "proxy:${app}" --arg port "$proxy_port" \
   '.ports | any(.holder.kind == "reservation" and .holder.owner == $owner and .port.published == $port)' \
@@ -247,14 +253,17 @@ if grep -qF "nonce=" "${tmp}/probe.html"; then
   die "a forged probe on ${proxy_port} reached ${app}"
 fi
 
-# check_host: Host routing on port 80 reaches the app, and an unknown Host
-# gets the proxy's 404, never the API.
+# check_host: Host routing on port 80 reaches the app under .localhost
+# and, with local names on (the default), under .local, and an unknown
+# Host gets the proxy's 404, never the API.
 check_host() {
-  local host_url
-  host_url="$(api /api/apps | jq -r ".apps[] | select(.name == \"${app}\") | .addresses[] | select(.kind == \"host\") | .url")"
-  [[ "$host_url" == "http://${app}.localhost/" ]] || die "expected the address http://${app}.localhost/, got ${host_url}"
-  log "Checking Host: ${app}.localhost on port 80"
+  local host_urls
+  host_urls="$(api /api/apps | jq -r ".apps[] | select(.name == \"${app}\") | [.addresses[] | select(.kind == \"host\") | .url] | sort | join(\" \")")"
+  [[ "$host_urls" == "http://${app}.local/ http://${app}.localhost/" ]] \
+    || die "expected the addresses http://${app}.local/ and http://${app}.localhost/, got ${host_urls}"
+  log "Checking Host: ${app}.localhost and ${app}.local on port 80"
   check_echo host80 "http://127.0.0.1/" "${app}.localhost"
+  check_echo host80-local "http://127.0.0.1/" "${app}.local"
   local name code
   for name in nope.localhost localhost "127.0.0.1:${port}"; do
     code="$(curl -sS -o "${tmp}/unknown.html" -w '%{http_code}' -H "Host: ${name}" http://127.0.0.1/api/health)" \
@@ -287,7 +296,7 @@ case "$(jq -r .state <<<"$host_json")" in
       as_root setcap cap_net_bind_service=+ep "${bin}/alchemyd"
       start_daemon
       wait_for "port 80 and ${app}'s addresses after the restart" \
-        "(.apps[] | select(.name == \"${app}\") | .addresses // [] | map(select(.state == \"ready\")) | length) == 2" \
+        ".apps[] | select(.name == \"${app}\") | .addresses // [] | map(select(.state == \"ready\") | .url) | index(\"http://${app}.localhost/\") != null and any(.[]; test(\"^http://[0-9.]+:\"))" \
         /api/apps
       api /api/apps | jq -e --arg url "$port_url" ".apps[] | select(.name == \"${app}\") | .addresses | any(.url == \$url)" \
         >/dev/null || die "${app} lost its port ${proxy_port} across a restart"
