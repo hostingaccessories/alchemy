@@ -1,7 +1,7 @@
 import { act, cleanup, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import type { EngineStatus } from "../lib/api.ts";
+import type { EngineStatus, MetricsHistory, MetricsResponse } from "../lib/api.ts";
 import { FakeEventSource, renderAt } from "../test/render.tsx";
 
 const ready: EngineStatus = {
@@ -26,6 +26,45 @@ const unknown: EngineStatus = {
 
 /** Whether the stubbed `GET /api/version` answers. */
 let daemonUp = true;
+
+/** Every `/api/metrics/history` URL requested, in order. */
+let historyRequests: string[] = [];
+
+/** Whether the stubbed daemon predates `/api/metrics`. */
+let oldDaemon = false;
+
+const GIB = 1024 ** 3;
+
+const sample: MetricsResponse = {
+  at: 7200,
+  interval: 60,
+  containers_in_vm: false,
+  machine: {
+    cpu: 12.5,
+    cpu_max: null,
+    cpus: 8,
+    load: [0.5, 0.25, 0.75],
+    memory_used: 4 * GIB,
+    memory_total: 16 * GIB,
+    swap_used: 0,
+    swap_total: 2 * GIB,
+    disk_used: 100 * GIB,
+    disk_total: 500 * GIB,
+    disk_read: 2048,
+    disk_write: null,
+    net_rx: 1536,
+    net_tx: 512,
+  },
+  projects: [
+    { name: "blog", containers: 2, cpu: 3.5, memory: 300 * 1024 ** 2, net_rx: 100, net_tx: null },
+  ],
+  containers: [],
+};
+
+function history(range: MetricsHistory["range"]): MetricsHistory {
+  const point = (t: number) => ({ ...sample, t, containers: [] });
+  return { range, step: 1200, project: null, points: [point(4800), point(6000)] };
+}
 
 const source = () => FakeEventSource.last();
 
@@ -56,8 +95,18 @@ function docker() {
   return screen.getByRole("status", { name: "Docker" });
 }
 
+/** Send a `metrics` event and wait for it to render. */
+async function sendMetrics(metrics: MetricsResponse) {
+  await act(async () => {
+    source().emit("metrics", JSON.stringify(metrics));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+}
+
 beforeEach(() => {
   daemonUp = true;
+  historyRequests = [];
+  oldDaemon = false;
   FakeEventSource.instances = [];
   vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal(
@@ -66,8 +115,18 @@ beforeEach(() => {
       if (!daemonUp) {
         throw new TypeError("connection refused");
       }
-      if (url === "/api/engine") {
+      if (oldDaemon && url.startsWith("/api/metrics")) {
+        return new Response(JSON.stringify({ error: "not found", code: "not_found" }), {
+          status: 404,
+        });
+      }
+      if (url === "/api/engine" || url === "/api/metrics") {
         return new Promise<Response>(() => {});
+      }
+      if (url.startsWith("/api/metrics/history?")) {
+        historyRequests.push(url);
+        const range = new URL(url, "http://x").searchParams.get("range") as MetricsHistory["range"];
+        return new Response(JSON.stringify(history(range)), { status: 200 });
       }
       return new Response(JSON.stringify({ version: "9.9.9" }), { status: 200 });
     }),
@@ -224,5 +283,61 @@ describe("Machines", () => {
     expect(opened.closed).toBe(false);
     unmount();
     expect(opened.closed).toBe(true);
+  });
+
+  it("waits for the first metrics sample", async () => {
+    await renderOnline();
+    expect(screen.getByText("Measuring this machine…")).toBeTruthy();
+    await sendMetrics({ ...sample, at: null, machine: null, projects: [] });
+    expect(screen.getByText("Measuring this machine…")).toBeTruthy();
+  });
+
+  it("shows the machine's usage and each app's share, charted over 24 hours", async () => {
+    await renderOnline();
+    await sendMetrics(sample);
+    const cpu = screen.getByRole("region", { name: "CPU" });
+    expect(within(cpu).getByText("12.5%")).toBeTruthy();
+    expect(within(cpu).getByText("8 CPUs · load 0.50 0.25 0.75")).toBeTruthy();
+    const memory = screen.getByRole("region", { name: "Memory" });
+    expect(within(memory).getByText("4.0 GiB of 16.0 GiB")).toBeTruthy();
+    const disk = screen.getByRole("region", { name: "Disk" });
+    expect(within(disk).getByText("Read 2.0 KiB/s · write –")).toBeTruthy();
+    const network = screen.getByRole("region", { name: "Network" });
+    expect(within(network).getByText("In 1.5 KiB/s")).toBeTruthy();
+    expect(screen.queryByText(/not the virtual machine/)).toBeNull();
+
+    const chart = await screen.findByRole("img", { name: "CPU over the last 24 hours" });
+    expect(chart.querySelector("path")?.getAttribute("d")).toBe("M97.22 26.25 L98.61 26.25");
+    expect(historyRequests).toEqual(["/api/metrics/history?range=24h"]);
+
+    const apps = screen.getByRole("region", { name: "Apps on this machine" });
+    const row = within(apps).getByRole("row", { name: /blog/ });
+    expect(within(row).getByText("3.5%")).toBeTruthy();
+    expect(within(row).getByText("300.0 MiB")).toBeTruthy();
+    expect(within(row).getByRole("img", { name: "blog CPU over the last 24 hours" })).toBeTruthy();
+  });
+
+  it("says when the figures are the host's, not Docker's VM", async () => {
+    await renderOnline();
+    await sendMetrics({ ...sample, containers_in_vm: true, projects: [] });
+    expect(screen.getByText(/not the virtual machine Docker runs your apps in/)).toBeTruthy();
+    expect(screen.getByText("No apps are running.")).toBeTruthy();
+  });
+
+  it("says when alchemyd is too old to report usage", async () => {
+    oldDaemon = true;
+    await renderOnline();
+    expect(await screen.findByText(/doesn't report usage/)).toBeTruthy();
+  });
+
+  it("switches the history range", async () => {
+    await renderOnline();
+    await sendMetrics(sample);
+    await act(async () => {
+      screen.getByRole("button", { name: "1h" }).click();
+    });
+    expect(await screen.findByRole("img", { name: "CPU over the last hour" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "1h" }).getAttribute("aria-pressed")).toBe("true");
+    expect(historyRequests).toContain("/api/metrics/history?range=1h");
   });
 });
