@@ -17,8 +17,8 @@ mod op;
 mod state;
 
 pub use elevate::{
-    CommandLine, Elevation, OSASCRIPT, OSASCRIPT_SCRIPT, PKEXEC, SUDO, TerminalReason,
-    elevated_command, elevation, sudo_command,
+    CommandLine, Elevation, OSASCRIPT, OSASCRIPT_SCRIPT, PKEXEC, PKEXEC_FLAGS, SUDO,
+    TerminalReason, elevated_command, elevation, sudo_command,
 };
 pub use helper::{
     ALCHEMYD, Distrust, FileKind, FileMeta, HELPER, HelperPath, HelperPathError, HelperTrust,

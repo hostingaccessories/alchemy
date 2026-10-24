@@ -15,6 +15,12 @@ pub const OSASCRIPT: &str = "/usr/bin/osascript";
 /// `pkexec`, by absolute path.
 pub const PKEXEC: &str = "/usr/bin/pkexec";
 
+/// What goes between `pkexec` and the helper. Without
+/// `--disable-internal-agent`, an alchemyd started from a terminal makes
+/// pkexec prompt on that terminal and block; with it, no agent is a fast
+/// exit 127 with `No authentication agent found.`
+pub const PKEXEC_FLAGS: [&str; 1] = ["--disable-internal-agent"];
+
 /// `sudo`, as the user would type it.
 pub const SUDO: &str = "sudo";
 
@@ -23,14 +29,17 @@ pub const SUDO: &str = "sudo";
 ///
 /// The helper's path and arguments are passed to the `run` handler as
 /// `argv`, never spliced into the script, and each is quoted with
-/// `quoted form of` for the shell `do shell script` runs.
+/// `quoted form of` for the shell `do shell script` runs. A plain
+/// `do shell script` loses the command's output and exit status when it
+/// fails, so the fixed suffix folds stderr in and always ends with an
+/// `exit=N` line, and line endings are kept as `\n`.
 pub const OSASCRIPT_SCRIPT: [&str; 7] = [
     "on run argv",
     "set helperCommand to \"\"",
     "repeat with helperArg in argv",
     "set helperCommand to helperCommand & quoted form of (helperArg as text) & \" \"",
     "end repeat",
-    "do shell script helperCommand with administrator privileges",
+    "do shell script helperCommand & \"</dev/null 2>&1; echo \\\"exit=$?\\\"\" with prompt \"Alchemy needs to change a system setting.\" with administrator privileges without altering line endings",
     "end run",
 ];
 
@@ -154,7 +163,10 @@ pub fn elevated_command(elevation: &Elevation, helper: &HelperPath, op: &HelperO
             .chain(OSASCRIPT_SCRIPT.iter().flat_map(|line| ["-e", line]))
             .map(str::to_owned)
             .collect(),
-        Elevation::Pkexec => vec![PKEXEC.to_owned()],
+        Elevation::Pkexec => std::iter::once(PKEXEC)
+            .chain(PKEXEC_FLAGS)
+            .map(str::to_owned)
+            .collect(),
         Elevation::Terminal { .. } => vec![SUDO.to_owned()],
     };
     argv.push(helper.as_str().to_owned());
@@ -265,6 +277,7 @@ mod tests {
                 HelperOp::GrantLowPorts,
                 vec![
                     PKEXEC,
+                    "--disable-internal-agent",
                     "/usr/libexec/alchemy/alchemy-helper",
                     "grant-low-ports",
                 ],
@@ -328,7 +341,12 @@ mod tests {
         assert!(
             OSASCRIPT_SCRIPT
                 .iter()
-                .any(|l| l.ends_with("with administrator privileges"))
+                .any(|l| l.contains("with administrator privileges without altering line endings"))
+        );
+        assert!(
+            OSASCRIPT_SCRIPT
+                .iter()
+                .any(|l| l.contains(r#"& "</dev/null 2>&1; echo \"exit=$?\"""#))
         );
     }
 

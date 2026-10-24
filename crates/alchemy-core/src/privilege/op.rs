@@ -43,6 +43,12 @@ impl Action {
         }
     }
 
+    /// Whether granting or undoing it only takes effect once alchemyd
+    /// restarts, as low ports do: Linux reads file capabilities at exec.
+    pub fn restarts_daemon(self) -> bool {
+        matches!(self, Self::LowPorts)
+    }
+
     /// The name on a command line or in a URL path, such as `low-ports`.
     pub fn cli_name(self) -> &'static str {
         match self {
@@ -322,11 +328,17 @@ mod tests {
     #[test]
     fn action_names() {
         let cases = [
-            (Action::LowPorts, "low_ports", "low-ports"),
-            (Action::Firewall, "firewall", "firewall"),
-            (Action::SystemService, "system_service", "system-service"),
+            (Action::LowPorts, "low_ports", "low-ports", true),
+            (Action::Firewall, "firewall", "firewall", false),
+            (
+                Action::SystemService,
+                "system_service",
+                "system-service",
+                false,
+            ),
         ];
-        for (action, wire, cli) in cases {
+        for (action, wire, cli, restarts) in cases {
+            assert_eq!(action.restarts_daemon(), restarts);
             assert_eq!(action.as_str(), wire);
             assert_eq!(action.to_string(), wire);
             assert_eq!(action.cli_name(), cli);

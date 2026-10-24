@@ -27,7 +27,11 @@ pub enum HostListener {
 }
 
 /// What decides the low-ports action.
+///
+/// Each flag is an independent fact read from the OS, not a state
+/// machine, so the bools stay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct LowPortFacts {
     /// The Host listener.
     pub host_listener: HostListener,
@@ -42,6 +46,11 @@ pub struct LowPortFacts {
     /// unit with `NoNewPrivileges=yes`, which also makes exec ignore file
     /// capabilities.
     pub no_new_privs: bool,
+    /// Whether alchemyd's binary carries `cap_net_bind_service` in its
+    /// `security.capability` xattr, as after a grant from a terminal. If
+    /// the running alchemyd isn't [`capable`](Self::capable), a restart
+    /// is all that is left.
+    pub file_capable: bool,
 }
 
 /// A host firewall Alchemy knows about.
@@ -125,6 +134,10 @@ pub enum PrivilegeState {
     Needed,
     /// Done, and can be undone.
     Granted,
+    /// Done on disk but not in effect until alchemyd restarts, as after a
+    /// grant from a terminal. Granting again restarts alchemyd without a
+    /// prompt.
+    NeedsRestart,
     /// A grant or undo is in flight, such as while the prompt is up.
     Pending,
     /// Not done yet, and no prompt is safe or available, so the user runs
@@ -149,6 +162,7 @@ impl PrivilegeState {
             Self::NotNeeded => "not_needed",
             Self::Needed => "needed",
             Self::Granted => "granted",
+            Self::NeedsRestart => "needs_restart",
             Self::Pending => "pending",
             Self::NeedsTerminal { .. } => "needs_terminal",
             Self::Unsupported { .. } => "unsupported",
@@ -228,6 +242,9 @@ pub enum Step {
     Busy,
     /// Alchemy can't do it here.
     Unsupported(UnsupportedReason),
+    /// Restart alchemyd: the change is on disk and takes effect when it
+    /// starts again.
+    Restart,
     /// Run this command: it shows a system prompt, then runs the helper.
     Prompt(CommandLine),
     /// Ask the user to run this `sudo` command in a terminal.
@@ -243,6 +260,7 @@ enum Base {
     NotNeeded,
     Needed,
     Granted,
+    NeedsRestart,
     Unsupported(UnsupportedReason),
 }
 
@@ -268,6 +286,14 @@ fn base(action: Action, facts: &PrivilegeFacts) -> Base {
             ) => Base::Unsupported(UnsupportedReason::NosuidMount {
                 alchemyd: facts.alchemyd.clone(),
             }),
+            (
+                HostOs::Linux,
+                LowPortFacts {
+                    host_listener: HostListener::Denied,
+                    file_capable: true,
+                    ..
+                },
+            ) => Base::NeedsRestart,
             (
                 HostOs::Linux,
                 LowPortFacts {
@@ -345,11 +371,23 @@ fn run(action: Action, grant: bool, facts: &PrivilegeFacts) -> Step {
     }
 }
 
+/// Whether low ports are still in effect but already gone from the
+/// binary, as after an undo from a terminal, so only a restart is left.
+fn revoked_on_disk(action: Action, facts: &PrivilegeFacts) -> bool {
+    action == Action::LowPorts
+        && facts.os == HostOs::Linux
+        && facts.low_ports.capable
+        && !facts.low_ports.file_capable
+}
+
 /// What to do to grant (`grant` true) or undo `action`.
 ///
 /// Granting runs the helper only when the action is
-/// [`Needed`](PrivilegeState::Needed); undoing only when it is
-/// [`Granted`](PrivilegeState::Granted). Low ports, the macOS firewall
+/// [`Needed`](PrivilegeState::Needed), and restarts alchemyd when it
+/// [`NeedsRestart`](PrivilegeState::NeedsRestart); undoing runs it only
+/// when it is [`Granted`](PrivilegeState::Granted) or needs a restart.
+/// Undoing low ports that are still in effect but already gone from the
+/// binary, as after an undo from a terminal, restarts alchemyd instead. Low ports, the macOS firewall
 /// entry, and the service all act on the helper's sibling alchemyd, so
 /// they are [`Unsupported`](Step::Unsupported) when that isn't the one
 /// running.
@@ -359,7 +397,11 @@ pub fn step(action: Action, grant: bool, facts: &PrivilegeFacts) -> Step {
     }
     match (base(action, facts), grant) {
         (Base::Unsupported(reason), true) => Step::Unsupported(reason),
-        (Base::Needed, true) | (Base::Granted, false) => run(action, grant, facts),
+        (Base::NeedsRestart, true) => Step::Restart,
+        (Base::Granted, false) if revoked_on_disk(action, facts) => Step::Restart,
+        (Base::Needed, true) | (Base::Granted | Base::NeedsRestart, false) => {
+            run(action, grant, facts)
+        }
         (Base::NotNeeded | Base::Granted, true)
         | (Base::NotNeeded | Base::Needed | Base::Unsupported(_), false) => Step::Nothing,
     }
@@ -379,11 +421,12 @@ pub fn state(action: Action, facts: &PrivilegeFacts) -> PrivilegeState {
     match base(action, facts) {
         Base::NotNeeded => PrivilegeState::NotNeeded,
         Base::Granted => PrivilegeState::Granted,
+        Base::NeedsRestart => PrivilegeState::NeedsRestart,
         Base::Unsupported(reason) => PrivilegeState::Unsupported { reason },
         Base::Needed => match run(action, true, facts) {
             Step::Terminal { command, reason } => PrivilegeState::NeedsTerminal { command, reason },
             Step::Unsupported(reason) => PrivilegeState::Unsupported { reason },
-            Step::Prompt(_) | Step::Nothing | Step::Busy => PrivilegeState::Needed,
+            Step::Prompt(_) | Step::Nothing | Step::Busy | Step::Restart => PrivilegeState::Needed,
         },
     }
 }
@@ -426,6 +469,7 @@ mod tests {
                 capable: false,
                 nosuid: false,
                 no_new_privs: false,
+                file_capable: false,
             },
             firewall: FirewallFacts {
                 active: None,
@@ -512,6 +556,35 @@ mod tests {
                 HostOs::Linux,
                 |f| f.low_ports.capable = true,
                 PrivilegeState::Granted,
+            ),
+            (
+                "granted from a terminal, restart left",
+                HostOs::Linux,
+                |f| {
+                    denied(f);
+                    f.low_ports.file_capable = true;
+                },
+                PrivilegeState::NeedsRestart,
+            ),
+            (
+                "file capability ignored on a nosuid mount",
+                HostOs::Linux,
+                |f| {
+                    denied(f);
+                    f.low_ports.file_capable = true;
+                    f.low_ports.nosuid = true;
+                },
+                PrivilegeState::Unsupported {
+                    reason: UnsupportedReason::NosuidMount {
+                        alchemyd: PathBuf::from(ALCHEMYD),
+                    },
+                },
+            ),
+            (
+                "file capability while listening",
+                HostOs::Linux,
+                |f| f.low_ports.file_capable = true,
+                PrivilegeState::NotNeeded,
             ),
             (
                 "granted, still denied before the re-exec",
@@ -810,11 +883,48 @@ mod tests {
                 prompt(PKEXEC, &["grant-low-ports"]),
             ),
             (
+                "restart after a grant from a terminal",
+                HostOs::Linux,
+                Action::LowPorts,
+                true,
+                |f| {
+                    denied(f);
+                    f.low_ports.file_capable = true;
+                    f.polkit_agent = false;
+                },
+                is(Step::Restart),
+            ),
+            (
+                "restart after an undo from a terminal",
+                HostOs::Linux,
+                Action::LowPorts,
+                false,
+                |f| {
+                    f.low_ports.capable = true;
+                    f.polkit_agent = false;
+                },
+                is(Step::Restart),
+            ),
+            (
+                "revoke a grant that needs a restart",
+                HostOs::Linux,
+                Action::LowPorts,
+                false,
+                |f| {
+                    denied(f);
+                    f.low_ports.file_capable = true;
+                },
+                prompt(PKEXEC, &["revoke-low-ports"]),
+            ),
+            (
                 "revoke low ports",
                 HostOs::Linux,
                 Action::LowPorts,
                 false,
-                |f| f.low_ports.capable = true,
+                |f| {
+                    f.low_ports.capable = true;
+                    f.low_ports.file_capable = true;
+                },
                 prompt(PKEXEC, &["revoke-low-ports"]),
             ),
             (
@@ -824,6 +934,7 @@ mod tests {
                 false,
                 |f| {
                     f.low_ports.capable = true;
+                    f.low_ports.file_capable = true;
                     f.polkit_agent = false;
                 },
                 is(Step::Terminal {
@@ -838,6 +949,7 @@ mod tests {
                 false,
                 |f| {
                     f.low_ports.capable = true;
+                    f.low_ports.file_capable = true;
                     f.alchemyd = PathBuf::from("/home/me/.cargo/bin/alchemyd");
                 },
                 is(Step::Unsupported(not_sibling())),
@@ -1008,6 +1120,7 @@ mod tests {
             (PrivilegeState::NotNeeded, "not_needed"),
             (PrivilegeState::Needed, "needed"),
             (PrivilegeState::Granted, "granted"),
+            (PrivilegeState::NeedsRestart, "needs_restart"),
             (PrivilegeState::Pending, "pending"),
             (
                 PrivilegeState::NeedsTerminal {
