@@ -12,15 +12,32 @@ publish.workspace      = true
 name = "alchemy-gui"
 path = "src/main.rs"
 
+[lib]
+name = "alchemy_gui"
+path = "src/lib.rs"
+
 [build-dependencies]
 tauri-build = { workspace = true }
 
 [dependencies]
 alchemy-api                  = { workspace = true, features = ["state-dir"] }
-tauri                        = { workspace = true }
+alchemy-core                 = { workspace = true }
+http-body-util               = { workspace = true }
+hyper                        = { workspace = true, features = ["client", "http1"] }
+hyper-util                   = { workspace = true, features = ["tokio"] }
+serde                        = { workspace = true }
+serde_json                   = { workspace = true }
+tauri                        = { workspace = true, features = ["tray-icon"] }
 tauri-plugin-opener          = { workspace = true }
 tauri-plugin-single-instance = { workspace = true }
 tauri-plugin-window-state    = { workspace = true }
+thiserror                    = { workspace = true }
+tokio                        = { workspace = true, features = ["rt", "net", "time", "macros", "sync", "process"] }
+
+[dev-dependencies]
+axum         = { workspace = true }
+futures-util = { workspace = true }
+tokio        = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true
