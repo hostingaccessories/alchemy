@@ -39,24 +39,6 @@ pub(crate) struct Sources {
     pub(crate) default_sockets: Vec<PathBuf>,
 }
 
-impl Sources {
-    /// The given flags plus this process's environment, looking for the
-    /// daemon at `default_sockets` when none of them names one.
-    pub(crate) fn from_env(
-        daemon_flag: Option<String>,
-        socket_flag: Option<PathBuf>,
-        default_sockets: Vec<PathBuf>,
-    ) -> Self {
-        Self {
-            daemon_flag,
-            socket_flag,
-            daemon_env: std::env::var_os(DAEMON_ENV),
-            socket_env: std::env::var_os(alchemy_api::SOCKET_ENV),
-            default_sockets,
-        }
-    }
-}
-
 /// Pick the daemon target: `--daemon`, then `--socket`, then
 /// `ALCHEMY_DAEMON`, then `ALCHEMY_SOCKET`, then the default sockets.
 ///

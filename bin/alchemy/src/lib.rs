@@ -17,7 +17,7 @@ mod sse;
 pub mod sudo;
 mod target;
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -161,6 +161,46 @@ pub async fn run_with_sockets<W: Write, P: Prompt, S: Sudo>(
     prompt: &mut P,
     sudo: &mut S,
 ) -> Result<(), ClientError> {
+    run_with_lookup(cli, Lookup::from_env(sockets), out, color, prompt, sudo).await
+}
+
+/// Where to look for alchemyd when no flag names it, and how to find the
+/// autostart service installed when none answers.
+pub struct Lookup {
+    /// [`DAEMON_ENV`], as read from the environment.
+    pub daemon_env: Option<OsString>,
+    /// `ALCHEMY_SOCKET`, as read from the environment.
+    pub socket_env: Option<OsString>,
+    /// The default sockets, tried in order.
+    pub sockets: Vec<PathBuf>,
+    /// Finds the autostart service installed on this machine, asked only
+    /// when no default socket answers.
+    pub installed: Box<dyn FnOnce() -> Option<InstalledService> + Send>,
+}
+
+impl Lookup {
+    /// This process's environment, `sockets`, and the service files on
+    /// disk.
+    pub fn from_env(sockets: Vec<PathBuf>) -> Self {
+        Self {
+            daemon_env: std::env::var_os(DAEMON_ENV),
+            socket_env: std::env::var_os(alchemy_api::SOCKET_ENV),
+            sockets,
+            installed: Box::new(service::find),
+        }
+    }
+}
+
+/// [`run_with_sudo`], finding alchemyd as `lookup` says instead of from
+/// this process's environment and files.
+pub async fn run_with_lookup<W: Write, P: Prompt, S: Sudo>(
+    cli: Cli,
+    lookup: Lookup,
+    out: &mut W,
+    color: Color,
+    prompt: &mut P,
+    sudo: &mut S,
+) -> Result<(), ClientError> {
     let Cli {
         json,
         daemon,
@@ -168,10 +208,7 @@ pub async fn run_with_sockets<W: Write, P: Prompt, S: Sudo>(
         command,
     } = cli;
     let context = |out, command| -> Result<_, ClientError> {
-        let socket = match target::resolve(Sources::from_env(daemon, socket, sockets))? {
-            Target::Unix(socket) => socket,
-            Target::Search(sockets) => target::find(sockets, answers, service::find)?,
-        };
+        let socket = locate(daemon, socket, lookup)?;
         Ok(Context::new(
             HttpDaemon::new(socket),
             Output::new(out, json, color),
@@ -284,6 +321,32 @@ async fn run_machine<W: Write, S: Sudo>(
         machine::Verb::Docker(args) => {
             machine::docker::run(&mut context(machine::docker::START_NAME)?, args).await
         }
+    }
+}
+
+/// The socket of the alchemyd that `--daemon` or `--socket` names, or
+/// else that `lookup` finds.
+fn locate(
+    daemon: Option<String>,
+    socket: Option<PathBuf>,
+    lookup: Lookup,
+) -> Result<PathBuf, ClientError> {
+    let Lookup {
+        daemon_env,
+        socket_env,
+        sockets,
+        installed,
+    } = lookup;
+    let sources = Sources {
+        daemon_flag: daemon,
+        socket_flag: socket,
+        daemon_env,
+        socket_env,
+        default_sockets: sockets,
+    };
+    match target::resolve(sources)? {
+        Target::Unix(socket) => Ok(socket),
+        Target::Search(sockets) => target::find(sockets, answers, installed),
     }
 }
 

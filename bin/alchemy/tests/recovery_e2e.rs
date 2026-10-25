@@ -20,11 +20,12 @@ use std::time::Duration;
 
 use alchemy::prompt::FakePrompt;
 use alchemy::sudo::FakeSudo;
-use alchemy::{Cli, ClientError, Color, DAEMON_ENV};
+use alchemy::{Cli, ClientError, Color, InstalledService, Lookup};
+use alchemy_api::autostart::{AutostartMode, LogHint};
 use alchemy_core::engine::{
     ContainerState, ContainerStatus, EngineFlavor, EngineState, EngineStatus,
 };
-use alchemy_core::lifecycle::{DesktopCommand, Supervisor, system_service_path, user_service_path};
+use alchemy_core::lifecycle::{DesktopCommand, Supervisor};
 use alchemy_core::privilege::{FileKind, FileMeta, FirewallFacts, HelperPath};
 use alchemy_core::route::HostOs;
 use alchemyd::apps::{AppsDeps, SystemFs};
@@ -530,77 +531,106 @@ async fn status_names_the_apps_that_did_not_come_back_and_why() {
     d.stop().await;
 }
 
-/// Run the `alchemy` binary with `args`, `HOME` and `XDG_CONFIG_HOME` in
-/// `home`, and the runtime directory in `home` too, so no daemon is found.
-async fn alchemy_bin(args: &[&str], home: &Path) -> std::process::Output {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_alchemy"));
-    cmd.args(args)
-        .env_remove(DAEMON_ENV)
-        .env_remove(alchemy_api::SOCKET_ENV)
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_RUNTIME_DIR", home)
-        .env("TMPDIR", home);
-    tokio::task::spawn_blocking(move || cmd.output())
-        .await
-        .unwrap()
-        .unwrap()
+/// Run `alchemy status` with nothing in the environment naming alchemyd,
+/// looking at `sockets` and finding `installed` as the service on disk.
+async fn status_without_a_daemon(
+    sockets: Vec<PathBuf>,
+    installed: Option<InstalledService>,
+    json: bool,
+) -> ClientError {
+    let mut args = vec!["alchemy", "status"];
+    if json {
+        args.insert(1, "--json");
+    }
+    let cli = Cli::try_parse_from(args).unwrap();
+    let lookup = Lookup {
+        daemon_env: None,
+        socket_env: None,
+        sockets,
+        installed: Box::new(move || installed),
+    };
+    let mut out = Vec::new();
+    let err = alchemy::run_with_lookup(
+        cli,
+        lookup,
+        &mut out,
+        Color::Off,
+        &mut FakePrompt::no_tty(),
+        &mut FakeSudo::no_tty(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(out, b"");
+    err
 }
 
 #[tokio::test]
 async fn the_unreachable_error_suggests_autostart_or_the_service_logs() {
-    let os = if cfg!(target_os = "macos") {
-        HostOs::MacOs
-    } else {
-        HostOs::Linux
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("alchemyd.sock");
+    let login = InstalledService {
+        mode: AutostartMode::Login,
+        logs: LogHint::Journal {
+            command: "journalctl --user -u alchemyd.service".into(),
+        },
     };
-    let home = tempfile::tempdir().unwrap();
-    let uid = std::os::unix::fs::MetadataExt::uid(&home.path().metadata().unwrap());
-    let boot = system_service_path(os, uid).exists().then(|| match os {
-        HostOs::MacOs => format!("see /Library/Logs/Alchemy/alchemyd.{uid}.log"),
-        HostOs::Linux => format!("see `journalctl -u alchemyd-{uid}.service`"),
-    });
-    let installed = |at: &str, logs: &str| {
-        format!("alchemyd is set to start {at} but isn't answering; to find out why, {logs}")
+    let boot = InstalledService {
+        mode: AutostartMode::Boot,
+        logs: LogHint::File {
+            path: "/Library/Logs/Alchemy/alchemyd.501.log".into(),
+        },
     };
-
-    let out = alchemy_bin(&["status"], home.path()).await;
-    let stderr = String::from_utf8(out.stderr).unwrap();
-    assert_eq!(out.status.code(), Some(69), "{stderr}");
-    assert!(
-        stderr.starts_with("alchemy: cannot reach alchemyd: "),
-        "{stderr}"
-    );
-    let want = boot.as_deref().map_or_else(
-        || "start alchemyd by running `alchemyd`, then `alchemy machine autostart login` starts it whenever you log in; or point --socket at the socket it listens on".to_owned(),
-        |logs| installed("at boot", logs),
-    );
-    assert_eq!(
-        stderr.lines().nth(1),
-        Some(format!("hint: {want}").as_str()),
-        "{stderr}"
-    );
-
-    let unit = user_service_path(os, Some(&home.path().join(".config")), home.path());
-    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
-    std::fs::write(&unit, "installed by a test").unwrap();
-    let out = alchemy_bin(&["--json", "status"], home.path()).await;
-    let stderr = String::from_utf8(out.stderr).unwrap();
-    assert_eq!(out.status.code(), Some(69), "{stderr}");
-    let json: serde_json::Value = serde_json::from_str(&stderr).unwrap();
-    assert_eq!(json["error"]["kind"], "daemon_unreachable");
-    let login = match os {
-        HostOs::MacOs => format!(
-            "see {}",
-            home.path()
-                .join("Library/Logs/Alchemy/alchemyd.log")
-                .display()
+    let cases = [
+        (
+            None,
+            "start alchemyd by running `alchemyd`, then `alchemy machine autostart login` starts it whenever you log in; or point --socket at the socket it listens on",
         ),
-        HostOs::Linux => "see `journalctl --user -u alchemyd.service`".to_owned(),
+        (
+            Some(login),
+            "alchemyd is set to start at login but isn't answering; to find out why, see `journalctl --user -u alchemyd.service`",
+        ),
+        (
+            Some(boot),
+            "alchemyd is set to start at boot but isn't answering; to find out why, see /Library/Logs/Alchemy/alchemyd.501.log",
+        ),
+    ];
+    for (installed, hint) in cases {
+        for json in [false, true] {
+            let err = status_without_a_daemon(vec![missing.clone()], installed.clone(), json).await;
+            assert_eq!((err.kind(), err.exit_code()), ("daemon_unreachable", 69));
+            assert!(
+                err.to_string()
+                    .starts_with(&format!("cannot reach alchemyd: {}: ", missing.display())),
+                "{err}"
+            );
+            assert_eq!(err.hint().as_deref(), Some(hint), "{installed:?}");
+            let report = if json { err.to_json() } else { err.to_text() };
+            assert!(report.contains(hint), "{report}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_that_answers_never_looks_for_a_service() {
+    let d = Daemon::start(machine(0o755), FakeComposeRunner::new()).await;
+    let cli = Cli::try_parse_from(["alchemy", "status"]).unwrap();
+    let lookup = Lookup {
+        daemon_env: None,
+        socket_env: None,
+        sockets: vec![d.socket.clone()],
+        installed: Box::new(|| panic!("looked for a service with alchemyd answering")),
     };
-    let want = boot.as_deref().map_or_else(
-        || installed("at login", &login),
-        |logs| installed("at boot", logs),
-    );
-    assert_eq!(json["error"]["hint"], want, "the system service wins");
+    let mut out = Vec::new();
+    alchemy::run_with_lookup(
+        cli,
+        lookup,
+        &mut out,
+        Color::Off,
+        &mut FakePrompt::no_tty(),
+        &mut FakeSudo::no_tty(),
+    )
+    .await
+    .unwrap();
+    assert!(String::from_utf8(out).unwrap().starts_with("alchemyd "));
+    d.stop().await;
 }

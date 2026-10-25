@@ -930,13 +930,20 @@ fn stale_socket(path: &Path) {
     assert!(path.exists());
 }
 
-/// Runs `status` with no `--socket`, looking for alchemyd at `sockets`.
+/// Runs `status` with no `--socket` and nothing in the environment naming
+/// alchemyd, looking for it at `sockets`.
 async fn status_searching(sockets: Vec<PathBuf>) -> Result<String, ClientError> {
     let cli = Cli::try_parse_from(["alchemy", "status"]).unwrap();
     let mut out = Vec::new();
-    alchemy::run_with_sockets(
-        cli,
+    let lookup = alchemy::Lookup {
+        daemon_env: None,
+        socket_env: None,
         sockets,
+        installed: Box::new(|| None),
+    };
+    alchemy::run_with_lookup(
+        cli,
+        lookup,
         &mut out,
         Color::Off,
         &mut FakePrompt::no_tty(),
