@@ -517,6 +517,11 @@ export interface Operation {
   finished_at: number | null;
   /** Why it did not succeed, safe to show. */
   error: string | null;
+  /**
+   * Why Alchemy started it on its own, such as "was running before the
+   * computer slept". Absent when someone asked for it.
+   */
+  reason?: string;
 }
 
 /** Mirrors `alchemy_api::operations::ActionRequest`, the body of `POST /api/apps/{name}/actions`. */
@@ -587,7 +592,8 @@ export type ApiEvent =
   | { event: "metrics"; data: MetricsResponse }
   | { event: "apps"; data: AppList }
   | { event: "operations"; data: OperationList }
-  | { event: "privileges"; data: PrivilegeList };
+  | { event: "privileges"; data: PrivilegeList }
+  | { event: "reconcile"; data: ReconcileStatus };
 
 /** Every SSE event name the daemon sends. */
 export type ApiEventName = ApiEvent["event"];
@@ -602,6 +608,7 @@ const EVENT_NAMES: { [K in ApiEventName]: K } = {
   apps: "apps",
   operations: "operations",
   privileges: "privileges",
+  reconcile: "reconcile",
 };
 
 /** The event names {@link subscribe} listens for. Others are ignored. */
@@ -906,6 +913,69 @@ export interface PrivilegeChange {
   privilege: Privilege;
 }
 
+/** Mirrors `alchemy_api::reconcile::ReconcileTrigger`: what set off a reconcile. */
+export type ReconcileTrigger = "daemon_start" | "wake" | "engine_returned";
+
+/** Mirrors `alchemy_api::reconcile::SkipReason`: why a reconcile left an app alone. */
+export type ReconcileSkipReason =
+  | "stop_intent"
+  | "not_running_before"
+  | "already_running"
+  | "partly_running"
+  | "status_unknown";
+
+/**
+ * Mirrors `alchemy_api::reconcile::ReconcileOutcome`; unknown outcomes arrive
+ * as `other`. `starting` follows its operation to `started` or `failed`.
+ */
+export type ReconcileOutcome = "starting" | "started" | "failed" | "skipped" | "other";
+
+/** Mirrors `alchemy_api::reconcile::ReconcileApp`: what a reconcile did with one app. */
+export interface ReconcileApp {
+  app: string;
+  outcome: ReconcileOutcome;
+  /** The `up` operation started for it, if one was. */
+  operation: string | null;
+  /** Why it was left alone, when `outcome` is `skipped`. */
+  reason: ReconcileSkipReason | null;
+  /** Why it was skipped, or what went wrong, safe to show. */
+  message: string | null;
+}
+
+/** Mirrors `alchemy_api::reconcile::Reconcile`: one reconcile, app by app. */
+export interface Reconcile {
+  trigger: ReconcileTrigger;
+  /** Unix seconds. */
+  at: number;
+  /** Why apps were started, as each operation's `reason` says. */
+  reason: string;
+  apps: ReconcileApp[];
+}
+
+/**
+ * Mirrors `alchemy_api::reconcile::ReconcileStatus`, returned by
+ * `GET /api/reconcile` and sent as the `reconcile` event. `last` is `null`
+ * until Docker is first ready.
+ */
+export interface ReconcileStatus {
+  last: Reconcile | null;
+}
+
+/** Mirrors `alchemy_api::engine::EngineStartResult`; unknown results arrive as `other`. */
+export type EngineStartResult = "starting" | "already_running" | "unsupported" | "other";
+
+/**
+ * Mirrors `alchemy_api::engine::EngineStart`, the answer to
+ * `POST /api/engine/start`. `starting` (202): follow the `engine` event.
+ * `unsupported`: show `message`, and `command` to run in a terminal when
+ * there is one. Docker Desktop missing is a 422 `unsupported` error.
+ */
+export interface EngineStart {
+  result: EngineStartResult;
+  message: string;
+  command: string | null;
+}
+
 /** Mirrors `alchemy_api::network::ProxyReport`. */
 export interface ProxyReport {
   /** `null` until the engine has been ready. */
@@ -1153,6 +1223,8 @@ export const api = {
     request<PrivilegeChange>("POST", `/machine/privileges/${encodeURIComponent(action)}`, {
       body,
     }),
+  reconcile: (signal?: AbortSignal) => request<ReconcileStatus>("GET", "/reconcile", { signal }),
+  startEngine: () => request<EngineStart>("POST", "/engine/start", { body: {} }),
   cancelOperation: (id: string) =>
     request<OperationResponse>("POST", `/operations/${encodeURIComponent(id)}/cancel`),
   followOperation,

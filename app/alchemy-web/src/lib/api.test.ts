@@ -112,6 +112,32 @@ describe("request", () => {
     });
   });
 
+  it("reads the last reconcile and starts Docker with an empty body", async () => {
+    const status = {
+      last: {
+        trigger: "wake",
+        at: 1_700_000_000,
+        reason: "was running before the computer slept",
+        apps: [{ app: "blog", outcome: "starting", operation: "op1", reason: null, message: null }],
+      },
+    };
+    const starting = { result: "starting", message: "Docker Desktop is starting", command: null };
+    const fetch = vi.fn(async (url: string) =>
+      url.endsWith("/reconcile")
+        ? new Response(JSON.stringify(status))
+        : new Response(JSON.stringify(starting), { status: 202 }),
+    );
+    vi.stubGlobal("fetch", fetch);
+    await expect(api.reconcile()).resolves.toEqual(status);
+    await expect(api.startEngine()).resolves.toEqual(starting);
+    expect(fetch).toHaveBeenLastCalledWith("/api/engine/start", {
+      method: "POST",
+      signal: undefined,
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+  });
+
   it.each(["POST", "PUT", "DELETE"] as const)("sends %s with a JSON body", async (method) => {
     const fetch = vi.fn(async () => new Response(JSON.stringify({ ok: true })));
     vi.stubGlobal("fetch", fetch);

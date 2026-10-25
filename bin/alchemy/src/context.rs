@@ -6,7 +6,7 @@ use std::path::Path;
 
 use alchemy_api::{
     ApiEvent, AppList, EngineStatus, ErrorCode, ErrorResponse, MetricsResponse, OperationList,
-    PrivilegeList, VersionResponse,
+    PrivilegeList, ReconcileStatus, VersionResponse,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -225,6 +225,9 @@ pub(crate) fn decode_event(raw: &SseEvent) -> Result<Option<ApiEvent>, ClientErr
         }
         "privileges" => {
             decode::<PrivilegeList>(raw.data.as_bytes()).map(|p| Some(ApiEvent::Privileges(p)))
+        }
+        "reconcile" => {
+            decode::<ReconcileStatus>(raw.data.as_bytes()).map(|r| Some(ApiEvent::Reconcile(r)))
         }
         _ => Ok(None),
     }
@@ -524,6 +527,7 @@ mod tests {
             ApiEvent::Apps(AppList::default()),
             ApiEvent::Operations(OperationList::default()),
             ApiEvent::Privileges(PrivilegeList::default()),
+            ApiEvent::Reconcile(ReconcileStatus::default()),
         ];
         for event in events {
             let raw = SseEvent {

@@ -96,6 +96,11 @@ export const liveQueries = {
     queryFn: ({ signal }) => api.privileges(signal),
     staleTime: Infinity,
   }),
+  reconcile: queryOptions({
+    queryKey: ["reconcile"],
+    queryFn: ({ signal }) => api.reconcile(signal),
+    staleTime: Infinity,
+  }),
 } satisfies { [K in ApiEventName]: LiveQuery<K> };
 
 /**

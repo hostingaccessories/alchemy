@@ -943,6 +943,7 @@ fn update() -> Operation {
         started_at: 1_700_000_000,
         finished_at: None,
         error: None,
+        reason: None,
     }
 }
 
@@ -968,6 +969,20 @@ fn operation() {
         concat!(
             r#"{"id":"19a3b4c5d6e-1","app":"blog","action":"update","state":"failed","steps":[],"#,
             r#""started_at":1700000000,"finished_at":1700000030,"error":"pull access denied"}"#,
+        ),
+    );
+    let reconciled = Operation {
+        action: Action::Up,
+        steps: vec![],
+        reason: Some("was running before the computer slept".into()),
+        ..update()
+    };
+    assert_wire(
+        &reconciled,
+        concat!(
+            r#"{"id":"19a3b4c5d6e-1","app":"blog","action":"up","state":"running","steps":[],"#,
+            r#""started_at":1700000000,"finished_at":null,"error":null,"#,
+            r#""reason":"was running before the computer slept"}"#,
         ),
     );
     assert_wire(
@@ -1731,4 +1746,126 @@ fn unknown_privilege_values_decode_as_a_fallback() {
     for action in alchemy_api::privileges::Action::ALL {
         assert_eq!(PrivilegeAction::from(action).action(), Some(action));
     }
+}
+
+#[test]
+fn reconcile_status_and_event() {
+    use alchemy_api::reconcile::{
+        Reconcile, ReconcileApp, ReconcileOutcome, ReconcileStatus, ReconcileTrigger, SkipReason,
+    };
+    assert_wire(&ReconcileStatus::default(), r#"{"last":null}"#);
+    let app = |name: &str, outcome, operation: Option<&str>, reason, message: Option<&str>| {
+        ReconcileApp {
+            app: StackName::new(name).unwrap(),
+            outcome,
+            operation: operation.map(Into::into),
+            reason,
+            message: message.map(Into::into),
+        }
+    };
+    let status = ReconcileStatus {
+        last: Some(Reconcile {
+            trigger: ReconcileTrigger::Wake,
+            at: 1_700_000_000,
+            reason: "was running before the computer slept".into(),
+            apps: vec![
+                app("blog", ReconcileOutcome::Starting, Some("op1"), None, None),
+                app("chat", ReconcileOutcome::Started, Some("op2"), None, None),
+                app(
+                    "shop",
+                    ReconcileOutcome::Failed,
+                    Some("op3"),
+                    None,
+                    Some("port 80 is taken"),
+                ),
+                app(
+                    "wiki",
+                    ReconcileOutcome::Skipped,
+                    None,
+                    Some(SkipReason::StopIntent),
+                    Some("you stopped it in Alchemy"),
+                ),
+            ],
+        }),
+    };
+    let json = concat!(
+        r#"{"last":{"trigger":"wake","at":1700000000,"#,
+        r#""reason":"was running before the computer slept","apps":["#,
+        r#"{"app":"blog","outcome":"starting","operation":"op1","reason":null,"message":null},"#,
+        r#"{"app":"chat","outcome":"started","operation":"op2","reason":null,"message":null},"#,
+        r#"{"app":"shop","outcome":"failed","operation":"op3","reason":null,"message":"port 80 is taken"},"#,
+        r#"{"app":"wiki","outcome":"skipped","operation":null,"reason":"stop_intent","#,
+        r#""message":"you stopped it in Alchemy"}]}}"#,
+    );
+    assert_wire(&status, json);
+    let event = ApiEvent::Reconcile(status);
+    assert_eq!(event.name(), "reconcile");
+    assert_wire(&event, &format!(r#"{{"event":"reconcile","data":{json}}}"#));
+}
+
+#[test]
+fn reconcile_enums() {
+    use alchemy_api::reconcile::{ReconcileOutcome, ReconcileTrigger, SkipReason};
+    for (trigger, want) in [
+        (ReconcileTrigger::DaemonStart, r#""daemon_start""#),
+        (ReconcileTrigger::Wake, r#""wake""#),
+        (ReconcileTrigger::EngineReturned, r#""engine_returned""#),
+    ] {
+        assert_wire(&trigger, want);
+    }
+    for (reason, want) in [
+        (SkipReason::StopIntent, r#""stop_intent""#),
+        (SkipReason::NotRunningBefore, r#""not_running_before""#),
+        (SkipReason::AlreadyRunning, r#""already_running""#),
+        (SkipReason::PartlyRunning, r#""partly_running""#),
+        (SkipReason::StatusUnknown, r#""status_unknown""#),
+    ] {
+        assert_wire(&reason, want);
+    }
+    for (outcome, want) in [
+        (ReconcileOutcome::Starting, r#""starting""#),
+        (ReconcileOutcome::Started, r#""started""#),
+        (ReconcileOutcome::Failed, r#""failed""#),
+        (ReconcileOutcome::Skipped, r#""skipped""#),
+        (ReconcileOutcome::Other, r#""other""#),
+    ] {
+        assert_wire(&outcome, want);
+    }
+    assert_eq!(
+        serde_json::from_str::<ReconcileOutcome>(r#""retrying""#).unwrap(),
+        ReconcileOutcome::Other
+    );
+}
+
+#[test]
+fn engine_start() {
+    use alchemy_api::engine::{EngineStart, EngineStartResult};
+    assert_wire(
+        &EngineStart {
+            result: EngineStartResult::Starting,
+            message: "Docker Desktop is starting".into(),
+            command: None,
+        },
+        r#"{"result":"starting","message":"Docker Desktop is starting","command":null}"#,
+    );
+    assert_wire(
+        &EngineStart {
+            result: EngineStartResult::Unsupported,
+            message: "m".into(),
+            command: Some("sudo systemctl start docker".into()),
+        },
+        r#"{"result":"unsupported","message":"m","command":"sudo systemctl start docker"}"#,
+    );
+    for (result, want) in [
+        (EngineStartResult::Starting, r#""starting""#),
+        (EngineStartResult::AlreadyRunning, r#""already_running""#),
+        (EngineStartResult::Unsupported, r#""unsupported""#),
+        (EngineStartResult::Other, r#""other""#),
+    ] {
+        assert_wire(&result, want);
+    }
+    assert_eq!(
+        serde_json::from_str::<EngineStartResult>(r#""queued""#).unwrap(),
+        EngineStartResult::Other
+    );
 }
