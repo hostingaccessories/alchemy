@@ -24,6 +24,10 @@
 //! that never serve the API, with the routes [`routing`] plans for it,
 //! and their `.local` names are announced to the LAN through [`mdns`].
 //!
+//! After alchemyd starts, the computer wakes, or Docker returns, the
+//! [`reconcile`] task brings back the apps that were running, and
+//! [`desktop`] starts Docker Desktop when someone asks.
+//!
 //! What needs root, such as port 80 on Linux, is granted through
 //! `alchemy-helper` behind a system prompt by [`privileges`]. A change
 //! that only takes effect at exec makes [`run`] return
@@ -33,6 +37,7 @@
 pub mod apps;
 pub mod auth;
 pub mod compose;
+pub mod desktop;
 pub mod engine;
 pub mod events;
 pub mod guard;
@@ -46,6 +51,7 @@ pub mod operations;
 pub mod ports;
 pub mod privileges;
 pub mod proxy;
+pub mod reconcile;
 pub mod restart;
 pub mod routing;
 mod secure_fs;
@@ -56,7 +62,7 @@ pub mod store;
 pub mod subnets;
 mod web;
 
-pub use state::State;
+pub use state::{EngineLink, State};
 
 use std::future::{Future, IntoFuture as _};
 use std::net::SocketAddr;
@@ -70,6 +76,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::apps::{AppEditor, AppsDeps};
+use crate::desktop::{FakeLauncher, SharedLauncher, SystemLauncher};
 use crate::engine::{EngineMonitor, EngineSource, SystemConnector, SystemProbe};
 use crate::logs::{SharedLogSource, SystemLogs};
 use crate::metrics::{Collector, MetricsSource, SystemMetrics};
@@ -78,6 +85,7 @@ use crate::operations::{OperationRunner, Operations, SystemRunner};
 use crate::ports::PortRegistry;
 use crate::privileges::{PrivilegeDeps, Privileges};
 use crate::proxy::ProxyStatus;
+use crate::reconcile::ReconcileDeps;
 use crate::routing::{ProxyDeps, ProxyHandle};
 use crate::session::{Auth, TokenFile};
 use crate::store::{SharedStore, SqliteStore, StateLock};
@@ -129,6 +137,10 @@ pub struct Deps<E, M = SystemMetrics> {
     /// Where the privileges' facts are read and how the helper is run as
     /// root.
     pub privileges: PrivilegeDeps,
+    /// How Docker Desktop is started when someone asks.
+    pub desktop: SharedLauncher,
+    /// How the reconcile task is tuned.
+    pub reconcile: ReconcileDeps,
 }
 
 /// Why [`run`] returned.
@@ -160,10 +172,13 @@ impl<E> Deps<E> {
     /// [`FakeEngineNetworks`] with none and no `daemon.json`. The proxy
     /// is [`ProxyDeps::loopback`]: app ports on loopback, no Host
     /// listener, and a connector that reaches nothing. Privileges are
-    /// [`PrivilegeDeps::fake`]. Use
+    /// [`PrivilegeDeps::fake`]. Docker Desktop is started through a
+    /// [`FakeLauncher`] that runs nothing, and the reconcile task has its
+    /// default tuning. Use
     /// [`Self::with_apps`], [`Self::with_runner`], [`Self::with_editor`],
     /// [`Self::with_network`], [`Self::with_subnets`],
-    /// [`Self::with_proxy`], and [`Self::with_privileges`] to change them.
+    /// [`Self::with_proxy`], [`Self::with_privileges`],
+    /// [`Self::with_desktop`], and [`Self::with_reconcile`] to change them.
     pub fn new(engine: E) -> Self {
         Self {
             state: State::new(),
@@ -187,6 +202,8 @@ impl<E> Deps<E> {
             ),
             proxy: ProxyDeps::loopback(),
             privileges: PrivilegeDeps::fake(),
+            desktop: Arc::new(FakeLauncher::new()),
+            reconcile: ReconcileDeps::default(),
         }
     }
 }
@@ -206,6 +223,8 @@ impl<E, M> Deps<E, M> {
             subnets: self.subnets,
             proxy: self.proxy,
             privileges: self.privileges,
+            desktop: self.desktop,
+            reconcile: self.reconcile,
         }
     }
 
@@ -264,6 +283,20 @@ impl<E, M> Deps<E, M> {
         self.privileges = privileges;
         self
     }
+
+    /// Start Docker Desktop through `desktop`.
+    #[must_use]
+    pub fn with_desktop(mut self, desktop: SharedLauncher) -> Self {
+        self.desktop = desktop;
+        self
+    }
+
+    /// Tune the reconcile task with `reconcile`.
+    #[must_use]
+    pub fn with_reconcile(mut self, reconcile: ReconcileDeps) -> Self {
+        self.reconcile = reconcile;
+        self
+    }
 }
 
 impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
@@ -278,6 +311,7 @@ impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
             .with_subnets(SubnetsDeps::system())
             .with_proxy(ProxyDeps::system())
             .with_privileges(PrivilegeDeps::system())
+            .with_desktop(Arc::new(SystemLauncher))
     }
 }
 
@@ -305,6 +339,9 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::
 /// Once both listeners are bound, and before either serves a request, a
 /// new TCP token is written to [`alchemy_api::TCP_TOKEN_FILE`] in the
 /// state directory; it is removed again on shutdown.
+///
+/// The [`reconcile`] task starts alongside them, reading the apps last
+/// seen running from the state database.
 ///
 /// Operations a previous daemon left running are marked interrupted at
 /// startup. On shutdown, running operations are interrupted and stored
@@ -363,42 +400,42 @@ pub async fn run_with(
         &store,
         &shutdown_rx,
     ));
-    background.push(privileges_task);
+    background.extend([
+        privileges_task,
+        spawn_reconcile(
+            deps.reconcile,
+            &deps.state,
+            &store,
+            &operations,
+            &shutdown_rx,
+        ),
+    ]);
+    let handlers = |router| with_handlers(router, &deps.editor, &ports, &privileges, &deps.desktop);
     let socket_task = serve(
         socket_listener,
-        with_handlers(
-            http::api_router(
-                deps.state.clone(),
-                store.clone(),
-                shutdown_rx.clone(),
-                deps.logs.clone(),
-                operations.clone(),
-                auth.clone(),
-            ),
-            &deps.editor,
-            &ports,
-            &privileges,
-        ),
+        handlers(http::api_router(
+            deps.state.clone(),
+            store.clone(),
+            shutdown_rx.clone(),
+            deps.logs.clone(),
+            operations.clone(),
+            auth.clone(),
+        )),
         &shutdown_rx,
     );
     let http_task = serve(
         http_listener,
-        with_handlers(
-            http::router(
-                deps.state,
-                store,
-                http::Tcp {
-                    listen: listen.ip(),
-                    auth,
-                },
-                shutdown_rx.clone(),
-                deps.logs,
-                operations.clone(),
-            ),
-            &deps.editor,
-            &ports,
-            &privileges,
-        ),
+        handlers(http::router(
+            deps.state,
+            store,
+            http::Tcp {
+                listen: listen.ip(),
+                auth,
+            },
+            shutdown_rx.clone(),
+            deps.logs,
+            operations.clone(),
+        )),
         &shutdown_rx,
     );
 
@@ -485,6 +522,25 @@ fn spawn_privileges(
     (privileges, ("privileges", task))
 }
 
+/// Start the [`reconcile`] task, tuned by `deps`, starting apps through
+/// `operations`, with its name.
+fn spawn_reconcile(
+    deps: ReconcileDeps,
+    state: &State,
+    store: &SharedStore,
+    operations: &Operations,
+    shutdown: &watch::Receiver<bool>,
+) -> (&'static str, JoinHandle<()>) {
+    let task = reconcile::run(
+        deps,
+        state.clone(),
+        store.clone(),
+        operations.clone(),
+        shutdown.clone(),
+    );
+    ("reconcile", tokio::spawn(task))
+}
+
 /// Serve `router` on `listener` until `shutdown` becomes `true`, letting
 /// requests in flight finish.
 fn serve<L>(
@@ -503,17 +559,21 @@ where
     )
 }
 
-/// Give `router` the app editor, the port registry, and the privileges
-/// its routes use.
+/// Give `router` the app editor, the port registry, the privileges, and
+/// the Docker Desktop launcher its routes use.
 fn with_handlers(
     router: axum::Router,
     editor: &Arc<AppEditor>,
     ports: &PortRegistry,
     privileges: &Privileges,
+    desktop: &SharedLauncher,
 ) -> axum::Router {
-    http::with_privileges(
-        http::with_ports(http::with_editor(router, editor.clone()), ports.clone()),
-        privileges.clone(),
+    http::with_desktop(
+        http::with_privileges(
+            http::with_ports(http::with_editor(router, editor.clone()), ports.clone()),
+            privileges.clone(),
+        ),
+        desktop.clone(),
     )
 }
 

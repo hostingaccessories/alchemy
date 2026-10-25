@@ -80,6 +80,13 @@ pub const MIGRATIONS: &[Migration] = &[
           ) STRICT;
           CREATE INDEX port_reservations_by_owner ON port_reservations (owner);",
     },
+    Migration {
+        version: 6,
+        name: "last_seen",
+        sql: "CREATE TABLE last_seen (
+            app TEXT PRIMARY KEY NOT NULL
+          ) STRICT;",
+    },
 ];
 
 /// The schema version this build migrates databases to.

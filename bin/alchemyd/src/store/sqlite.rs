@@ -245,6 +245,30 @@ impl Store for SqliteStore {
         })
     }
 
+    fn last_seen(&self) -> BoxFuture<'_, Result<Vec<String>, StoreError>> {
+        Box::pin(self.call(|conn| {
+            let mut stmt = conn.prepare("SELECT app FROM last_seen ORDER BY app")?;
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<String>, _>>()
+        }))
+    }
+
+    fn set_last_seen<'a>(
+        &'a self,
+        app: &'a str,
+        running: bool,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        let app = app.to_owned();
+        Box::pin(self.call(move |conn| {
+            let sql = if running {
+                "INSERT INTO last_seen (app) VALUES (?1) ON CONFLICT (app) DO NOTHING"
+            } else {
+                "DELETE FROM last_seen WHERE app = ?1"
+            };
+            conn.execute(sql, [app]).map(drop)
+        }))
+    }
+
     fn put_operation_row(&self, row: OperationRow) -> BoxFuture<'_, Result<(), StoreError>> {
         Box::pin(self.call(move |conn| {
             conn.execute(

@@ -26,6 +26,7 @@
 //! [`Privileges`] that [`with_privileges`] adds.
 
 mod app_files;
+mod lifecycle;
 mod ports;
 mod privileges;
 
@@ -63,6 +64,7 @@ use tower_http::cors::CorsLayer;
 use crate::State;
 use crate::apps::{self, AppEditor, settings};
 use crate::auth::{LAUNCH_PATH, LOGIN_PATH};
+use crate::desktop::SharedLauncher;
 use crate::events::{self, Topic};
 use crate::guard::{self, Refusal, TAURI_ORIGINS};
 use crate::logs::{self, LogQuery, LogsRefusal, SharedLogSource};
@@ -247,6 +249,12 @@ pub fn with_privileges(router: Router, privileges: Privileges) -> Router {
     router.layer(Extension(privileges))
 }
 
+/// Give `router`'s `POST /api/engine/start` route `launcher` to start
+/// Docker Desktop with.
+pub fn with_desktop(router: Router, launcher: SharedLauncher) -> Router {
+    router.layer(Extension(launcher))
+}
+
 /// Wrap `routes` the way the Unix socket serves them: the content-type
 /// check alone, since no browser can reach the socket.
 pub fn socket_checks(routes: Router) -> Router {
@@ -269,6 +277,8 @@ fn api(
         .route("/session", get(session))
         .route(LAUNCH_PATH, post(launch))
         .route("/engine", get(engine))
+        .route("/engine/start", post(lifecycle::start_engine))
+        .route("/reconcile", get(lifecycle::reconcile))
         .route("/events", get(events))
         .route("/metrics", get(metrics))
         .route("/metrics/history", get(metrics_history))

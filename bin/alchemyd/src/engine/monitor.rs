@@ -194,7 +194,9 @@ where
         }
         state.set_engine_facts(Some(engine_facts(version.as_ref(), &info, self.os)));
         publish_engine(state, status);
-        follow(&api, state).await
+        let outcome = follow(&api, state).await;
+        state.engine_lost();
+        outcome
     }
 }
 
@@ -227,7 +229,9 @@ where
 ///
 /// The event stream is polled before the listing so its request goes out
 /// first; events that arrive during the listing are buffered and applied
-/// on top of it, so nothing between the two is lost.
+/// on top of it, so nothing between the two is lost. Once they are in
+/// [`State::containers`], [`State::engine_listed`] says so; the caller
+/// marks the link lost when this returns.
 ///
 /// A listing says a container stopped but not how. Compose containers
 /// stopped with no exit known yet are inspected alongside the events, a
@@ -275,6 +279,7 @@ async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
                 containers.apply(event) | changed
             })
     });
+    state.engine_listed();
 
     let mut inspections = futures_util::stream::iter(state.containers().needs_inspect())
         .map(|id| async move {
@@ -426,6 +431,7 @@ fn publish_engine(state: &State, status: EngineStatus) {
 
 /// Containers are only known while the engine is ready.
 fn publish_not_ready(state: &State, status: EngineStatus) {
+    state.engine_lost();
     state.update_containers(|containers| containers.replace_all([]));
     state.set_engine_facts(None);
     publish_engine(state, status);

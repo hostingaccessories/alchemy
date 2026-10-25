@@ -10,6 +10,7 @@ use alchemy_api::OperationList;
 use alchemy_api::apps::{AppList, AppSettings};
 use alchemy_api::network::{NetworkReport, NetworkSettings};
 use alchemy_api::privileges::PrivilegeList;
+use alchemy_api::reconcile::ReconcileStatus;
 use alchemy_core::engine::{Containers, EngineState, EngineStatus};
 use alchemy_core::route::EngineFacts;
 use tokio::sync::watch;
@@ -47,7 +48,25 @@ struct Inner {
     mdns: watch::Sender<MdnsStatus>,
     routing: watch::Sender<Routing>,
     privileges: watch::Sender<PrivilegeList>,
+    engine_link: watch::Sender<EngineLink>,
+    wakes: watch::Sender<u64>,
+    reconcile: watch::Sender<ReconcileStatus>,
     log_streams: LogStreams,
+}
+
+/// Whether the engine monitor's containers can be trusted: which
+/// connection to the engine this is, and whether its first listing is in
+/// [`State::containers`].
+///
+/// `connection` rises each time a connection's first listing lands, so
+/// the first is 1. `listed` goes back to `false` when that connection
+/// ends, such as when Docker quits or its event stream breaks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineLink {
+    /// The current or last connection, counting from 1, or 0 before any.
+    pub connection: u64,
+    /// Whether that connection is up and has listed every container.
+    pub listed: bool,
 }
 
 impl State {
@@ -79,6 +98,9 @@ impl State {
                 mdns: watch::Sender::new(MdnsStatus::default()),
                 routing: watch::Sender::new(Routing::default()),
                 privileges: watch::Sender::new(PrivilegeList::default()),
+                engine_link: watch::Sender::new(EngineLink::default()),
+                wakes: watch::Sender::new(0),
+                reconcile: watch::Sender::new(ReconcileStatus::default()),
                 log_streams: LogStreams::default(),
             }),
         }
@@ -382,6 +404,74 @@ impl State {
         send_if_changed(&self.inner.privileges, privileges)
     }
 
+    /// Whether the engine's containers are listed, and on which
+    /// connection.
+    pub fn engine_link(&self) -> EngineLink {
+        *self.inner.engine_link.borrow()
+    }
+
+    /// Subscribe to changes to [`Self::engine_link`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_engine_link(&self) -> watch::Receiver<EngineLink> {
+        self.inner.engine_link.subscribe()
+    }
+
+    /// Record that a new connection to the engine has put its first
+    /// listing in [`Self::containers`]. Call it after the listing.
+    pub fn engine_listed(&self) {
+        self.inner.engine_link.send_modify(|link| {
+            link.connection = link.connection.saturating_add(1);
+            link.listed = true;
+        });
+    }
+
+    /// Record that the engine connection ended, or that the engine isn't
+    /// ready. Returns whether a listed connection ended.
+    pub fn engine_lost(&self) -> bool {
+        self.inner.engine_link.send_if_modified(|link| {
+            let was = link.listed;
+            link.listed = false;
+            was
+        })
+    }
+
+    /// How many wakes from sleep have been noticed since alchemyd started.
+    pub fn wakes(&self) -> u64 {
+        *self.inner.wakes.borrow()
+    }
+
+    /// Subscribe to [`Self::woke`], by count.
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_wakes(&self) -> watch::Receiver<u64> {
+        self.inner.wakes.subscribe()
+    }
+
+    /// Record that the computer woke from sleep. The reconcile task
+    /// brings back what was running, once the engine is listed.
+    pub fn woke(&self) {
+        self.inner.wakes.send_modify(|n| *n = n.saturating_add(1));
+    }
+
+    /// The last reconcile, and how each app it started is doing.
+    pub fn reconcile(&self) -> ReconcileStatus {
+        self.inner.reconcile.borrow().clone()
+    }
+
+    /// Subscribe to changes to [`Self::reconcile`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_reconcile(&self) -> watch::Receiver<ReconcileStatus> {
+        self.inner.reconcile.subscribe()
+    }
+
+    /// Replace the last reconcile. Returns whether it changed;
+    /// subscribers are only notified if it did.
+    pub fn set_reconcile(&self, reconcile: ReconcileStatus) -> bool {
+        send_if_changed(&self.inner.reconcile, reconcile)
+    }
+
     /// The log streams open on either listener, held to
     /// [`MAX_STREAMS`](crate::logs::MAX_STREAMS). Unlike the parts above,
     /// it is a count to take a place in, not a value to watch.
@@ -532,6 +622,43 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn engine_link_counts_connections_and_notes_losses() {
+        let state = State::new();
+        let rx = state.watch_engine_link();
+        assert!(!state.engine_lost());
+        assert!(!rx.has_changed().unwrap());
+        state.engine_listed();
+        assert_eq!(
+            state.engine_link(),
+            EngineLink {
+                connection: 1,
+                listed: true
+            }
+        );
+        assert!(state.engine_lost());
+        assert!(!state.engine_lost());
+        state.engine_listed();
+        assert_eq!(
+            state.engine_link(),
+            EngineLink {
+                connection: 2,
+                listed: true
+            }
+        );
+    }
+
+    #[test]
+    fn wakes_count_up() {
+        let state = State::new();
+        let mut rx = state.watch_wakes();
+        state.woke();
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow_and_update(), 1);
+        state.woke();
+        assert_eq!(state.wakes(), 2);
     }
 
     #[test]

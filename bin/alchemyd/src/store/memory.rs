@@ -1,6 +1,6 @@
 //! An in-memory [`Store`] for tests.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use alchemy_core::engine::Intent;
@@ -14,6 +14,7 @@ pub struct MemoryStore {
     settings: Mutex<BTreeMap<String, serde_json::Value>>,
     metrics: Mutex<BTreeMap<(i64, i64), String>>,
     intents: Mutex<BTreeMap<String, Intent>>,
+    last_seen: Mutex<BTreeSet<String>>,
     operations: Mutex<BTreeMap<String, OperationRow>>,
     reservations: Mutex<BTreeMap<ReservationKey, PortReservation>>,
 }
@@ -40,6 +41,12 @@ impl MemoryStore {
 
     fn intent_map(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Intent>> {
         self.intents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn last_seen_set(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+        self.last_seen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -169,6 +176,26 @@ impl Store for MemoryStore {
                 .iter()
                 .map(|(project, intent)| (project.clone(), *intent))
                 .collect())
+        })
+    }
+
+    fn last_seen(&self) -> BoxFuture<'_, Result<Vec<String>, StoreError>> {
+        Box::pin(async move { Ok(self.last_seen_set().iter().cloned().collect()) })
+    }
+
+    fn set_last_seen<'a>(
+        &'a self,
+        app: &'a str,
+        running: bool,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            let mut set = self.last_seen_set();
+            if running {
+                set.insert(app.to_owned());
+            } else {
+                set.remove(app);
+            }
+            Ok(())
         })
     }
 

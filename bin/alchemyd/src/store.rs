@@ -1,5 +1,5 @@
-//! Persistent daemon state: settings, metrics history, stop intent, and
-//! operation history.
+//! Persistent daemon state: settings, metrics history, stop intent,
+//! operation history, and the apps last seen running.
 //!
 //! Everything goes through the [`Store`] trait. The daemon runs on
 //! [`SqliteStore`], a SQLite database in the per-user state directory
@@ -97,6 +97,18 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// Every stored intent, by project name. A row whose action this
     /// build does not know is left out.
     fn intents(&self) -> BoxFuture<'_, Result<Vec<(String, Intent)>, StoreError>>;
+
+    /// The apps that were running when last seen, by name, for
+    /// [`LastSeen`](alchemy_core::lifecycle::LastSeen).
+    fn last_seen(&self) -> BoxFuture<'_, Result<Vec<String>, StoreError>>;
+
+    /// Add `app` to the apps last seen running, or remove it when
+    /// `running` is false. Either is harmless to repeat.
+    fn set_last_seen<'a>(
+        &'a self,
+        app: &'a str,
+        running: bool,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Store `row`, replacing any operation stored with the same id.
     fn put_operation_row(&self, row: OperationRow) -> BoxFuture<'_, Result<(), StoreError>>;
@@ -544,6 +556,32 @@ mod tests {
             store.intents().await.unwrap(),
             [("blog".to_owned(), down), ("shop".to_owned(), up)]
         );
+    }
+
+    /// Every store keeps a set of names, each once.
+    async fn last_seen_behaves(store: SharedStore) {
+        assert_eq!(store.last_seen().await.unwrap(), Vec::<String>::new());
+        store.set_last_seen("shop", true).await.unwrap();
+        store.set_last_seen("blog", true).await.unwrap();
+        store.set_last_seen("blog", true).await.unwrap();
+        store.set_last_seen("wiki", false).await.unwrap();
+        assert_eq!(store.last_seen().await.unwrap(), ["blog", "shop"]);
+        store.set_last_seen("shop", false).await.unwrap();
+        store.set_last_seen("shop", false).await.unwrap();
+        assert_eq!(store.last_seen().await.unwrap(), ["blog"]);
+    }
+
+    #[tokio::test]
+    async fn memory_store_last_seen() {
+        last_seen_behaves(Arc::new(MemoryStore::new())).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_last_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        last_seen_behaves(Arc::new(SqliteStore::open(tmp.path()).await.unwrap())).await;
+        let reopened: SharedStore = Arc::new(SqliteStore::open(tmp.path()).await.unwrap());
+        assert_eq!(reopened.last_seen().await.unwrap(), ["blog"]);
     }
 
     #[tokio::test]
