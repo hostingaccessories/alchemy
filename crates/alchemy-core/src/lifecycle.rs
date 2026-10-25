@@ -38,7 +38,8 @@ pub use reconcile::{
 pub use service_file::{
     DESKTOP_BUNDLE_ID, LAUNCH_AGENT_LABEL, LOG_DIR, LOG_FILE, SYSTEM_LOG_DIR, SYSTEMD_USER_UNIT,
     ServiceFileError, TransientInstall, launch_agent_path, launch_agent_plist, log_path,
-    system_log_path, systemd_user_unit, systemd_user_unit_path, transient_install,
+    system_log_path, system_service_path, systemd_user_unit, systemd_user_unit_path,
+    transient_install, user_service_path,
 };
 pub use supervisor::{
     ServiceCall, Supervisor, service_call, supervisor_from_cgroup, supervisor_from_launchd,

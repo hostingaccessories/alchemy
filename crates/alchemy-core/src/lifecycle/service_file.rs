@@ -12,6 +12,8 @@ use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::route::HostOs;
+
 /// The launch agent's label. The system service's launch daemon is
 /// `computer.alchemy.alchemyd.<uid>`, so the two never collide.
 pub const LAUNCH_AGENT_LABEL: &str = "computer.alchemy.alchemyd";
@@ -77,6 +79,27 @@ pub fn systemd_user_unit_path(xdg_config_home: Option<&Path>, home: &Path) -> Pa
         .map_or_else(|| home.join(".config"), Path::to_path_buf)
         .join("systemd/user")
         .join(SYSTEMD_USER_UNIT)
+}
+
+/// The per-user service file on `os` for the user with `home`: the
+/// launch agent on macOS, the `systemd --user` unit on Linux.
+pub fn user_service_path(os: HostOs, xdg_config_home: Option<&Path>, home: &Path) -> PathBuf {
+    match os {
+        HostOs::MacOs => launch_agent_path(home),
+        HostOs::Linux => systemd_user_unit_path(xdg_config_home, home),
+    }
+}
+
+/// The system service file `alchemy-helper install-service --uid <uid>`
+/// writes on `os`: a systemd system unit on Linux, a launch daemon on
+/// macOS. Its existence is what "installed" means.
+pub fn system_service_path(os: HostOs, uid: u32) -> PathBuf {
+    match os {
+        HostOs::Linux => PathBuf::from(format!("/etc/systemd/system/alchemyd-{uid}.service")),
+        HostOs::MacOs => PathBuf::from(format!(
+            "/Library/LaunchDaemons/{LAUNCH_AGENT_LABEL}.{uid}.plist"
+        )),
+    }
 }
 
 /// The macOS log file for the user with `home`.
@@ -528,6 +551,35 @@ WantedBy=default.target
                 systemd_user_unit_path(xdg.map(Path::new), home),
                 PathBuf::from(want),
                 "{xdg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_paths_per_os() {
+        let xdg = Some(Path::new("/xdg/config"));
+        let cases = [
+            (
+                HostOs::MacOs,
+                "/Users/jo/Library/LaunchAgents/computer.alchemy.alchemyd.plist",
+                "/Library/LaunchDaemons/computer.alchemy.alchemyd.501.plist",
+            ),
+            (
+                HostOs::Linux,
+                "/xdg/config/systemd/user/alchemyd.service",
+                "/etc/systemd/system/alchemyd-501.service",
+            ),
+        ];
+        for (os, user, system) in cases {
+            assert_eq!(
+                user_service_path(os, xdg, Path::new("/Users/jo")),
+                PathBuf::from(user),
+                "{os:?}"
+            );
+            assert_eq!(
+                system_service_path(os, 501),
+                PathBuf::from(system),
+                "{os:?}"
             );
         }
     }
