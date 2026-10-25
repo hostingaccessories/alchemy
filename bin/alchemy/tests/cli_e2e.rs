@@ -216,8 +216,16 @@ async fn status_reports_the_daemon_and_docker() {
         ],
         "{out}"
     );
-    assert!(lines[2].starts_with("Local names (mDNS): "), "{out}");
-    assert_eq!(lines.len(), 3, "{out}");
+    assert_eq!(
+        lines[2..4],
+        [
+            "Autostart: off (alchemyd starts only when you run it)",
+            "Logs: the terminal alchemyd was started from",
+        ],
+        "{out}"
+    );
+    assert!(lines[4].starts_with("Local names (mDNS): "), "{out}");
+    assert_eq!(lines.len(), 5, "{out}");
 
     daemon
         .state
