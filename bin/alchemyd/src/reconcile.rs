@@ -7,6 +7,8 @@
 //! - every app's status from [`State::apps`] while the engine's
 //!   containers are listed ([`State::engine_link`]), with each change to
 //!   the set stored, so it survives a reboot;
+//! - each app that no longer exists, which is [forgotten](LastSeen::forget)
+//!   so a new app with its name is not started as if it had been running;
 //! - a disruption when the engine connection ends, the computer wakes
 //!   ([`State::woke`]), or alchemyd stops;
 //! - a trigger: `daemon_start` for the first listed connection,
@@ -21,10 +23,10 @@
 //! is in [`State::reconcile`], and each started app's outcome follows its
 //! operation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alchemy_api::apps::App;
+use alchemy_api::apps::{App, AppDirState, AppList};
 use alchemy_api::reconcile::{Reconcile, ReconcileApp, ReconcileOutcome, ReconcileStatus};
 use alchemy_core::StackName;
 use alchemy_core::engine::{Containers, EngineState, Intent};
@@ -142,6 +144,7 @@ struct Task {
     connection: u64,
     linked: bool,
     pending: Option<ReconcileTrigger>,
+    roots: BTreeMap<StackName, String>,
 }
 
 impl Task {
@@ -171,6 +174,7 @@ impl Task {
             connection: 0,
             linked: false,
             pending: None,
+            roots: BTreeMap::new(),
         }
     }
 
@@ -210,15 +214,25 @@ impl Task {
         self.trigger(ReconcileTrigger::Wake);
     }
 
-    /// Note every app's status, while the engine's containers are listed.
+    /// Forget the apps that no longer exist, then note every app's
+    /// status, while the engine's containers are listed.
     async fn observe(&mut self) {
+        let list = self.state.apps();
+        let forgotten: Vec<LastSeenChange> = gone(self.seen.running(), &list, &self.roots)
+            .iter()
+            .filter_map(|app| self.seen.forget(app))
+            .collect();
+        self.persist(forgotten).await;
+        self.roots.extend(
+            list.apps
+                .iter()
+                .map(|app| (app.name.clone(), app.root.clone())),
+        );
         if !self.linked || self.state.engine().state != EngineState::Ready {
             return;
         }
         let now = self.now();
-        let changes: Vec<LastSeenChange> = self
-            .state
-            .apps()
+        let changes: Vec<LastSeenChange> = list
             .apps
             .iter()
             .filter_map(|app| self.seen.observe(&app.name, app.status, now))
@@ -304,6 +318,37 @@ impl Task {
             self.state.set_reconcile(status);
         }
     }
+}
+
+/// The apps in `running` that no longer exist in `list`, given the folder
+/// each app was last found in, by name, in `roots`.
+///
+/// An app is gone when its folder is no longer searched, or was read and
+/// no longer holds it. One whose folder couldn't be read, such as a
+/// drive that isn't mounted, is kept. One never seen this run, as after a
+/// restart, is gone only when every folder was read. Nothing is gone
+/// before the folders are listed.
+fn gone(
+    running: &BTreeSet<StackName>,
+    list: &AppList,
+    roots: &BTreeMap<StackName, String>,
+) -> Vec<StackName> {
+    if list.dirs.is_empty() {
+        return Vec::new();
+    }
+    let read = |path: &str| {
+        list.dirs
+            .iter()
+            .find(|dir| dir.path == path)
+            .is_none_or(|dir| dir.state == AppDirState::Ok)
+    };
+    let all_read = list.dirs.iter().all(|dir| dir.state == AppDirState::Ok);
+    running
+        .iter()
+        .filter(|name| !list.apps.iter().any(|app| &app.name == *name))
+        .filter(|name| roots.get(*name).map_or(all_read, |root| read(root)))
+        .cloned()
+        .collect()
 }
 
 /// Alchemy's last intent for each app, by name, from its Compose
@@ -453,6 +498,68 @@ mod tests {
                     },
                 },
             ],
+        }
+    }
+
+    fn dir(path: &str, state: AppDirState) -> alchemy_api::apps::AppDir {
+        alchemy_api::apps::AppDir {
+            path: path.into(),
+            home: false,
+            state,
+            message: None,
+            skipped: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn finds_apps_that_are_gone() {
+        use AppDirState::{Missing, Ok, Unreadable};
+        type Case = (&'static str, Vec<(&'static str, AppDirState)>, bool, bool);
+        let blog = name("blog");
+        let roots = BTreeMap::from([(blog.clone(), "/apps".to_owned())]);
+        let none = BTreeMap::new();
+        let cases: [Case; 7] = [
+            ("its folder was read", vec![("/apps", Ok)], true, true),
+            (
+                "its folder is no longer searched",
+                vec![("/other", Ok)],
+                true,
+                true,
+            ),
+            (
+                "its folder can't be read",
+                vec![("/apps", Unreadable)],
+                true,
+                false,
+            ),
+            (
+                "its folder went missing",
+                vec![("/apps", Missing)],
+                true,
+                false,
+            ),
+            (
+                "not seen this run, all read",
+                vec![("/apps", Ok)],
+                false,
+                true,
+            ),
+            (
+                "not seen this run, one unread",
+                vec![("/apps", Ok), ("/usb", Missing)],
+                false,
+                false,
+            ),
+            ("nothing listed yet", vec![], true, false),
+        ];
+        for (what, dirs, known, want) in cases {
+            let list = AppList {
+                dirs: dirs.into_iter().map(|(p, s)| dir(p, s)).collect(),
+                ..AppList::default()
+            };
+            let running = BTreeSet::from([blog.clone()]);
+            let got = gone(&running, &list, if known { &roots } else { &none });
+            assert_eq!(got.contains(&blog), want, "{what}");
         }
     }
 

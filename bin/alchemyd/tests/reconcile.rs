@@ -196,23 +196,31 @@ struct Daemon {
     task: tokio::task::JoinHandle<anyhow::Result<alchemyd::Stopped>>,
 }
 
-fn write_apps(root: &Path) -> FakeComposeConfig {
+/// Write the folders of `present`, and tell Compose about every app.
+fn write_apps(root: &Path, present: &[&str]) -> FakeComposeConfig {
     let apps = root.join("apps");
     let config = FakeComposeConfig::new();
     for name in APPS {
-        std::fs::create_dir_all(apps.join(name)).unwrap();
-        std::fs::write(
-            apps.join(name).join("compose.yaml"),
-            "services:\n  web:\n    image: nginx\n",
-        )
-        .unwrap();
+        if present.contains(&name) {
+            recreate(root, name);
+        }
         config.project(apps.join(name), name, &["web"]);
     }
     config
 }
 
 async fn start(root: &Path, runner: &FakeComposeRunner, launcher: Arc<FakeLauncher>) -> Daemon {
-    let config = write_apps(root);
+    start_with(root, runner, launcher, &APPS).await
+}
+
+/// A daemon over the app folders in `present` alone.
+async fn start_with(
+    root: &Path,
+    runner: &FakeComposeRunner,
+    launcher: Arc<FakeLauncher>,
+    present: &[&str],
+) -> Daemon {
+    let config = write_apps(root, present);
     let socket = root.join("alchemyd.sock");
     let mut deps = Deps::new(DrivenEngine)
         .with_apps(
@@ -240,7 +248,7 @@ async fn start(root: &Path, runner: &FakeComposeRunner, launcher: Arc<FakeLaunch
             let _ = stop_rx.await;
         },
     ));
-    for app in APPS {
+    for app in present {
         until(
             &socket,
             &format!("/api/apps/{app}"),
@@ -460,4 +468,121 @@ async fn a_missing_docker_desktop_is_unsupported() {
     assert_eq!(body["code"], "unsupported");
     assert_eq!(body["error"], "Docker Desktop isn't installed");
     daemon.stop().await;
+}
+
+async fn until_missing(socket: &Path, app: &str) {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while call(socket, "GET", &format!("/api/apps/{app}"), "").await.0 != 404 {
+        assert!(tokio::time::Instant::now() < deadline, "{app} never went");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn recreate(root: &Path, app: &str) {
+    let dir = root.join("apps").join(app);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("compose.yaml"),
+        "services:\n  web:\n    image: nginx\n",
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn an_app_deleted_while_docker_was_away_is_forgotten() {
+    let (_dir, root) = tempdir();
+    let runner = FakeComposeRunner::new();
+    let daemon = start(&root, &runner, Arc::new(FakeLauncher::new())).await;
+    connect_engine(&daemon.state, &["blog"]);
+    until(
+        &daemon.socket,
+        "/api/reconcile",
+        "the first reconcile",
+        |b| b["last"]["trigger"] == "daemon_start",
+    )
+    .await;
+
+    lose_engine(&daemon.state);
+    std::fs::remove_dir_all(root.join("apps/blog")).unwrap();
+    until_missing(&daemon.socket, "blog").await;
+    connect_engine(&daemon.state, &[]);
+    until(&daemon.socket, "/api/reconcile", "Docker returning", |b| {
+        b["last"]["trigger"] == "engine_returned"
+    })
+    .await;
+
+    recreate(&root, "blog");
+    until(&daemon.socket, "/api/apps/blog", "the new blog read", |b| {
+        b["project"].is_string()
+    })
+    .await;
+    daemon.state.woke();
+    let body = until(
+        &daemon.socket,
+        "/api/reconcile",
+        "the wake reconcile",
+        |b| b["last"]["trigger"] == "wake",
+    )
+    .await;
+    assert_eq!(
+        outcome(&body, "blog")["reason"],
+        "not_running_before",
+        "{body}"
+    );
+    assert_eq!(ups(&runner), [] as [String; 0]);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn an_app_deleted_while_alchemyd_was_stopped_is_forgotten() {
+    let (_dir, root) = tempdir();
+    let runner = FakeComposeRunner::new();
+    let first = start(&root, &runner, Arc::new(FakeLauncher::new())).await;
+    connect_engine(&first.state, &["blog"]);
+    until(
+        &first.socket,
+        "/api/reconcile",
+        "the first reconcile",
+        |b| !b["last"].is_null(),
+    )
+    .await;
+    first.stop().await;
+
+    std::fs::remove_dir_all(root.join("apps/blog")).unwrap();
+    let second = start_with(
+        &root,
+        &runner,
+        Arc::new(FakeLauncher::new()),
+        &["shop", "wiki"],
+    )
+    .await;
+    connect_engine(&second.state, &[]);
+    until(
+        &second.socket,
+        "/api/reconcile",
+        "the restart reconcile",
+        |b| b["last"]["trigger"] == "daemon_start",
+    )
+    .await;
+
+    recreate(&root, "blog");
+    until(&second.socket, "/api/apps/blog", "the new blog read", |b| {
+        b["project"].is_string()
+    })
+    .await;
+    second.state.woke();
+    let body = until(
+        &second.socket,
+        "/api/reconcile",
+        "the wake reconcile",
+        |b| b["last"]["trigger"] == "wake",
+    )
+    .await;
+    assert_eq!(
+        outcome(&body, "blog")["reason"],
+        "not_running_before",
+        "{body}"
+    );
+    assert_eq!(ups(&runner), [] as [String; 0]);
+    second.stop().await;
 }
