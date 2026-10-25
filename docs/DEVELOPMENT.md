@@ -292,7 +292,12 @@ at once and the `engine` event reports the rest:
 
 The web UI's Docker Desktop notice has **Start Docker Desktop**, with its
 progress until Docker is ready and "Docker Desktop hasn't started yet"
-after two minutes. Tests use `FakeLauncher` (`Deps::new` has it), so no
+after two minutes. `alchemy machine docker start` asks the same and
+follows the `engine` event until Docker is ready, for up to 3 minutes
+(`--no-wait` returns once it is starting). It prints "Docker is running"
+when it already was. An `unsupported` answer, or no ready engine in time,
+exits 1 with kind `docker_not_started`, and the hint gives the
+`systemctl` command when there is one. Tests use `FakeLauncher` (`Deps::new` has it), so no
 test starts Docker.
 
 The engine tests use fakes and run without Docker; the few that need the
@@ -1143,6 +1148,25 @@ notification. Linux runs `daemon-reload`, `enable`, then `start`, or
 `restart` when the file changed under a running unit, keeping
 `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` for `systemctl --user`.
 
+`alchemy machine autostart` prints the mode, the modes it can be, what
+runs alchemyd, where it logs, and why any mode isn't available;
+`alchemy machine autostart off|login|boot` switches. Switching to or
+from `boot` follows the same path as `alchemy machine privileges grant`:
+it waits for the system prompt, or runs the `sudo` command on a terminal
+and puts the request again, or, without a terminal, prints the command
+and exits 3. A switch that hands over prints which service takes over
+(and with `off` from inside the per-user service, that alchemyd
+stopped). A cancelled or refused prompt, or a failed switch, exits 1
+with kind `autostart_failed`. `alchemy status` prints `Autostart:` and
+`Logs:` lines too.
+
+When the CLI finds no alchemyd at the default sockets, its hint depends
+on which service files are on disk, read without alchemyd
+(`alchemy_core::lifecycle` gives each OS's paths): with none, it says to
+run `alchemyd` and suggests `alchemy machine autostart login`; with one,
+it says alchemyd is set to start at login or at boot but isn't
+answering, and where its logs are.
+
 `alchemyd service install [--start]` and `alchemyd service remove` do
 the same for the per-user service from the command line, for the
 binary's own canonical path. They print one line and exit 0, or print
@@ -1249,7 +1273,13 @@ seconds), `reason`, and `apps`, each with an `outcome` of `starting`,
 and a `message` for people. `failed` with no `operation` means the start
 was refused (Docker gone, a conflict). The web UI shows it as a notice on
 Apps: what came back, what didn't and why, with **Copy report** and
-**Dismiss**, and nothing when nothing needs a look.
+**Dismiss**, and nothing when nothing needs a look. `alchemy status`
+prints it under a heading such as `Recovery after the computer woke, 3
+minutes ago:`, one line per app it started, is starting, couldn't start
+(`wiki: didn't come back: port 8080 is already in use`), or left down
+for a reason worth knowing; apps that weren't running before or already
+were are left out, and a reconcile with nothing to do prints `nothing
+needed starting`.
 
 To see it, run a few apps, stop one with `alchemy app stop` and one with
 `docker compose stop`, wait 20 seconds, then restart alchemyd after

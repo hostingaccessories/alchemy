@@ -504,6 +504,9 @@ never starts Docker on its own; it waits for you to ask.
   sudo systemctl start docker
   ```
 
+From a terminal, `alchemy machine docker start` starts Docker Desktop and
+waits until Docker is ready, or prints the command for Docker Engine.
+
 To have Docker Desktop start by itself, turn on **Start Docker Desktop
 when you sign in to your computer** in Docker Desktop's settings, under
 **General**.
@@ -535,6 +538,10 @@ hides it until the next time. When everything was still running, as
 after a short sleep, it says nothing. An app Alchemy started this way
 says so in its progress: "Alchemy did this on its own, because blog was
 running before the computer slept."
+
+`alchemy status` shows the same, under a line such as `Recovery after the
+computer woke, 3 minutes ago:`, with one line for each app that came back
+or didn't, and why.
 
 A few things to know:
 
@@ -612,8 +619,24 @@ addresses won't work. You can change it later in System Settings under
 your last session. For a server nobody signs in to, choose **Start when
 this machine starts**.
 
-**Without the web UI,** on a server, the daemon installs its own sign-in
-service from a terminal, with no password:
+**From a terminal,** the CLI does the same:
+
+```sh
+alchemy machine autostart          # the current choice, and where the log is
+alchemy machine autostart login    # start when you sign in
+alchemy machine autostart boot     # start when this machine starts
+alchemy machine autostart off      # don't start on its own
+```
+
+For `boot`, and for leaving it, it asks for your password the same way as
+`alchemy machine privileges grant`: through the system prompt, or by
+running the `sudo` command right there in the terminal. `alchemy status`
+also shows the choice and where the log is. If Alchemy is set to start on
+its own but isn't answering, `alchemy status` says so and tells you which
+log to read.
+
+With no `alchemyd` running at all, the daemon can install its own
+sign-in service, with no password:
 
 ```sh
 alchemyd service install --start   # start it now, and at every sign-in
