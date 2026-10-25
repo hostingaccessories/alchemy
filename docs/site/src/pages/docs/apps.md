@@ -347,11 +347,11 @@ computer need one, and Alchemy asks first, every time, with the system's
 own password prompt. Each one can be undone. They are listed under
 **Privileges** on the **Machines** page:
 
-| Change             | What it does                                                                               | When you see it                                  |
-| ------------------ | ------------------------------------------------------------------------------------------ | ------------------------------------------------ |
-| **Port 80**        | Lets Alchemy use port 80, so apps open at `http://photos.local` with no port number.       | Linux only; a Mac doesn't need it                |
-| **Firewall**       | Opens port 80, the app ports (8100 to 8999), and local names in the firewall, all at once. | When ufw, firewalld, or the macOS firewall is on |
-| **System service** | Runs Alchemy when the computer starts, before anyone signs in, as you rather than as root. | Not offered yet                                  |
+| Change             | What it does                                                                               | When you see it                                                |
+| ------------------ | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------- |
+| **Port 80**        | Lets Alchemy use port 80, so apps open at `http://photos.local` with no port number.       | Linux only; a Mac doesn't need it                              |
+| **Firewall**       | Opens port 80, the app ports (8100 to 8999), and local names in the firewall, all at once. | When ufw, firewalld, or the macOS firewall is on               |
+| **System service** | Runs Alchemy when the computer starts, before anyone signs in, as you rather than as root. | When you choose to [run Alchemy at boot](#run-alchemy-at-boot) |
 
 Select **Allow port 80**, **Open the firewall**, or **Install the
 service**, and enter your password when the system asks. To undo one,
@@ -482,6 +482,143 @@ When an app or a service isn't running, Alchemy says why, problem first:
 Alchemy remembers what it last asked of each app, so it still tells its own
 stops from someone else's after it restarts. Containers that were already
 stopped when alchemyd started are checked once for their exit code.
+
+## Starting Docker
+
+Alchemy runs your apps with Docker, so while Docker isn't running, the
+Apps page says so and each app reads **Waiting for Docker**. Alchemy
+never starts Docker on its own; it waits for you to ask.
+
+- **Docker Desktop:** select **Start Docker Desktop** on the notice that
+  says **Docker Desktop isn't running**. Alchemy opens Docker Desktop in
+  the background and shows its progress until Docker is ready, which can
+  take a minute. Your apps come back once it is (see
+  [below](#alchemy-after-a-restart-or-sleep)). If it still hasn't started
+  after two minutes, the notice says **Docker Desktop hasn't started
+  yet**: look in Docker Desktop for a message that needs you, such as an
+  update or a license question, then try again.
+- **Docker Engine on Linux:** starting it needs an administrator, so the
+  notice shows the command to run in a terminal, with **Copy command**:
+
+  ```sh
+  sudo systemctl start docker
+  ```
+
+To have Docker Desktop start by itself, turn on **Start Docker Desktop
+when you sign in to your computer** in Docker Desktop's settings, under
+**General**.
+
+## Alchemy after a restart or sleep
+
+Restarting the computer, putting it to sleep, and quitting Docker are
+normal. When Alchemy starts again, the computer wakes up, or Docker comes
+back, Alchemy brings back every app that was running before, and leaves
+the rest as they were:
+
+| The app...                                                 | After a restart or sleep                            |
+| ---------------------------------------------------------- | --------------------------------------------------- |
+| was running                                                | Comes back                                          |
+| was stopped in Alchemy (**Stop** or **Take down**)         | Stays stopped                                       |
+| was stopped outside Alchemy, such as `docker compose stop` | Stays stopped                                       |
+| crashed while Docker was running                           | Stays stopped; its restart policy decides           |
+| is only partly running                                     | Left alone; select **Start** to bring the rest back |
+| can't be read, so Alchemy can't tell whether it ran        | Left alone                                          |
+
+Alchemy tries each app once. If one fails to start, it doesn't keep
+trying: it tells you why, and you start it again when it's fixed.
+
+**What you see.** The top of the Apps page says what happened, such as
+"2 apps came back after this computer slept for 2 hours", and lists each
+app that didn't come back with the reason and what to do. **Copy report**
+copies it as plain text, for a note or an AI assistant, and **Dismiss**
+hides it until the next time. When everything was still running, as
+after a short sleep, it says nothing. An app Alchemy started this way
+says so in its progress: "Alchemy did this on its own, because blog was
+running before the computer slept."
+
+A few things to know:
+
+- **Alchemy has to be running.** If it doesn't start by itself after a
+  restart, choose when it should: see
+  [Run Alchemy at boot](#run-alchemy-at-boot).
+- **Docker has to be running.** After a restart, start Docker Desktop
+  (see [Starting Docker](#starting-docker)) or have it start when you
+  sign in. Your apps come back as soon as Docker is ready.
+- **After waking up,** Alchemy picks up a new network address and
+  announces the apps' `.local` names again within a few seconds, so
+  addresses keep working when you move between networks.
+- **Docker restart policies still apply.** An app with
+  `restart: unless-stopped` or `always` is started by Docker itself when
+  Docker starts, whether or not Alchemy is running. Alchemy covers the
+  apps without one.
+- **Stopping an app by hand counts after about 20 seconds.** An app
+  stopped outside Alchemy just before a restart may come back. Stop it in
+  Alchemy instead, and Alchemy remembers.
+
+## Run Alchemy at boot
+
+Alchemy keeps your apps running only while it runs itself. Choose when it
+starts on the **Machines** page, under **Start automatically**:
+
+| Choice                             | When Alchemy starts                                    | Best for                                   |
+| ---------------------------------- | ------------------------------------------------------ | ------------------------------------------ |
+| **Don't start on its own**         | When you start it yourself, or open the Alchemy app    | Trying Alchemy out                         |
+| **Start when I sign in**           | When you sign in to this computer. No password needed. | A Mac or Linux desktop with Docker Desktop |
+| **Start when this machine starts** | When the computer starts, before anyone signs in       | A home server with Docker Engine           |
+
+Your choice is saved as soon as you select it. With Docker Desktop,
+choose **Start when I sign in**: Docker Desktop starts when you sign in
+too, so there's nothing to gain from starting earlier.
+
+**Start when this machine starts** installs Alchemy as a system service.
+It needs an administrator's password once, through the system's password
+prompt, or, when there's no prompt (over SSH, or on a computer with no
+desktop), a command to run in a terminal, with **Copy command** and **Try
+again**, as in
+[Changes that need your password](#changes-that-need-your-password). It
+still runs as you, never as root. On Linux it can use port 80 without
+**Allow port 80**. Switching to it from **Start when I sign in** hands
+over from one to the other: Alchemy restarts for a moment, the page
+reconnects, and your apps keep running.
+
+When a choice isn't available, the page says why. The usual reasons:
+
+- **Alchemy runs from an AppImage**, which a service can't start. Install
+  the `.deb` package to start Alchemy on its own.
+- **macOS is running Alchemy from a temporary copy**, because the app was
+  opened from Downloads. Move Alchemy to the Applications folder first.
+- **No systemd user manager is running** for you on Linux, so **Start
+  when I sign in** can't work there. Use **Start when this machine
+  starts**.
+
+**Where Alchemy logs.** The page shows where Alchemy writes its log, to
+read when something goes wrong:
+
+| Choice                             | macOS                                           | Linux                                       |
+| ---------------------------------- | ----------------------------------------------- | ------------------------------------------- |
+| **Start when I sign in**           | `~/Library/Logs/Alchemy/alchemyd.log`           | `journalctl --user -u alchemyd.service`     |
+| **Start when this machine starts** | `/Library/Logs/Alchemy/alchemyd.<your uid>.log` | `journalctl -u alchemyd-<your uid>.service` |
+
+**On a Mac,** turning on **Start when I sign in** shows a notification
+that "alchemyd" can run in the background, and alchemyd is listed in
+System Settings under **General**, **Login Items & Extensions**. If you
+switch it off there, Alchemy won't start when you sign in. The first time
+Alchemy announces a `.local` name, macOS may ask whether alchemyd can
+find devices on your local network: select **Allow**, or `.local`
+addresses won't work. You can change it later in System Settings under
+**Privacy & Security**, **Local Network**.
+
+**On Linux,** **Start when I sign in** stops Alchemy when you sign out of
+your last session. For a server nobody signs in to, choose **Start when
+this machine starts**.
+
+**Without the web UI,** on a server, the daemon installs its own sign-in
+service from a terminal, with no password:
+
+```sh
+alchemyd service install --start   # start it now, and at every sign-in
+alchemyd service remove            # stop it, and don't start it again
+```
 
 ## Where Alchemy keeps its state
 
