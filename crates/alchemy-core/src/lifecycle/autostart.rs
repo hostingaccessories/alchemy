@@ -96,6 +96,19 @@ pub enum UserService {
     Outdated,
 }
 
+impl UserService {
+    /// Compare the file `on_disk`, if there is one, with `rendered`, what
+    /// would be written now. A file that can't be rendered any more, as
+    /// after alchemyd moved to a path a unit can't hold, is outdated.
+    pub fn compare(on_disk: Option<&str>, rendered: Option<&str>) -> Self {
+        match (on_disk, rendered) {
+            (None, _) => Self::Missing,
+            (Some(file), Some(want)) if file == want => Self::Current,
+            (Some(_), _) => Self::Outdated,
+        }
+    }
+}
+
 /// Which services are installed, as the daemon read them from disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InstalledServices {
@@ -173,6 +186,34 @@ pub fn autostart_steps(installed: InstalledServices, target: AutostartMode) -> V
         }
     }
     steps
+}
+
+/// Which services can be installed on this machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ModeSupport {
+    /// The per-user service: on Linux, a `systemd --user` manager runs
+    /// and alchemyd's path fits in a unit; on macOS, the user has a home.
+    pub user_service: bool,
+    /// The system service: the helper can install it, from a prompt or a
+    /// terminal.
+    pub system_service: bool,
+}
+
+/// The modes alchemyd can be switched to, in display order: `off`
+/// always, `login` and `boot` when `support` says so, and `current`
+/// whatever it says, so the mode in place is always listed.
+pub fn available_modes(current: AutostartMode, support: ModeSupport) -> Vec<AutostartMode> {
+    AutostartMode::ALL
+        .into_iter()
+        .filter(|mode| {
+            *mode == current
+                || match mode {
+                    AutostartMode::Off => true,
+                    AutostartMode::Login => support.user_service,
+                    AutostartMode::Boot => support.system_service,
+                }
+        })
+        .collect()
 }
 
 /// Where alchemyd's logs go.
@@ -356,6 +397,48 @@ mod tests {
             assert_eq!(
                 bad.parse::<AutostartMode>(),
                 Err(AutostartModeError(bad.to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn user_service_from_files() {
+        let cases = [
+            (None, Some("unit"), Missing),
+            (None, None, Missing),
+            (Some("unit"), Some("unit"), Current),
+            (Some("old"), Some("unit"), Outdated),
+            (Some("unit"), None, Outdated),
+        ];
+        for (on_disk, rendered, want) in cases {
+            assert_eq!(
+                UserService::compare(on_disk, rendered),
+                want,
+                "{on_disk:?} {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn modes_available() {
+        let support = |user_service, system_service| ModeSupport {
+            user_service,
+            system_service,
+        };
+        let cases = [
+            (Off, support(true, true), vec![Off, Login, Boot]),
+            (Off, support(true, false), vec![Off, Login]),
+            (Off, support(false, true), vec![Off, Boot]),
+            (Off, support(false, false), vec![Off]),
+            (Login, support(false, false), vec![Off, Login]),
+            (Boot, support(true, false), vec![Off, Login, Boot]),
+            (Boot, support(false, false), vec![Off, Boot]),
+        ];
+        for (current, support, want) in cases {
+            assert_eq!(
+                available_modes(current, support),
+                want,
+                "{current} {support:?}"
             );
         }
     }

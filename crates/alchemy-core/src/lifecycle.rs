@@ -17,11 +17,12 @@ mod last_seen;
 mod liveness;
 mod reconcile;
 mod service_file;
+mod supervisor;
 mod wake;
 
 pub use autostart::{
-    AutostartMode, AutostartModeError, AutostartStep, InstalledServices, LogHint, UserService,
-    autostart_steps, log_hint,
+    AutostartMode, AutostartModeError, AutostartStep, InstalledServices, LogHint, ModeSupport,
+    UserService, autostart_steps, available_modes, log_hint,
 };
 pub use docker_start::{
     DesktopCommand, DockerStart, OPEN_DESKTOP_LINUX, OPEN_DESKTOP_MACOS, START_ENGINE_HINT,
@@ -37,5 +38,8 @@ pub use reconcile::{
 pub use service_file::{
     LAUNCH_AGENT_LABEL, LOG_DIR, LOG_FILE, SYSTEMD_USER_UNIT, ServiceFileError, launch_agent_path,
     launch_agent_plist, log_path, systemd_user_unit, systemd_user_unit_path,
+};
+pub use supervisor::{
+    ServiceCall, Supervisor, service_call, supervisor_from_cgroup, supervisor_from_launchd,
 };
 pub use wake::{ClockSample, WAKE_THRESHOLD, WAKE_TICK, WakeDetector, Woke};

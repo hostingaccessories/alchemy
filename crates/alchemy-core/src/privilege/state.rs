@@ -51,6 +51,11 @@ pub struct LowPortFacts {
     /// the running alchemyd isn't [`capable`](Self::capable), a restart
     /// is all that is left.
     pub file_capable: bool,
+    /// Whether the system service runs alchemyd. Its unit grants
+    /// `CAP_NET_BIND_SERVICE` through `AmbientCapabilities`, so the file
+    /// capability is neither needed nor, if revoked, would it change
+    /// anything.
+    pub system_unit: bool,
 }
 
 /// A host firewall Alchemy knows about.
@@ -267,6 +272,12 @@ enum Base {
 fn base(action: Action, facts: &PrivilegeFacts) -> Base {
     match action {
         Action::LowPorts => match (facts.os, facts.low_ports) {
+            (
+                HostOs::Linux,
+                LowPortFacts {
+                    system_unit: true, ..
+                },
+            ) => Base::NotNeeded,
             (HostOs::Linux, LowPortFacts { capable: true, .. }) => Base::Granted,
             (
                 HostOs::Linux,
@@ -470,6 +481,7 @@ mod tests {
                 nosuid: false,
                 no_new_privs: false,
                 file_capable: false,
+                system_unit: false,
             },
             firewall: FirewallFacts {
                 active: None,
@@ -551,6 +563,25 @@ mod tests {
                 PrivilegeState::NotNeeded,
             ),
             ("denied", HostOs::Linux, denied, PrivilegeState::Needed),
+            (
+                "under the system unit",
+                HostOs::Linux,
+                |f| {
+                    f.low_ports.system_unit = true;
+                    f.low_ports.capable = true;
+                    f.low_ports.file_capable = true;
+                },
+                PrivilegeState::NotNeeded,
+            ),
+            (
+                "under the system unit, even if denied",
+                HostOs::Linux,
+                |f| {
+                    denied(f);
+                    f.low_ports.system_unit = true;
+                },
+                PrivilegeState::NotNeeded,
+            ),
             (
                 "granted",
                 HostOs::Linux,
