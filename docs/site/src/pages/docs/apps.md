@@ -628,15 +628,15 @@ addresses won't work. You can change it later in System Settings under
 **Privacy & Security**, **Local Network**.
 
 **On Linux,** **Start at login** stops Alchemy when you log out of
-your last session. For a server nobody logs in to, choose **Start when
-this machine starts**.
+your last session. For a server nobody logs in to, choose **Start at
+boot**.
 
 **From a terminal,** the CLI does the same:
 
 ```sh
 alchemy machine autostart          # the current choice, and where the log is
 alchemy machine autostart login    # start when you log in
-alchemy machine autostart boot     # start when this machine starts
+alchemy machine autostart boot     # start at boot, before anyone logs in
 alchemy machine autostart off      # don't start on its own
 ```
 

@@ -62,7 +62,7 @@ const ACTIONS: Record<PrivilegeAction, ActionText> = {
     },
   },
   system_service: {
-    what: "A system service starts alchemyd when this machine starts, before anyone signs in.",
+    what: "A system service starts alchemyd at boot, before anyone logs in.",
     grant: "Install the service",
     undo: "Remove the service",
     titles: {

@@ -25,19 +25,19 @@ const MODES: Record<AutostartMode, { label: string; what: string }> = {
     what: "Start alchemyd yourself, or open the Alchemy app.",
   },
   login: {
-    label: "Start when I sign in",
-    what: "No password needed. alchemyd starts when you sign in to this computer, and Docker Desktop with it.",
+    label: "Start at login",
+    what: "No password needed. alchemyd starts when you log in to this computer, and Docker Desktop with it.",
   },
   boot: {
-    label: "Start when this machine starts",
-    what: "Before anyone signs in, for a home server. Needs an administrator's password once.",
+    label: "Start at boot",
+    what: "When this machine starts, before anyone logs in, for a home server. Needs an administrator's password once.",
   },
 };
 
 const RUNNING: Record<Supervisor, string> = {
   manual: "alchemyd was started by hand this time.",
-  user_service: "alchemyd is running as the service that starts when you sign in.",
-  system_service: "alchemyd is running as the service that starts with this machine.",
+  user_service: "alchemyd is running as the service that starts at login.",
+  system_service: "alchemyd is running as the service that starts at boot.",
 };
 
 /** How the last switch ended, when it didn't work. */
@@ -59,11 +59,11 @@ function lastAttempt(last: AutostartAttempt | null): string | null {
 }
 
 /**
- * Whether alchemyd starts on its own: off, at sign-in, or when the machine
- * starts. Changing it saves at once. Starting at boot goes through the
- * system prompt, or a command to copy when there's none, like the
- * privileges. Says where alchemyd logs. Renders nothing when alchemyd is too
- * old to report it, or while signed out.
+ * Whether alchemyd starts on its own: off, at login, or at boot. Changing
+ * it saves at once. Starting at boot goes through the system prompt, or a
+ * command to copy when there's none, like the privileges. Says where
+ * alchemyd logs. Renders nothing when alchemyd is too old to report it, or
+ * while signed out.
  */
 export function AutostartSection() {
   const client = useQueryClient();
@@ -141,7 +141,7 @@ export function AutostartSection() {
           <Notice tone="busy" title="Waiting for you to answer the system prompt…" />
         )}
         {answer?.outcome === "restarting" && (
-          <Notice tone="busy" title="Handing over to the service that starts with this machine…">
+          <Notice tone="busy" title="Handing over to the service that starts at boot…">
             <p>alchemyd stops in a moment and the service takes over. Alchemy reconnects.</p>
           </Notice>
         )}

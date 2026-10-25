@@ -1372,7 +1372,7 @@ describe("Autostart", () => {
     expect(screen.queryByRole("heading", { name: "Start automatically" })).toBeNull();
   });
 
-  it("starts at sign-in without a terminal, and says where the logs are", async () => {
+  it("starts at login without a terminal, and says where the logs are", async () => {
     autostartValue = off;
     autostartAnswers = [
       { status: 200, body: { outcome: "done", command: null, message: null, autostart: login } },
@@ -1387,14 +1387,12 @@ describe("Autostart", () => {
       within(autostart).getByText("Its log is in the terminal it was started from."),
     ).toBeTruthy();
 
-    await userEvent
-      .setup()
-      .click(within(autostart).getByRole("radio", { name: /Start when I sign in/ }));
+    await userEvent.setup().click(within(autostart).getByRole("radio", { name: /Start at login/ }));
     expect(autostartPuts).toEqual([{ mode: "login" }]);
     expect(
       await within(autostart).findByText("/Users/me/Library/Logs/Alchemy/alchemyd.log"),
     ).toBeTruthy();
-    expect(within(autostart).getByRole("radio", { name: /Start when I sign in/ })).toHaveProperty(
+    expect(within(autostart).getByRole("radio", { name: /Start at login/ })).toHaveProperty(
       "checked",
       true,
     );
@@ -1415,13 +1413,11 @@ describe("Autostart", () => {
     ];
     await renderOnline();
     const autostart = await section();
-    await userEvent
-      .setup()
-      .click(within(autostart).getByRole("radio", { name: /Start when this machine starts/ }));
+    await userEvent.setup().click(within(autostart).getByRole("radio", { name: /Start at boot/ }));
     expect(
       await within(autostart).findByText("Waiting for you to answer the system prompt…"),
     ).toBeTruthy();
-    expect(within(autostart).getByRole("radio", { name: /Start when I sign in/ })).toHaveProperty(
+    expect(within(autostart).getByRole("radio", { name: /Start at login/ })).toHaveProperty(
       "disabled",
       true,
     );
@@ -1432,10 +1428,10 @@ describe("Autostart", () => {
     });
     expect(
       within(autostart).getByText(
-        "The last change to “Start when this machine starts” was cancelled at the system prompt.",
+        "The last change to “Start at boot” was cancelled at the system prompt.",
       ),
     ).toBeTruthy();
-    expect(within(autostart).getByRole("radio", { name: /Start when I sign in/ })).toHaveProperty(
+    expect(within(autostart).getByRole("radio", { name: /Start at login/ })).toHaveProperty(
       "checked",
       true,
     );
@@ -1460,9 +1456,7 @@ describe("Autostart", () => {
     const autostart = await section();
     expect(within(autostart).getByText("journalctl --user -u alchemyd.service")).toBeTruthy();
     const user = userEvent.setup();
-    await user.click(
-      within(autostart).getByRole("radio", { name: /Start when this machine starts/ }),
-    );
+    await user.click(within(autostart).getByRole("radio", { name: /Start at boot/ }));
     expect(await within(autostart).findByText("No polkit agent is running.")).toBeTruthy();
     expect(autostart.querySelector("pre")?.textContent).toBe(bootLine);
     await user.click(within(autostart).getByRole("button", { name: "Try again" }));
@@ -1487,8 +1481,8 @@ describe("Autostart", () => {
         .getAllByRole("listitem")
         .map((li) => li.textContent),
     ).toEqual([
-      `Start when I sign in isn't available here: ${appImage}`,
-      `Start when this machine starts isn't available here: ${appImage}`,
+      `Start at login isn't available here: ${appImage}`,
+      `Start at boot isn't available here: ${appImage}`,
     ]);
   });
 
@@ -1502,9 +1496,7 @@ describe("Autostart", () => {
     ];
     await renderOnline();
     const autostart = await section();
-    await userEvent
-      .setup()
-      .click(within(autostart).getByRole("radio", { name: /Start when I sign in/ }));
+    await userEvent.setup().click(within(autostart).getByRole("radio", { name: /Start at login/ }));
     const alert = await within(autostart).findByRole("alert");
     expect(within(alert).getByText("Another change to autostart is in progress.")).toBeTruthy();
   });
