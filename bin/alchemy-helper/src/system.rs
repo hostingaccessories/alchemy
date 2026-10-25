@@ -55,6 +55,12 @@ pub trait System {
     /// itself, never its target.
     fn remove_file(&self, path: &Path) -> io::Result<bool>;
 
+    /// Create the directory `path`, not its parents, with permission bits
+    /// `mode` before the umask. Returns whether it created it; anything
+    /// already there, even a symlink, is left alone for the caller to
+    /// inspect.
+    fn create_dir(&self, path: &Path, mode: u32) -> io::Result<bool>;
+
     /// Run `command` and wait for it, capturing its output.
     fn run(&self, command: &FixedCommand) -> io::Result<CommandOutput>;
 }
@@ -82,6 +88,8 @@ pub const MAX_READ: u64 = 64 * 1024;
 pub struct FileInfo {
     /// The file is a regular file, not a directory, device, FIFO, or socket.
     pub regular: bool,
+    /// The file is a directory.
+    pub directory: bool,
     /// The owner's UID.
     pub uid: u32,
     /// The permission bits, such as `0o755`.

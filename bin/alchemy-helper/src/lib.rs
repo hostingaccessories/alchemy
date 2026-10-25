@@ -41,6 +41,7 @@ pub use error::{Exit, HelperError};
 pub use firewall::{MIN_PROXY_PORT, ProxyPorts, ProxyPortsError};
 pub use low_ports::{CAPABILITY_XATTR, NET_BIND_SERVICE_EP};
 pub use real::{COMMAND_PATH, RealSystem};
+pub use service::{LAUNCH_DAEMON_LOG_DIR, launch_daemon_log};
 pub use sibling::DAEMON;
 pub use system::{CommandOutput, FileInfo, FixedCommand, OpenError, System};
 

@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -42,6 +42,7 @@ impl System for RealSystem {
         let statvfs = rustix::fs::fstatvfs(file)?;
         Ok(FileInfo {
             regular: FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile,
+            directory: FileType::from_raw_mode(stat.st_mode) == FileType::Directory,
             uid: stat.st_uid,
             mode: permission_bits(stat.st_mode),
             nosuid: statvfs.f_flag.contains(StatVfsMountFlags::NOSUID),
@@ -113,6 +114,14 @@ impl System for RealSystem {
         match std::fs::remove_file(path) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn create_dir(&self, path: &Path, mode: u32) -> io::Result<bool> {
+        match std::fs::DirBuilder::new().mode(mode).create(path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -301,6 +310,24 @@ mod tests {
         assert_eq!(std::os::unix::fs::MetadataExt::uid(&meta), 0);
         assert_eq!(std::os::unix::fs::MetadataExt::gid(&meta), 0);
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn create_dir_makes_one_directory_and_leaves_what_is_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("logs");
+        let sys = RealSystem;
+        assert!(sys.create_dir(&dir, 0o700).unwrap());
+        assert!(!sys.create_dir(&dir, 0o700).unwrap());
+        let fd = sys.open_nofollow(&dir).unwrap();
+        let info = sys.inspect(&fd).unwrap();
+        assert!(info.directory && !info.regular);
+        assert_eq!(info.mode, 0o700);
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(!sys.create_dir(&link, 0o755).unwrap());
+        assert!(matches!(sys.open_nofollow(&link), Err(OpenError::Symlink)));
+        assert!(sys.create_dir(&tmp.path().join("a/b"), 0o755).is_err());
     }
 
     #[test]
