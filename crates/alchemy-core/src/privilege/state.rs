@@ -83,8 +83,8 @@ pub struct FirewallFacts {
 pub struct ServiceFacts {
     /// Whether the service is installed.
     pub installed: bool,
-    /// Whether alchemyd should run at boot. M9 decides when; until then
-    /// the daemon passes `false`.
+    /// Whether alchemyd should run at boot: autostart mode `boot`, from
+    /// [`AutostartMode::wants_system_service`](crate::lifecycle::AutostartMode::wants_system_service).
     pub wanted: bool,
 }
 
