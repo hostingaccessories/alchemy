@@ -29,6 +29,11 @@ pub struct Wanted {
     /// The port each name's `_http._tcp` service carries, by label: the
     /// best port that reaches the app.
     pub ports: BTreeMap<HostLabel, u16>,
+    /// Counts the wakes routing has seen. When it changes, the mDNS task
+    /// withdraws every name and announces it again, so the LAN hears of
+    /// it anew after sleep, as RFC 6762 section 8 asks of a responder
+    /// whose network may have changed.
+    pub reannounce: u64,
 }
 
 impl Wanted {
@@ -97,6 +102,18 @@ pub fn steps(published: &Published, wanted: &Wanted) -> Vec<Step> {
             MdnsChange::Withdraw(gone) => Step::Withdraw(gone.label.clone()),
         })
         .chain(repointed)
+        .collect()
+}
+
+/// The calls that withdraw every name in `published`, then announce
+/// every name in `wanted` as if nothing were published. An announcement
+/// that repeats one does nothing, so this is how a name is heard anew.
+pub fn reannounce(published: &Published, wanted: &Wanted) -> Vec<Step> {
+    published
+        .names
+        .iter()
+        .map(|a| Step::Withdraw(a.label.clone()))
+        .chain(steps(&Published::default(), wanted))
         .collect()
 }
 
@@ -241,6 +258,7 @@ mod tests {
             lan: names.first().map(|(_, addr, _)| lan(addr)),
             names: names.iter().map(|(n, a, _)| ann(n, a)).collect(),
             ports: names.iter().map(|(n, _, p)| (label(n), *p)).collect(),
+            reannounce: 0,
         }
     }
 
@@ -313,6 +331,46 @@ mod tests {
             }
             assert_eq!(after.names, to.names, "{name}");
             assert_eq!(after.ports, to.ports, "{name}");
+            assert_eq!(steps(&after, &to), [], "{name}: settled");
+        }
+    }
+
+    #[test]
+    fn reannounce_withdraws_everything_then_announces_what_is_wanted() {
+        let ip = "192.168.1.20";
+        let new_ip = "192.168.1.30";
+        let cases = [
+            ("nothing", vec![], vec![], vec![]),
+            (
+                "same names",
+                vec![("blog", ip, 80)],
+                vec![("blog", ip, 80)],
+                vec![
+                    Step::Withdraw(label("blog")),
+                    Step::Announce(ann("blog", ip), 80),
+                ],
+            ),
+            (
+                "the LAN moved and a name went",
+                vec![("blog", ip, 80), ("old", ip, 80)],
+                vec![("blog", new_ip, 8100)],
+                vec![
+                    Step::Withdraw(label("blog")),
+                    Step::Withdraw(label("old")),
+                    Step::Announce(ann("blog", new_ip), 8100),
+                ],
+            ),
+        ];
+        for (name, from, to, want) in cases {
+            let from = published(&from);
+            let to = wanted(&to);
+            let got = reannounce(&from, &to);
+            assert_eq!(got, want, "{name}");
+            let mut after = from;
+            for step in &got {
+                after.apply(step);
+            }
+            assert_eq!(after.names, to.names, "{name}");
             assert_eq!(steps(&after, &to), [], "{name}: settled");
         }
     }

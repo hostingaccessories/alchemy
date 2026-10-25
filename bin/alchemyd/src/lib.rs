@@ -28,6 +28,10 @@
 //! [`reconcile`] task brings back the apps that were running, and
 //! [`desktop`] starts Docker Desktop when someone asks.
 //!
+//! It notices the computer waking from sleep through [`wake`], and then
+//! reads the LAN address again, announces `.local` names again, and
+//! subscribes to Docker's events again.
+//!
 //! What needs root, such as port 80 on Linux, is granted through
 //! `alchemy-helper` behind a system prompt by [`privileges`]. A change
 //! that only takes effect at exec makes [`run`] return
@@ -60,6 +64,7 @@ pub mod socket;
 mod state;
 pub mod store;
 pub mod subnets;
+pub mod wake;
 mod web;
 
 pub use state::{EngineLink, State};
@@ -90,6 +95,7 @@ use crate::routing::{ProxyDeps, ProxyHandle};
 use crate::session::{Auth, TokenFile};
 use crate::store::{SharedStore, SqliteStore, StateLock};
 use crate::subnets::{EngineNetworks, FakeDaemonConfig, FakeEngineNetworks, SubnetsDeps};
+use crate::wake::WakeDeps;
 
 /// Default HTTP listen address. Loopback only: the TCP listener's token
 /// keeps out other processes and users on this machine, but there is no
@@ -141,6 +147,8 @@ pub struct Deps<E, M = SystemMetrics> {
     pub desktop: SharedLauncher,
     /// How the reconcile task is tuned.
     pub reconcile: ReconcileDeps,
+    /// Where the clocks that tell a wake from sleep are read.
+    pub wake: WakeDeps,
 }
 
 /// Why [`run`] returned.
@@ -173,12 +181,13 @@ impl<E> Deps<E> {
     /// is [`ProxyDeps::loopback`]: app ports on loopback, no Host
     /// listener, and a connector that reaches nothing. Privileges are
     /// [`PrivilegeDeps::fake`]. Docker Desktop is started through a
-    /// [`FakeLauncher`] that runs nothing, and the reconcile task has its
-    /// default tuning. Use
-    /// [`Self::with_apps`], [`Self::with_runner`], [`Self::with_editor`],
-    /// [`Self::with_network`], [`Self::with_subnets`],
-    /// [`Self::with_proxy`], [`Self::with_privileges`],
-    /// [`Self::with_desktop`], and [`Self::with_reconcile`] to change them.
+    /// [`FakeLauncher`] that runs nothing, the reconcile task has its
+    /// default tuning, and wakes are noticed on this machine's clocks.
+    /// Use [`Self::with_apps`], [`Self::with_runner`],
+    /// [`Self::with_editor`], [`Self::with_network`],
+    /// [`Self::with_subnets`], [`Self::with_proxy`],
+    /// [`Self::with_privileges`], [`Self::with_desktop`],
+    /// [`Self::with_reconcile`], and [`Self::with_wake`] to change them.
     pub fn new(engine: E) -> Self {
         Self {
             state: State::new(),
@@ -204,6 +213,7 @@ impl<E> Deps<E> {
             privileges: PrivilegeDeps::fake(),
             desktop: Arc::new(FakeLauncher::new()),
             reconcile: ReconcileDeps::default(),
+            wake: WakeDeps::system(),
         }
     }
 }
@@ -225,6 +235,7 @@ impl<E, M> Deps<E, M> {
             privileges: self.privileges,
             desktop: self.desktop,
             reconcile: self.reconcile,
+            wake: self.wake,
         }
     }
 
@@ -297,6 +308,13 @@ impl<E, M> Deps<E, M> {
         self.reconcile = reconcile;
         self
     }
+
+    /// Tell a wake from sleep with `wake`.
+    #[must_use]
+    pub fn with_wake(mut self, wake: WakeDeps) -> Self {
+        self.wake = wake;
+        self
+    }
 }
 
 impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
@@ -329,8 +347,8 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::
 /// or migrated; a corrupt or too-new one fails startup before either
 /// listener is bound, and the app and network settings in it are loaded
 /// into the state before anything is served. The engine task, the metrics collector, the apps
-/// task, the network check, the web address proxy, and the routing task
-/// that feeds it run alongside the listeners. An engine
+/// task, the network check, the wake task, the web address proxy, and the
+/// routing task that feeds it run alongside the listeners. An engine
 /// that is absent or broken never fails startup; it only shows up in the
 /// engine status. Neither does a missing or unreadable app folder, which
 /// shows up in the app list, nor a network that overlaps, which shows up
@@ -402,6 +420,7 @@ pub async fn run_with(
     ));
     background.extend([
         privileges_task,
+        spawn_wake(deps.wake, &deps.state, &shutdown_rx),
         spawn_reconcile(
             deps.reconcile,
             &deps.state,
@@ -539,6 +558,18 @@ fn spawn_reconcile(
         shutdown.clone(),
     );
     ("reconcile", tokio::spawn(task))
+}
+
+/// Start the [`wake`] task, with its name.
+fn spawn_wake(
+    deps: WakeDeps,
+    state: &State,
+    shutdown: &watch::Receiver<bool>,
+) -> (&'static str, JoinHandle<()>) {
+    (
+        "wake",
+        tokio::spawn(wake::run(deps, state.clone(), shutdown.clone())),
+    )
 }
 
 /// Serve `router` on `listener` until `shutdown` becomes `true`, letting

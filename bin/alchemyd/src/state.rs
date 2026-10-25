@@ -12,6 +12,7 @@ use alchemy_api::network::{NetworkReport, NetworkSettings};
 use alchemy_api::privileges::PrivilegeList;
 use alchemy_api::reconcile::ReconcileStatus;
 use alchemy_core::engine::{Containers, EngineState, EngineStatus};
+use alchemy_core::lifecycle::Woke;
 use alchemy_core::route::EngineFacts;
 use tokio::sync::watch;
 
@@ -51,6 +52,7 @@ struct Inner {
     engine_link: watch::Sender<EngineLink>,
     wakes: watch::Sender<u64>,
     reconcile: watch::Sender<ReconcileStatus>,
+    last_wake: watch::Sender<Option<Woke>>,
     log_streams: LogStreams,
 }
 
@@ -101,6 +103,7 @@ impl State {
                 engine_link: watch::Sender::new(EngineLink::default()),
                 wakes: watch::Sender::new(0),
                 reconcile: watch::Sender::new(ReconcileStatus::default()),
+                last_wake: watch::Sender::new(None),
                 log_streams: LogStreams::default(),
             }),
         }
@@ -470,6 +473,28 @@ impl State {
     /// subscribers are only notified if it did.
     pub fn set_reconcile(&self, reconcile: ReconcileStatus) -> bool {
         send_if_changed(&self.inner.reconcile, reconcile)
+    }
+
+    /// The last wake [`Self::record_wake`] recorded, or `None` since the
+    /// daemon started.
+    pub fn last_wake(&self) -> Option<Woke> {
+        *self.inner.last_wake.borrow()
+    }
+
+    /// Subscribe to [`Self::last_wake`]. Each wake notifies, even one that
+    /// reads the same as the last. Tasks that only need to know a wake
+    /// happened use [`Self::watch_wakes`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_last_wake(&self) -> watch::Receiver<Option<Woke>> {
+        self.inner.last_wake.subscribe()
+    }
+
+    /// Record a wake the [`wake`](crate::wake) task noticed, with how long
+    /// the computer slept, then count it with [`Self::woke`].
+    pub fn record_wake(&self, woke: Woke) {
+        self.inner.last_wake.send_replace(Some(woke));
+        self.woke();
     }
 
     /// The log streams open on either listener, held to

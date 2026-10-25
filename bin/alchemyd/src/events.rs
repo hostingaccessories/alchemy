@@ -3,7 +3,9 @@
 //! A topic is one live value the daemon publishes, such as the engine
 //! status. Every connection subscribes to all topics and merges them into
 //! one stream of [`ApiEvent`]s. Each topic sends its current value on
-//! connect, then again on every change.
+//! connect, then again on every change, except one built with
+//! [`Topic::changes`], such as the `woke` event, which reports only what
+//! happens after connecting.
 //!
 //! Adding a topic takes an [`ApiEvent`] variant in `alchemy-api` and one
 //! entry in [`topics`]. The HTTP handler does not change.
@@ -12,6 +14,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use alchemy_api::ApiEvent;
+use futures_util::future;
 use futures_util::stream::{self, BoxStream};
 use futures_util::{Stream, StreamExt as _};
 use tokio::sync::watch;
@@ -43,6 +46,28 @@ impl Topic {
         }
     }
 
+    /// A topic over a [`watch`] channel that sends only the values set
+    /// after the connection subscribed, never the current one: for events
+    /// that report something that happened. `event` turns each into an
+    /// [`ApiEvent`], or `None` to send nothing.
+    ///
+    /// The topic ends when the channel's sender is dropped.
+    pub fn changes<T, W, E>(watch: W, event: E) -> Self
+    where
+        T: Clone + Send + Sync + 'static,
+        W: Fn(&State) -> watch::Receiver<T> + Send + Sync + 'static,
+        E: Fn(T) -> Option<ApiEvent> + Clone + Send + Sync + 'static,
+    {
+        Self {
+            subscribe: Arc::new(move |state| {
+                let event = event.clone();
+                changes(watch(state))
+                    .filter_map(move |value| future::ready(event(value)))
+                    .boxed()
+            }),
+        }
+    }
+
     fn subscribe(&self, state: &State) -> EventStream {
         (self.subscribe)(state)
     }
@@ -63,6 +88,9 @@ pub fn topics() -> Vec<Topic> {
         Topic::watch(State::watch_operations, ApiEvent::Operations),
         Topic::watch(State::watch_privileges, ApiEvent::Privileges),
         Topic::watch(State::watch_reconcile, ApiEvent::Reconcile),
+        Topic::changes(State::watch_last_wake, |woke| {
+            woke.map(|woke| ApiEvent::Woke(crate::wake::api_wake(woke)))
+        }),
     ]
 }
 
@@ -76,6 +104,19 @@ pub fn stream(
     let merged = stream::select_all(topics.iter().map(|topic| topic.subscribe(state)));
     merged.take_until(async move {
         let _ = shutdown.wait_for(|stop| *stop).await;
+    })
+}
+
+/// One value per change after `rx` subscribed, until the sender is
+/// dropped.
+fn changes<T>(rx: watch::Receiver<T>) -> impl Stream<Item = T> + Send + use<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    stream::unfold(rx, |mut rx| async move {
+        rx.changed().await.ok()?;
+        let value = rx.borrow_and_update().clone();
+        Some((value, rx))
     })
 }
 
@@ -125,6 +166,24 @@ mod tests {
         assert_eq!(values.next().await, Some(2));
         drop(tx);
         assert_eq!(values.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn changes_skips_the_current_value_and_what_maps_to_nothing() {
+        let (tx, rx) = watch::channel(Some(EngineState::Ready));
+        let topic = Topic::changes(move |_| rx.clone(), |s: Option<EngineState>| s.map(engine));
+        let mut events = topic.subscribe(&State::new());
+        tx.send_replace(None);
+        tx.send_replace(Some(EngineState::Starting));
+        assert_eq!(events.next().await, Some(engine(EngineState::Starting)));
+        tx.send_replace(Some(EngineState::Starting));
+        assert_eq!(
+            events.next().await,
+            Some(engine(EngineState::Starting)),
+            "a repeat is sent again"
+        );
+        drop(tx);
+        assert_eq!(events.next().await, None);
     }
 
     #[tokio::test]

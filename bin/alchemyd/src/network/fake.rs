@@ -15,6 +15,7 @@ struct Inner {
     routes: Vec<Route>,
     listeners: Vec<Listener>,
     failing: bool,
+    lan_reads: usize,
 }
 
 /// [`HostNetwork`] that answers with what it was given.
@@ -59,6 +60,11 @@ impl FakeNetwork {
         self.lock().failing = failing;
     }
 
+    /// How many times the LAN addresses were read.
+    pub fn lan_reads(&self) -> usize {
+        self.lock().lan_reads
+    }
+
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -79,6 +85,7 @@ impl HostNetwork for FakeNetwork {
     }
 
     fn lan_addresses(&self) -> BoxFuture<'_, Result<Vec<LanAddress>, NetworkError>> {
+        self.lock().lan_reads += 1;
         let answer = self.answer(|inner| inner.lan_addresses.clone());
         Box::pin(async move { answer })
     }
@@ -142,6 +149,7 @@ mod tests {
         assert_eq!(shared.lan_addresses().await.unwrap(), [address]);
         assert_eq!(shared.routes().await.unwrap(), [route]);
         assert_eq!(shared.listeners().await.unwrap(), [listener]);
+        assert_eq!(fake.lan_reads(), 2);
 
         fake.set_failing(true);
         assert!(shared.lan_subnets().await.is_err());

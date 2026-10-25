@@ -12,9 +12,11 @@ use alchemy_core::engine::{
     EngineProbe, EngineState, EngineStatus, SocketProbe, classify, not_ready_flavor,
     reconnect_delay,
 };
+use alchemy_core::lifecycle::{Liveness, LivenessCheck, PingOutcome};
 use futures_util::StreamExt as _;
 use futures_util::future::{FusedFuture as _, FutureExt as _};
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 use super::{
     ApiError, BollardApi, DockerApi, DockerCli, Endpoint, EndpointError, EngineInfo, HostEnv,
@@ -87,12 +89,20 @@ impl Connector for SystemConnector {
 /// probed every [`POLL_INTERVAL`]. When a ready engine's event stream ends,
 /// the monitor waits [`reconnect_delay`] and probes again; that delay grows
 /// while streams keep ending before delivering an event.
+///
+/// A stream can also hang without ending, as one may after sleep. So a
+/// stream that has been quiet for as long as its [`Liveness`] says is
+/// checked with a ping, and one whose ping fails or takes too long counts
+/// as ended. After a wake, from [`State::watch_wakes`], the monitor
+/// subscribes again at once whatever a ping would say, since a ping on a
+/// new connection proves nothing about the old stream.
 #[derive(Debug, Clone)]
 pub struct EngineMonitor<P, C> {
     env: HostEnv,
     os: Os,
     probe: P,
     connector: C,
+    liveness: Liveness,
 }
 
 impl EngineMonitor<SystemProbe, SystemConnector> {
@@ -112,14 +122,23 @@ where
     P: HostProbe + Send + Sync + 'static,
     C: Connector + Send + Sync + 'static,
 {
-    /// A monitor over the given environment and effects.
+    /// A monitor over the given environment and effects, pinging a quiet
+    /// stream as [`Liveness::default`] says.
     pub fn new(env: HostEnv, os: Os, probe: P, connector: C) -> Self {
         Self {
             env,
             os,
             probe,
             connector,
+            liveness: Liveness::default(),
         }
+    }
+
+    /// Ping a quiet stream as `liveness` says instead.
+    #[must_use]
+    pub fn with_liveness(mut self, liveness: Liveness) -> Self {
+        self.liveness = liveness;
+        self
     }
 
     async fn cycle(&self, state: &State, last_ready: &mut Option<LastReady>) -> Outcome {
@@ -194,7 +213,7 @@ where
         }
         state.set_engine_facts(Some(engine_facts(version.as_ref(), &info, self.os)));
         publish_engine(state, status);
-        let outcome = follow(&api, state).await;
+        let outcome = follow(&api, state, self.liveness).await;
         state.engine_lost();
         outcome
     }
@@ -243,7 +262,11 @@ where
 /// container whose addresses that listing doesn't change after a network
 /// event is listed again up to [`NETWORK_RELISTS`] times, since the event
 /// can come before the listing shows it.
-async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
+///
+/// Once following, a stream quiet for as long as `liveness` says gets a
+/// ping, and one that fails ends it; a wake ends it at once.
+async fn follow(api: &impl DockerApi, state: &State, liveness: Liveness) -> Outcome {
+    let mut woke = state.watch_wakes();
     let mut events = api.events();
     let mut pending: Vec<ContainerEvent> = Vec::new();
     let listing = {
@@ -290,26 +313,29 @@ async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
     let relist = futures_util::future::Fuse::terminated();
     tokio::pin!(relist);
     let mut relists = Relists::default();
+    let mut heard = Instant::now();
     loop {
         if relist.is_terminated()
             && let Some(delay) = relists.start()
         {
             relist.set(list_after(api, delay).fuse());
         }
+        let quiet = until_ping(liveness, heard, state);
         tokio::select! {
             biased;
+            Ok(()) = woke.changed() => {
+                tracing::info!("subscribing to Docker events again after a wake");
+                return Outcome::Woke;
+            }
             item = events.next() => match item {
                 Some(Ok(event)) => {
                     delivered = true;
+                    heard = Instant::now();
                     relists.event(&event);
                     state.update_containers(|containers| containers.apply(&event));
                 }
-                Some(Err(error)) => {
-                    tracing::debug!(error = %error, "Docker event stream failed");
-                    return Outcome::Disconnected { delivered };
-                }
-                None => {
-                    tracing::debug!("Docker event stream ended");
+                end => {
+                    tracing::debug!(error = ?end.and_then(Result::err), "Docker event stream ended");
                     return Outcome::Disconnected { delivered };
                 }
             },
@@ -328,8 +354,50 @@ async fn follow(api: &impl DockerApi, state: &State) -> Outcome {
                 Ok(None) => {}
                 Err(error) => tracing::debug!(error = %error, id, "inspecting a stopped container failed"),
             },
+            () = tokio::time::sleep(quiet) => {
+                if !answers(api, liveness).await {
+                    return Outcome::Disconnected { delivered };
+                }
+                heard = Instant::now();
+            }
         }
     }
+}
+
+/// How long until a stream last heard from at `heard` is due a ping. It
+/// waits longer while no container is running.
+fn until_ping(liveness: Liveness, heard: Instant, state: &State) -> Duration {
+    let running = state
+        .watch_containers()
+        .borrow()
+        .iter()
+        .any(|c| c.state == ContainerState::Running);
+    match liveness.check(heard.elapsed(), running) {
+        LivenessCheck::Wait(left) => left,
+        LivenessCheck::Ping => Duration::ZERO,
+    }
+}
+
+/// Ping the engine, and say whether the connection is still alive as
+/// `liveness` judges it.
+async fn answers(api: &impl DockerApi, liveness: Liveness) -> bool {
+    let started = Instant::now();
+    let ping = match tokio::time::timeout(liveness.ping_timeout, api.ping()).await {
+        Ok(Ok(())) => PingOutcome::Answered(started.elapsed()),
+        Ok(Err(error)) => {
+            tracing::debug!(error = %error, "pinging Docker failed");
+            PingOutcome::Failed
+        }
+        Err(_) => PingOutcome::TimedOut,
+    };
+    let alive = liveness.alive(ping);
+    if !alive {
+        tracing::info!(
+            ?ping,
+            "Docker stopped answering on a quiet event stream; reconnecting"
+        );
+    }
+    alive
 }
 
 async fn list_after(
@@ -496,10 +564,13 @@ enum Outcome {
     /// The engine was ready and its event stream ended. `delivered` is
     /// whether the stream produced at least one event first.
     Disconnected { delivered: bool },
+    /// The computer woke while following, so subscribe again at once.
+    Woke,
 }
 
 /// Delay before the next cycle. Reconnect attempts count up while event
 /// streams keep ending without delivering anything, and reset otherwise.
+/// A wake reconnects at once.
 #[derive(Debug, Default)]
 struct Backoff {
     attempt: u32,
@@ -511,6 +582,10 @@ impl Backoff {
             Outcome::NotReady => {
                 self.attempt = 0;
                 POLL_INTERVAL
+            }
+            Outcome::Woke => {
+                self.attempt = 0;
+                Duration::ZERO
             }
             Outcome::Disconnected { delivered } => {
                 if delivered {
@@ -619,6 +694,8 @@ mod tests {
             (dropped, 8),
             (dropped, 10),
             (dropped, 10),
+            (Outcome::Woke, 0),
+            (dropped, 1),
         ];
         let mut backoff = Backoff::default();
         for (i, (outcome, secs)) in cases.into_iter().enumerate() {

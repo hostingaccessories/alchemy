@@ -26,7 +26,9 @@
 //! service carries, go to the [`mdns`](crate::mdns) task as [`Wanted`]
 //! on [`ProxyHandle::names`], so it and the addresses agree on one LAN
 //! read and one plan. The LAN address is read again every
-//! [`ProxyDeps::interval`], so a new one re-announces every name.
+//! [`ProxyDeps::interval`], so a new one re-announces every name. After
+//! the computer wakes, as [`State::watch_wakes`] says, it is read again at
+//! once and every name is announced again, whether or not it moved.
 //!
 //! A proxy listener another program held is tried again every
 //! [`ProxyDeps::interval`].
@@ -226,8 +228,8 @@ pub struct ProxyHandle {
 /// It plans at start, whenever the apps, their configurations, the
 /// containers, the engine, the network check, the network settings, the
 /// mDNS announcer's status, or the proxy's listeners change, and every
-/// [`ProxyDeps::interval`]. Nothing is routed until the
-/// engine has been ready once, since how the proxy reaches containers
+/// [`ProxyDeps::interval`], and checks at once after a wake. Nothing is
+/// routed until the engine has been ready once, since how the proxy reaches containers
 /// depends on it; after that the last engine's facts are kept while it
 /// is away. Docker's networks are reached through `engine`, the LAN
 /// address through `host`, and ports are reserved through `ports`.
@@ -259,6 +261,7 @@ pub async fn run(
         lan_ipv4: None,
         checks: BTreeMap::new(),
         recheck: false,
+        reannounce: 0,
     };
     let mut apps = router.state.watch_apps();
     let mut configs = router.state.watch_app_configs();
@@ -269,6 +272,7 @@ pub async fn run(
     let mut settings = router.state.watch_network_settings();
     let mut mdns = router.state.watch_mdns();
     let mut status = router.proxy.status.clone();
+    let mut woke = router.state.watch_wakes();
     let mut tick = tokio::time::interval(router.deps.interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     tick.tick().await;
@@ -300,6 +304,11 @@ pub async fn run(
             Ok(()) = settings.changed() => false,
             Ok(()) = mdns.changed() => false,
             Ok(()) = status.changed() => false,
+            Ok(()) = woke.changed() => {
+                router.reannounce = router.reannounce.wrapping_add(1);
+                tracing::info!("reading the LAN address and announcing .local names again after a wake");
+                true
+            }
             _ = tick.tick() => true,
         };
         if ticked {
@@ -333,6 +342,8 @@ struct Router {
     checks: BTreeMap<Listen, (Vec<SocketAddr>, ListenerCheck)>,
     /// Whether every listener is due a check, not just new ones.
     recheck: bool,
+    /// How many wakes it has seen, for [`Wanted::reannounce`].
+    reannounce: u64,
 }
 
 impl Router {
@@ -563,7 +574,8 @@ impl Router {
     }
 
     /// Hand the mDNS task `wanted`, waking it only when it changed.
-    fn send_names(&self, wanted: Wanted) {
+    fn send_names(&self, mut wanted: Wanted) {
+        wanted.reannounce = self.reannounce;
         self.proxy.names.send_if_modified(|current| {
             if current.as_ref() == Some(&wanted) {
                 false

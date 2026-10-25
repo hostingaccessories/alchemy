@@ -6,7 +6,7 @@
 //! a listener another program answers made unavailable, and `<app>.local`
 //! routed only while the `network.mdns` setting is on, announced through
 //! a fake announcer that follows the LAN address, the setting, conflicts,
-//! and shutdown.
+//! a wake, and shutdown.
 
 #![allow(
     clippy::unwrap_used,
@@ -1089,6 +1089,66 @@ async fn announces_local_names_and_follows_the_lan_the_setting_and_conflicts() {
     daemon.stop().await;
     assert_eq!(announcer.calls().last(), Some(&FakeCall::Shutdown));
     assert_eq!(announcer.published(), []);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wake_announces_every_local_name_again() {
+    use alchemy_core::lifecycle::Woke;
+    use alchemy_core::route::HostLabel;
+    use alchemyd::mdns::{Backend, FakeAnnouncer, FakeCall};
+
+    let host = FakeNetwork::new();
+    host.set_lan_addresses(vec![lan_address("en0", [192, 168, 1, 20])]);
+    let announcer = FakeAnnouncer::new(Backend::Builtin);
+    let daemon = local_names_daemon(
+        host.clone(),
+        ProxyDeps::loopback().with_announcer(Arc::new(announcer.clone())),
+    )
+    .await;
+    let wiki = HostLabel::new("wiki").unwrap();
+    daemon
+        .app_where("wiki", |app| {
+            app.addresses
+                .iter()
+                .any(|a| a.url.starts_with("http://wiki.local:") && a.state == AddressState::Ready)
+        })
+        .await;
+    let before = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let calls = announcer.calls().len();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if announcer.published().len() == 1 && announcer.calls().len() == calls {
+                return calls;
+            }
+        }
+    })
+    .await
+    .expect("the announcements never settled");
+    let published = announcer.published();
+
+    daemon.state.record_wake(Woke {
+        slept_for: Duration::from_secs(3_600),
+        at_ms: 1_700_000_000_000,
+    });
+    eventually("wiki.local to be announced again", || {
+        announcer.calls().len() >= before + 2
+    })
+    .await;
+    let calls = announcer.calls();
+    assert_eq!(
+        calls[before..before + 2],
+        [
+            FakeCall::Withdraw(wiki.clone()),
+            FakeCall::Announce(published[0].clone())
+        ],
+        "{calls:?}"
+    );
+    assert_eq!(announcer.published(), published);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(announcer.calls().len(), before + 2, "once per wake");
+
+    daemon.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

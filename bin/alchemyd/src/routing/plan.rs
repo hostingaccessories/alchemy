@@ -134,6 +134,7 @@ pub fn mdns_wanted(inputs: &RoutingInputs<'_>, lan: Option<&LanIpv4>) -> Wanted 
         lan: lan.cloned(),
         names,
         ports,
+        reannounce: 0,
     }
 }
 

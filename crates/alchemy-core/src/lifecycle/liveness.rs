@@ -17,7 +17,7 @@ use std::time::Duration;
 /// pings, while a container is running. #112 recommends a minute: an
 /// idle engine costs one small request a minute, and a hung stream is
 /// caught within about a minute even without a wake to prompt it.
-pub const IDLE_PING: Duration = Duration::from_secs(60);
+pub const IDLE_PING: Duration = Duration::from_mins(1);
 
 /// The same while no container is running.
 ///
@@ -25,7 +25,7 @@ pub const IDLE_PING: Duration = Duration::from_secs(60);
 /// running containers, and #112 couldn't rule out that a ping wakes it.
 /// Pinging less often than that lets the VM pause between pings either
 /// way, and with nothing running a hung stream has little to miss.
-pub const IDLE_PING_STOPPED: Duration = Duration::from_secs(10 * 60);
+pub const IDLE_PING_STOPPED: Duration = Duration::from_mins(10);
 
 /// How long a ping may take before the connection counts as gone. A
 /// healthy local engine answers `/_ping` in milliseconds; Docker Desktop
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn pings_less_often_than_resource_saver_pauses_while_nothing_runs() {
-        assert!(Liveness::default().idle_ping_stopped > secs(5 * 60));
+        assert!(Liveness::default().idle_ping_stopped > Duration::from_mins(5));
     }
 
     #[test]
