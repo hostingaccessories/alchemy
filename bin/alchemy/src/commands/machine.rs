@@ -1,6 +1,8 @@
 //! `alchemy machine`: the machines Alchemy runs apps on. For now, only
 //! this one.
 
+pub mod autostart;
+pub mod docker;
 pub mod ports;
 pub mod privileges;
 pub mod stats;
@@ -40,4 +42,17 @@ pub enum Verb {
     /// system password prompt; where it can't, as over SSH, this runs the
     /// `sudo` command alchemyd gives in the terminal instead.
     Privileges(privileges::Args),
+    /// Show or set whether alchemyd starts on its own: off, at login, or
+    /// at boot.
+    ///
+    /// `login` runs alchemyd as a per-user service when you log in, with
+    /// no password. `boot` runs it as a system service when the computer
+    /// starts, for a home server nobody logs in to; it needs your
+    /// password once, asked the same way as `alchemy machine privileges
+    /// grant`. Only one is ever installed. Without a mode, this shows the
+    /// current one and where alchemyd logs.
+    Autostart(autostart::Args),
+    /// Work with Docker on this machine, such as starting Docker
+    /// Desktop.
+    Docker(docker::Args),
 }

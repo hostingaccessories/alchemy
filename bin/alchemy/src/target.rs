@@ -10,7 +10,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::error::{ClientError, Unreached};
+use crate::error::{ClientError, InstalledService, Unreached};
 
 /// Environment variable that names the daemon by URL, as `--daemon` does.
 pub const DAEMON_ENV: &str = "ALCHEMY_DAEMON";
@@ -86,13 +86,14 @@ pub(crate) fn resolve(sources: Sources) -> Result<Target, ClientError> {
 }
 
 /// The first of `sockets` that `answers`, or every one tried and why it
-/// didn't.
+/// didn't, with the autostart service `installed` finds, asked only then.
 ///
 /// Only the default lookup searches. A socket the user named is used as
 /// given, so its error comes from the request itself.
 pub(crate) fn find(
     sockets: Vec<PathBuf>,
     mut answers: impl FnMut(&Path) -> std::io::Result<()>,
+    installed: impl FnOnce() -> Option<InstalledService>,
 ) -> Result<PathBuf, ClientError> {
     let mut tried = Vec::with_capacity(sockets.len());
     for socket in sockets {
@@ -104,7 +105,10 @@ pub(crate) fn find(
             }),
         }
     }
-    Err(ClientError::NoDaemon { tried })
+    Err(ClientError::NoDaemon {
+        tried,
+        service: installed(),
+    })
 }
 
 fn non_empty(value: Option<OsString>) -> Option<OsString> {
@@ -307,9 +311,9 @@ mod tests {
             (&[], "tried /a.sock, /b.sock"),
         ];
         for (live, want) in cases {
-            let got = match find(both(), answers(live)) {
+            let got = match find(both(), answers(live), || None) {
                 Ok(socket) => format!("found {}", socket.display()),
-                Err(ClientError::NoDaemon { tried }) => {
+                Err(ClientError::NoDaemon { tried, .. }) => {
                     let tried: Vec<_> = tried
                         .iter()
                         .map(|t| t.socket.display().to_string())
@@ -331,10 +335,39 @@ mod tests {
                 asked.push(p.to_owned());
                 Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
             },
+            || None,
         )
         .unwrap_err();
         assert_eq!(asked, [PathBuf::from("/a.sock"), PathBuf::from("/b.sock")]);
         assert_eq!(err.exit_code(), 69);
+    }
+
+    #[test]
+    fn find_looks_for_a_service_only_when_no_socket_answers() {
+        use alchemy_api::autostart::{AutostartMode, LogHint};
+        let service = InstalledService {
+            mode: AutostartMode::Login,
+            logs: LogHint::Terminal,
+        };
+        let found = find(
+            vec![PathBuf::from("/a.sock")],
+            |_| Ok(()),
+            || panic!("looked for a service with a daemon answering"),
+        );
+        assert_eq!(found.unwrap(), PathBuf::from("/a.sock"));
+        let err = find(
+            vec![PathBuf::from("/a.sock")],
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            || Some(service.clone()),
+        )
+        .unwrap_err();
+        let ClientError::NoDaemon {
+            service: Some(got), ..
+        } = err
+        else {
+            panic!("{err:?}");
+        };
+        assert_eq!(got, service);
     }
 
     #[cfg(unix)]

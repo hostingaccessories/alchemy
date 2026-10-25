@@ -30,9 +30,13 @@ pub(crate) fn sse(event: &str, data: &str) -> SseEvent {
     }
 }
 
+/// A scripted stream item: an event or an error, or `None` to hang
+/// there, as a stream that goes quiet.
+type Item = Option<Result<SseEvent, ClientError>>;
+
 enum Script {
     One(Result<Reply, ClientError>),
-    Events(Result<Opened<VecDeque<Result<SseEvent, ClientError>>>, ClientError>),
+    Events(Result<Opened<VecDeque<Item>>, ClientError>),
 }
 
 /// Answers requests from a script, in order, and records every request as
@@ -94,7 +98,21 @@ impl FakeDaemon {
         self,
         items: impl IntoIterator<Item = Result<SseEvent, ClientError>>,
     ) -> Self {
-        let items = items.into_iter().collect();
+        let items = items.into_iter().map(Some).collect();
+        self.push(
+            &Method::GET,
+            EVENTS_PATH,
+            Script::Events(Ok(Opened::Stream(items))),
+        )
+    }
+
+    /// Open the event stream, send `items`, then send nothing more and
+    /// never end it.
+    pub(crate) fn events_then_hang(
+        self,
+        items: impl IntoIterator<Item = Result<SseEvent, ClientError>>,
+    ) -> Self {
+        let items = items.into_iter().map(Some).chain([None]).collect();
         self.push(
             &Method::GET,
             EVENTS_PATH,
@@ -108,7 +126,7 @@ impl FakeDaemon {
         path: &str,
         items: impl IntoIterator<Item = Result<SseEvent, ClientError>>,
     ) -> Self {
-        let items = items.into_iter().collect();
+        let items = items.into_iter().map(Some).collect();
         self.push(
             &Method::GET,
             path,
@@ -197,10 +215,17 @@ impl Daemon for FakeDaemon {
 
 /// The scripted events on a [`FakeDaemon`] stream.
 #[derive(Debug)]
-pub(crate) struct FakeEvents(VecDeque<Result<SseEvent, ClientError>>);
+pub(crate) struct FakeEvents(VecDeque<Item>);
 
 impl EventStream for FakeEvents {
     fn next(&mut self) -> impl Future<Output = Result<Option<SseEvent>, ClientError>> {
-        ready(self.0.pop_front().transpose())
+        let next = self.0.pop_front();
+        async move {
+            match next {
+                Some(Some(item)) => item.map(Some),
+                Some(None) => std::future::pending().await,
+                None => Ok(None),
+            }
+        }
     }
 }

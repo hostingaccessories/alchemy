@@ -4,9 +4,10 @@
 use std::io::Write;
 use std::path::Path;
 
+use alchemy_api::autostart::Autostart;
 use alchemy_api::{
     ApiEvent, AppList, EngineStatus, ErrorCode, ErrorResponse, MetricsResponse, OperationList,
-    PrivilegeList, ReconcileStatus, VersionResponse,
+    PrivilegeList, ReconcileStatus, VersionResponse, Wake,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -229,6 +230,10 @@ pub(crate) fn decode_event(raw: &SseEvent) -> Result<Option<ApiEvent>, ClientErr
         "reconcile" => {
             decode::<ReconcileStatus>(raw.data.as_bytes()).map(|r| Some(ApiEvent::Reconcile(r)))
         }
+        "woke" => decode::<Wake>(raw.data.as_bytes()).map(|w| Some(ApiEvent::Woke(w))),
+        "autostart" => {
+            decode::<Autostart>(raw.data.as_bytes()).map(|a| Some(ApiEvent::Autostart(a)))
+        }
         _ => Ok(None),
     }
 }
@@ -319,6 +324,7 @@ impl<D: Daemon> Context<D, Vec<u8>> {
     clippy::indexing_slicing
 )]
 mod tests {
+    use alchemy_api::autostart::{AutostartMode, LogHint, Supervisor};
     use alchemy_api::{EngineState, HealthResponse, HealthStatus};
 
     use super::*;
@@ -528,6 +534,19 @@ mod tests {
             ApiEvent::Operations(OperationList::default()),
             ApiEvent::Privileges(PrivilegeList::default()),
             ApiEvent::Reconcile(ReconcileStatus::default()),
+            ApiEvent::Woke(Wake {
+                slept_for: 600,
+                at: 1_700_000_000,
+            }),
+            ApiEvent::Autostart(Autostart {
+                mode: AutostartMode::Login,
+                available_modes: AutostartMode::ALL.to_vec(),
+                log_hint: LogHint::Terminal,
+                supervisor: Supervisor::Manual,
+                pending: None,
+                last: None,
+                unavailable: Vec::new(),
+            }),
         ];
         for event in events {
             let raw = SseEvent {

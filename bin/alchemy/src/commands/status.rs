@@ -1,21 +1,34 @@
 //! `alchemy status`: whether alchemyd is reachable, which version it runs,
-//! whether Docker is ready, whether apps' `.local` names are announced,
-//! whether Docker's networks overlap the home network, and whether the web
-//! address proxy's ports work.
+//! whether Docker is ready, whether alchemyd starts on its own and where
+//! it logs, whether apps' `.local` names are announced, what came back
+//! after the last restart, wake, or Docker returning, whether Docker's
+//! networks overlap the home network, and whether the web address proxy's
+//! ports work.
 
 use std::io::Write;
 use std::path::Path;
 
 use alchemy_api::ApiEvent;
+use alchemy_api::autostart::Autostart;
 use alchemy_api::network::{
     ListenerState, MdnsBackend, MdnsReport, MdnsState, NetworkReport, NetworkWarning, ProxyReport,
 };
 use alchemy_api::privileges::PrivilegeAction;
+use alchemy_api::reconcile::{
+    Reconcile, ReconcileApp, ReconcileOutcome, ReconcileStatus, ReconcileTrigger, SkipReason,
+};
 use alchemy_core::engine::{EngineFlavor, EngineState, EngineStatus};
+use alchemy_core::lifecycle::{DockerStart, plan_docker_start};
 
+use crate::commands::machine::autostart::{self, logs_text, mode_text};
+use crate::commands::machine::docker;
 use crate::context::Context;
 use crate::daemon::{Daemon, DaemonInfo};
 use crate::error::ClientError;
+use crate::service::host_os;
+
+/// The route the last reconcile comes from.
+pub(crate) const RECONCILE_PATH: &str = "/api/reconcile";
 
 /// The command's name, for errors.
 pub(crate) const NAME: &str = "status";
@@ -43,10 +56,53 @@ pub(crate) async fn run<D: Daemon, W: Write>(
     }
     let engine = ctx.get::<EngineStatus>("/api/engine").await?;
     let network = ctx.get::<NetworkReport>("/api/network").await.ok();
-    for line in status_lines(&daemon, ctx.socket(), &engine, network.as_ref(), ctx.json()) {
+    let autostart = ctx.get::<Autostart>(autostart::PATH).await.ok();
+    let reconcile = ctx.get::<ReconcileStatus>(RECONCILE_PATH).await.ok();
+    let report = Report {
+        engine: &engine,
+        network: network.as_ref(),
+        autostart: autostart.as_ref(),
+        reconcile: reconcile.as_ref(),
+        now: unix_now(),
+    };
+    for line in status_lines(&daemon, ctx.socket(), &report, ctx.json()) {
         ctx.out().line(line)?;
     }
     Ok(())
+}
+
+/// The wall clock in Unix seconds, for how long ago the last reconcile
+/// ran. A clock before 1970 reads as 0.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Everything `alchemy status` reports beyond the daemon itself. Each
+/// part but the engine is missing from an older alchemyd, and from
+/// `--watch`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Report<'a> {
+    pub(crate) engine: &'a EngineStatus,
+    pub(crate) network: Option<&'a NetworkReport>,
+    pub(crate) autostart: Option<&'a Autostart>,
+    pub(crate) reconcile: Option<&'a ReconcileStatus>,
+    /// Now, in Unix seconds.
+    pub(crate) now: i64,
+}
+
+impl<'a> Report<'a> {
+    /// The engine alone, as `--watch` follows it.
+    pub(crate) const fn engine(engine: &'a EngineStatus) -> Self {
+        Self {
+            engine,
+            network: None,
+            autostart: None,
+            reconcile: None,
+            now: 0,
+        }
+    }
 }
 
 /// Follow the engine status, printing the engine line again only when it
@@ -67,11 +123,11 @@ async fn watch<D: Daemon, W: Write>(
         };
         let line = engine_line(&engine);
         if last_line.is_none() {
-            for line in status_lines(daemon, ctx.socket(), &engine, None, ctx.json()) {
+            for line in status_lines(daemon, ctx.socket(), &Report::engine(&engine), ctx.json()) {
                 ctx.out().line(line)?;
             }
         } else if ctx.json() {
-            let json = status_json(daemon, ctx.socket(), &engine, None);
+            let json = status_json(daemon, ctx.socket(), &Report::engine(&engine));
             ctx.out().line(json)?;
         } else if last_line.as_ref() != Some(&line) {
             ctx.out().line(&line)?;
@@ -80,27 +136,133 @@ async fn watch<D: Daemon, W: Write>(
     }
 }
 
-/// What `alchemy status` prints: the daemon, engine, and local names
-/// lines, then any network, proxy, and local names warnings, or one JSON
-/// object.
+/// What `alchemy status` prints: the daemon and engine lines, with how
+/// to start Docker when it is down, autostart and the logs, local names,
+/// the last reconcile, then any network, proxy, and local names warnings;
+/// or one JSON object.
 pub(crate) fn status_lines(
     daemon: &DaemonInfo,
     socket: &Path,
-    engine: &EngineStatus,
-    network: Option<&NetworkReport>,
+    report: &Report<'_>,
     json: bool,
 ) -> Vec<String> {
     if json {
-        return vec![status_json(daemon, socket, engine, network)];
+        return vec![status_json(daemon, socket, report)];
     }
-    let mut lines = vec![daemon_line(daemon, socket), engine_line(engine)];
-    if let Some(network) = network {
+    let mut lines = vec![daemon_line(daemon, socket), engine_line(report.engine)];
+    lines.extend(docker_fix(report.engine));
+    if let Some(autostart) = report.autostart {
+        lines.extend(autostart_lines(autostart));
+    }
+    if let Some(network) = report.network {
         lines.extend(mdns_line(&network.mdns));
+    }
+    if let Some(last) = report.reconcile.and_then(|r| r.last.as_ref()) {
+        lines.extend(recovery_lines(last, report.now));
+    }
+    if let Some(network) = report.network {
         lines.extend(warning_lines(&network.warnings));
         lines.extend(proxy_lines(&network.proxy));
         lines.extend(mdns_warning_lines(&network.mdns));
     }
     lines
+}
+
+/// How to start Docker when it isn't running: `alchemy machine docker
+/// start` for Docker Desktop, or the command alchemyd would give for an
+/// engine it doesn't start, such as Docker Engine on Linux.
+pub(crate) fn docker_fix(engine: &EngineStatus) -> Option<String> {
+    if engine.state != EngineState::NotRunning {
+        return None;
+    }
+    match plan_docker_start(host_os(), engine.state, engine.flavor) {
+        DockerStart::Launch(_) => Some(format!("  Fix: run `alchemy {}`", docker::START_NAME)),
+        DockerStart::Refuse(refusal) => refusal
+            .command()
+            .map(|command| format!("  Fix: run `{command}`")),
+        DockerStart::AlreadyRunning | DockerStart::AlreadyStarting => None,
+    }
+}
+
+/// Whether alchemyd starts on its own, and where the one answering logs.
+pub(crate) fn autostart_lines(autostart: &Autostart) -> Vec<String> {
+    let pending = autostart
+        .pending
+        .map_or_else(String::new, |mode| format!("; switching to {mode}"));
+    vec![
+        format!("Autostart: {}{pending}", mode_text(autostart.mode)),
+        format!(
+            "Logs: {}",
+            logs_text(&autostart.log_hint, autostart.supervisor)
+        ),
+    ]
+}
+
+/// What the last reconcile did: a heading with what set it off and when,
+/// then each app it started, is starting, couldn't start, or left down
+/// for a reason worth knowing. Apps that weren't running before, or
+/// already were, are left out.
+pub(crate) fn recovery_lines(last: &Reconcile, now: i64) -> Vec<String> {
+    let heading = format!(
+        "Recovery {}, {}",
+        trigger_text(last.trigger),
+        ago(last.at, now)
+    );
+    let apps: Vec<String> = last.apps.iter().filter_map(recovery_app).collect();
+    if apps.is_empty() {
+        return vec![format!("{heading}: nothing needed starting")];
+    }
+    std::iter::once(format!("{heading}:"))
+        .chain(apps.into_iter().map(|line| format!("  {line}")))
+        .collect()
+}
+
+fn recovery_app(app: &ReconcileApp) -> Option<String> {
+    let name = &app.app;
+    let message = app.message.as_deref();
+    Some(match app.outcome {
+        ReconcileOutcome::Started => format!("{name}: started"),
+        ReconcileOutcome::Starting => format!("{name}: starting…"),
+        ReconcileOutcome::Failed => format!(
+            "{name}: didn't come back: {}",
+            message.unwrap_or("its start failed")
+        ),
+        ReconcileOutcome::Skipped => match app.reason {
+            Some(SkipReason::NotRunningBefore | SkipReason::AlreadyRunning) => return None,
+            reason => format!(
+                "{name}: not started: {}",
+                message
+                    .or(reason.map(SkipReason::message))
+                    .unwrap_or("Alchemy left it alone")
+            ),
+        },
+        _ => format!("{name}: in a state this alchemy doesn't know; upgrade alchemy"),
+    })
+}
+
+fn trigger_text(trigger: ReconcileTrigger) -> &'static str {
+    match trigger {
+        ReconcileTrigger::DaemonStart => "after alchemyd started",
+        ReconcileTrigger::Wake => "after the computer woke",
+        ReconcileTrigger::EngineReturned => "after Docker came back",
+    }
+}
+
+/// How long before `now` the moment `at` was, both in Unix seconds, such
+/// as `3 minutes ago`. A moment in the future reads as just now.
+pub(crate) fn ago(at: i64, now: i64) -> String {
+    let secs = now.saturating_sub(at);
+    let (count, unit) = match secs {
+        ..60 => return "just now".to_owned(),
+        60..3_600 => (secs / 60, "minute"),
+        3_600..86_400 => (secs / 3_600, "hour"),
+        _ => (secs / 86_400, "day"),
+    };
+    if count == 1 {
+        format!("1 {unit} ago")
+    } else {
+        format!("{count} {unit}s ago")
+    }
 }
 
 /// Whether apps' `.local` names are announced, and through what, or `None`
@@ -242,24 +404,26 @@ pub(crate) fn engine_line(engine: &EngineStatus) -> String {
 }
 
 /// The `--json` object: the daemon, its socket, the engine status, and
-/// the network report, when there is one.
-pub(crate) fn status_json(
-    daemon: &DaemonInfo,
-    socket: &Path,
-    engine: &EngineStatus,
-    network: Option<&NetworkReport>,
-) -> String {
+/// the network report, autostart, and last reconcile, when there are
+/// ones.
+pub(crate) fn status_json(daemon: &DaemonInfo, socket: &Path, report: &Report<'_>) -> String {
     let mut json = serde_json::json!({
         "daemon": daemon.version,
         "protocol": daemon.api,
         "socket": socket,
-        "engine": engine,
+        "engine": report.engine,
     });
-    if let (Some(network), Some(object)) = (network, json.as_object_mut()) {
-        object.insert(
-            "network".to_owned(),
-            serde_json::to_value(network).unwrap_or_default(),
-        );
+    if let Some(object) = json.as_object_mut() {
+        let parts = [
+            ("network", report.network.map(serde_json::to_value)),
+            ("autostart", report.autostart.map(serde_json::to_value)),
+            ("reconcile", report.reconcile.map(serde_json::to_value)),
+        ];
+        for (key, value) in parts {
+            if let Some(value) = value {
+                object.insert(key.to_owned(), value.unwrap_or_default());
+            }
+        }
     }
     json.to_string()
 }
@@ -422,8 +586,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&status_json(
             &daemon,
             Path::new("/run/alchemyd.sock"),
-            &engine,
-            None,
+            &Report::engine(&engine),
         ))
         .unwrap();
         assert_eq!(
@@ -460,6 +623,7 @@ mod tests {
 
     const ENGINE: &str = "/api/engine";
     const NETWORK: &str = "/api/network";
+    const AUTOSTART: &str = "/api/machine/autostart";
 
     struct Run {
         result: Result<(), ClientError>,
@@ -542,7 +706,9 @@ mod tests {
         let fake = FakeDaemon::new()
             .version("1.2.3", 1)
             .ok(Method::GET, ENGINE, &ready())
-            .ok(Method::GET, NETWORK, &NetworkReport::default());
+            .ok(Method::GET, NETWORK, &NetworkReport::default())
+            .error(Method::GET, AUTOSTART, 404, "not_found", "not found")
+            .error(Method::GET, RECONCILE_PATH, 404, "not_found", "not found");
         let run = run_with(fake, false, false).await;
         run.result.unwrap();
         assert_eq!(
@@ -551,7 +717,13 @@ mod tests {
         );
         assert_eq!(
             run.requests,
-            ["GET /api/version", "GET /api/engine", "GET /api/network"]
+            [
+                "GET /api/version",
+                "GET /api/engine",
+                "GET /api/network",
+                "GET /api/machine/autostart",
+                "GET /api/reconcile"
+            ]
         );
     }
 
@@ -560,7 +732,9 @@ mod tests {
         let fake = FakeDaemon::new()
             .version("1.2.3", 1)
             .ok(Method::GET, ENGINE, &ready())
-            .ok(Method::GET, NETWORK, &overlapping());
+            .ok(Method::GET, NETWORK, &overlapping())
+            .error(Method::GET, AUTOSTART, 404, "not_found", "not found")
+            .error(Method::GET, RECONCILE_PATH, 404, "not_found", "not found");
         let run = run_with(fake, false, false).await;
         run.result.unwrap();
         let lines: Vec<&str> = run.out.lines().collect();
@@ -673,7 +847,9 @@ mod tests {
         let fake = FakeDaemon::new()
             .version("1.2.3", 1)
             .ok(Method::GET, ENGINE, &ready())
-            .ok(Method::GET, NETWORK, &report);
+            .ok(Method::GET, NETWORK, &report)
+            .error(Method::GET, AUTOSTART, 404, "not_found", "not found")
+            .error(Method::GET, RECONCILE_PATH, 404, "not_found", "not found");
         let run = run_with(fake, false, false).await;
         run.result.unwrap();
         assert_eq!(
@@ -757,7 +933,9 @@ mod tests {
         let fake = FakeDaemon::new()
             .version("1.2.3", 1)
             .ok(Method::GET, ENGINE, &ready())
-            .error(Method::GET, NETWORK, 404, "not_found", "not found");
+            .error(Method::GET, NETWORK, 404, "not_found", "not found")
+            .error(Method::GET, AUTOSTART, 404, "not_found", "not found")
+            .error(Method::GET, RECONCILE_PATH, 404, "not_found", "not found");
         let run = run_with(fake, false, false).await;
         run.result.unwrap();
         assert_eq!(run.out, format!("{DAEMON_LINE}\n{READY_LINE}\n"));
@@ -768,7 +946,9 @@ mod tests {
         let fake = FakeDaemon::new()
             .version("1.2.3", 1)
             .ok(Method::GET, ENGINE, &ready())
-            .ok(Method::GET, NETWORK, &overlapping());
+            .ok(Method::GET, NETWORK, &overlapping())
+            .error(Method::GET, AUTOSTART, 404, "not_found", "not found")
+            .error(Method::GET, RECONCILE_PATH, 404, "not_found", "not found");
         let run = run_with(fake, true, false).await;
         run.result.unwrap();
         assert_eq!(
@@ -906,5 +1086,220 @@ mod tests {
             assert_eq!(err.exit_code(), code, "{err}");
             assert_eq!(run.out, "", "{err}");
         }
+    }
+
+    #[test]
+    fn ago_reads_naturally() {
+        let now = 1_700_000_000;
+        let cases = [
+            (now + 5, "just now"),
+            (now, "just now"),
+            (now - 59, "just now"),
+            (now - 60, "1 minute ago"),
+            (now - 150, "2 minutes ago"),
+            (now - 3_600, "1 hour ago"),
+            (now - 7_300, "2 hours ago"),
+            (now - 86_400 * 3, "3 days ago"),
+        ];
+        for (at, want) in cases {
+            assert_eq!(ago(at, now), want, "{}", now - at);
+        }
+    }
+
+    #[test]
+    fn docker_fix_points_at_the_way_to_start_it() {
+        use EngineFlavor::{DockerDesktop, DockerEngine, Other};
+        let desktop = "  Fix: run `alchemy machine docker start`";
+        let engine = "  Fix: run `sudo systemctl start docker`";
+        let linux = cfg!(target_os = "linux");
+        let cases = [
+            (EngineState::NotRunning, Some(DockerDesktop), Some(desktop)),
+            (EngineState::NotRunning, Some(DockerEngine), Some(engine)),
+            (EngineState::NotRunning, None, linux.then_some(engine)),
+            (EngineState::NotRunning, Some(Other), None),
+            (EngineState::Ready, Some(DockerDesktop), None),
+            (EngineState::Starting, Some(DockerDesktop), None),
+            (EngineState::NotInstalled, Some(DockerDesktop), None),
+        ];
+        for (state, flavor, want) in cases {
+            let engine = status(state, flavor, [None, None, None], None);
+            assert_eq!(docker_fix(&engine).as_deref(), want, "{state:?} {flavor:?}");
+        }
+    }
+
+    fn reconcile_app(
+        app: &str,
+        outcome: ReconcileOutcome,
+        reason: Option<SkipReason>,
+        message: Option<&str>,
+    ) -> ReconcileApp {
+        ReconcileApp {
+            app: alchemy_api::reconcile::StackName::new(app).unwrap(),
+            outcome,
+            operation: None,
+            reason,
+            message: message.map(str::to_owned),
+        }
+    }
+
+    fn reconcile(trigger: ReconcileTrigger, apps: Vec<ReconcileApp>) -> Reconcile {
+        Reconcile {
+            trigger,
+            at: 1_700_000_000,
+            reason: trigger.start_reason().to_owned(),
+            apps,
+        }
+    }
+
+    #[test]
+    fn recovery_names_what_came_back_and_what_didnt() {
+        use ReconcileOutcome::{Failed, Skipped, Started, Starting};
+        let now = 1_700_000_180;
+        let last = reconcile(
+            ReconcileTrigger::Wake,
+            vec![
+                reconcile_app("blog", Started, None, None),
+                reconcile_app("shop", Starting, None, None),
+                reconcile_app("wiki", Failed, None, Some("port 8080 is already in use")),
+                reconcile_app("docs", Failed, None, None),
+                reconcile_app(
+                    "mail",
+                    Skipped,
+                    Some(SkipReason::StopIntent),
+                    Some("you stopped it in Alchemy"),
+                ),
+                reconcile_app("git", Skipped, Some(SkipReason::PartlyRunning), None),
+                reconcile_app("old", Skipped, Some(SkipReason::NotRunningBefore), None),
+                reconcile_app("up", Skipped, Some(SkipReason::AlreadyRunning), None),
+            ],
+        );
+        assert_eq!(
+            recovery_lines(&last, now),
+            [
+                "Recovery after the computer woke, 3 minutes ago:",
+                "  blog: started",
+                "  shop: starting…",
+                "  wiki: didn't come back: port 8080 is already in use",
+                "  docs: didn't come back: its start failed",
+                "  mail: not started: you stopped it in Alchemy",
+                "  git: not started: some of its services are already running",
+            ]
+        );
+        let quiet = reconcile(
+            ReconcileTrigger::DaemonStart,
+            vec![reconcile_app(
+                "up",
+                Skipped,
+                Some(SkipReason::AlreadyRunning),
+                None,
+            )],
+        );
+        assert_eq!(
+            recovery_lines(&quiet, 1_700_000_000),
+            ["Recovery after alchemyd started, just now: nothing needed starting"]
+        );
+        let returned = reconcile(ReconcileTrigger::EngineReturned, Vec::new());
+        assert!(recovery_lines(&returned, now)[0].starts_with("Recovery after Docker came back"));
+    }
+
+    fn autostart(
+        mode: alchemy_api::autostart::AutostartMode,
+        supervisor: alchemy_api::autostart::Supervisor,
+    ) -> Autostart {
+        Autostart {
+            mode,
+            available_modes: alchemy_api::autostart::AutostartMode::ALL.to_vec(),
+            log_hint: alchemy_api::autostart::LogHint::Journal {
+                command: "journalctl --user -u alchemyd.service".into(),
+            },
+            supervisor,
+            pending: None,
+            last: None,
+            unavailable: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn autostart_lines_say_the_mode_and_where_logs_go() {
+        use alchemy_api::autostart::{AutostartMode, Supervisor};
+        let login = autostart(AutostartMode::Login, Supervisor::UserService);
+        assert_eq!(
+            autostart_lines(&login),
+            [
+                "Autostart: login (alchemyd starts when you log in, as a per-user service)",
+                "Logs: journalctl --user -u alchemyd.service",
+            ]
+        );
+        let mut manual = autostart(AutostartMode::Off, Supervisor::Manual);
+        manual.pending = Some(AutostartMode::Boot);
+        assert_eq!(
+            autostart_lines(&manual),
+            [
+                "Autostart: off (alchemyd starts only when you run it); switching to boot",
+                "Logs: the terminal alchemyd was started from",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn status_adds_autostart_and_the_last_recovery() {
+        use alchemy_api::autostart::{AutostartMode, Supervisor};
+        let mut down = ready();
+        down.state = EngineState::NotRunning;
+        let now = autostart(AutostartMode::Login, Supervisor::UserService);
+        let last = ReconcileStatus {
+            last: Some(reconcile(
+                ReconcileTrigger::DaemonStart,
+                vec![reconcile_app(
+                    "wiki",
+                    ReconcileOutcome::Failed,
+                    None,
+                    Some("Docker isn't running"),
+                )],
+            )),
+        };
+        let fake = FakeDaemon::new()
+            .version("1.2.3", 1)
+            .ok(Method::GET, ENGINE, &down)
+            .error(Method::GET, NETWORK, 404, "not_found", "not found")
+            .ok(Method::GET, AUTOSTART, &now)
+            .ok(Method::GET, RECONCILE_PATH, &last);
+        let run = run_with(fake, false, false).await;
+        run.result.unwrap();
+        let lines: Vec<&str> = run.out.lines().collect();
+        assert_eq!(lines[0], DAEMON_LINE);
+        assert_eq!(
+            lines[1..3],
+            [
+                "Docker Desktop isn't running at unix:///var/run/docker.sock",
+                "  Fix: run `alchemy machine docker start`",
+            ]
+        );
+        assert_eq!(
+            lines[3..5],
+            [
+                "Autostart: login (alchemyd starts when you log in, as a per-user service)",
+                "Logs: journalctl --user -u alchemyd.service",
+            ]
+        );
+        assert!(
+            lines[5].starts_with("Recovery after alchemyd started, "),
+            "{}",
+            run.out
+        );
+        assert_eq!(lines[6], "  wiki: didn't come back: Docker isn't running");
+        assert_eq!(lines.len(), 7, "{}", run.out);
+
+        let fake = FakeDaemon::new()
+            .version("1.2.3", 1)
+            .ok(Method::GET, ENGINE, &down)
+            .error(Method::GET, NETWORK, 404, "not_found", "not found")
+            .ok(Method::GET, AUTOSTART, &now)
+            .ok(Method::GET, RECONCILE_PATH, &last);
+        let run = run_with(fake, true, false).await;
+        let json = &json_lines(&run.out)[0];
+        assert_eq!(json["autostart"], serde_json::to_value(&now).unwrap());
+        assert_eq!(json["reconcile"], serde_json::to_value(&last).unwrap());
+        assert!(json.get("network").is_none(), "{json}");
     }
 }

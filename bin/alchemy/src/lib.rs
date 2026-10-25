@@ -12,6 +12,7 @@ mod error;
 mod output;
 pub mod prompt;
 pub mod safety;
+mod service;
 mod sse;
 pub mod sudo;
 mod target;
@@ -32,7 +33,7 @@ use crate::prompt::{Prompt, TtyPrompt};
 use crate::sudo::{Sudo, TerminalSudo};
 use crate::target::{Sources, Target};
 
-pub use error::{ClientError, Exit, ProtocolError, Unreached};
+pub use error::{ClientError, Exit, InstalledService, ProtocolError, Unreached};
 pub use output::Color;
 pub use target::DAEMON_ENV;
 
@@ -169,7 +170,7 @@ pub async fn run_with_sockets<W: Write, P: Prompt, S: Sudo>(
     let context = |out, command| -> Result<_, ClientError> {
         let socket = match target::resolve(Sources::from_env(daemon, socket, sockets))? {
             Target::Unix(socket) => socket,
-            Target::Search(sockets) => target::find(sockets, answers)?,
+            Target::Search(sockets) => target::find(sockets, answers, service::find)?,
         };
         Ok(Context::new(
             HttpDaemon::new(socket),
@@ -275,6 +276,13 @@ async fn run_machine<W: Write, S: Sudo>(
         }
         machine::Verb::Ports(args) => {
             machine::ports::run(&mut context(machine::ports::NAME)?, args).await
+        }
+        machine::Verb::Autostart(args) => {
+            let mut context = context(machine::autostart::name(&args))?;
+            machine::autostart::run(&mut context, sudo, args).await
+        }
+        machine::Verb::Docker(args) => {
+            machine::docker::run(&mut context(machine::docker::START_NAME)?, args).await
         }
     }
 }
