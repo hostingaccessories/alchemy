@@ -214,7 +214,11 @@ where
         state.set_engine_facts(Some(engine_facts(version.as_ref(), &info, self.os)));
         publish_engine(state, status);
         let outcome = follow(&api, state, self.liveness).await;
-        state.engine_lost();
+        if outcome == Outcome::Woke {
+            state.engine_resubscribing();
+        } else {
+            state.engine_lost();
+        }
         outcome
     }
 }

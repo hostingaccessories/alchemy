@@ -1,7 +1,8 @@
 //! Wake wiring: `run_with` noticing a sleep on a fake clock, then sending
 //! one `woke` event on `/api/events`, reading the LAN address again at
 //! once instead of on the next routing tick, and subscribing again to an
-//! engine whose event stream hung, all within seconds.
+//! engine whose event stream hung, all within seconds, with one reconcile
+//! for the wake and none for the connection it made again.
 //!
 //! This is the sleep test CI runs on both Linux and macOS: nothing in it
 //! depends on the host's clocks, network, or Docker.
@@ -16,12 +17,13 @@
 use std::future::{Future, ready};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alchemy_api::Wake;
 use alchemy_core::engine::{ContainerEvent, ContainerState, ContainerStatus, EngineState};
+use alchemy_core::lifecycle::ReconcileTrigger;
 use alchemyd::Deps;
 use alchemyd::engine::{
     ApiError, CliError, Connector, DockerApi, DockerCli, Endpoint, EngineMonitor, EngineVersion,
@@ -32,6 +34,7 @@ use alchemyd::wake::{FakeClock, WakeDeps};
 use futures_util::{Stream, StreamExt as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
+use tokio::sync::Notify;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET: &str = "/run/fake/docker.sock";
@@ -39,16 +42,22 @@ const DOCKER: &str = "/usr/bin/docker";
 const TICK: Duration = Duration::from_millis(20);
 
 /// An engine at [`SOCKET`] that answers everything at once, but whose
-/// event streams never send or end, as one can after sleep. Counts each
-/// subscription.
+/// event streams never send, and end only when told to, as one can hang
+/// after sleep. Counts each subscription.
 #[derive(Debug, Clone, Default)]
 struct HangingEngine {
     subscriptions: Arc<AtomicUsize>,
+    end: Arc<Notify>,
 }
 
 impl HangingEngine {
     fn subscriptions(&self) -> usize {
         self.subscriptions.load(Ordering::SeqCst)
+    }
+
+    /// End the open event streams, as Docker going away does.
+    fn drop_streams(&self) {
+        self.end.notify_waiters();
     }
 }
 
@@ -106,7 +115,10 @@ impl DockerApi for HangingEngine {
         &self,
     ) -> impl Stream<Item = Result<ContainerEvent, ApiError>> + Send + Unpin + 'static {
         self.subscriptions.fetch_add(1, Ordering::SeqCst);
-        futures_util::stream::pending().boxed()
+        let end = Arc::clone(&self.end);
+        futures_util::stream::once(async move { end.notified().await })
+            .filter_map(|()| ready(None))
+            .boxed()
     }
 
     fn inspect_exit(
@@ -184,7 +196,24 @@ async fn drain_for(stream: &mut UnixStream, seen: &mut String, wait: Duration) {
     }
 }
 
+/// The trigger of each reconcile that runs from now on.
+fn record_reconciles(state: &alchemyd::State) -> Arc<Mutex<Vec<ReconcileTrigger>>> {
+    let triggers = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&triggers);
+    let mut rx = state.watch_reconcile();
+    tokio::spawn(async move {
+        while rx.changed().await.is_ok() {
+            let last = rx.borrow_and_update().last.clone();
+            if let Some(last) = last {
+                seen.lock().unwrap().push(last.trigger);
+            }
+        }
+    });
+    triggers
+}
+
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn after_a_sleep_it_rereads_the_lan_and_resubscribes_to_docker_within_seconds() {
     let dir = tempfile::Builder::new()
         .prefix("wk")
@@ -224,6 +253,11 @@ async fn after_a_sleep_it_rereads_the_lan_and_resubscribes_to_docker_within_seco
     eventually("the daemon to listen", || socket.exists()).await;
     eventually("Docker to be followed", || engine.subscriptions() == 1).await;
     eventually("the LAN address to be read", || host.lan_reads() == 1).await;
+    eventually("the daemon_start reconcile", || {
+        state.reconcile().last.map(|r| r.trigger) == Some(ReconcileTrigger::DaemonStart)
+    })
+    .await;
+    let triggers = record_reconciles(&state);
 
     let mut events = UnixStream::connect(&socket).await.unwrap();
     events
@@ -270,6 +304,27 @@ async fn after_a_sleep_it_rereads_the_lan_and_resubscribes_to_docker_within_seco
     );
     assert_eq!(host.lan_reads(), 2, "once per wake");
     assert_eq!(engine.subscriptions(), 2, "once per wake");
+    eventually("the wake reconcile", || {
+        triggers.lock().unwrap().contains(&ReconcileTrigger::Wake)
+    })
+    .await;
+    tokio::time::sleep(TICK * 10).await;
+    assert_eq!(
+        *triggers.lock().unwrap(),
+        [ReconcileTrigger::Wake],
+        "one reconcile per wake, and none for subscribing again"
+    );
+
+    engine.drop_streams();
+    eventually("Docker returning after the wake", || {
+        triggers.lock().unwrap().len() == 2
+    })
+    .await;
+    assert_eq!(
+        *triggers.lock().unwrap(),
+        [ReconcileTrigger::Wake, ReconcileTrigger::EngineReturned],
+        "a real disconnect after a wake still counts"
+    );
 
     stop.send(()).unwrap();
     tokio::time::timeout(TIMEOUT, daemon)

@@ -1137,7 +1137,11 @@ async fn monitor_reconnects_and_resyncs_when_the_stream_drops() {
     containers_until(&run.state, |c| !c.is_empty()).await;
     let mut engine_rx = run.state.watch_engine();
     assert_eq!(engine_rx.borrow_and_update().state, EngineState::Ready);
-    let link = |connection, listed| alchemyd::EngineLink { connection, listed };
+    let link = |connection, listed| alchemyd::EngineLink {
+        connection,
+        listed,
+        resubscribed: false,
+    };
     assert_eq!(run.state.engine_link(), link(1, true));
 
     {
@@ -1270,6 +1274,15 @@ async fn monitor_subscribes_again_at_once_after_a_wake() {
     assert!(
         !engine_rx.has_changed().unwrap(),
         "the same engine is not republished"
+    );
+    assert_eq!(
+        run.state.engine_link(),
+        alchemyd::EngineLink {
+            connection: 2,
+            listed: true,
+            resubscribed: true,
+        },
+        "not Docker returning"
     );
 
     tokio::time::sleep(Duration::from_secs(5)).await;

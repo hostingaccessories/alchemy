@@ -65,12 +65,20 @@ struct Inner {
 /// `connection` rises each time a connection's first listing lands, so
 /// the first is 1. `listed` goes back to `false` when that connection
 /// ends, such as when Docker quits or its event stream breaks.
+///
+/// After a wake the monitor drops its connection itself and subscribes
+/// again, with no sign that Docker went away. `resubscribed` says so,
+/// from then until a connection is next lost, so that the new connection
+/// isn't taken for Docker returning.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EngineLink {
     /// The current or last connection, counting from 1, or 0 before any.
     pub connection: u64,
     /// Whether that connection is up and has listed every container.
     pub listed: bool,
+    /// Whether the last connection was dropped by alchemyd to subscribe
+    /// again after a wake, rather than lost.
+    pub resubscribed: bool,
 }
 
 impl State {
@@ -435,11 +443,25 @@ impl State {
     /// Record that the engine connection ended, or that the engine isn't
     /// ready. Returns whether a listed connection ended.
     pub fn engine_lost(&self) -> bool {
+        let mut was = false;
         self.inner.engine_link.send_if_modified(|link| {
-            let was = link.listed;
+            was = link.listed;
+            let changed = link.listed || link.resubscribed;
             link.listed = false;
-            was
-        })
+            link.resubscribed = false;
+            changed
+        });
+        was
+    }
+
+    /// Record that the monitor dropped the engine connection itself, to
+    /// subscribe again after a wake. Unlike [`Self::engine_lost`], the
+    /// next connection doesn't count as Docker returning.
+    pub fn engine_resubscribing(&self) {
+        self.inner.engine_link.send_modify(|link| {
+            link.listed = false;
+            link.resubscribed = true;
+        });
     }
 
     /// How many wakes from sleep have been noticed since alchemyd started.
@@ -682,7 +704,8 @@ mod tests {
             state.engine_link(),
             EngineLink {
                 connection: 1,
-                listed: true
+                listed: true,
+                resubscribed: false,
             }
         );
         assert!(state.engine_lost());
@@ -692,9 +715,29 @@ mod tests {
             state.engine_link(),
             EngineLink {
                 connection: 2,
-                listed: true
+                listed: true,
+                resubscribed: false,
             }
         );
+
+        let mut rx = state.watch_engine_link();
+        state.engine_resubscribing();
+        assert!(rx.has_changed().unwrap());
+        state.engine_listed();
+        assert_eq!(
+            *rx.borrow_and_update(),
+            EngineLink {
+                connection: 3,
+                listed: true,
+                resubscribed: true,
+            },
+            "a connection made again after a wake says so"
+        );
+        assert!(state.engine_lost());
+        assert!(!state.engine_link().resubscribed, "until one is lost");
+        state.engine_resubscribing();
+        assert!(!state.engine_lost(), "nothing listed was lost");
+        assert!(rx.has_changed().unwrap(), "but the flag cleared");
     }
 
     #[test]

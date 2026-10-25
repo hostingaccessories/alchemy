@@ -1,5 +1,6 @@
 //! Reconcile wiring: `run_with` bringing back the apps that were running
-//! after a restart, Docker returning, and a wake, skipping stop intents
+//! after a restart, Docker returning, and a wake, but not after the engine
+//! monitor subscribes again for a wake, skipping stop intents
 //! and stops made by hand, reporting a failing app without retrying it,
 //! and starting Docker Desktop on request, all against a fake engine
 //! driven through the shared state, a fake Compose runner, and a fake
@@ -410,6 +411,46 @@ async fn docker_returning_and_a_wake_each_try_a_failing_app_once() {
     );
     tokio::time::sleep(GRACE * 3).await;
     assert_eq!(ups(&runner), ["blog", "blog"], "once per trigger");
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn subscribing_again_after_a_wake_is_not_docker_returning() {
+    let (_dir, root) = tempdir();
+    let runner = FakeComposeRunner::new();
+    let daemon = start(&root, &runner, Arc::new(FakeLauncher::new())).await;
+    connect_engine(&daemon.state, &APPS);
+    until(
+        &daemon.socket,
+        "/api/reconcile",
+        "the first reconcile",
+        |b| b["last"]["trigger"] == "daemon_start",
+    )
+    .await;
+
+    stop_container(&daemon.state, "blog");
+    daemon.state.woke();
+    let woke = until(
+        &daemon.socket,
+        "/api/reconcile",
+        "the wake reconcile",
+        |b| b["last"]["trigger"] == "wake" && outcome(b, "blog")["outcome"] == "started",
+    )
+    .await;
+
+    daemon.state.engine_resubscribing();
+    connect_engine(&daemon.state, &APPS);
+    tokio::time::sleep(GRACE * 5).await;
+    let (_, after) = call(&daemon.socket, "GET", "/api/reconcile", "").await;
+    assert_eq!(after, woke, "one reconcile per wake, the wake's");
+    assert_eq!(ups(&runner), ["blog"]);
+
+    lose_engine(&daemon.state);
+    connect_engine(&daemon.state, &APPS);
+    until(&daemon.socket, "/api/reconcile", "Docker returning", |b| {
+        b["last"]["trigger"] == "engine_returned"
+    })
+    .await;
     daemon.stop().await;
 }
 

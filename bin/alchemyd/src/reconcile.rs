@@ -14,7 +14,10 @@
 //! - a trigger: `daemon_start` for the first listed connection,
 //!   `engine_returned` for each one after, and `wake` for each
 //!   [`State::woke`]. Triggers that come before a reconcile can run are
-//!   [coalesced](ReconcileTrigger::coalesce) into one.
+//!   [coalesced](ReconcileTrigger::coalesce) into one. The connection the
+//!   engine monitor makes again after a wake
+//!   ([`EngineLink::resubscribed`]) is neither a disruption nor a
+//!   trigger: the wake's reconcile waits for its listing instead.
 //!
 //! A reconcile waits until the engine is listed and the apps task has
 //! read every app again, then starts each app the plan says to as an
@@ -143,6 +146,7 @@ struct Task {
     origin: Instant,
     connection: u64,
     linked: bool,
+    resubscribing: bool,
     pending: Option<ReconcileTrigger>,
     roots: BTreeMap<StackName, String>,
 }
@@ -173,6 +177,7 @@ impl Task {
             origin: Instant::now(),
             connection: 0,
             linked: false,
+            resubscribing: false,
             pending: None,
             roots: BTreeMap::new(),
         }
@@ -193,18 +198,29 @@ impl Task {
         let now = self.now();
         let new_connection = link.listed && link.connection != self.connection;
         if self.linked && (!link.listed || new_connection) {
-            self.seen.disrupted(Disruption::EngineGone, now);
             self.linked = false;
+            self.resubscribing = link.resubscribed;
+            if !link.resubscribed {
+                self.seen.disrupted(Disruption::EngineGone, now);
+            }
+        } else if self.resubscribing && !link.resubscribed {
+            self.resubscribing = false;
+            self.seen.disrupted(Disruption::EngineGone, now);
         }
         if new_connection {
             let trigger = if self.connection == 0 {
-                ReconcileTrigger::DaemonStart
+                Some(ReconcileTrigger::DaemonStart)
+            } else if link.resubscribed {
+                None
             } else {
-                ReconcileTrigger::EngineReturned
+                Some(ReconcileTrigger::EngineReturned)
             };
             self.connection = link.connection;
             self.linked = true;
-            self.trigger(trigger);
+            self.resubscribing = false;
+            if let Some(trigger) = trigger {
+                self.trigger(trigger);
+            }
         }
     }
 
