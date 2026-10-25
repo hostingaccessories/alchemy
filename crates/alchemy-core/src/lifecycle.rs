@@ -28,7 +28,9 @@ pub use docker_start::{
     StartRefusal, plan_docker_start,
 };
 pub use last_seen::{Disruption, LastSeen, LastSeenChange, STOP_GRACE};
-pub use liveness::{IDLE_PING, Liveness, LivenessCheck, PING_TIMEOUT, PingOutcome};
+pub use liveness::{
+    IDLE_PING, IDLE_PING_STOPPED, Liveness, LivenessCheck, PING_TIMEOUT, PingOutcome,
+};
 pub use reconcile::{
     AppPlan, Decision, ReconcilePlan, ReconcileTrigger, SkipReason, plan_reconcile,
 };
@@ -36,4 +38,4 @@ pub use service_file::{
     LAUNCH_AGENT_LABEL, LOG_DIR, LOG_FILE, SYSTEMD_USER_UNIT, ServiceFileError, launch_agent_path,
     launch_agent_plist, log_path, systemd_user_unit, systemd_user_unit_path,
 };
-pub use wake::{ClockSample, WAKE_THRESHOLD, WakeDetector, Woke};
+pub use wake::{ClockSample, WAKE_THRESHOLD, WAKE_TICK, WakeDetector, Woke};

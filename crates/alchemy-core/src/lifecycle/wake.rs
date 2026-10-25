@@ -1,26 +1,32 @@
 //! Wake detection from a gap between the wall clock and the monotonic
 //! clock.
 //!
-//! Rust's `Instant` stops while the computer sleeps on both platforms
-//! (`CLOCK_MONOTONIC` on Linux, `mach_absolute_time` on macOS), and the
-//! wall clock doesn't. So between two samples taken a tick apart, the wall
-//! clock moving further than the monotonic one means the computer slept
-//! for about the difference. Per #12 this is the whole mechanism: no OS
-//! power listeners, no FFI.
+//! Rust's and Tokio's `Instant` stop while the computer sleeps on both
+//! platforms (`CLOCK_MONOTONIC` on Linux, `CLOCK_UPTIME_RAW` on macOS), and
+//! the wall clock doesn't. So between two samples taken a tick apart, the
+//! wall clock moving further than the monotonic one means the computer
+//! slept for about the difference. Per #12 this is the whole mechanism: no
+//! OS power listeners, no FFI. #112 measured it and set [`WAKE_TICK`] and
+//! [`WAKE_THRESHOLD`].
 
 use std::time::Duration;
 
+/// How often to sample both clocks, per #112: a wake is noticed within
+/// one tick of resuming.
+pub const WAKE_TICK: Duration = Duration::from_secs(2);
+
 /// How much further the wall clock must move than the monotonic clock
-/// between two samples to count as a wake.
+/// between two samples to count as a wake, per #112.
 ///
-/// It sits well above the noise and well below a real sleep. Scheduling
-/// jitter delays when a sample is taken but moves both clocks together,
-/// so it adds nothing. NTP slews the wall clock by at most 500 ppm, half
-/// a millisecond per second of tick. What remains is a forward step of
-/// the wall clock, such as NTP correcting after a wake or the user
+/// It sits well above the noise and well below a sleep worth recovering
+/// from. #112 measured at most 60 µs of gap on an idle Mac: scheduling
+/// jitter delays when a sample is taken but moves both clocks together.
+/// NTP slews the wall clock by at most 500 ppm, 1 ms per [`WAKE_TICK`].
+/// What remains is a forward step of the wall clock, such as the user
 /// setting the time; a step this large reads as a wake, which only costs
-/// an extra reconcile. #112 measures the real gaps.
-pub const WAKE_THRESHOLD: Duration = Duration::from_secs(5);
+/// an extra reconcile. A sleep shorter than this needs no recovery, since
+/// Docker Desktop's VM and mDNS caches survive it.
+pub const WAKE_THRESHOLD: Duration = Duration::from_secs(10);
 
 /// Both clocks, read one right after the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,7 +69,7 @@ impl Default for WakeDetector {
 }
 
 impl WakeDetector {
-    /// A detector that reports gaps larger than `threshold`.
+    /// A detector that reports gaps of at least `threshold`.
     pub const fn new(threshold: Duration) -> Self {
         Self {
             threshold,
@@ -76,14 +82,14 @@ impl WakeDetector {
     ///
     /// The first sample only sets the baseline. A wall clock that moved
     /// backwards, or less than the threshold further than the monotonic
-    /// clock, is not a wake. A monotonic clock that went backwards, which
+    /// clock, is not a wake: #112 ignores negative gaps. A monotonic clock that went backwards, which
     /// it shouldn't, only resets the baseline.
     pub fn observe(&mut self, sample: ClockSample) -> Option<Woke> {
         let last = self.last.replace(sample)?;
         let monotonic = sample.monotonic.checked_sub(last.monotonic)?;
         let wall = u64::try_from(sample.wall_ms.saturating_sub(last.wall_ms)).ok()?;
         let slept_for = Duration::from_millis(wall).checked_sub(monotonic)?;
-        (slept_for > self.threshold).then_some(Woke {
+        (slept_for >= self.threshold).then_some(Woke {
             slept_for,
             at_ms: sample.wall_ms,
         })
@@ -108,14 +114,16 @@ mod tests {
 
     #[test]
     fn wakes_from_clock_gaps() {
-        let cases: [(&str, ClockSample, Option<u64>); 11] = [
+        let cases: [(&str, ClockSample, Option<u64>); 13] = [
             ("steady tick", sample(1_000, 1_000), None),
             ("late tick", sample(30_000, 30_000), None),
             ("jitter", sample(1_000, 1_003), None),
             ("ntp slew ahead", sample(1_000, 1_001), None),
             ("ntp slew behind", sample(1_000, 999), None),
-            ("at the threshold", sample(1_000, 6_000), None),
-            ("just over", sample(1_000, 6_001), Some(5_001)),
+            ("ntp step under", sample(2_000, 7_000), None),
+            ("just under", sample(2_000, 11_999), None),
+            ("at the threshold", sample(2_000, 12_000), Some(10_000)),
+            ("just over", sample(2_000, 12_001), Some(10_001)),
             ("an hour asleep", sample(1_000, 3_601_000), Some(3_600_000)),
             ("clock stepped back", sample(1_000, -3_600_000), None),
             (
@@ -173,7 +181,11 @@ mod tests {
 
     #[test]
     fn threshold_is_a_parameter() {
-        let cases = [(1_000, 2_500, true), (2_000, 2_500, false)];
+        let cases = [
+            (1_000, 2_500, true),
+            (2_000, 2_500, true),
+            (2_001, 2_500, false),
+        ];
         for (threshold_ms, wall_ms, woke) in cases {
             let mut detector = WakeDetector::new(Duration::from_millis(threshold_ms));
             detector.observe(sample(0, 0));
