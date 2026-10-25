@@ -112,6 +112,11 @@ export const liveQueries = {
     queryFn: ({ signal }) => api.reconcile(signal),
     staleTime: Infinity,
   }),
+  autostart: queryOptions({
+    queryKey: ["autostart"],
+    queryFn: ({ signal }) => api.autostart(signal),
+    staleTime: Infinity,
+  }),
 } satisfies { [K in LiveEventName]: LiveQuery<K> };
 
 /**

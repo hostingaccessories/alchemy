@@ -606,7 +606,8 @@ export type ApiEvent =
   | { event: "operations"; data: OperationList }
   | { event: "privileges"; data: PrivilegeList }
   | { event: "reconcile"; data: ReconcileStatus }
-  | { event: "woke"; data: Wake };
+  | { event: "woke"; data: Wake }
+  | { event: "autostart"; data: Autostart };
 
 /** Every SSE event name the daemon sends. */
 export type ApiEventName = ApiEvent["event"];
@@ -623,6 +624,7 @@ const EVENT_NAMES: { [K in ApiEventName]: K } = {
   privileges: "privileges",
   reconcile: "reconcile",
   woke: "woke",
+  autostart: "autostart",
 };
 
 /** The event names {@link subscribe} listens for. Others are ignored. */
@@ -925,6 +927,73 @@ export interface PrivilegeChange {
   command: HelperCommand | null;
   message: string | null;
   privilege: Privilege;
+}
+
+/**
+ * Mirrors `alchemy_core::lifecycle::AutostartMode`: `off`, `login` (a
+ * per-user service, no root), or `boot` (the system service, behind a prompt).
+ */
+export type AutostartMode = "off" | "login" | "boot";
+
+/** Mirrors `alchemy_core::lifecycle::Supervisor`: what runs the alchemyd answering. */
+export type Supervisor = "manual" | "user_service" | "system_service";
+
+/** Mirrors `alchemy_core::lifecycle::LogHint`: where alchemyd logs, tagged by `kind`. */
+export type LogHint =
+  | { kind: "file"; path: string }
+  | { kind: "journal"; command: string }
+  | { kind: "terminal" };
+
+/** Mirrors `alchemy_api::autostart::AutostartAttempt`: how the last switch ended. */
+export interface AutostartAttempt {
+  mode: AutostartMode;
+  result: AttemptResult;
+  message: string | null;
+  /** Unix seconds. */
+  at: number;
+}
+
+/**
+ * Mirrors `alchemy_api::autostart::Autostart`, returned by
+ * `GET /api/machine/autostart` and sent as the `autostart` event.
+ */
+export interface Autostart {
+  /** The mode the installed services put alchemyd in. */
+  mode: AutostartMode;
+  /** The modes it can be switched to here, `mode` included. */
+  available_modes: AutostartMode[];
+  log_hint: LogHint;
+  supervisor: Supervisor;
+  /** The mode a switch in flight is going to, such as while a prompt is up. */
+  pending: AutostartMode | null;
+  last: AutostartAttempt | null;
+}
+
+/** Mirrors `alchemy_api::autostart::AutostartRequest`, the body of `PUT /api/machine/autostart`. */
+export interface AutostartRequest {
+  mode: AutostartMode;
+}
+
+/** Mirrors `alchemy_api::autostart::AutostartOutcome`; unknown outcomes arrive as `other`. */
+export type AutostartOutcome =
+  | "done"
+  | "unchanged"
+  | "pending"
+  | "needs_terminal"
+  | "restarting"
+  | "other";
+
+/**
+ * Mirrors `alchemy_api::autostart::AutostartChange`. `pending` (202): follow
+ * the `autostart` event until `pending` clears, then read `last`.
+ * `needs_terminal`: run `command`, then ask again. `restarting` (202): this
+ * alchemyd hands over to the system service; reconnect.
+ */
+export interface AutostartChange {
+  outcome: AutostartOutcome;
+  command: HelperCommand | null;
+  message: string | null;
+  autostart: Autostart;
 }
 
 /** Mirrors `alchemy_api::reconcile::ReconcileTrigger`: what set off a reconcile. */
@@ -1239,6 +1308,9 @@ export const api = {
     }),
   reconcile: (signal?: AbortSignal) => request<ReconcileStatus>("GET", "/reconcile", { signal }),
   startEngine: () => request<EngineStart>("POST", "/engine/start", { body: {} }),
+  autostart: (signal?: AbortSignal) => request<Autostart>("GET", "/machine/autostart", { signal }),
+  setAutostart: (body: AutostartRequest) =>
+    request<AutostartChange>("PUT", "/machine/autostart", { body }),
   cancelOperation: (id: string) =>
     request<OperationResponse>("POST", `/operations/${encodeURIComponent(id)}/cancel`),
   followOperation,
