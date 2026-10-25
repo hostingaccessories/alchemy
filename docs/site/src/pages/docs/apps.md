@@ -351,7 +351,7 @@ own password prompt. Each one can be undone. They are listed under
 | ------------------ | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------- |
 | **Port 80**        | Lets Alchemy use port 80, so apps open at `http://photos.local` with no port number.       | Linux only; a Mac doesn't need it                              |
 | **Firewall**       | Opens port 80, the app ports (8100 to 8999), and local names in the firewall, all at once. | When ufw, firewalld, or the macOS firewall is on               |
-| **System service** | Runs Alchemy when the computer starts, before anyone signs in, as you rather than as root. | When you choose to [run Alchemy at boot](#run-alchemy-at-boot) |
+| **System service** | Runs Alchemy when the computer starts, before anyone logs in, as you rather than as root.  | When you choose to [run Alchemy at boot](#run-alchemy-at-boot) |
 
 Select **Allow port 80**, **Open the firewall**, or **Install the
 service**, and enter your password when the system asks. To undo one,
@@ -550,7 +550,7 @@ A few things to know:
   [Run Alchemy at boot](#run-alchemy-at-boot).
 - **Docker has to be running.** After a restart, start Docker Desktop
   (see [Starting Docker](#starting-docker)) or have it start when you
-  sign in. Your apps come back as soon as Docker is ready.
+  log in. Your apps come back as soon as Docker is ready.
 - **After waking up,** Alchemy picks up a new network address and
   announces the apps' `.local` names again within a few seconds, so
   addresses keep working when you move between networks.
@@ -567,24 +567,24 @@ A few things to know:
 Alchemy keeps your apps running only while it runs itself. Choose when it
 starts on the **Machines** page, under **Start automatically**:
 
-| Choice                             | When Alchemy starts                                    | Best for                                   |
-| ---------------------------------- | ------------------------------------------------------ | ------------------------------------------ |
-| **Don't start on its own**         | When you start it yourself, or open the Alchemy app    | Trying Alchemy out                         |
-| **Start when I sign in**           | When you sign in to this computer. No password needed. | A Mac or Linux desktop with Docker Desktop |
-| **Start when this machine starts** | When the computer starts, before anyone signs in       | A home server with Docker Engine           |
+| Choice             | When Alchemy starts                                   | Best for                                   |
+| ------------------ | ----------------------------------------------------- | ------------------------------------------ |
+| **Off**            | When you start it yourself, or open the Alchemy app   | Trying Alchemy out                         |
+| **Start at login** | When you log in to this computer. No password needed. | A Mac or Linux desktop with Docker Desktop |
+| **Start at boot**  | When the computer starts, before anyone logs in       | A home server with Docker Engine           |
 
 Your choice is saved as soon as you select it. With Docker Desktop,
-choose **Start when I sign in**: Docker Desktop starts when you sign in
+choose **Start at login**: Docker Desktop starts when you log in
 too, so there's nothing to gain from starting earlier.
 
-**Start when this machine starts** installs Alchemy as a system service.
+**Start at boot** installs Alchemy as a system service.
 It needs an administrator's password once, through the system's password
 prompt, or, when there's no prompt (over SSH, or on a computer with no
 desktop), a command to run in a terminal, with **Copy command** and **Try
 again**, as in
 [Changes that need your password](#changes-that-need-your-password). It
 still runs as you, never as root. On Linux it can use port 80 without
-**Allow port 80**. Switching to it from **Start when I sign in** hands
+**Allow port 80**. Switching to it from **Start at login** hands
 over from one to the other: Alchemy restarts for a moment, the page
 reconnects, and your apps keep running.
 
@@ -594,36 +594,48 @@ When a choice isn't available, the page says why. The usual reasons:
   the `.deb` package to start Alchemy on its own.
 - **macOS is running Alchemy from a temporary copy**, because the app was
   opened from Downloads. Move Alchemy to the Applications folder first.
-- **No systemd user manager is running** for you on Linux, so **Start
-  when I sign in** can't work there. Use **Start when this machine
-  starts**.
+- **No systemd user manager is running** for you on Linux, so **Start at
+  login** can't work there. Use **Start at boot**.
+
+**The desktop app** makes sure Alchemy is running. When you open it and
+Alchemy isn't running yet, it turns on **Start at login** for you, with
+no password, and shows "Starting Alchemy…" until it answers. Its icon in
+the menu bar (macOS) or the system tray (Linux) shows whether Alchemy and
+Docker are running and how many apps run, with **Open Alchemy**, **Start
+Docker Desktop** when it's stopped, **Start at login**, and **Quit**.
+Closing the window only hides it: open the app again, or click its Dock
+icon, to bring it back. **Quit** closes the app alone; Alchemy and your
+apps keep running. If Alchemy stops, the menu and the window offer
+**Start Alchemy**. On Linux, the tray needs KDE, or GNOME with the
+AppIndicator extension (Ubuntu has it on by default); without one, open
+the app again to show its window.
 
 **Where Alchemy logs.** The page shows where Alchemy writes its log, to
 read when something goes wrong:
 
-| Choice                             | macOS                                           | Linux                                       |
-| ---------------------------------- | ----------------------------------------------- | ------------------------------------------- |
-| **Start when I sign in**           | `~/Library/Logs/Alchemy/alchemyd.log`           | `journalctl --user -u alchemyd.service`     |
-| **Start when this machine starts** | `/Library/Logs/Alchemy/alchemyd.<your uid>.log` | `journalctl -u alchemyd-<your uid>.service` |
+| Choice             | macOS                                           | Linux                                       |
+| ------------------ | ----------------------------------------------- | ------------------------------------------- |
+| **Start at login** | `~/Library/Logs/Alchemy/alchemyd.log`           | `journalctl --user -u alchemyd.service`     |
+| **Start at boot**  | `/Library/Logs/Alchemy/alchemyd.<your uid>.log` | `journalctl -u alchemyd-<your uid>.service` |
 
-**On a Mac,** turning on **Start when I sign in** shows a notification
+**On a Mac,** turning on **Start at login** shows a notification
 that "alchemyd" can run in the background, and alchemyd is listed in
 System Settings under **General**, **Login Items & Extensions**. If you
-switch it off there, Alchemy won't start when you sign in. The first time
+switch it off there, Alchemy won't start when you log in. The first time
 Alchemy announces a `.local` name, macOS may ask whether alchemyd can
 find devices on your local network: select **Allow**, or `.local`
 addresses won't work. You can change it later in System Settings under
 **Privacy & Security**, **Local Network**.
 
-**On Linux,** **Start when I sign in** stops Alchemy when you sign out of
-your last session. For a server nobody signs in to, choose **Start when
+**On Linux,** **Start at login** stops Alchemy when you log out of
+your last session. For a server nobody logs in to, choose **Start when
 this machine starts**.
 
 **From a terminal,** the CLI does the same:
 
 ```sh
 alchemy machine autostart          # the current choice, and where the log is
-alchemy machine autostart login    # start when you sign in
+alchemy machine autostart login    # start when you log in
 alchemy machine autostart boot     # start when this machine starts
 alchemy machine autostart off      # don't start on its own
 ```
@@ -636,10 +648,10 @@ its own but isn't answering, `alchemy status` says so and tells you which
 log to read.
 
 With no `alchemyd` running at all, the daemon can install its own
-sign-in service, with no password:
+login service, with no password:
 
 ```sh
-alchemyd service install --start   # start it now, and at every sign-in
+alchemyd service install --start   # start it now, and at every login
 alchemyd service remove            # stop it, and don't start it again
 ```
 

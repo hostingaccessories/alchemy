@@ -1066,7 +1066,7 @@ the web UI, and the desktop app only ask it through the API.
 | Mode    | What starts alchemyd                                                                | Installed by                                        | Logs                                                                           |
 | ------- | ----------------------------------------------------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------ |
 | `off`   | You, or the desktop app                                                             |                                                     | The terminal it runs in                                                        |
-| `login` | A per-user service, at sign-in: a LaunchAgent, or a `systemd --user` unit           | alchemyd, without root                              | `~/Library/Logs/Alchemy/alchemyd.log`; `journalctl --user -u alchemyd.service` |
+| `login` | A per-user service, at login: a LaunchAgent, or a `systemd --user` unit             | alchemyd, without root                              | `~/Library/Logs/Alchemy/alchemyd.log`; `journalctl --user -u alchemyd.service` |
 | `boot`  | The [system service](#firewall-and-system-service), at boot, running as you (UID N) | `alchemy-helper install-service`, behind one prompt | `/Library/Logs/Alchemy/alchemyd.N.log`; `journalctl -u alchemyd-N.service`     |
 
 The per-user service files, rendered by `alchemy_core::lifecycle`
