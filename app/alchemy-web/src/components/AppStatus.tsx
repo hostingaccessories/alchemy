@@ -3,6 +3,7 @@ import {
   CircleCheck,
   CircleDot,
   CircleQuestionMark,
+  Hourglass,
   type LucideIcon,
 } from "lucide-react";
 
@@ -25,9 +26,26 @@ const PROBLEM = { icon: CircleAlert, className: "text-error" };
 
 /**
  * An app's status as an icon and words, saying why it isn't running when
- * `reason` is a crash or a stop made outside Alchemy.
+ * `reason` is a crash or a stop made outside Alchemy. With `dockerAway`, an
+ * app whose status alchemyd can't know reads as waiting for Docker.
  */
-export function AppStatus({ status, reason }: { status: StackStatus; reason?: StopReason }) {
+export function AppStatus({
+  status,
+  reason,
+  dockerAway = false,
+}: {
+  status: StackStatus;
+  reason?: StopReason;
+  dockerAway?: boolean;
+}) {
+  if (dockerAway && (STATUSES[status] === undefined || status === "unknown")) {
+    return (
+      <span className="inline-flex shrink-0 items-center gap-1.5 text-sm text-muted">
+        <Hourglass className="size-4" aria-hidden />
+        Waiting for Docker
+      </span>
+    );
+  }
   const known = STATUSES[status] ?? STATUSES.unknown;
   const problem = status !== "running" && status !== "unknown" && isStopProblem(reason);
   const { icon: Icon, className } = problem ? PROBLEM : known;

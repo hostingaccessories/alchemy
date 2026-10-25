@@ -242,6 +242,11 @@ function OperationProgress({ operation }: { operation: Operation }) {
           ) : undefined
         }
       >
+        {operation.reason && (
+          <p>
+            Alchemy did this on its own, because {operation.app} {operation.reason}.
+          </p>
+        )}
         {operation.error && operation.state !== "running" && <p>{operation.error}</p>}
         {cancelError && <p className="text-error">{cancelError}</p>}
       </Notice>

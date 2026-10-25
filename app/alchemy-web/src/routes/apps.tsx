@@ -8,11 +8,14 @@ import { AddApp } from "../components/AddApp.tsx";
 import { AppStatus } from "../components/AppStatus.tsx";
 import { Button } from "../components/Button.tsx";
 import { EmptyState } from "../components/EmptyState.tsx";
+import { DockerAwayNotice } from "../components/EngineStatus.tsx";
 import { ErrorState } from "../components/ErrorState.tsx";
 import { Loading } from "../components/Loading.tsx";
 import { Notice } from "../components/Notice.tsx";
 import { PageHeader } from "../components/PageHeader.tsx";
+import { RecoveryNotice } from "../components/Recovery.tsx";
 import type { App, AppDir, AppList, UnmanagedApp } from "../lib/api.ts";
+import { useDockerAway } from "../lib/engineStart.ts";
 import { useDaemonConnection } from "../lib/live.tsx";
 import { liveQueries } from "../lib/queries.ts";
 import { unmanagedStopReason } from "../lib/stopReason.ts";
@@ -42,6 +45,8 @@ function AppsPage() {
         )}
       </PageHeader>
       {adding && <AddApp dirs={dirs} onCancel={() => setAdding(false)} />}
+      <DockerAwayNotice />
+      <RecoveryNotice />
       {daemon.kind !== "online" && apps.data === undefined ? (
         <p className="text-muted">Your apps appear once alchemyd is reachable.</p>
       ) : apps.isError ? (
@@ -61,6 +66,7 @@ function AppsPage() {
 
 function AppsView({ list }: { list: AppList }) {
   const home = list.dirs.find((dir) => dir.home);
+  const dockerAway = useDockerAway();
   return (
     <>
       {list.apps.length === 0 ? (
@@ -80,17 +86,17 @@ function AppsView({ list }: { list: AppList }) {
       ) : (
         <ul aria-label="Your apps" className="flex flex-col gap-2">
           {list.apps.map((app) => (
-            <AppRow key={app.dir} app={app} />
+            <AppRow key={app.dir} app={app} dockerAway={dockerAway} />
           ))}
         </ul>
       )}
       <FolderProblems dirs={list.dirs} />
-      {list.unmanaged.length > 0 && <Unmanaged projects={list.unmanaged} />}
+      {list.unmanaged.length > 0 && <Unmanaged projects={list.unmanaged} dockerAway={dockerAway} />}
     </>
   );
 }
 
-function AppRow({ app }: { app: App }) {
+function AppRow({ app, dockerAway }: { app: App; dockerAway: boolean }) {
   return (
     <li>
       <Link
@@ -105,7 +111,7 @@ function AppRow({ app }: { app: App }) {
             <span className="text-sm text-warn">{app.problems[0]?.message}</span>
           )}
         </div>
-        <AppStatus status={app.status} reason={app.stop_reason} />
+        <AppStatus status={app.status} reason={app.stop_reason} dockerAway={dockerAway} />
         <ChevronRight className="size-4 text-muted" aria-hidden />
       </Link>
     </li>
@@ -152,7 +158,7 @@ function FolderProblems({ dirs }: { dirs: AppDir[] }) {
   );
 }
 
-function Unmanaged({ projects }: { projects: UnmanagedApp[] }) {
+function Unmanaged({ projects, dockerAway }: { projects: UnmanagedApp[]; dockerAway: boolean }) {
   return (
     <section aria-labelledby="unmanaged" className="flex flex-col gap-3">
       <div>
@@ -174,7 +180,11 @@ function Unmanaged({ projects }: { projects: UnmanagedApp[] }) {
               <span className="font-medium">{project.project}</span>
               <span className="truncate text-sm text-muted">{project.dir ?? "Folder unknown"}</span>
             </div>
-            <AppStatus status={project.status} reason={unmanagedStopReason(project.stop_reason)} />
+            <AppStatus
+              status={project.status}
+              reason={unmanagedStopReason(project.stop_reason)}
+              dockerAway={dockerAway}
+            />
           </li>
         ))}
       </ul>

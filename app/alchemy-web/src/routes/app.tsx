@@ -8,12 +8,14 @@ import { AppLogs } from "../components/AppLogs.tsx";
 import { AppActions } from "../components/AppActions.tsx";
 import { AppStatus, StopReasonStatus } from "../components/AppStatus.tsx";
 import { buttonClass } from "../components/Button.tsx";
+import { DockerAwayNotice } from "../components/EngineStatus.tsx";
 import { ErrorState } from "../components/ErrorState.tsx";
 import { AddressLink } from "../components/ExternalLink.tsx";
 import { Loading } from "../components/Loading.tsx";
 import { Notice } from "../components/Notice.tsx";
 import { PageHeader } from "../components/PageHeader.tsx";
 import type { App, AppAddress, AppService, ImageSource } from "../lib/api.ts";
+import { useDockerAway } from "../lib/engineStart.ts";
 import { useDaemonConnection } from "../lib/live.tsx";
 import { addressUrl } from "../lib/platform.ts";
 import { liveQueries } from "../lib/queries.ts";
@@ -43,13 +45,15 @@ function AppPage() {
   const daemon = useDaemonConnection();
   const apps = useQuery({ ...liveQueries.apps, enabled: daemon.kind === "online" });
   const app = apps.data?.apps.find((candidate) => candidate.name === name);
+  const dockerAway = useDockerAway(daemon.kind === "online");
 
   return (
     <div className="flex max-w-3xl flex-col gap-8">
       <PageHeader title={name}>
-        {app && <AppStatus status={app.status} reason={app.stop_reason} />}
+        {app && <AppStatus status={app.status} reason={app.stop_reason} dockerAway={dockerAway} />}
         {app && <OpenApp app={app} />}
       </PageHeader>
+      <DockerAwayNotice />
       {daemon.kind !== "online" && apps.data === undefined ? (
         <p className="text-muted">This app appears once alchemyd is reachable.</p>
       ) : apps.isError ? (
