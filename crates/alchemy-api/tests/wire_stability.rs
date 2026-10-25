@@ -1882,6 +1882,8 @@ fn engine_start() {
         serde_json::from_str::<EngineStartResult>(r#""queued""#).unwrap(),
         EngineStartResult::Other
     );
+}
+
 fn autostart() -> alchemy_api::autostart::Autostart {
     use alchemy_api::autostart::{Autostart, AutostartAttempt, AutostartMode, LogHint, Supervisor};
     Autostart {

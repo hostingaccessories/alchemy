@@ -34,6 +34,7 @@ use alchemy_api::privileges::{
     AttemptResult, ChangeOutcome, HelperCommand, Privilege, PrivilegeAction, PrivilegeAttempt,
     PrivilegeChange, PrivilegeList, PrivilegeReason, PrivilegeState as WireState,
 };
+use alchemy_core::lifecycle::{AutostartMode, Supervisor};
 use alchemy_core::privilege::{
     Action, CommandLine, HelperFacts, HostListener, LowPortFacts, PrivilegeFacts, PrivilegeState,
     ProxyPorts, ServiceFacts, Step, TerminalReason, UnsupportedReason, helper_trust, states, step,
@@ -72,6 +73,9 @@ pub struct PrivilegeDeps {
     pub prompt_timeout: Duration,
     /// How often the facts are read again when nothing prompts it.
     pub interval: Duration,
+    /// What runs this alchemyd. Under the system unit, low ports are not
+    /// needed.
+    pub supervisor: Supervisor,
 }
 
 impl PrivilegeDeps {
@@ -91,7 +95,15 @@ impl PrivilegeDeps {
             elevator,
             prompt_timeout: PROMPT_TIMEOUT,
             interval: DEFAULT_INTERVAL,
+            supervisor: Supervisor::Manual,
         }
+    }
+
+    /// Say `supervisor` runs this alchemyd.
+    #[must_use]
+    pub fn with_supervisor(mut self, supervisor: Supervisor) -> Self {
+        self.supervisor = supervisor;
+        self
     }
 
     /// A [`FakePrivilegeSystem::plain`] machine and a [`FakeElevator`]
@@ -156,6 +168,7 @@ struct Inner {
     last: Mutex<BTreeMap<Action, PrivilegeAttempt>>,
     no_agent: AtomicBool,
     restart: watch::Sender<bool>,
+    requested: Mutex<Option<AutostartMode>>,
 }
 
 impl Privileges {
@@ -171,8 +184,26 @@ impl Privileges {
                 last: Mutex::new(BTreeMap::new()),
                 no_agent: AtomicBool::new(false),
                 restart: watch::Sender::new(false),
+                requested: Mutex::new(None),
             }),
         }
+    }
+
+    /// Record that autostart was asked to switch to `mode`, which decides
+    /// whether the system service is wanted. Until the first request it
+    /// is wanted exactly when it is installed.
+    pub fn request_mode(&self, mode: AutostartMode) {
+        if let Ok(mut requested) = self.inner.requested.lock() {
+            *requested = Some(mode);
+        }
+    }
+
+    /// Wait until no grant or undo of `action` is in flight, and return
+    /// how the last one ended.
+    pub async fn settled(&self, action: Action) -> Option<PrivilegeAttempt> {
+        let mut pending = self.inner.pending.subscribe();
+        let _ = pending.wait_for(|p| !p.contains(&action)).await;
+        self.last().remove(&action)
     }
 
     /// Read the facts now, with the actions in flight.
@@ -187,6 +218,8 @@ impl Privileges {
                 proxy_ports: self.inner.proxy_ports,
                 no_agent: self.inner.no_agent.load(Ordering::SeqCst),
                 pending: self.inner.pending.borrow().clone(),
+                supervisor: self.inner.deps.supervisor,
+                requested: self.inner.requested.lock().ok().and_then(|r| *r),
             },
         ))
     }
@@ -381,13 +414,19 @@ pub struct Context {
     pub no_agent: bool,
     /// The actions in flight.
     pub pending: BTreeSet<Action>,
+    /// What runs this alchemyd.
+    pub supervisor: Supervisor,
+    /// The autostart mode last asked for, if any.
+    pub requested: Option<AutostartMode>,
 }
 
 /// The [`PrivilegeFacts`] from what the OS says and `context`.
 ///
 /// The helper's trust is decided here from its metadata. A polkit agent
 /// is assumed wherever pkexec is installed, until pkexec says otherwise:
-/// there is no reliable way to ask polkit beforehand.
+/// there is no reliable way to ask polkit beforehand. The system service
+/// is wanted when autostart was last asked for `boot`, or, before any
+/// request, when it is installed.
 pub fn privilege_facts(system: SystemFacts, context: &Context) -> PrivilegeFacts {
     let helper = system.helper.map(|reading| HelperFacts {
         trust: helper_trust(&reading.path, &reading.meta),
@@ -406,12 +445,16 @@ pub fn privilege_facts(system: SystemFacts, context: &Context) -> PrivilegeFacts
             nosuid: system.nosuid,
             no_new_privs: system.no_new_privs,
             file_capable: system.file_capable,
+            system_unit: context.supervisor == Supervisor::SystemService,
         },
         firewall: system.firewall,
-        service: ServiceFacts {
-            installed: system.service_installed,
-            wanted: false,
-        },
+        service: context.requested.map_or(
+            ServiceFacts {
+                installed: system.service_installed,
+                wanted: system.service_installed,
+            },
+            |mode| mode.service_facts(system.service_installed),
+        ),
         pending: context.pending.clone(),
     }
 }
@@ -648,13 +691,51 @@ mod tests {
             proxy_ports: ProxyPorts::DEFAULT,
             no_agent,
             pending: BTreeSet::from([Action::Firewall]),
+            supervisor: Supervisor::Manual,
+            requested: None,
         };
         let facts = privilege_facts(installed(), &context(false));
         assert_eq!(facts.helper.as_ref().unwrap().trust, HelperTrust::Trusted);
         assert!(facts.polkit_agent);
         assert_eq!(facts.low_ports.host_listener, HostListener::Denied);
+        assert!(!facts.low_ports.system_unit);
         assert_eq!(facts.pending, BTreeSet::from([Action::Firewall]));
         assert!(!facts.service.wanted);
+
+        let unit = Context {
+            supervisor: Supervisor::SystemService,
+            ..context(false)
+        };
+        assert!(privilege_facts(installed(), &unit).low_ports.system_unit);
+
+        let mut service = installed();
+        service.service_installed = true;
+        let cases = [
+            (None, false, false),
+            (None, true, true),
+            (Some(AutostartMode::Boot), false, true),
+            (Some(AutostartMode::Boot), true, true),
+            (Some(AutostartMode::Login), true, false),
+            (Some(AutostartMode::Off), false, false),
+        ];
+        for (requested, installed_now, wanted) in cases {
+            let mut system = installed();
+            system.service_installed = installed_now;
+            let context = Context {
+                requested,
+                ..context(false)
+            };
+            let facts = privilege_facts(system, &context);
+            assert_eq!(
+                facts.service,
+                ServiceFacts {
+                    installed: installed_now,
+                    wanted
+                },
+                "{requested:?} {installed_now}"
+            );
+        }
+        assert!(privilege_facts(service, &context(false)).service.wanted);
 
         assert!(!privilege_facts(installed(), &context(true)).polkit_agent);
         let mut no_pkexec = installed();

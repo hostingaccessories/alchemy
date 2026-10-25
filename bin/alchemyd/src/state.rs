@@ -8,6 +8,7 @@ use std::sync::Arc;
 use alchemy_api::MetricsResponse;
 use alchemy_api::OperationList;
 use alchemy_api::apps::{AppList, AppSettings};
+use alchemy_api::autostart::Autostart;
 use alchemy_api::network::{NetworkReport, NetworkSettings};
 use alchemy_api::privileges::PrivilegeList;
 use alchemy_api::reconcile::ReconcileStatus;
@@ -53,6 +54,7 @@ struct Inner {
     wakes: watch::Sender<u64>,
     reconcile: watch::Sender<ReconcileStatus>,
     last_wake: watch::Sender<Option<Woke>>,
+    autostart: watch::Sender<Option<Autostart>>,
     log_streams: LogStreams,
 }
 
@@ -104,6 +106,7 @@ impl State {
                 wakes: watch::Sender::new(0),
                 reconcile: watch::Sender::new(ReconcileStatus::default()),
                 last_wake: watch::Sender::new(None),
+                autostart: watch::Sender::new(None),
                 log_streams: LogStreams::default(),
             }),
         }
@@ -495,6 +498,25 @@ impl State {
     pub fn record_wake(&self, woke: Woke) {
         self.inner.last_wake.send_replace(Some(woke));
         self.woke();
+    }
+
+    /// Autostart, as [`Autostart`](crate::autostart::Autostart) last read
+    /// it, or `None` before the first read.
+    pub fn autostart(&self) -> Option<Autostart> {
+        self.inner.autostart.borrow().clone()
+    }
+
+    /// Subscribe to changes to [`Self::autostart`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_autostart(&self) -> watch::Receiver<Option<Autostart>> {
+        self.inner.autostart.subscribe()
+    }
+
+    /// Replace autostart. Returns whether it changed; subscribers are only
+    /// notified if it did.
+    pub fn set_autostart(&self, autostart: Autostart) -> bool {
+        send_if_changed(&self.inner.autostart, Some(autostart))
     }
 
     /// The log streams open on either listener, held to

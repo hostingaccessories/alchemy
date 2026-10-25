@@ -94,8 +94,8 @@ pub fn system_log_path(uid: u32) -> PathBuf {
 /// that holds it quits (#112).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransientInstall {
-    /// alchemyd runs from inside an AppImage, a FUSE mount that exists
-    /// only while the AppImage runs.
+    /// alchemyd runs from inside an `AppImage`, a FUSE mount that exists
+    /// only while the `AppImage` runs.
     AppImage,
     /// macOS App Translocation runs the app from a random read-only copy,
     /// because it was opened where it was downloaded.
@@ -116,7 +116,7 @@ impl fmt::Display for TransientInstall {
 }
 
 /// Whether the alchemyd at `alchemyd`, its canonical path, is somewhere
-/// a service can't point at. `appimage` is whether the AppImage runtime's
+/// a service can't point at. `appimage` is whether the `AppImage` runtime's
 /// `APPIMAGE` variable is set.
 pub fn transient_install(alchemyd: &Path, appimage: bool) -> Option<TransientInstall> {
     let mut components = alchemyd.components().filter_map(|c| match c {

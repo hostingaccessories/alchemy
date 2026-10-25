@@ -46,6 +46,24 @@ impl Topic {
         }
     }
 
+    /// A topic over a [`watch`] channel of optional values, like
+    /// [`Self::watch`], that sends nothing while the value is `None`.
+    pub fn watch_some<T, W, E>(watch: W, event: E) -> Self
+    where
+        T: Clone + Send + Sync + 'static,
+        W: Fn(&State) -> watch::Receiver<Option<T>> + Send + Sync + 'static,
+        E: Fn(T) -> ApiEvent + Clone + Send + Sync + 'static,
+    {
+        Self {
+            subscribe: Arc::new(move |state| {
+                let event = event.clone();
+                values(watch(state))
+                    .filter_map(move |value| future::ready(value.map(event.clone())))
+                    .boxed()
+            }),
+        }
+    }
+
     /// A topic over a [`watch`] channel that sends only the values set
     /// after the connection subscribed, never the current one: for events
     /// that report something that happened. `event` turns each into an
@@ -91,6 +109,7 @@ pub fn topics() -> Vec<Topic> {
         Topic::changes(State::watch_last_wake, |woke| {
             woke.map(|woke| ApiEvent::Woke(crate::wake::api_wake(woke)))
         }),
+        Topic::watch_some(State::watch_autostart, ApiEvent::Autostart),
     ]
 }
 

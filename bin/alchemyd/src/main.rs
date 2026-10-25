@@ -25,6 +25,28 @@ struct Cli {
     /// Directory for the state database. Defaults to the per-user state dir.
     #[arg(long, env = alchemyd::store::STATE_DIR_ENV)]
     state_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Manage the per-user service that starts alchemyd at login.
+    #[command(subcommand)]
+    Service(ServiceCommand),
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum ServiceCommand {
+    /// Install the per-user service for this alchemyd.
+    Install {
+        /// Also start it now.
+        #[arg(long)]
+        start: bool,
+    },
+    /// Stop and remove the per-user service.
+    Remove,
 }
 
 fn main() -> ExitCode {
@@ -36,6 +58,10 @@ fn main() -> ExitCode {
             EnvFilter::try_from_env("ALCHEMY_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    if let Some(Command::Service(command)) = cli.command {
+        return service(&command);
+    }
 
     let Some(state_dir) = cli.state_dir.or_else(alchemyd::store::default_state_dir) else {
         tracing::error!(
@@ -63,7 +89,7 @@ fn main() -> ExitCode {
     };
 
     match runtime.block_on(alchemyd::run(config, shutdown_signal())) {
-        Ok(alchemyd::Stopped::Shutdown) => ExitCode::SUCCESS,
+        Ok(alchemyd::Stopped::Shutdown | alchemyd::Stopped::HandedOver) => ExitCode::SUCCESS,
         Ok(alchemyd::Stopped::Restart) => {
             runtime.shutdown_timeout(Duration::from_secs(5));
             let error = alchemyd::restart::exec_self();
@@ -72,6 +98,37 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             tracing::error!(error = format!("{e:#}"), "alchemyd exited with an error");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run `alchemyd service ...`, print what it did, and exit 0, or print why
+/// not and exit 1.
+fn service(command: &ServiceCommand) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("alchemyd: failed to start async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(async {
+        match command {
+            ServiceCommand::Install { start } => alchemyd::autostart::service_install(*start).await,
+            ServiceCommand::Remove => alchemyd::autostart::service_remove().await,
+        }
+    });
+    match result {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("alchemyd: {e}");
             ExitCode::FAILURE
         }
     }

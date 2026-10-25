@@ -22,10 +22,14 @@
 //! Creating apps and editing their files needs an [`AppEditor`], which
 //! [`with_editor`] adds to either router; without one those routes answer
 //! 503. So does `/api/ports` without the [`PortRegistry`] that
-//! [`with_ports`] adds, and `/api/machine/privileges` without the
-//! [`Privileges`] that [`with_privileges`] adds.
+//! [`with_ports`] adds, `/api/machine/privileges` without the
+//! [`Privileges`] that [`with_privileges`] adds, and
+//! `/api/machine/autostart` without the
+//! [`Autostart`](crate::autostart::Autostart) that [`with_autostart`]
+//! adds.
 
 mod app_files;
+mod autostart;
 mod lifecycle;
 mod ports;
 mod privileges;
@@ -255,6 +259,11 @@ pub fn with_desktop(router: Router, launcher: SharedLauncher) -> Router {
     router.layer(Extension(launcher))
 }
 
+/// Give `router`'s autostart routes `autostart` to read and change.
+pub fn with_autostart(router: Router, autostart: crate::autostart::Autostart) -> Router {
+    router.layer(Extension(autostart))
+}
+
 /// Wrap `routes` the way the Unix socket serves them: the content-type
 /// check alone, since no browser can reach the socket.
 pub fn socket_checks(routes: Router) -> Router {
@@ -311,6 +320,10 @@ fn api(
         .route("/network", get(network))
         .route("/machine/privileges", get(privileges::list))
         .route("/machine/privileges/{action}", post(privileges::change))
+        .route(
+            "/machine/autostart",
+            get(autostart::show).put(autostart::set),
+        )
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found)
         .with_state(Api {
