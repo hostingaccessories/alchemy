@@ -234,7 +234,15 @@ impl Tracker {
             started_at,
             finished_at: None,
             error: None,
+            reason: None,
         })
+    }
+
+    /// The same, started by Alchemy on its own for `reason`.
+    #[must_use]
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.operation.reason = Some(reason.into());
+        self
     }
 
     /// Keep tracking `operation`, such as one read back from storage, with

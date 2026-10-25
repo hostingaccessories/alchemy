@@ -12,6 +12,7 @@
 //! which is what [`WakeDetector`] relies on.
 
 mod autostart;
+mod docker_start;
 mod last_seen;
 mod liveness;
 mod reconcile;
@@ -21,6 +22,10 @@ mod wake;
 pub use autostart::{
     AutostartMode, AutostartModeError, AutostartStep, InstalledServices, LogHint, UserService,
     autostart_steps, log_hint,
+};
+pub use docker_start::{
+    DesktopCommand, DockerStart, OPEN_DESKTOP_LINUX, OPEN_DESKTOP_MACOS, START_ENGINE_HINT,
+    StartRefusal, plan_docker_start,
 };
 pub use last_seen::{Disruption, LastSeen, LastSeenChange, STOP_GRACE};
 pub use liveness::{IDLE_PING, Liveness, LivenessCheck, PING_TIMEOUT, PingOutcome};

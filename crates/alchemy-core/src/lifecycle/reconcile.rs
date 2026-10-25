@@ -46,6 +46,27 @@ impl ReconcileTrigger {
             Self::EngineReturned => "was running before Docker stopped",
         }
     }
+
+    /// One trigger for two that come before a reconcile can run, such as
+    /// a wake while Docker is still reconnecting: the one whose reason
+    /// says most, so the daemon starting beats a wake, which beats Docker
+    /// returning.
+    #[must_use]
+    pub const fn coalesce(self, other: Self) -> Self {
+        if self.rank() >= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::DaemonStart => 2,
+            Self::Wake => 1,
+            Self::EngineReturned => 0,
+        }
+    }
 }
 
 impl fmt::Display for ReconcileTrigger {
@@ -207,6 +228,22 @@ mod tests {
 
     fn skip(reason: SkipReason) -> Decision {
         Decision::Skip { reason }
+    }
+
+    #[test]
+    fn coalesces_to_the_trigger_that_says_most() {
+        use ReconcileTrigger::{DaemonStart, EngineReturned, Wake};
+        let cases = [
+            (DaemonStart, Wake, DaemonStart),
+            (Wake, DaemonStart, DaemonStart),
+            (EngineReturned, DaemonStart, DaemonStart),
+            (EngineReturned, Wake, Wake),
+            (Wake, EngineReturned, Wake),
+            (EngineReturned, EngineReturned, EngineReturned),
+        ];
+        for (a, b, want) in cases {
+            assert_eq!(a.coalesce(b), want, "{a} {b}");
+        }
     }
 
     #[test]
