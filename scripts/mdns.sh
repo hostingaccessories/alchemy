@@ -13,10 +13,10 @@
 # Usage: scripts/mdns.sh
 #   MDNS_PORT          HTTP port for the test daemon (default 17243)
 #   MDNS_SKIP_BUILD=1  reuse existing target/release binaries
-#   MDNS_SETCAP=1      when port 80 is refused, grant alchemyd
-#                      cap_net_bind_service with sudo setcap, so
-#                      http://<app>.local/ is checked rather than
-#                      http://<app>.local:<port>/
+#   MDNS_GRANT=1       when port 80 is refused, grant low ports through
+#                      alchemy-helper (sudo, then alchemyd re-execs
+#                      itself), so http://<app>.local/ is checked rather
+#                      than http://<app>.local:<port>/; revoked on exit
 #
 # Needs avahi-daemon, avahi-utils, libnss-mdns (`mdns4_minimal` in
 # /etc/nsswitch.conf), and python3. Another device is played by a few lines
@@ -56,9 +56,9 @@ cd "$root"
 
 if [[ "${MDNS_SKIP_BUILD:-}" != 1 ]]; then
   log "Building release binaries"
-  cargo build --release --locked -p alchemyd -p alchemy
+  cargo build --release --locked -p alchemyd -p alchemy -p alchemy-helper
 fi
-for exe in alchemyd alchemy; do
+for exe in alchemyd alchemy alchemy-helper; do
   [[ -x "${bin}/${exe}" ]] || fail "missing ${bin}/${exe}"
 done
 
@@ -74,6 +74,10 @@ avahi_was_running=""
 
 alchemy() { "${bin}/alchemy" --socket "$socket" "$@"; }
 api() { curl -fsS --unix-socket "$socket" "http://alchemyd$1"; }
+post() {
+  curl -fsS --unix-socket "$socket" -X POST -H 'Content-Type: application/json' \
+    -d "$2" "http://alchemyd$1"
+}
 
 # Without systemd, as in a container, run avahi-daemon directly; it needs
 # the system D-Bus.
@@ -138,7 +142,7 @@ cleanup() {
     docker compose --project-directory "${apps_dir}/${app}" down --timeout 1 >/dev/null 2>&1 || true
   fi
   if [[ -n "$granted" ]]; then
-    as_root setcap -r "${bin}/alchemyd" 2>/dev/null || true
+    as_root "${bin}/alchemy-helper" revoke-low-ports >/dev/null 2>&1 || true
   fi
   if [[ -n "$avahi_was_running" ]] && ! avahi-daemon --check 2>/dev/null; then
     avahi_start || true
@@ -169,6 +173,34 @@ wait_for() {
     sleep 0.5
   done
   die "timed out waiting for ${what}: ${answer}"
+}
+
+# grant_low_ports: grant low ports the way `alchemy machine privileges`
+# does when alchemyd can't prompt (here, because target/ isn't
+# root-owned): POST the grant, run the sudo command alchemyd answers
+# with, POST it again, and wait for alchemyd to re-exec itself, keeping
+# its PID.
+grant_low_ports() {
+  local helper change starts
+  helper="$(realpath "${bin}/alchemy-helper")"
+  change="$(post /api/machine/privileges/low-ports '{"grant":true}')" \
+    || die "POST /api/machine/privileges/low-ports failed"
+  jq -e --arg helper "$helper" '.outcome == "needs_terminal" and .command.argv == ["sudo", $helper, "grant-low-ports"]' \
+    <<<"$change" >/dev/null || die "expected alchemyd to ask for sudo ${helper} grant-low-ports: ${change}"
+  log "Running $(jq -r .command.line <<<"$change")"
+  granted=1
+  as_root "$helper" grant-low-ports >"${tmp}/helper.json" \
+    || die "alchemy-helper grant-low-ports failed: $(cat "${tmp}/helper.json")"
+  starts="$(grep -c 'alchemyd listening' "${tmp}/alchemyd.log")"
+  change="$(post /api/machine/privileges/low-ports '{"grant":true}')" \
+    || die "the second POST /api/machine/privileges/low-ports failed"
+  jq -e '.outcome == "restarting"' <<<"$change" >/dev/null || die "expected alchemyd to restart: ${change}"
+  for _ in $(seq 1 100); do
+    (($(grep -c 'alchemyd listening' "${tmp}/alchemyd.log") > starts)) && return 0
+    kill -0 "$daemon_pid" 2>/dev/null || die "alchemyd exited instead of re-executing itself"
+    sleep 0.2
+  done
+  die "alchemyd did not restart after grant-low-ports"
 }
 
 # Plain mDNS with no responder library: `rival` answers for a name as
@@ -319,12 +351,9 @@ log "Bringing up ${app}"
 alchemy app up "$app" >"${tmp}/up.txt" 2>&1 || { cat "${tmp}/up.txt" >&2; die "alchemy app up ${app} failed"; }
 
 host_json="$(api /api/network | jq -c .proxy.host)"
-if [[ "$(jq -r .state <<<"$host_json")" != listening && "${MDNS_SETCAP:-}" == 1 ]]; then
-  log "Granting alchemyd cap_net_bind_service and restarting it"
-  stop_daemon
-  granted=1
-  as_root setcap cap_net_bind_service=+ep "${bin}/alchemyd"
-  start_daemon
+if [[ "$(jq -r .state <<<"$host_json")" != listening && "${MDNS_GRANT:-}" == 1 ]]; then
+  log "Granting low ports through alchemy-helper"
+  grant_low_ports
   wait_for "port 80" '.proxy.host.state == "listening"' /api/network
 fi
 

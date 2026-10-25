@@ -22,10 +22,12 @@
 //! Creating apps and editing their files needs an [`AppEditor`], which
 //! [`with_editor`] adds to either router; without one those routes answer
 //! 503. So does `/api/ports` without the [`PortRegistry`] that
-//! [`with_ports`] adds.
+//! [`with_ports`] adds, and `/api/machine/privileges` without the
+//! [`Privileges`] that [`with_privileges`] adds.
 
 mod app_files;
 mod ports;
+mod privileges;
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -67,6 +69,7 @@ use crate::logs::{self, LogQuery, LogsRefusal, SharedLogSource};
 use crate::metrics::Scope;
 use crate::operations::{CancelError, Operations, StartError};
 use crate::ports::PortRegistry;
+use crate::privileges::Privileges;
 use crate::session::Auth;
 use crate::store::SharedStore;
 
@@ -239,6 +242,11 @@ pub fn with_ports(router: Router, registry: PortRegistry) -> Router {
     router.layer(Extension(registry))
 }
 
+/// Give `router`'s privilege routes `privileges` to read and change.
+pub fn with_privileges(router: Router, privileges: Privileges) -> Router {
+    router.layer(Extension(privileges))
+}
+
 /// Wrap `routes` the way the Unix socket serves them: the content-type
 /// check alone, since no browser can reach the socket.
 pub fn socket_checks(routes: Router) -> Router {
@@ -291,6 +299,8 @@ fn api(
         )
         .route("/ports", get(ports::list))
         .route("/network", get(network))
+        .route("/machine/privileges", get(privileges::list))
+        .route("/machine/privileges/{action}", post(privileges::change))
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found)
         .with_state(Api {

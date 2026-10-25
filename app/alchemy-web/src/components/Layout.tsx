@@ -5,6 +5,7 @@ import { type ReactNode, useState } from "react";
 import type { ApiError } from "../lib/api.ts";
 import { useDaemonConnection, useSignedOut } from "../lib/live.tsx";
 import { isTauri } from "../lib/platform.ts";
+import { useRestart } from "../lib/restart.ts";
 import { useWindowTheme } from "../lib/theme.ts";
 import { Code } from "./Code.tsx";
 import { DaemonStatus } from "./DaemonStatus.tsx";
@@ -22,12 +23,13 @@ const NAV: { to: "/apps" | "/machines" | "/settings"; label: string; icon: Lucid
  * The app frame: sidebar, header, and the current route in the outlet. Pages
  * fill the header's slot with {@link PageHeader}; the daemon's connection
  * state sits beside it, and a banner spans the page while the daemon is
- * unreachable. Fits the desktop shell's 800px minimum width.
+ * unreachable, restarting, or refusing this page. Fits the desktop shell's 800px minimum width.
  */
 export function Layout() {
   const [slot, setSlot] = useState<HTMLElement | null>(null);
   const daemon = useDaemonConnection();
   const signedOut = useSignedOut();
+  const restart = useRestart();
   useWindowTheme();
 
   return (
@@ -61,8 +63,9 @@ export function Layout() {
             <DaemonStatus state={daemon} />
           </div>
         </header>
-        {daemon.kind === "offline" && <DaemonUnreachable error={daemon.error} />}
-        {daemon.kind === "online" && signedOut && <SignedOut />}
+        {daemon.kind === "offline" &&
+          (restart.restarting ? <Restarting /> : <DaemonUnreachable error={daemon.error} />)}
+        {daemon.kind === "online" && signedOut && <SignedOut restarted={restart.restarted} />}
         <main className="min-h-0 flex-1 overflow-y-auto px-6 py-6">
           <HeaderSlotContext value={slot}>
             <Outlet />
@@ -77,10 +80,11 @@ export function Layout() {
  * Shown while `alchemyd` answers but refuses this page as not signed in. A
  * browser signs in through `alchemy open`; the shell signs in with the
  * daemon's token on its own, so there it means the token couldn't be read.
- * It clears itself once the event stream connects.
+ * `restarted` says alchemyd restarted for a privilege, which ends every
+ * browser session. It clears itself once the event stream connects.
  */
-function SignedOut() {
-  const { title, body } = signedOutText();
+function SignedOut({ restarted }: { restarted: boolean }) {
+  const { title, body } = signedOutText(restarted);
   return (
     <div role="alert" className="shrink-0 border-b border-border bg-warn/10 px-6 py-3">
       <Notice tone="warn" title={title}>
@@ -91,11 +95,22 @@ function SignedOut() {
 }
 
 /** What to say about being signed out, in the browser or the shell. */
-function signedOutText(): { title: string; body: ReactNode } {
+function signedOutText(restarted: boolean): { title: string; body: ReactNode } {
   if (isTauri()) {
     return {
       title: "Alchemy can't sign in to alchemyd",
       body: "Check that alchemyd is running as you on this machine. Alchemy tries again on its own.",
+    };
+  }
+  if (restarted) {
+    return {
+      title: "alchemyd restarted to put the change in effect, so you're signed out",
+      body: (
+        <>
+          Run <Code>alchemy open</Code> in a terminal on this machine to sign in again and see the
+          result.
+        </>
+      ),
     };
   }
   return {
@@ -107,6 +122,21 @@ function signedOutText(): { title: string; body: ReactNode } {
       </>
     ),
   };
+}
+
+/**
+ * Shown instead of {@link DaemonUnreachable} while alchemyd restarts to put
+ * a privilege in effect. It clears itself once the event stream reconnects,
+ * or gives way to that banner if alchemyd doesn't come back in time.
+ */
+function Restarting() {
+  return (
+    <div role="status" className="shrink-0 border-b border-border bg-surface-muted px-6 py-3">
+      <Notice tone="busy" title="alchemyd is restarting to put the change in effect…">
+        <p>Alchemy reconnects as soon as it's back.</p>
+      </Notice>
+    </div>
+  );
 }
 
 /**

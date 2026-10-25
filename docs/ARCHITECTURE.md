@@ -26,8 +26,8 @@ Everything below follows from the line at the top of this page.
    `alchemy_api`'s socket module, the private
    `runtime_dir_from(xdg, temp, uid)` decides the path; `runtime_dir()`
    reads the environment and calls it.
-4. **Binaries are thin.** `alchemyd` and `alchemy` are a library plus a small
-   `main.rs`. `main` parses arguments, sets up logging and the runtime, and
+4. **Binaries are thin.** `alchemyd`, `alchemy`, and `alchemy-helper` are a
+   library plus a small `main.rs`. `main` parses arguments, sets up logging and the runtime, and
    calls into the library. Interesting logic belongs in a crate with tests.
 5. **The daemon is the single source of truth.** `alchemyd` owns all runtime
    state. The CLI, web UI, and desktop shell are clients and never
@@ -117,7 +117,79 @@ The API is a stable contract:
   explicit features. New dependencies must pass `cargo deny check`.
 - **Document public items.** `missing_docs` warns and pedantic clippy is on.
 
-## 5. Comments
+## 5. Privileged operations
+
+Everything that needs root goes through `alchemy-helper`, and this table is
+the whole list. Every action has an undo with the same arguments, and
+every operation is idempotent: running it twice reports `changed: false`
+the second time. Adding an operation, or widening one, is an architecture
+change: raise it before writing it.
+
+| Action           | Grant                             | Undo                               | Platforms                                  |
+| ---------------- | --------------------------------- | ---------------------------------- | ------------------------------------------ |
+| `low_ports`      | `grant-low-ports`                 | `revoke-low-ports`                 | Linux                                      |
+| `firewall`       | `open-firewall --proxy-ports S-E` | `close-firewall --proxy-ports S-E` | ufw, firewalld, macOS application firewall |
+| `system_service` | `install-service --uid N`         | `remove-service --uid N`           | systemd, launchd                           |
+
+Why each needs root:
+
+- **Low ports:** binding port 80 on Linux needs `cap_net_bind_service`.
+  The grant writes the `security.capability` xattr (that capability and
+  nothing else) on the `alchemyd` next to the helper, and alchemyd
+  re-execs itself to pick it up. It is refused on a `nosuid` mount, where
+  the kernel would ignore it. Rebuilds and upgrades drop it.
+- **Firewall:** opens 80/tcp, the proxy range, and 5353/udp with a ufw
+  app profile or firewalld service named `alchemy`, only when one of them
+  is active, or adds and unblocks alchemyd in the macOS application
+  firewall. Raw nftables and iptables are never edited.
+- **System service:** writes a fixed-template systemd unit (numeric
+  `User=N`) or LaunchDaemon (`UserName`) for the sibling `alchemyd` and
+  starts it. alchemyd itself never runs as root.
+
+`check` only reports whether the helper runs as root. Docker group
+membership is root-equivalent, so Alchemy explains it and never automates
+it. macOS needs no root for port 80 or mDNS.
+
+**The helper.** It never takes a path argument: every operation acts on
+the `alchemyd` next to its own canonical path, opened once with
+`O_NOFOLLOW` and changed through that file descriptor. Flag values are
+validated before the root check. It runs only fixed commands by absolute
+path, with a cleared environment, and checks that each one is a
+root-owned regular file nobody else can write. It prints one JSON result
+line and exits with a sysexits code, never 126 or 127, which mean
+something else under pkexec; `not_root` is 77.
+
+**Trust rule.** alchemyd offers a system prompt only for a helper that is
+owned by root and writable by neither group nor others, along with every
+directory up to `/`, with no symlinks on the way. Otherwise, malware
+running as the user could swap the binary just before the password
+prompt. A helper that fails the rule, such as every build in `target/`,
+gets `needs_terminal` instead. The rule is pure:
+`alchemy_core::privilege::helper_trust`.
+
+**Elevation.** alchemyd owns it, behind the `Elevator` trait, and never
+waits for it in a request: `POST /api/machine/privileges/{action}` answers
+`pending` and the prompt runs in the background.
+
+- macOS: `osascript` with a fixed script; the helper path and arguments go
+  in as `argv` and are quoted with `quoted form of`, never spliced into the
+  script.
+- Linux: `pkexec --disable-internal-agent` when a polkit agent answers.
+- Otherwise: `needs_terminal` with the exact `sudo alchemy-helper ...`
+  command. The CLI runs it itself when it has a TTY; the web UI shows it.
+
+alchemyd builds every argv in `alchemy_core::privilege` (`HelperOp`,
+`elevated_command`); clients never build one. A grant of low ports takes
+effect at exec, so alchemyd shuts down cleanly and re-execs its own
+canonical binary with the same argv, keeping its PID.
+
+**Contract.** The helper depends on no internal crate, so the argv is the
+contract. `bin/alchemyd/tests/helper_contract.rs` feeds every argv alchemyd
+can build, through osascript, pkexec, and sudo, to `alchemy_helper::parse`
+and checks it is the same operation. Add an operation to both sides and to
+that test together.
+
+## 6. Comments
 
 Comments are for people reading the code, not narration of it. Keep them
 short and accurate; fix or delete one that has drifted from the code.
@@ -133,7 +205,7 @@ short and accurate; fix or delete one that has drifted from the code.
   wrapped doc line with `- `, because rustfmt and clippy read it as a list
   item (`doc_lazy_continuation`).
 
-## 6. Platforms
+## 7. Platforms
 
 Linux and macOS are supported; CI runs on both, x86_64 and arm64. There are
 no Windows code paths.
@@ -143,7 +215,7 @@ no Windows code paths.
 - Watch for host-only assumptions in tests, such as paths or socket length
   limits that differ between Linux and macOS.
 
-## 7. Definition of done
+## 8. Definition of done
 
 A change is complete when:
 

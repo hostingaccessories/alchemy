@@ -91,6 +91,11 @@ export const liveQueries = {
     queryFn: ({ signal }) => api.operations(signal),
     staleTime: Infinity,
   }),
+  privileges: queryOptions({
+    queryKey: ["privileges"],
+    queryFn: ({ signal }) => api.privileges(signal),
+    staleTime: Infinity,
+  }),
 } satisfies { [K in ApiEventName]: LiveQuery<K> };
 
 /**

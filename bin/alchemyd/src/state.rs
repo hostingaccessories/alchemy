@@ -9,6 +9,7 @@ use alchemy_api::MetricsResponse;
 use alchemy_api::OperationList;
 use alchemy_api::apps::{AppList, AppSettings};
 use alchemy_api::network::{NetworkReport, NetworkSettings};
+use alchemy_api::privileges::PrivilegeList;
 use alchemy_core::engine::{Containers, EngineState, EngineStatus};
 use alchemy_core::route::EngineFacts;
 use tokio::sync::watch;
@@ -45,6 +46,7 @@ struct Inner {
     network_settings: watch::Sender<NetworkSettings>,
     mdns: watch::Sender<MdnsStatus>,
     routing: watch::Sender<Routing>,
+    privileges: watch::Sender<PrivilegeList>,
     log_streams: LogStreams,
 }
 
@@ -76,6 +78,7 @@ impl State {
                 network_settings: watch::Sender::new(NetworkSettings::default()),
                 mdns: watch::Sender::new(MdnsStatus::default()),
                 routing: watch::Sender::new(Routing::default()),
+                privileges: watch::Sender::new(PrivilegeList::default()),
                 log_streams: LogStreams::default(),
             }),
         }
@@ -357,6 +360,26 @@ impl State {
     /// only notified if it did.
     pub fn set_routing(&self, routing: Routing) -> bool {
         send_if_changed(&self.inner.routing, routing)
+    }
+
+    /// Every privilege and where it stands, as
+    /// [`Privileges`](crate::privileges::Privileges) last read them. Empty
+    /// until the first read.
+    pub fn privileges(&self) -> PrivilegeList {
+        self.inner.privileges.borrow().clone()
+    }
+
+    /// Subscribe to changes to [`Self::privileges`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_privileges(&self) -> watch::Receiver<PrivilegeList> {
+        self.inner.privileges.subscribe()
+    }
+
+    /// Replace the privileges. Returns whether they changed; subscribers
+    /// are only notified if they did.
+    pub fn set_privileges(&self, privileges: PrivilegeList) -> bool {
+        send_if_changed(&self.inner.privileges, privileges)
     }
 
     /// The log streams open on either listener, held to

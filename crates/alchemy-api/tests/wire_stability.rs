@@ -17,6 +17,10 @@ use alchemy_api::operations::{
     Action, ActionPlan, ActionRequest, Operation, OperationEvent, OperationList, OperationResponse,
     OperationState, OutputLine, PlannedStep, Step, StepCommand, StepState,
 };
+use alchemy_api::privileges::{
+    AttemptResult, ChangeOutcome, HelperCommand, Privilege, PrivilegeAction, PrivilegeAttempt,
+    PrivilegeChange, PrivilegeList, PrivilegeReason, PrivilegeRequest, PrivilegeState,
+};
 use alchemy_api::session::{LaunchResponse, SessionAuth, SessionResponse};
 use alchemy_api::{
     API_VERSION, ApiEvent, ContainerStatus, ContainerUsage, EngineFlavor, EngineState,
@@ -85,6 +89,7 @@ fn error_codes() {
         (ErrorCode::OperationNotFound, r#""operation_not_found""#),
         (ErrorCode::Busy, r#""busy""#),
         (ErrorCode::Internal, r#""internal""#),
+        (ErrorCode::Unsupported, r#""unsupported""#),
         (ErrorCode::Unknown, r#""unknown""#),
     ];
     for (code, want) in codes {
@@ -1334,12 +1339,14 @@ fn net(cidr: &str) -> alchemy_api::network::Ipv4Net {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn network_report() {
     use alchemy_api::network::{
         AddressPool, AlchemyNetwork, AlchemyNetworkState, DockerNetwork, HostSide, ListenerState,
         MdnsBackend, MdnsReport, MdnsState, NetworkReport, NetworkWarning, NetworkWarningKind,
         PoolsSource, ProxyListener, ProxyReport, Reachability,
     };
+    use alchemy_api::privileges::PrivilegeAction;
     let report = NetworkReport {
         engine_ready: true,
         lan: vec![net("192.168.0.0/16")],
@@ -1376,6 +1383,7 @@ fn network_report() {
                 state: ListenerState::Unavailable,
                 message: Some("m".into()),
                 fix: Some("f".into()),
+                privilege: Some(PrivilegeAction::LowPorts),
             },
             ports: vec![ProxyListener {
                 port: 8100,
@@ -1383,6 +1391,7 @@ fn network_report() {
                 state: ListenerState::Listening,
                 message: None,
                 fix: None,
+                privilege: None,
             }],
         },
         mdns: MdnsReport {
@@ -1403,9 +1412,10 @@ fn network_report() {
             r#""warnings":[{"kind":"pool_overlap","message":"m","fix":"f","#,
             r#""subnet":"192.168.0.0/16","host":"lan","host_subnet":"192.168.0.0/16","#,
             r#""network":null}],"proxy":{"reachability":"container_ip","#,
-            r#""host":{"port":80,"app":null,"state":"unavailable","message":"m","fix":"f"},"#,
+            r#""host":{"port":80,"app":null,"state":"unavailable","message":"m","fix":"f","#,
+            r#""privilege":"low_ports"},"#,
             r#""ports":[{"port":8100,"app":"blog","state":"listening","message":null,"#,
-            r#""fix":null}]},"mdns":{"state":"unavailable","backend":"dns_sd","#,
+            r#""fix":null,"privilege":null}]},"mdns":{"state":"unavailable","backend":"dns_sd","#,
             r#""message":"m","fix":"f"}}"#,
         ),
     );
@@ -1415,10 +1425,11 @@ fn network_report() {
         r#""alchemy":{"name":"alchemy","state":"pending","subnet":null},"warnings":[]"#,
     );
     let proxy = r#""proxy":{"reachability":null,"host":{"port":80,"app":null,"state":"off","message":null,"fix":null},"ports":[]}"#;
+    let proxy_now = r#""proxy":{"reachability":null,"host":{"port":80,"app":null,"state":"off","message":null,"fix":null,"privilege":null},"ports":[]}"#;
     assert_wire(
         &NetworkReport::default(),
         &format!(
-            r#"{older},{proxy},"mdns":{{"state":"off","backend":null,"message":null,"fix":null}}}}"#
+            r#"{older},{proxy_now},"mdns":{{"state":"off","backend":null,"message":null,"fix":null}}}}"#
         ),
     );
     let without_proxy: NetworkReport = serde_json::from_str(&format!("{older}}}")).unwrap();
@@ -1431,7 +1442,7 @@ fn network_report() {
     assert_eq!(
         without_mdns,
         NetworkReport::default(),
-        "a daemon without mDNS"
+        "a daemon without mDNS, or a listener's privilege"
     );
 }
 
@@ -1557,4 +1568,167 @@ fn network_enums() {
     assert_eq!(future, NetworkWarningKind::Other);
     let future: PoolsSource = serde_json::from_str(r#""etcd""#).unwrap();
     assert_eq!(future, PoolsSource::Unknown);
+}
+
+fn low_ports() -> Privilege {
+    Privilege {
+        action: PrivilegeAction::LowPorts,
+        state: PrivilegeState::NeedsTerminal,
+        reason: Some(PrivilegeReason::UntrustedHelper),
+        message: Some("m".into()),
+        command: Some(HelperCommand {
+            argv: vec![
+                "sudo".into(),
+                "/opt/a/alchemy-helper".into(),
+                "grant-low-ports".into(),
+            ],
+            line: "sudo /opt/a/alchemy-helper grant-low-ports".into(),
+        }),
+        restarts: true,
+        last: Some(PrivilegeAttempt {
+            grant: true,
+            result: AttemptResult::Cancelled,
+            message: Some("c".into()),
+            at: 1_700_000_000,
+        }),
+    }
+}
+
+const LOW_PORTS: &str = concat!(
+    r#"{"action":"low_ports","state":"needs_terminal","reason":"untrusted_helper","#,
+    r#""message":"m","command":{"argv":["sudo","/opt/a/alchemy-helper","grant-low-ports"],"#,
+    r#""line":"sudo /opt/a/alchemy-helper grant-low-ports"},"restarts":true,"#,
+    r#""last":{"grant":true,"result":"cancelled","message":"c","at":1700000000}}"#,
+);
+
+#[test]
+fn privilege_list_and_event() {
+    let firewall = Privilege {
+        action: PrivilegeAction::Firewall,
+        state: PrivilegeState::NotNeeded,
+        reason: None,
+        message: None,
+        command: None,
+        restarts: false,
+        last: None,
+    };
+    let list = PrivilegeList {
+        privileges: vec![low_ports(), firewall],
+    };
+    let json = format!(
+        concat!(
+            r#"{{"privileges":[{},{{"action":"firewall","state":"not_needed","reason":null,"#,
+            r#""message":null,"command":null,"restarts":false,"last":null}}]}}"#,
+        ),
+        LOW_PORTS
+    );
+    assert_wire(&list, &json);
+    let event = ApiEvent::Privileges(list);
+    assert_eq!(event.name(), "privileges");
+    assert_wire(
+        &event,
+        &format!(r#"{{"event":"privileges","data":{json}}}"#),
+    );
+}
+
+#[test]
+fn privilege_request_and_change() {
+    assert_wire(&PrivilegeRequest { grant: true }, r#"{"grant":true}"#);
+    assert_wire(&PrivilegeRequest { grant: false }, r#"{"grant":false}"#);
+    let change = PrivilegeChange {
+        outcome: ChangeOutcome::NeedsTerminal,
+        command: low_ports().command,
+        message: Some("m".into()),
+        privilege: low_ports(),
+    };
+    assert_wire(
+        &change,
+        &format!(
+            concat!(
+                r#"{{"outcome":"needs_terminal","command":{{"argv":["sudo","/opt/a/alchemy-helper","#,
+                r#""grant-low-ports"],"line":"sudo /opt/a/alchemy-helper grant-low-ports"}},"#,
+                r#""message":"m","privilege":{}}}"#,
+            ),
+            LOW_PORTS
+        ),
+    );
+}
+
+#[test]
+fn privilege_enums() {
+    for (action, want) in [
+        (PrivilegeAction::LowPorts, r#""low_ports""#),
+        (PrivilegeAction::Firewall, r#""firewall""#),
+        (PrivilegeAction::SystemService, r#""system_service""#),
+        (PrivilegeAction::Other, r#""other""#),
+    ] {
+        assert_wire(&action, want);
+    }
+    for (state, want) in [
+        (PrivilegeState::NotNeeded, r#""not_needed""#),
+        (PrivilegeState::Needed, r#""needed""#),
+        (PrivilegeState::Granted, r#""granted""#),
+        (PrivilegeState::NeedsRestart, r#""needs_restart""#),
+        (PrivilegeState::Pending, r#""pending""#),
+        (PrivilegeState::NeedsTerminal, r#""needs_terminal""#),
+        (PrivilegeState::Unsupported, r#""unsupported""#),
+        (PrivilegeState::Other, r#""other""#),
+    ] {
+        assert_wire(&state, want);
+    }
+    for (reason, want) in [
+        (PrivilegeReason::UntrustedHelper, r#""untrusted_helper""#),
+        (PrivilegeReason::NoPolkitAgent, r#""no_polkit_agent""#),
+        (PrivilegeReason::NoHelper, r#""no_helper""#),
+        (PrivilegeReason::NotHelperSibling, r#""not_helper_sibling""#),
+        (
+            PrivilegeReason::UnmanagedFirewall,
+            r#""unmanaged_firewall""#,
+        ),
+        (PrivilegeReason::RunsAsRoot, r#""runs_as_root""#),
+        (PrivilegeReason::NosuidMount, r#""nosuid_mount""#),
+        (PrivilegeReason::NoNewPrivileges, r#""no_new_privileges""#),
+        (PrivilegeReason::Other, r#""other""#),
+    ] {
+        assert_wire(&reason, want);
+    }
+    for (result, want) in [
+        (AttemptResult::Done, r#""done""#),
+        (AttemptResult::Cancelled, r#""cancelled""#),
+        (AttemptResult::Denied, r#""denied""#),
+        (AttemptResult::NeedsTerminal, r#""needs_terminal""#),
+        (AttemptResult::Failed, r#""failed""#),
+        (AttemptResult::Other, r#""other""#),
+    ] {
+        assert_wire(&result, want);
+    }
+    for (outcome, want) in [
+        (ChangeOutcome::Pending, r#""pending""#),
+        (ChangeOutcome::Restarting, r#""restarting""#),
+        (ChangeOutcome::NeedsTerminal, r#""needs_terminal""#),
+        (ChangeOutcome::Unchanged, r#""unchanged""#),
+        (ChangeOutcome::Other, r#""other""#),
+    ] {
+        assert_wire(&outcome, want);
+    }
+}
+
+#[test]
+fn unknown_privilege_values_decode_as_a_fallback() {
+    let got: Privilege = serde_json::from_str(concat!(
+        r#"{"action":"docker_group","state":"later","reason":"new","message":null,"#,
+        r#""command":null,"restarts":false,"last":{"grant":false,"result":"new","#,
+        r#""message":null,"at":0}}"#,
+    ))
+    .unwrap();
+    assert_eq!(got.action, PrivilegeAction::Other);
+    assert_eq!(got.action.action(), None);
+    assert_eq!(got.state, PrivilegeState::Other);
+    assert_eq!(got.reason, Some(PrivilegeReason::Other));
+    assert_eq!(got.last.unwrap().result, AttemptResult::Other);
+    let outcome: ChangeOutcome = serde_json::from_str(r#""later""#).unwrap();
+    assert_eq!(outcome, ChangeOutcome::Other);
+    for action in alchemy_api::privileges::Action::ALL {
+        assert_eq!(PrivilegeAction::from(action).action(), Some(action));
+    }
 }

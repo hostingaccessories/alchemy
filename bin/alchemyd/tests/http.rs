@@ -198,7 +198,7 @@ struct Daemon {
     socket: PathBuf,
     state_dir: PathBuf,
     stop: tokio::sync::oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<anyhow::Result<alchemyd::Stopped>>,
     _dir: tempfile::TempDir,
 }
 

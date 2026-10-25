@@ -204,7 +204,7 @@ struct Daemon {
     state: State,
     socket: PathBuf,
     stop: tokio::sync::oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<anyhow::Result<alchemyd::Stopped>>,
     _dir: tempfile::TempDir,
 }
 

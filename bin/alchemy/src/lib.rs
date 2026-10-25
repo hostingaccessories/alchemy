@@ -13,6 +13,7 @@ mod output;
 pub mod prompt;
 pub mod safety;
 mod sse;
+pub mod sudo;
 mod target;
 
 use std::ffi::OsStr;
@@ -28,6 +29,7 @@ use crate::daemon::HttpDaemon;
 use crate::editor::TerminalEditor;
 use crate::output::Output;
 use crate::prompt::{Prompt, TtyPrompt};
+use crate::sudo::{Sudo, TerminalSudo};
 use crate::target::{Sources, Target};
 
 pub use error::{ClientError, Exit, ProtocolError};
@@ -131,6 +133,18 @@ pub async fn run_with<W: Write, P: Prompt>(
     color: Color,
     prompt: &mut P,
 ) -> Result<(), ClientError> {
+    run_with_sudo(cli, out, color, prompt, &mut TerminalSudo::from_env()).await
+}
+
+/// [`run_with`], running the `sudo` commands alchemyd hands over through
+/// `sudo` instead of on the terminal.
+pub async fn run_with_sudo<W: Write, P: Prompt, S: Sudo>(
+    cli: Cli,
+    out: &mut W,
+    color: Color,
+    prompt: &mut P,
+    sudo: &mut S,
+) -> Result<(), ClientError> {
     let Cli {
         json,
         daemon,
@@ -207,7 +221,7 @@ pub async fn run_with<W: Write, P: Prompt>(
                 app::cancel::run(&mut context(out, app::cancel::NAME)?, args).await
             }
         },
-        Command::Machine(args) => run_machine(args.command, |name| context(out, name)).await,
+        Command::Machine(args) => run_machine(args.command, sudo, |name| context(out, name)).await,
         Command::Settings(args) => match args.command {
             settings::Verb::Show(args) => {
                 settings::show::run(&mut context(out, settings::show::NAME)?, args).await
@@ -227,12 +241,17 @@ pub async fn run_with<W: Write, P: Prompt>(
 }
 
 /// Run the `alchemy machine` verb `verb` in the context `context` makes
-/// for the command named.
-async fn run_machine<W: Write>(
+/// for the command named, running any `sudo` command through `sudo`.
+async fn run_machine<W: Write, S: Sudo>(
     verb: machine::Verb,
+    sudo: &mut S,
     context: impl FnOnce(&'static str) -> Result<Context<HttpDaemon, W>, ClientError>,
 ) -> Result<(), ClientError> {
     match verb {
+        machine::Verb::Privileges(args) => {
+            let mut context = context(machine::privileges::name(&args))?;
+            machine::privileges::run(&mut context, sudo, args).await
+        }
         machine::Verb::Stats(args) => {
             machine::stats::run(&mut context(machine::stats::NAME)?, args).await
         }

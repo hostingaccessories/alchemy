@@ -18,9 +18,10 @@ repository   = "https://github.com/hostingaccessories/alchemy"
 publish      = false
 
 [workspace.dependencies]
-alchemy-core = { path = "crates/alchemy-core" }
-alchemy-api  = { path = "crates/alchemy-api" }
-alchemyd     = { path = "bin/alchemyd" }
+alchemy-core   = { path = "crates/alchemy-core" }
+alchemy-api    = { path = "crates/alchemy-api" }
+alchemyd       = { path = "bin/alchemyd" }
+alchemy-helper = { path = "bin/alchemy-helper" }
 
 anyhow             = "1"
 axum               = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }

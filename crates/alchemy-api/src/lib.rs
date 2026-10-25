@@ -14,8 +14,9 @@
 //! `GET /api/events` streams [`ApiEvent`]s. The app routes and their
 //! types are in [`apps`], an app's log stream in [`logs`], the
 //! lifecycle operation routes in [`operations`], signing in to the TCP
-//! listener in [`session`], the port registry in [`ports`], and
-//! `GET /api/network` in [`network`].
+//! listener in [`session`], the port registry in [`ports`],
+//! `GET /api/network` in [`network`], and the machine's privileges in
+//! [`privileges`].
 //!
 //! The default build is pure. Enable the `socket` feature for the daemon
 //! socket path shared by `alchemyd` and its local clients, and the
@@ -36,6 +37,7 @@ pub mod logs;
 pub mod network;
 pub mod operations;
 pub mod ports;
+pub mod privileges;
 pub mod session;
 #[cfg(feature = "socket")]
 mod socket;
@@ -44,6 +46,7 @@ mod state_dir;
 
 pub use apps::AppList;
 pub use operations::OperationList;
+pub use privileges::PrivilegeList;
 
 #[cfg(feature = "socket")]
 pub use socket::{SOCKET_ENV, SOCKET_FILE, default_socket_path, runtime_dir};
@@ -142,6 +145,9 @@ pub enum ErrorCode {
     Busy,
     /// The daemon failed while handling a valid request.
     Internal,
+    /// Alchemy can't do what was asked on this machine, such as a
+    /// privilege whose helper is missing; the error says why.
+    Unsupported,
     /// A code this build does not know, sent by a newer daemon, or no code
     /// at all.
     #[default]
@@ -222,6 +228,9 @@ pub enum ApiEvent {
     /// finished, newest first, sent once on connect and again on every
     /// change.
     Operations(OperationList),
+    /// Every privilege, as `GET /api/machine/privileges` returns them,
+    /// sent once on connect and again on every change.
+    Privileges(PrivilegeList),
 }
 
 impl ApiEvent {
@@ -232,6 +241,7 @@ impl ApiEvent {
             Self::Metrics(_) => "metrics",
             Self::Apps(_) => "apps",
             Self::Operations(_) => "operations",
+            Self::Privileges(_) => "privileges",
         }
     }
 
@@ -252,6 +262,7 @@ impl Serialize for EventData<'_> {
             ApiEvent::Metrics(metrics) => metrics.serialize(serializer),
             ApiEvent::Apps(apps) => apps.serialize(serializer),
             ApiEvent::Operations(operations) => operations.serialize(serializer),
+            ApiEvent::Privileges(privileges) => privileges.serialize(serializer),
         }
     }
 }

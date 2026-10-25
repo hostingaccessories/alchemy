@@ -2,6 +2,7 @@
 //! this one.
 
 pub mod ports;
+pub mod privileges;
 pub mod stats;
 
 /// Arguments to `alchemy machine`.
@@ -31,4 +32,12 @@ pub enum Verb {
     /// own user's processes, so a port a root process holds shows without
     /// a name, and on some Macs isn't listed.
     Ports(ports::Args),
+    /// List what needs root on this machine, such as port 80 on Linux or
+    /// the host firewall, or grant or revoke one.
+    ///
+    /// Each action shows whether it is needed, granted, or can't be done
+    /// here, and why. Granting goes through alchemyd, which shows one
+    /// system password prompt; where it can't, as over SSH, this runs the
+    /// `sudo` command alchemyd gives in the terminal instead.
+    Privileges(privileges::Args),
 }

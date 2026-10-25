@@ -12,9 +12,17 @@ publish.workspace      = true
 name = "alchemy-helper"
 path = "src/main.rs"
 
+[lib]
+name = "alchemy_helper"
+path = "src/lib.rs"
+
 [dependencies]
-clap   = { workspace = true }
-rustix = { workspace = true }
+clap      = { workspace = true }
+rustix    = { workspace = true, features = ["fs"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

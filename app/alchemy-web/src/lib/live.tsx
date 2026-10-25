@@ -1,24 +1,34 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useEffect } from "react";
 
-import { ApiError, NO_RESPONSE, api, isSignedOut } from "./api.ts";
+import { type ApiEvent, ApiError, NO_RESPONSE, api, isSignedOut } from "./api.ts";
 import { invalidateOnReconnect, sessionQuery, versionQuery, writeLiveEvent } from "./queries.ts";
+import { expectRestart, restartDone, restartsSoon } from "./restart.ts";
 
 /**
  * Holds the app's one `/api/events` stream and writes each event into the
  * Query cache through `liveQueries`. When the stream drops it re-probes the
  * daemon and whether the page is signed in, and when it reconnects it
- * invalidates the cache. Must sit inside `QueryClientProvider`.
+ * invalidates the cache and forgets any restart it expected. A `privileges`
+ * event that says alchemyd is about to restart notes it, whichever page is
+ * open. Must sit inside `QueryClientProvider`.
  */
 export function LiveProvider({ children }: { children: ReactNode }) {
   const client = useQueryClient();
 
   useEffect(() => {
     let dropped = false;
-    return api.subscribe((event) => writeLiveEvent(client, event), {
+    const onEvent = (event: ApiEvent) => {
+      writeLiveEvent(client, event);
+      if (event.event === "privileges" && restartsSoon(event.data)) {
+        expectRestart(client);
+      }
+    };
+    return api.subscribe(onEvent, {
       onOpen: () => {
         if (dropped) {
           dropped = false;
+          restartDone(client);
           void invalidateOnReconnect(client);
         }
       },

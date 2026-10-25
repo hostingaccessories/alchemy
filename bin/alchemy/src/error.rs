@@ -20,7 +20,8 @@ pub enum Exit {
     Failure,
     /// The command line was invalid.
     Usage,
-    /// A confirmation was declined, or was needed without a TTY.
+    /// A confirmation was declined, or was needed without a TTY, as was
+    /// a sudo password for a privilege.
     Confirmation,
     /// alchemyd is unreachable or went away: `sysexits.h` `EX_UNAVAILABLE`.
     Unavailable,
@@ -153,6 +154,20 @@ pub enum ClientError {
     /// A local file could not be read or written.
     #[error("{0}")]
     File(String),
+    /// A privilege needs a command run with sudo in a terminal, and there
+    /// is no terminal to run it in. The command is printed on stdout.
+    #[error("`{command}` needs sudo in a terminal: {why}")]
+    NeedsTerminal {
+        /// The command, as typed after `alchemy`.
+        command: String,
+        /// Why alchemyd can't show a system prompt instead.
+        why: String,
+        /// The command to run in a terminal, as one shell line.
+        line: String,
+    },
+    /// Granting or revoking a privilege did not succeed.
+    #[error("{0}")]
+    PrivilegeFailed(String),
 }
 
 /// Why an exchange with alchemyd failed below the API.
@@ -208,11 +223,14 @@ impl ClientError {
             | Self::OperationFailed { .. }
             | Self::NothingToCancel(_)
             | Self::Editor(_)
-            | Self::File(_) => Exit::Failure,
+            | Self::File(_)
+            | Self::PrivilegeFailed(_) => Exit::Failure,
             Self::Usage { .. } | Self::RemoteDaemon { .. } | Self::InvalidTarget { .. } => {
                 Exit::Usage
             }
-            Self::ConfirmationRequired { .. } | Self::Declined { .. } => Exit::Confirmation,
+            Self::ConfirmationRequired { .. }
+            | Self::Declined { .. }
+            | Self::NeedsTerminal { .. } => Exit::Confirmation,
             Self::Interrupted => Exit::Interrupted,
         }
     }
@@ -245,6 +263,8 @@ impl ClientError {
             Self::NothingToCancel(_) => "nothing_to_cancel",
             Self::Editor(_) => "editor",
             Self::File(_) => "file",
+            Self::NeedsTerminal { .. } => "needs_terminal",
+            Self::PrivilegeFailed(_) => "privilege_failed",
         }
     }
 
@@ -273,6 +293,11 @@ impl ClientError {
             }
             Self::ConfirmationRequired { .. } => "pass --yes to go ahead without a prompt",
             Self::Editor(_) => "set VISUAL or EDITOR to the editor you use",
+            Self::NeedsTerminal { command, line, .. } => {
+                return Some(format!(
+                    "run `{line}` in a terminal, then run `alchemy {command}` again"
+                ));
+            }
             Self::Daemon(_)
             | Self::Output(_)
             | Self::InvalidTarget { .. }
@@ -281,7 +306,8 @@ impl ClientError {
             | Self::Runtime(_)
             | Self::OperationFailed { .. }
             | Self::NothingToCancel(_)
-            | Self::File(_) => return None,
+            | Self::File(_)
+            | Self::PrivilegeFailed(_) => return None,
         };
         Some(hint.to_owned())
     }
@@ -583,6 +609,26 @@ mod tests {
                 1,
                 "file",
                 "cannot read compose.yaml: not found".into(),
+                None,
+            ),
+            (
+                ClientError::NeedsTerminal {
+                    command: "machine privileges grant low-ports".into(),
+                    why: "there is no polkit agent to show a prompt.".into(),
+                    line: "sudo /usr/libexec/alchemy/alchemy-helper grant-low-ports".into(),
+                },
+                3,
+                "needs_terminal",
+                "`machine privileges grant low-ports` needs sudo in a terminal: there is no polkit agent to show a prompt.".into(),
+                Some(
+                    "run `sudo /usr/libexec/alchemy/alchemy-helper grant-low-ports` in a terminal, then run `alchemy machine privileges grant low-ports` again",
+                ),
+            ),
+            (
+                ClientError::PrivilegeFailed("granting firewall was cancelled".into()),
+                1,
+                "privilege_failed",
+                "granting firewall was cancelled".into(),
                 None,
             ),
         ];

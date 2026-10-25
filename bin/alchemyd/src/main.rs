@@ -1,10 +1,11 @@
 //! `alchemyd` entry point: parse arguments, install logging, run the daemon
-//! until SIGINT or SIGTERM.
+//! until SIGINT or SIGTERM, and re-execute it when a privilege change asks.
 
 use std::io::IsTerminal as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -62,7 +63,13 @@ fn main() -> ExitCode {
     };
 
     match runtime.block_on(alchemyd::run(config, shutdown_signal())) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(alchemyd::Stopped::Shutdown) => ExitCode::SUCCESS,
+        Ok(alchemyd::Stopped::Restart) => {
+            runtime.shutdown_timeout(Duration::from_secs(5));
+            let error = alchemyd::restart::exec_self();
+            tracing::error!(%error, "alchemyd couldn't restart itself");
+            ExitCode::FAILURE
+        }
         Err(e) => {
             tracing::error!(error = format!("{e:#}"), "alchemyd exited with an error");
             ExitCode::FAILURE

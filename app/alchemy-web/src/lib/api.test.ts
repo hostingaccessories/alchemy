@@ -81,6 +81,37 @@ describe("request", () => {
     ]);
   });
 
+  it("reads privileges and asks for one with a 202 answer", async () => {
+    const pending = {
+      outcome: "pending",
+      command: null,
+      message: null,
+      privilege: {
+        action: "low_ports",
+        state: "pending",
+        reason: null,
+        message: null,
+        command: null,
+        restarts: true,
+        last: null,
+      },
+    };
+    const fetch = vi.fn(async (url: string) =>
+      url.endsWith("/privileges")
+        ? new Response(JSON.stringify({ privileges: [pending.privilege] }))
+        : new Response(JSON.stringify(pending), { status: 202 }),
+    );
+    vi.stubGlobal("fetch", fetch);
+    await expect(api.privileges()).resolves.toEqual({ privileges: [pending.privilege] });
+    await expect(api.changePrivilege("low_ports", { grant: true })).resolves.toEqual(pending);
+    expect(fetch).toHaveBeenLastCalledWith("/api/machine/privileges/low_ports", {
+      method: "POST",
+      signal: undefined,
+      headers: { "content-type": "application/json" },
+      body: '{"grant":true}',
+    });
+  });
+
   it.each(["POST", "PUT", "DELETE"] as const)("sends %s with a JSON body", async (method) => {
     const fetch = vi.fn(async () => new Response(JSON.stringify({ ok: true })));
     vi.stubGlobal("fetch", fetch);

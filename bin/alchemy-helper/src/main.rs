@@ -1,45 +1,41 @@
-//! `alchemy-helper`: the privileged one-shot.
-//!
-//! This binary is the security boundary. It is never setuid and never
-//! long-running: callers elevate it explicitly (`sudo`, `pkexec`, or
-//! macOS `osascript ... with administrator privileges`), it performs one
-//! narrowly validated operation, and it exits. It refuses to run unless
-//! its effective UID is already 0.
-//!
-//! Operations are added as subcommands with strictly validated
-//! arguments; nothing is ever passed through a shell.
+//! `alchemy-helper` entry point: parse, check for root, run, report.
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
-
-/// `sysexits.h` `EX_NOPERM`.
-const EX_NOPERM: u8 = 77;
-
-/// Alchemy privileged helper.
-#[derive(Debug, Parser)]
-#[command(name = "alchemy-helper", version, about)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Verify the helper is running with root privileges and exit.
-    Check,
-}
+use alchemy_helper::{Exit, HelperError, Platform, RealSystem};
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    if !rustix::process::geteuid().is_root() {
-        eprintln!("alchemy-helper: must be run as root");
-        return ExitCode::from(EX_NOPERM);
-    }
-    match cli.command {
-        Command::Check => {
-            println!("ok");
-            ExitCode::SUCCESS
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
+    let operation = match alchemy_helper::parse(std::env::args_os()) {
+        Ok(operation) => operation,
+        Err(e) if !e.is_usage() => {
+            print!("{e}");
+            return ExitCode::SUCCESS;
         }
-    }
+        Err(e) => {
+            let result = Err(HelperError::Usage(e.to_string()));
+            return exit(alchemy_helper::report(
+                None,
+                &result,
+                &mut stdout,
+                &mut stderr,
+            ));
+        }
+    };
+    let result = if rustix::process::geteuid().is_root() {
+        alchemy_helper::run(&operation, &RealSystem, Platform::current())
+    } else {
+        Err(HelperError::NotRoot)
+    };
+    exit(alchemy_helper::report(
+        Some(&operation),
+        &result,
+        &mut stdout,
+        &mut stderr,
+    ))
+}
+
+fn exit(status: Exit) -> ExitCode {
+    ExitCode::from(status.code())
 }

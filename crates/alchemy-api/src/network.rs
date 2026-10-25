@@ -18,6 +18,8 @@
 pub use alchemy_core::network::{AddressPool, HostSide, Ipv4Net};
 use serde::{Deserialize, Serialize};
 
+use crate::privileges::PrivilegeAction;
+
 /// `GET /api/network`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkReport {
@@ -197,6 +199,7 @@ impl Default for ProxyReport {
                 state: ListenerState::Off,
                 message: None,
                 fix: None,
+                privilege: None,
             },
             ports: Vec::new(),
         }
@@ -220,6 +223,12 @@ pub struct ProxyListener {
     pub message: Option<String>,
     /// What to do about it, when the user can do something.
     pub fix: Option<String>,
+    /// The privilege that would open it, such as `low_ports` for port 80
+    /// refused for lack of permission on Linux. Its state, and how to
+    /// grant it, are in `GET /api/machine/privileges`. Defaults to `None`
+    /// when an older daemon leaves it out.
+    #[serde(default)]
+    pub privilege: Option<PrivilegeAction>,
 }
 
 /// The state of a [`ProxyListener`].

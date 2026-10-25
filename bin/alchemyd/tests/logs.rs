@@ -137,7 +137,7 @@ struct Daemon {
     state: State,
     logs: FakeLogSource,
     stop: oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<anyhow::Result<alchemyd::Stopped>>,
 }
 
 impl Daemon {

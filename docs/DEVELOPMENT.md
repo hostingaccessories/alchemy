@@ -747,14 +747,11 @@ in `/api/network`):
 
 macOS lets any user listen on port 80. Linux doesn't: when the bind is
 refused, the port 80 addresses (`<app>.local` and `<app>.localhost`) are
-`unavailable`, `alchemy status` prints a warning with the fix, and each
-app's own port, by IP or as `<app>.local:<port>`, keeps working. To
-grant the capability (again after every rebuild, since it is stored on the
-file):
-
-```sh
-sudo setcap cap_net_bind_service=+ep "$(command -v alchemyd)"
-```
+`unavailable`, the port 80 listener in `/api/network` carries
+`privilege: low_ports`, `alchemy status` prints a warning with the fix,
+and each app's own port, by IP or as `<app>.local:<port>`, keeps working.
+Allowing port 80 is a [privileged action](#privileges); see
+[Port 80 on Linux](#port-80-on-linux).
 
 A port 80 that another program holds is tried again every 10 seconds;
 `alchemy machine ports` names the holder.
@@ -878,14 +875,147 @@ guest or isolated Wi-Fi network, which blocks multicast. If it can't open
 the name, turn off a VPN, and on iOS iCloud Private Relay and Limit IP
 Address Tracking for that network. iOS resolves `.local` in Safari;
 Android does from version 12.
-Without the port 80 capability on Linux, phones get
-`http://<app>.local:<port>` until M8.
+Until [port 80 is allowed](#port-80-on-linux) on Linux, phones get
+`http://<app>.local:<port>`.
 
 ```sh
 curl --unix-socket /run/user/1000/alchemy/alchemyd.sock http://alchemyd/api/network | jq .mdns
 avahi-resolve -4 -n immich.local      # Linux with avahi
 dns-sd -G v4 immich.local             # macOS
 ```
+
+### Privileges
+
+The few things that need root, port 80 on Linux, firewall rules, and a
+system service, go through `alchemy-helper`, run once per change with
+elevated rights. [ARCHITECTURE.md](ARCHITECTURE.md#5-privileged-operations)
+lists every operation, its undo, and the trust rule. The daemon decides
+and elevates; clients only ask it.
+
+`GET /api/machine/privileges` lists the three actions, `low_ports`,
+`firewall`, and `system_service`, each with a `state`:
+
+| `state`          | Meaning                                                                                          |
+| ---------------- | ------------------------------------------------------------------------------------------------ |
+| `not_needed`     | Nothing to do, such as port 80 on macOS, or no ufw or firewalld running.                         |
+| `needed`         | A system prompt can grant it.                                                                    |
+| `pending`        | A prompt is up, or alchemyd is about to restart.                                                 |
+| `granted`        | Done.                                                                                            |
+| `needs_restart`  | The change is on disk but alchemyd hasn't picked it up; granting again restarts it.              |
+| `needs_terminal` | No prompt is possible; `command` holds the exact `sudo alchemy-helper ...` line to run.          |
+| `unsupported`    | It can't be done here; `reason` and `message` say why (`not_helper_sibling`, `nosuid_mount`, …). |
+
+`POST /api/machine/privileges/{action}` with `{"grant": true}` (or
+`false` to undo) answers `pending` while a prompt is up, `restarting`
+when alchemyd re-execs itself, `needs_terminal` with the command to run,
+or `unchanged`. After running a `needs_terminal` command, send the same
+`POST` again: for port 80 that restarts alchemyd, keeping its PID. The
+`privileges` event on `/api/events` carries the same list whenever it
+changes, and `last` on each action says how the latest grant or undo
+through this alchemyd ended (`done`, `cancelled`, `denied`,
+`needs_terminal`, or `failed`).
+
+`alchemy machine privileges` prints the same list, with a note for each
+action that needs something, and `grant ACTION` / `revoke ACTION`
+(`low-ports`, `firewall`, or `system-service`) follow that flow. On
+`needs_terminal` with a terminal (stdin and stderr), the CLI prints
+`Running: sudo ...`, runs alchemyd's command itself, with no shell, so
+sudo asks for the password there, then posts again. It runs at most one
+sudo command per call and refuses a command that doesn't start with
+`sudo`. Without a terminal it prints the command on stdout (the whole
+answer with `--json`) and exits 3. On `pending` it follows the
+`privileges` event until the prompt is answered; on `restarting` it waits
+up to 60 seconds for alchemyd to answer again. A cancelled or refused
+prompt, or a failed sudo, exits 1 (`privilege_failed`).
+
+The machine page has a **Privileges** section with one row per action
+(**Port 80**, **Firewall**, **System service**) and a button for the next
+step (**Allow port 80**, **Open the firewall**, **Install the service**,
+and their undos). For `needs_terminal` it shows the command with **Copy
+command** and **Try again**, which posts again, and for `needs_restart` a
+**Restart alchemyd** button. The port 80 warning carries the same control,
+keyed on `privilege: low_ports`, not on the `fix` text. While alchemyd
+restarts the UI shows a neutral "alchemyd is restarting" banner and
+reconnects; the desktop shell re-reads the new token on its own, but a
+browser signed in with `alchemy open` loses its session and has to run
+`alchemy open` again.
+
+alchemyd prompts (osascript on macOS, pkexec with a polkit agent on Linux)
+only when the helper is root-owned and no one else can write it or any
+directory above it. **A build in `target/` never qualifies, so in
+development every action is `needs_terminal`.** That is deliberate, not a
+bug. To try the real prompt, install both binaries side by side in a
+root-owned directory and run alchemyd from there:
+
+```sh
+# Linux
+sudo install -d -o root -g root -m 755 /usr/libexec/alchemy
+sudo install -o root -g root -m 755 target/release/alchemyd target/release/alchemy-helper /usr/libexec/alchemy/
+/usr/libexec/alchemy/alchemyd
+
+# macOS (/Applications, /usr/local, and /opt/homebrew can be group- or user-writable)
+sudo install -d -o root -g wheel -m 755 /Library/PrivilegedHelperTools/alchemy
+sudo install -o root -g wheel -m 755 target/release/alchemyd target/release/alchemy-helper /Library/PrivilegedHelperTools/alchemy/
+/Library/PrivilegedHelperTools/alchemy/alchemyd
+```
+
+The helper only acts on the `alchemyd` next to it. If the running alchemyd
+isn't that one (for example `cargo run` with a helper installed
+elsewhere), actions that touch alchemyd are `unsupported` with
+`not_helper_sibling`.
+
+#### Port 80 on Linux
+
+`grant-low-ports` sets `cap_net_bind_service` on the `alchemyd` next to
+the helper, as the `security.capability` xattr; alchemyd then restarts in
+place to pick it up, keeping its PID. With a development build:
+
+```console
+$ alchemy machine privileges grant low-ports
+alchemy-helper isn't installed safely: /home/you/alchemy/target/release/alchemy-helper is owned by UID 1000, not root.
+Running: sudo /home/you/alchemy/target/release/alchemy-helper grant-low-ports
+{"result":"ok","operation":"grant-low-ports","changed":true}
+Restarting alchemyd to put the change in effect…
+Granted low-ports; alchemyd restarted to put it in effect
+```
+
+`alchemy machine privileges revoke low-ports` undoes it the same way. By
+hand, the steps are: `POST` `{"grant":true}`, run the `command.line` it
+answers with, then `POST` again.
+
+- **Rebuilds drop it.** Cargo writes a new file, and the kernel clears the
+  xattr on any write, so grant again after `cargo build`. Packaging will
+  re-apply it on upgrade (M14).
+- It is `unsupported` when alchemyd's binary is on a `nosuid` mount or
+  alchemyd runs with `NoNewPrivileges`: the kernel ignores the capability
+  there.
+- A lowered `net.ipv4.ip_unprivileged_port_start` (Docker sets it to 0
+  inside containers) makes port 80 just work, so the action is
+  `not_needed`. Test in a container with
+  `--sysctl net.ipv4.ip_unprivileged_port_start=1024`.
+
+#### Firewall and system service
+
+`open-firewall` opens 80/tcp, the whole proxy range (`8100-8999` by
+default), and 5353/udp in one go, so a new app never needs another
+prompt. It acts only on an active ufw (an app profile in
+`/etc/ufw/applications.d/alchemy`) or firewalld (a service in
+`/etc/firewalld/services/alchemy.xml`), so `close-firewall` removes
+exactly what was added; on macOS with the application firewall on, it
+adds and unblocks alchemyd. alchemyd detects ufw from `ENABLED=yes` in
+`/etc/ufw/ufw.conf` and firewalld from `systemctl is-active firewalld`,
+without root. Raw nftables or iptables rules are never edited and read as
+`not_needed` for now; detecting a firewall that blocks Alchemy is M10.
+
+`install-service --uid N` installs and starts
+`/etc/systemd/system/alchemyd-N.service` (with `User=N`) or
+`/Library/LaunchDaemons/computer.alchemy.alchemyd.N.plist` (with
+`UserName`) for the sibling `alchemyd`, and `remove-service --uid N`
+stops and removes it. The operations exist, but nothing offers them yet:
+`system_service` is `not_needed` unless a service is already installed.
+M9 wires them, and decides where the service's socket goes; today the
+unit sets `ALCHEMY_SOCKET=/run/alchemy-N/alchemyd.sock`, which the CLI
+only finds with `--socket`.
 
 ### Web UI in debug vs release
 
@@ -993,7 +1123,10 @@ checks:
   reaches its route. It needs `jq`;
 - `/` serves the embedded web UI;
 - `alchemy status` reaches the daemon and reports the same version;
-- `alchemy-helper` refuses to run without root;
+- every `alchemy-helper` operation (`check`, `grant-low-ports`,
+  `revoke-low-ports`, `open-firewall`, `close-firewall`,
+  `install-service`, `remove-service`) refuses to run without root,
+  printing its `not_root` result line and exiting 77;
 - a second daemon on the same state directory refuses to start, before
   binding its socket, and the first keeps serving;
 - the daemon shuts down cleanly on `SIGTERM` and removes its socket and
@@ -1085,22 +1218,39 @@ with `alchemy app up`, and checks that:
   [mDNS test](#mdns-test)'s job;
 - once the app is stopped, its port answers 503.
 
-When port 80 is refused, it checks the warning, the `setcap` fix, and the
-`unavailable` address instead. With `WEB_ADDR_SETCAP=1` it then grants the
-capability with `sudo setcap`, restarts the daemon on the same state
-directory, checks the app kept its port, and runs the port 80 checks too;
-the capability is removed again on exit. Without it, the port 80 checks
-are skipped.
+When port 80 is refused, it checks the warning, the
+`privileges grant low-ports` fix, the `low_ports` privilege on the
+listener, and the `unavailable` address instead. With `WEB_ADDR_GRANT=1`
+it is also the end-to-end test of the [privileged helper](#port-80-on-linux),
+taking the path `alchemy machine privileges grant low-ports` takes when
+alchemyd can't prompt:
+
+1. `POST /api/machine/privileges/low-ports` with `{"grant":true}`
+   answers `needs_terminal` with exactly `sudo <target>/release/alchemy-helper
+   grant-low-ports`, because `target/` isn't root-owned;
+2. the script runs that command, and the helper reports `changed`;
+3. the same `POST` again answers `restarting`, and alchemyd shuts down
+   cleanly and re-execs itself with the same PID, now with
+   `cap_net_bind_service` in `CapEff`;
+4. port 80 is `listening`, the privilege is `granted`, the app kept its
+   port, and the port 80 checks above pass;
+5. `{"grant":false}`, `sudo alchemy-helper revoke-low-ports`, and the
+   `POST` again restart it once more, with the same PID and no
+   capability: port 80 is `unavailable` with `privilege: low_ports`
+   again, and the privilege is `needed` or `needs_terminal`.
+
+The capability is revoked again on exit if the test stops halfway.
+Without `WEB_ADDR_GRANT=1`, the port 80 checks are skipped.
 
 It needs `jq`, `curl`, a user that can reach Docker, and `sudo` for
-`WEB_ADDR_SETCAP=1` (unless run as root). It pulls `busybox:1.37.0`. It
+`WEB_ADDR_GRANT=1` (unless run as root). It pulls `busybox:1.37.0`. It
 runs a Compose project named `webaddr`, which it removes on exit, and lets
 the daemon create the `alchemy` network, so it refuses to run unless
 `CI=true` or `WEB_ADDR_CONFIRM=1`. Set `WEB_ADDR_SKIP_BUILD=1` to reuse
 `target/release`. CI runs it on Linux after the home-network test, reusing
-the smoke test's build, with `WEB_ADDR_SETCAP=1`. macOS and Docker Desktop
-are covered by the routing integration tests in
-`bin/alchemyd/tests/routing.rs`.
+the smoke test's build, with `WEB_ADDR_GRANT=1`, so CI reaches port 80 only
+through the helper. macOS and Docker Desktop are covered by the routing
+integration tests in `bin/alchemyd/tests/routing.rs`.
 
 It can run in the same privileged container as the home-network test, but
 inside Docker Desktop's VM the engine reports a `linuxkit` kernel, so
@@ -1143,8 +1293,9 @@ LAN interface, which a CI runner can't spare.
 
 It needs `avahi-daemon`, `avahi-utils`, `libnss-mdns`, `python3`, `jq`,
 `curl`, a user that can reach Docker, and `sudo` (unless run as root) to
-start and stop avahi and for `MDNS_SETCAP=1`, which grants port 80 as the
-web-address test does. It leaves avahi running or stopped as it found it,
+start and stop avahi and for `MDNS_GRANT=1`, which grants low ports
+through `alchemy-helper` as the web-address test does, and revokes them on
+exit. It leaves avahi running or stopped as it found it,
 and refuses to run unless `CI=true` or `MDNS_CONFIRM=1`. Set
 `MDNS_SKIP_BUILD=1` to reuse `target/release`. CI runs it on Linux last in
 the smoke job, after installing the packages. The app publishes its port,
