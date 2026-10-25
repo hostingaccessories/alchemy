@@ -298,6 +298,12 @@ async fn status_watch_prints_a_line_per_change_until_the_daemon_stops() {
     let mut watch = Watch::start(cli(&daemon.socket, false, true));
     assert_eq!(watch.line().await, daemon_line(&daemon.socket));
     assert_eq!(watch.line().await, "Docker isn't running");
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            watch.line().await,
+            "  Fix: run `sudo systemctl start docker`"
+        );
+    }
 
     daemon
         .state

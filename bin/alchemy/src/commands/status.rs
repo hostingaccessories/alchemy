@@ -985,15 +985,13 @@ mod tests {
             "{:?}",
             run.result
         );
-        assert_eq!(
-            run.out.lines().collect::<Vec<_>>(),
-            [
-                DAEMON_LINE,
-                "Docker isn't running",
-                "Docker is starting…",
-                READY_LINE
-            ]
-        );
+        let fix = cfg!(target_os = "linux").then_some("  Fix: run `sudo systemctl start docker`");
+        let want: Vec<&str> = [DAEMON_LINE, "Docker isn't running"]
+            .into_iter()
+            .chain(fix)
+            .chain(["Docker is starting…", READY_LINE])
+            .collect();
+        assert_eq!(run.out.lines().collect::<Vec<_>>(), want);
         assert_eq!(run.requests, ["GET /api/version", "GET /api/events"]);
     }
 
