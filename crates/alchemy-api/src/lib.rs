@@ -49,7 +49,7 @@ pub use operations::OperationList;
 pub use privileges::PrivilegeList;
 
 #[cfg(feature = "socket")]
-pub use socket::{SOCKET_ENV, SOCKET_FILE, default_socket_path, runtime_dir};
+pub use socket::{SOCKET_ENV, SOCKET_FILE, default_socket_path, runtime_dir, socket_candidates};
 #[cfg(feature = "state-dir")]
 pub use state_dir::{STATE_DIR_ENV, TCP_TOKEN_FILE, default_state_dir, tcp_token_path};
 
