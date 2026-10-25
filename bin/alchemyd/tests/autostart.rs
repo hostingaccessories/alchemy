@@ -435,6 +435,22 @@ async fn modes_that_cannot_work_here_are_refused() {
     let d = start(Supervisor::Manual, facts, manager).await;
     let now = d.get().await;
     assert_eq!(now.available_modes, [AutostartMode::Off]);
+    assert_eq!(
+        now.unavailable
+            .iter()
+            .map(|u| (u.mode, u.message.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                AutostartMode::Login,
+                "No systemd --user manager is running for this user."
+            ),
+            (
+                AutostartMode::Boot,
+                "Alchemy can't find alchemy-helper next to alchemyd."
+            ),
+        ]
+    );
     for (mode, why) in [
         (
             "boot",

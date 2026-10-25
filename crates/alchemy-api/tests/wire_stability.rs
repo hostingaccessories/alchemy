@@ -1904,6 +1904,7 @@ fn autostart() -> alchemy_api::autostart::Autostart {
             message: Some("c".into()),
             at: 1_700_000_000,
         }),
+        unavailable: vec![],
     }
 }
 
@@ -1931,6 +1932,7 @@ fn autostart_and_event() {
         supervisor: Supervisor::Manual,
         pending: None,
         last: None,
+        unavailable: vec![],
     };
     assert_wire(
         &off,
@@ -1953,6 +1955,37 @@ fn autostart_and_event() {
             r#"{"mode":"boot","available_modes":["off"],"#,
             r#""log_hint":{"kind":"journal","command":"journalctl -u alchemyd-1000.service"},"#,
             r#""supervisor":"system_service","pending":null,"last":null}"#,
+        ),
+    );
+}
+
+#[test]
+fn autostart_unavailable_modes() {
+    use alchemy_api::autostart::{Autostart, AutostartMode, LogHint, Supervisor, UnavailableMode};
+    let appimage = Autostart {
+        mode: AutostartMode::Off,
+        available_modes: vec![AutostartMode::Off],
+        log_hint: LogHint::Terminal,
+        supervisor: Supervisor::Manual,
+        pending: None,
+        last: None,
+        unavailable: vec![
+            UnavailableMode {
+                mode: AutostartMode::Login,
+                message: "a".into(),
+            },
+            UnavailableMode {
+                mode: AutostartMode::Boot,
+                message: "b".into(),
+            },
+        ],
+    };
+    assert_wire(
+        &appimage,
+        concat!(
+            r#"{"mode":"off","available_modes":["off"],"log_hint":{"kind":"terminal"},"#,
+            r#""supervisor":"manual","pending":null,"last":null,"#,
+            r#""unavailable":[{"mode":"login","message":"a"},{"mode":"boot","message":"b"}]}"#,
         ),
     );
 }

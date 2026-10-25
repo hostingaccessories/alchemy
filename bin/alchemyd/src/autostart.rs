@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alchemy_api::autostart::{
-    Autostart as Status, AutostartAttempt, AutostartChange, AutostartOutcome,
+    Autostart as Status, AutostartAttempt, AutostartChange, AutostartOutcome, UnavailableMode,
 };
 use alchemy_api::privileges::{AttemptResult, ChangeOutcome, HelperCommand, PrivilegeAttempt};
 use alchemy_core::lifecycle::{
@@ -552,13 +552,25 @@ impl Autostart {
             (HostOs::MacOs, AutostartMode::Login, None) => LogHint::Terminal,
             (os, mode, home) => log_hint(os, mode, home.unwrap_or(Path::new("/")), facts.uid),
         };
+        let available = available_modes(mode, support.modes());
+        let unavailable = AutostartMode::ALL
+            .into_iter()
+            .filter(|candidate| !available.contains(candidate))
+            .filter_map(|candidate| {
+                support.why_not(candidate).map(|why| UnavailableMode {
+                    mode: candidate,
+                    message: why.to_owned(),
+                })
+            })
+            .collect();
         Status {
             mode,
-            available_modes: available_modes(mode, support.modes()),
+            available_modes: available,
             log_hint,
             supervisor: deps.supervisor,
             pending: self.inner.pending.lock().ok().and_then(|p| *p),
             last: self.inner.last.lock().ok().and_then(|l| l.clone()),
+            unavailable,
         }
     }
 

@@ -54,6 +54,21 @@ pub struct Autostart {
     /// How the last switch asked of this alchemyd ended, or `None` before
     /// any has ended. A restart forgets it.
     pub last: Option<AutostartAttempt>,
+    /// The modes left out of `available_modes`, each with why, in display
+    /// order. Omitted when every mode is available, and empty from an
+    /// alchemyd older than it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<UnavailableMode>,
+}
+
+/// A mode that can't be switched to on this machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnavailableMode {
+    /// The mode.
+    pub mode: AutostartMode,
+    /// Why, in a sentence safe to show, such as that no `systemd --user`
+    /// manager runs.
+    pub message: String,
 }
 
 /// How a switch ended.
