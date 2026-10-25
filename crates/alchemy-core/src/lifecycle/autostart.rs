@@ -14,7 +14,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::service_file::{SYSTEMD_USER_UNIT, log_path};
+use super::service_file::{SYSTEMD_USER_UNIT, log_path, system_log_path};
 use crate::privilege::ServiceFacts;
 use crate::route::HostOs;
 
@@ -238,13 +238,17 @@ pub enum LogHint {
 /// Where logs go for alchemyd in `mode` on `os`, for the user with `home`
 /// and `uid`.
 ///
-/// Both macOS plists log to [`log_path`]. A system unit is named
-/// `alchemyd-<uid>.service`, as M8's helper installs it.
+/// The launch agent logs to [`log_path`] and the launch daemon to
+/// [`system_log_path`]. A system unit is named `alchemyd-<uid>.service`,
+/// as M8's helper installs it.
 pub fn log_hint(os: HostOs, mode: AutostartMode, home: &Path, uid: u32) -> LogHint {
     match (os, mode) {
         (_, AutostartMode::Off) => LogHint::Terminal,
-        (HostOs::MacOs, AutostartMode::Login | AutostartMode::Boot) => LogHint::File {
+        (HostOs::MacOs, AutostartMode::Login) => LogHint::File {
             path: log_path(home),
+        },
+        (HostOs::MacOs, AutostartMode::Boot) => LogHint::File {
+            path: system_log_path(uid),
         },
         (HostOs::Linux, AutostartMode::Login) => LogHint::Journal {
             command: format!("journalctl --user -u {SYSTEMD_USER_UNIT}"),
@@ -451,8 +455,14 @@ mod tests {
         };
         let cases = [
             (HostOs::MacOs, Off, LogHint::Terminal),
-            (HostOs::MacOs, Login, log.clone()),
-            (HostOs::MacOs, Boot, log),
+            (HostOs::MacOs, Login, log),
+            (
+                HostOs::MacOs,
+                Boot,
+                LogHint::File {
+                    path: PathBuf::from("/Library/Logs/Alchemy/alchemyd.501.log"),
+                },
+            ),
             (HostOs::Linux, Off, LogHint::Terminal),
             (
                 HostOs::Linux,

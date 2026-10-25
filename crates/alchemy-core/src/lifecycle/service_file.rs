@@ -7,7 +7,8 @@
 //! verbatim only if systemd would not interpret any of it; a plist takes
 //! any path without control characters, escaped as XML.
 
-use std::path::{Path, PathBuf};
+use std::fmt;
+use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
@@ -24,6 +25,16 @@ pub const LOG_DIR: &str = "Library/Logs/Alchemy";
 
 /// The log file's name in [`LOG_DIR`].
 pub const LOG_FILE: &str = "alchemyd.log";
+
+/// Where the system service's launch daemon logs on macOS. It is
+/// root-owned all the way up: the root launchd opens the log, and a path
+/// under the user's home could be a symlink the user planted (#112).
+pub const SYSTEM_LOG_DIR: &str = "/Library/Logs/Alchemy";
+
+/// The bundle ID of the desktop app, which the launch agent names as
+/// responsible for it, so macOS can attribute it to Alchemy in Login
+/// Items and Local Network privacy (#112).
+pub const DESKTOP_BUNDLE_ID: &str = "computer.alchemy.desktop";
 
 /// Why a service file could not be rendered.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -71,6 +82,55 @@ pub fn systemd_user_unit_path(xdg_config_home: Option<&Path>, home: &Path) -> Pa
 /// The macOS log file for the user with `home`.
 pub fn log_path(home: &Path) -> PathBuf {
     home.join(LOG_DIR).join(LOG_FILE)
+}
+
+/// The system service's macOS log file for the user with `uid`, as
+/// `alchemy-helper install-service` writes it.
+pub fn system_log_path(uid: u32) -> PathBuf {
+    Path::new(SYSTEM_LOG_DIR).join(format!("alchemyd.{uid}.log"))
+}
+
+/// Why alchemyd's path can't back a service: it is gone once the app
+/// that holds it quits (#112).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransientInstall {
+    /// alchemyd runs from inside an AppImage, a FUSE mount that exists
+    /// only while the AppImage runs.
+    AppImage,
+    /// macOS App Translocation runs the app from a random read-only copy,
+    /// because it was opened where it was downloaded.
+    Translocated,
+}
+
+impl fmt::Display for TransientInstall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::AppImage => {
+                "Alchemy runs from an AppImage, which a service can't start. Install the .deb package to start Alchemy on its own."
+            }
+            Self::Translocated => {
+                "macOS is running Alchemy from a temporary copy. Move Alchemy to the Applications folder first."
+            }
+        })
+    }
+}
+
+/// Whether the alchemyd at `alchemyd`, its canonical path, is somewhere
+/// a service can't point at. `appimage` is whether the AppImage runtime's
+/// `APPIMAGE` variable is set.
+pub fn transient_install(alchemyd: &Path, appimage: bool) -> Option<TransientInstall> {
+    let mut components = alchemyd.components().filter_map(|c| match c {
+        Component::Normal(name) => name.to_str(),
+        _ => None,
+    });
+    let first_two = (components.next(), components.next());
+    if appimage || matches!(first_two, (Some("tmp"), Some(mount)) if mount.starts_with(".mount_")) {
+        return Some(TransientInstall::AppImage);
+    }
+    alchemyd
+        .components()
+        .any(|c| c.as_os_str() == "AppTranslocation")
+        .then_some(TransientInstall::Translocated)
 }
 
 /// An absolute UTF-8 path with no control characters.
@@ -146,6 +206,10 @@ pub fn launch_agent_plist(alchemyd: &Path, home: &Path) -> Result<String, Servic
 \t<string>{log}</string>
 \t<key>StandardErrorPath</key>
 \t<string>{log}</string>
+\t<key>AssociatedBundleIdentifiers</key>
+\t<array>
+\t\t<string>{DESKTOP_BUNDLE_ID}</string>
+\t</array>
 </dict>
 </plist>
 ",
@@ -219,6 +283,10 @@ mod tests {
 \t<string>/Users/jo/Library/Logs/Alchemy/alchemyd.log</string>
 \t<key>StandardErrorPath</key>
 \t<string>/Users/jo/Library/Logs/Alchemy/alchemyd.log</string>
+\t<key>AssociatedBundleIdentifiers</key>
+\t<array>
+\t\t<string>computer.alchemy.desktop</string>
+\t</array>
 </dict>
 </plist>
 ";
@@ -388,6 +456,48 @@ WantedBy=default.target
         let want = Err(ServiceFileError::Unprintable { path: path.into() });
         assert_eq!(systemd_user_unit(path), want);
         assert_eq!(launch_agent_plist(path, Path::new("/Users/jo")), want);
+    }
+
+    #[test]
+    fn transient_installs() {
+        let cases = [
+            ("/usr/bin/alchemyd", false, None),
+            (
+                "/Applications/Alchemy.app/Contents/MacOS/alchemyd",
+                false,
+                None,
+            ),
+            (
+                "/tmp/.mount_AlchemXYZ/usr/bin/alchemyd",
+                false,
+                Some(TransientInstall::AppImage),
+            ),
+            ("/usr/bin/alchemyd", true, Some(TransientInstall::AppImage)),
+            ("/home/u/tmp/.mount_x/alchemyd", false, None),
+            (
+                "/private/var/folders/xy/T/AppTranslocation/1234/d/Alchemy.app/Contents/MacOS/alchemyd",
+                false,
+                Some(TransientInstall::Translocated),
+            ),
+            ("/opt/AppTranslocationNot/alchemyd", false, None),
+        ];
+        for (path, appimage, want) in cases {
+            assert_eq!(
+                transient_install(Path::new(path), appimage),
+                want,
+                "{path} {appimage}"
+            );
+        }
+        assert!(
+            TransientInstall::Translocated
+                .to_string()
+                .contains("Applications")
+        );
+        assert!(TransientInstall::AppImage.to_string().contains(".deb"));
+        assert_eq!(
+            system_log_path(501),
+            PathBuf::from("/Library/Logs/Alchemy/alchemyd.501.log")
+        );
     }
 
     #[test]
