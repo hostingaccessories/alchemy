@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::Path;
 
 use alchemy_api::autostart::Autostart;
+use alchemy_api::sse::SseEvent;
 use alchemy_api::{
     ApiEvent, AppList, EngineStatus, ErrorCode, ErrorResponse, MetricsResponse, OperationList,
     PrivilegeList, ReconcileStatus, VersionResponse, Wake,
@@ -15,7 +16,6 @@ use serde::de::DeserializeOwned;
 use crate::daemon::{Daemon, DaemonInfo, EventStream, Method, Opened, Reply};
 use crate::error::{ClientError, ProtocolError};
 use crate::output::Output;
-use crate::sse::SseEvent;
 
 /// The route that reports the daemon's version, for the handshake.
 pub(crate) const VERSION_PATH: &str = "/api/version";

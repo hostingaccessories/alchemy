@@ -8,9 +8,8 @@
 use std::path::PathBuf;
 
 use alchemy_api::autostart::{AutostartMode, LogHint};
+use alchemy_api::sse::{MAX_EVENT, SseError};
 use thiserror::Error;
-
-use crate::sse::{MAX_EVENT, SseError};
 
 /// The process exit statuses `alchemy` uses. Each is a contract that
 /// scripts branch on.

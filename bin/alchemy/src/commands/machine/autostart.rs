@@ -430,12 +430,12 @@ pub(crate) fn logs_text(hint: &LogHint, supervisor: Supervisor) -> String {
 )]
 mod tests {
     use alchemy_api::autostart::UnavailableMode;
+    use alchemy_api::sse::SseEvent;
     use clap::Parser as _;
 
     use super::*;
     use crate::daemon::Method;
     use crate::daemon::fake::{FakeDaemon, sse};
-    use crate::sse::SseEvent;
     use crate::sudo::{FakeSudo, SUDO};
     use crate::{Cli, Command};
 

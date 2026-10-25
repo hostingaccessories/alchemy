@@ -23,7 +23,9 @@
 //! The default build is pure. Enable the `socket` feature for the daemon
 //! socket path shared by `alchemyd` and its local clients, and the
 //! `state-dir` feature for the state directory and the TCP token file in
-//! it, shared by `alchemyd` and the desktop shell.
+//! it, shared by `alchemyd` and the desktop shell. The `sse` feature adds
+//! [`sse`], a pure parser for the event streams, shared by the CLI and
+//! the desktop shell.
 
 pub use alchemy_core::engine::{
     ContainerStatus, EngineFlavor, EngineState, EngineStatus, StopReason,
@@ -46,6 +48,8 @@ pub mod reconcile;
 pub mod session;
 #[cfg(feature = "socket")]
 mod socket;
+#[cfg(feature = "sse")]
+pub mod sse;
 #[cfg(feature = "state-dir")]
 mod state_dir;
 pub mod wake;

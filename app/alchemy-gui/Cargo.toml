@@ -20,7 +20,7 @@ path = "src/lib.rs"
 tauri-build = { workspace = true }
 
 [dependencies]
-alchemy-api                  = { workspace = true, features = ["state-dir"] }
+alchemy-api                  = { workspace = true, features = ["sse", "state-dir"] }
 alchemy-core                 = { workspace = true }
 http-body-util               = { workspace = true }
 hyper                        = { workspace = true, features = ["client", "http1"] }

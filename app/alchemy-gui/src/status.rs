@@ -8,10 +8,10 @@
 use alchemy_api::apps::StackStatus;
 use alchemy_api::autostart::{Autostart, AutostartMode};
 use alchemy_api::reconcile::{ReconcileOutcome, ReconcileStatus};
+use alchemy_api::sse::SseEvent;
 use alchemy_api::{AppList, EngineFlavor, EngineState, EngineStatus};
 
 use crate::launch::Launch;
-use crate::sse::SseEvent;
 
 /// The longest notice the tray shows before cutting it short.
 pub const NOTICE_MAX: usize = 120;

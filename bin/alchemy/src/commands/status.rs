@@ -472,11 +472,11 @@ fn ready_line(engine: &EngineStatus) -> String {
 )]
 mod tests {
     use alchemy_api::network::NetworkWarningKind;
+    use alchemy_api::sse::SseEvent;
 
     use super::*;
     use crate::daemon::Method;
     use crate::daemon::fake::{FAKE_SOCKET, FakeDaemon, sse};
-    use crate::sse::SseEvent;
 
     fn status(
         state: EngineState,

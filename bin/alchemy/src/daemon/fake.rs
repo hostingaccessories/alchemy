@@ -12,12 +12,12 @@ use std::collections::VecDeque;
 use std::future::{Future, ready};
 use std::path::Path;
 
+use alchemy_api::sse::SseEvent;
 use serde::Serialize;
 
 use super::{Daemon, EventStream, Method, Opened, Reply};
 use crate::context::{EVENTS_PATH, VERSION_PATH};
 use crate::error::ClientError;
-use crate::sse::SseEvent;
 
 /// The socket path a [`FakeDaemon`] reports.
 pub(crate) const FAKE_SOCKET: &str = "/run/alchemyd.sock";

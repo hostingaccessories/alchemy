@@ -11,10 +11,11 @@ mod http;
 
 use std::path::Path;
 
+use alchemy_api::sse::SseEvent;
+
 pub(crate) use hyper::Method;
 
 use crate::error::ClientError;
-use crate::sse::SseEvent;
 
 pub(crate) use http::HttpDaemon;
 

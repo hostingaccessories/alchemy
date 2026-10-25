@@ -169,12 +169,12 @@ fn start_lines(answer: &EngineStart, engine: Option<&EngineStatus>, json: bool) 
     clippy::indexing_slicing
 )]
 mod tests {
+    use alchemy_api::sse::SseEvent;
     use alchemy_core::engine::EngineFlavor;
 
     use super::*;
     use crate::daemon::Method;
     use crate::daemon::fake::{FakeDaemon, sse};
-    use crate::sse::SseEvent;
 
     fn answer(result: EngineStartResult, message: &str, command: Option<&str>) -> EngineStart {
         EngineStart {

@@ -14,6 +14,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use alchemy_api::sse::{SseEvent, SseParser};
 use http_body_util::{BodyExt as _, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::client::conn::http1;
@@ -25,7 +26,6 @@ use tokio::net::TcpStream;
 pub use hyper::Method;
 
 use crate::launch::Probe;
-use crate::sse::{SseEvent, SseParser};
 
 /// Where alchemyd listens by default, `alchemyd::DEFAULT_LISTEN`. The web
 /// UI's `DEFAULT_DAEMON_URL` names the same address.

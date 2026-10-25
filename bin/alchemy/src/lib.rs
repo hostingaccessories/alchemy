@@ -13,7 +13,6 @@ mod output;
 pub mod prompt;
 pub mod safety;
 mod service;
-mod sse;
 pub mod sudo;
 mod target;
 

@@ -35,15 +35,15 @@ Everything below follows from the line at the top of this page.
 
 ## 2. Crates and dependency direction
 
-| Crate            | Path                  | Role                                                                                                 |
-| ---------------- | --------------------- | ---------------------------------------------------------------------------------------------------- |
-| `alchemy-core`   | `crates/alchemy-core` | Pure domain model (stacks, the Docker engine, operations, logs, metrics, and their invariants)       |
-| `alchemy-api`    | `crates/alchemy-api`  | HTTP API types; the socket path and the state directory behind the `socket` and `state-dir` features |
-| `alchemyd`       | `bin/alchemyd`        | Daemon: HTTP API on TCP and a Unix socket, embedded web UI                                           |
-| `alchemy`        | `bin/alchemy`         | CLI, an HTTP client over the Unix socket                                                             |
-| `alchemy-helper` | `bin/alchemy-helper`  | Privileged one-shot                                                                                  |
-| `alchemy-gui`    | `app/alchemy-gui`     | Tauri desktop shell around the web UI                                                                |
-| `alchemy-web`    | `app/alchemy-web`     | React web UI, served by the daemon and bundled into the shell                                        |
+| Crate            | Path                  | Role                                                                                                                                   |
+| ---------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `alchemy-core`   | `crates/alchemy-core` | Pure domain model (stacks, the Docker engine, operations, logs, metrics, and their invariants)                                         |
+| `alchemy-api`    | `crates/alchemy-api`  | HTTP API types; the socket path, the state directory, and the event-stream parser behind the `socket`, `state-dir`, and `sse` features |
+| `alchemyd`       | `bin/alchemyd`        | Daemon: HTTP API on TCP and a Unix socket, embedded web UI                                                                             |
+| `alchemy`        | `bin/alchemy`         | CLI, an HTTP client over the Unix socket                                                                                               |
+| `alchemy-helper` | `bin/alchemy-helper`  | Privileged one-shot                                                                                                                    |
+| `alchemy-gui`    | `app/alchemy-gui`     | Tauri desktop shell around the web UI                                                                                                  |
+| `alchemy-web`    | `app/alchemy-web`     | React web UI, served by the daemon and bundled into the shell                                                                          |
 
 Internal dependencies flow strictly downhill, with no cycles:
 

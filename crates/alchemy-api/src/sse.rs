@@ -4,30 +4,32 @@
 //! Follows the WHATWG event-stream format: lines end in CRLF, LF, or CR;
 //! a blank line dispatches the event; `:` starts a comment, such as the
 //! daemon's keep-alives; several `data:` lines join with newlines. `id`
-//! and `retry` are read and dropped, since the CLI never reconnects.
+//! and `retry` are read and dropped, since no client resumes a stream.
 //! Bytes arrive in whatever chunks the transport delivers, so a line or a
 //! CRLF may be split across calls to [`SseParser::push`].
+//!
+//! Pure: the transport reads the bytes and hands them over.
 
 use thiserror::Error;
 
 /// Upper bound on one event's bytes, comments and all, so a daemon that
 /// never ends a line cannot exhaust memory.
-pub(crate) const MAX_EVENT: usize = 1 << 20;
+pub const MAX_EVENT: usize = 1 << 20;
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// One dispatched event: its `event:` name and its joined `data:` lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SseEvent {
+pub struct SseEvent {
     /// The `event:` field, or `message` when none was sent.
-    pub(crate) event: String,
+    pub event: String,
     /// Every `data:` line of the event, joined with `\n`.
-    pub(crate) data: String,
+    pub data: String,
 }
 
 /// Why a stream could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub(crate) enum SseError {
+pub enum SseError {
     /// An event grew past [`MAX_EVENT`] bytes before it was dispatched.
     #[error("event stream: an event is longer than {MAX_EVENT} bytes")]
     TooLong,
@@ -35,7 +37,7 @@ pub(crate) enum SseError {
 
 /// Turns chunks of an event stream into [`SseEvent`]s.
 #[derive(Debug, Default)]
-pub(crate) struct SseParser {
+pub struct SseParser {
     line: Vec<u8>,
     event: Option<String>,
     data: Option<String>,
@@ -46,12 +48,12 @@ pub(crate) struct SseParser {
 
 impl SseParser {
     /// A parser at the start of a stream.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
     /// Feed the next `chunk` and return the events it completed, in order.
-    pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, SseError> {
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, SseError> {
         let mut events = Vec::new();
         for &byte in chunk {
             let after_cr = std::mem::replace(&mut self.after_cr, false);

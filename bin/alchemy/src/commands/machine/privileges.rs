@@ -736,7 +736,7 @@ mod tests {
     }
 
     #[allow(clippy::unnecessary_wraps)]
-    fn event(changed: &Privilege) -> Result<crate::sse::SseEvent, ClientError> {
+    fn event(changed: &Privilege) -> Result<alchemy_api::sse::SseEvent, ClientError> {
         Ok(sse(
             "privileges",
             &serde_json::to_string(&list_of(changed)).unwrap(),

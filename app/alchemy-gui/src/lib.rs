@@ -25,7 +25,6 @@
 pub mod client;
 pub mod launch;
 pub mod shell;
-pub mod sse;
 pub mod status;
 pub mod token;
 pub mod tray;

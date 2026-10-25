@@ -1925,7 +1925,8 @@ status and a body or raw server-sent events, and has the real
   Its `next()` gives the next `ApiEvent`, skipping event names this build
   doesn't know, and `Ok(None)` when the daemon ends the stream; a command
   that follows changes returns `ClientError::Disconnected` then, as
-  `status --watch` does. The SSE parser is `src/sse.rs`.
+  `status --watch` does. The SSE parser is `alchemy_api::sse`, shared
+  with the desktop shell.
 
 `Context` turns error statuses into errors: a 404 `not_found` or 405
 `method_not_allowed` means the daemon predates the route and becomes
