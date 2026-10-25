@@ -1110,6 +1110,8 @@ async fn monitor_reconnects_and_resyncs_when_the_stream_drops() {
     containers_until(&run.state, |c| !c.is_empty()).await;
     let mut engine_rx = run.state.watch_engine();
     assert_eq!(engine_rx.borrow_and_update().state, EngineState::Ready);
+    let link = |connection, listed| alchemyd::EngineLink { connection, listed };
+    assert_eq!(run.state.engine_link(), link(1, true));
 
     {
         let mut h = host.lock().unwrap();
@@ -1125,6 +1127,7 @@ async fn monitor_reconnects_and_resyncs_when_the_stream_drops() {
     );
     assert_eq!(dropped.elapsed(), reconnect_delay(0));
     assert_eq!(subscriptions(&host), 2);
+    assert_eq!(run.state.engine_link(), link(2, true), "a new connection");
     assert!(
         !engine_rx.has_changed().unwrap(),
         "reconnecting to the same engine does not republish its status"
@@ -1141,6 +1144,7 @@ async fn monitor_reconnects_and_resyncs_when_the_stream_drops() {
     let status = engine_until(&run.state, |s| s.state != EngineState::Ready).await;
     assert_eq!(status.state, EngineState::NotRunning);
     assert!(run.state.containers().is_empty());
+    assert_eq!(run.state.engine_link(), link(2, false));
     assert_eq!(
         status.flavor,
         Some(EngineFlavor::DockerEngine),
