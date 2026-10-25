@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 
 import type {
   App,
+  Autostart,
   AppList,
   EngineStatus,
   MetricsHistory,
@@ -121,6 +122,15 @@ let engineStarts = 0;
 /** What the stubbed `POST /api/engine/start` answers. */
 let engineStartAnswer: { status: number; body: unknown } = STARTING;
 
+/** What the stubbed `GET /api/machine/autostart` answers; `null` for a daemon without it. */
+let autostartValue: Autostart | null = null;
+
+/** The bodies of every `PUT /api/machine/autostart`, in order. */
+let autostartPuts: unknown[] = [];
+
+/** The stubbed answers to the next PUTs, in order; then a 500. */
+let autostartAnswers: { status: number; body: unknown }[] = [];
+
 const GIB = 1024 ** 3;
 
 const sample: MetricsResponse = {
@@ -207,6 +217,9 @@ beforeEach(() => {
   signedOut = false;
   engineStarts = 0;
   engineStartAnswer = STARTING;
+  autostartValue = null;
+  autostartPuts = [];
+  autostartAnswers = [];
   FakeEventSource.instances = [];
   vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal(
@@ -274,6 +287,19 @@ beforeEach(() => {
       }
       if (url === "/api/settings/network") {
         return new Response(JSON.stringify(networkSettings), { status: 200 });
+      }
+      if (url === "/api/machine/autostart" && init?.method === "PUT") {
+        autostartPuts.push(typeof init.body === "string" ? JSON.parse(init.body) : null);
+        const reply = autostartAnswers.shift();
+        if (reply === undefined) {
+          return new Response(JSON.stringify({ error: "no answer", code: "internal" }), {
+            status: 500,
+          });
+        }
+        return new Response(JSON.stringify(reply.body), { status: reply.status });
+      }
+      if (url === "/api/machine/autostart" && autostartValue !== null) {
+        return new Response(JSON.stringify(autostartValue), { status: 200 });
       }
       if (url === "/api/machine/privileges") {
         return new Response(JSON.stringify(privilegeList), { status: 200 });
@@ -1308,5 +1334,178 @@ describe("Privileges", () => {
     await waitFor(() =>
       expect(screen.queryByRole("group", { name: "Web address warnings" })).toBeNull(),
     );
+  });
+});
+
+describe("Autostart", () => {
+  const off: Autostart = {
+    mode: "off",
+    available_modes: ["off", "login", "boot"],
+    log_hint: { kind: "terminal" },
+    supervisor: "manual",
+    pending: null,
+    last: null,
+  };
+  const login: Autostart = {
+    ...off,
+    mode: "login",
+    log_hint: { kind: "file", path: "/Users/me/Library/Logs/Alchemy/alchemyd.log" },
+  };
+  const bootLine = "sudo /opt/alchemy/alchemy-helper install-service --uid 501";
+  const appImage = "Alchemy runs from an AppImage. Install the .deb to start it on its own.";
+
+  async function sendAutostart(value: Autostart) {
+    await act(async () => {
+      source().emit("autostart", JSON.stringify(value));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+
+  async function section() {
+    const heading = await screen.findByRole("heading", { name: "Start automatically" });
+    return heading.parentElement!;
+  }
+
+  it("shows nothing about autostart when alchemyd is too old to report it", async () => {
+    await renderOnline();
+    await screen.findByRole("heading", { name: "Privileges" });
+    expect(screen.queryByRole("heading", { name: "Start automatically" })).toBeNull();
+  });
+
+  it("starts at sign-in without a terminal, and says where the logs are", async () => {
+    autostartValue = off;
+    autostartAnswers = [
+      { status: 200, body: { outcome: "done", command: null, message: null, autostart: login } },
+    ];
+    await renderOnline();
+    const autostart = await section();
+    expect(within(autostart).getByRole("radio", { name: /Don't start on its own/ })).toHaveProperty(
+      "checked",
+      true,
+    );
+    expect(
+      within(autostart).getByText("Its log is in the terminal it was started from."),
+    ).toBeTruthy();
+
+    await userEvent
+      .setup()
+      .click(within(autostart).getByRole("radio", { name: /Start when I sign in/ }));
+    expect(autostartPuts).toEqual([{ mode: "login" }]);
+    expect(
+      await within(autostart).findByText("/Users/me/Library/Logs/Alchemy/alchemyd.log"),
+    ).toBeTruthy();
+    expect(within(autostart).getByRole("radio", { name: /Start when I sign in/ })).toHaveProperty(
+      "checked",
+      true,
+    );
+  });
+
+  it("waits for the system prompt to start at boot, and says when it was cancelled", async () => {
+    autostartValue = login;
+    autostartAnswers = [
+      {
+        status: 202,
+        body: {
+          outcome: "pending",
+          command: null,
+          message: null,
+          autostart: { ...login, pending: "boot" },
+        },
+      },
+    ];
+    await renderOnline();
+    const autostart = await section();
+    await userEvent
+      .setup()
+      .click(within(autostart).getByRole("radio", { name: /Start when this machine starts/ }));
+    expect(
+      await within(autostart).findByText("Waiting for you to answer the system prompt…"),
+    ).toBeTruthy();
+    expect(within(autostart).getByRole("radio", { name: /Start when I sign in/ })).toHaveProperty(
+      "disabled",
+      true,
+    );
+
+    await sendAutostart({
+      ...login,
+      last: { mode: "boot", result: "cancelled", message: null, at: 1 },
+    });
+    expect(
+      within(autostart).getByText(
+        "The last change to “Start when this machine starts” was cancelled at the system prompt.",
+      ),
+    ).toBeTruthy();
+    expect(within(autostart).getByRole("radio", { name: /Start when I sign in/ })).toHaveProperty(
+      "checked",
+      true,
+    );
+  });
+
+  it("shows the command to start at boot when there's no prompt, and tries again", async () => {
+    autostartValue = {
+      ...off,
+      log_hint: { kind: "journal", command: "journalctl --user -u alchemyd.service" },
+    };
+    const terminal = {
+      status: 200,
+      body: {
+        outcome: "needs_terminal",
+        command: { argv: bootLine.split(" "), line: bootLine },
+        message: "No polkit agent is running.",
+        autostart: autostartValue,
+      },
+    };
+    autostartAnswers = [terminal, terminal];
+    await renderOnline();
+    const autostart = await section();
+    expect(within(autostart).getByText("journalctl --user -u alchemyd.service")).toBeTruthy();
+    const user = userEvent.setup();
+    await user.click(
+      within(autostart).getByRole("radio", { name: /Start when this machine starts/ }),
+    );
+    expect(await within(autostart).findByText("No polkit agent is running.")).toBeTruthy();
+    expect(autostart.querySelector("pre")?.textContent).toBe(bootLine);
+    await user.click(within(autostart).getByRole("button", { name: "Try again" }));
+    expect(autostartPuts).toEqual([{ mode: "boot" }, { mode: "boot" }]);
+  });
+
+  it("says why a mode isn't available instead of offering it", async () => {
+    autostartValue = {
+      ...off,
+      available_modes: ["off"],
+      unavailable: [
+        { mode: "login", message: appImage },
+        { mode: "boot", message: appImage },
+      ],
+    };
+    await renderOnline();
+    const autostart = await section();
+    expect(within(autostart).getAllByRole("radio")).toHaveLength(1);
+    const unavailable = within(autostart).getByRole("list", { name: "Not available here" });
+    expect(
+      within(unavailable)
+        .getAllByRole("listitem")
+        .map((li) => li.textContent),
+    ).toEqual([
+      `Start when I sign in isn't available here: ${appImage}`,
+      `Start when this machine starts isn't available here: ${appImage}`,
+    ]);
+  });
+
+  it("says when alchemyd refused the change", async () => {
+    autostartValue = off;
+    autostartAnswers = [
+      {
+        status: 409,
+        body: { error: "Another change to autostart is in progress.", code: "conflict" },
+      },
+    ];
+    await renderOnline();
+    const autostart = await section();
+    await userEvent
+      .setup()
+      .click(within(autostart).getByRole("radio", { name: /Start when I sign in/ }));
+    const alert = await within(autostart).findByRole("alert");
+    expect(within(alert).getByText("Another change to autostart is in progress.")).toBeTruthy();
   });
 });
