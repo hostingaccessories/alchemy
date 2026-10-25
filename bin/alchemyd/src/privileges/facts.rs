@@ -136,12 +136,7 @@ pub fn grants_net_bind_service(xattr: &[u8]) -> bool {
 /// unit on Linux, a `LaunchDaemon` on macOS. Its existence is what
 /// "installed" means.
 pub fn service_file(os: HostOs, uid: u32) -> PathBuf {
-    match os {
-        HostOs::Linux => PathBuf::from(format!("/etc/systemd/system/alchemyd-{uid}.service")),
-        HostOs::MacOs => PathBuf::from(format!(
-            "/Library/LaunchDaemons/computer.alchemy.alchemyd.{uid}.plist"
-        )),
-    }
+    alchemy_core::lifecycle::system_service_path(os, uid)
 }
 
 /// The firewall from what alchemyd can read without root on Linux:

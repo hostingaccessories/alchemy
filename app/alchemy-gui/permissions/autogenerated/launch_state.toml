@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-launch-state"
+description = "Enables the launch_state command without any pre-configured scope."
+commands.allow = ["launch_state"]
+
+[[permission]]
+identifier = "deny-launch-state"
+description = "Denies the launch_state command without any pre-configured scope."
+commands.deny = ["launch_state"]

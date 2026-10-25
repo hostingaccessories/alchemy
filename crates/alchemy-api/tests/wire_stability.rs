@@ -26,7 +26,7 @@ use alchemy_api::{
     API_VERSION, ApiEvent, ContainerStatus, ContainerUsage, EngineFlavor, EngineState,
     EngineStatus, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, MachineUsage,
     MetricsHistory, MetricsPoint, MetricsRange, MetricsResponse, ProjectUsage, StopReason,
-    VersionResponse,
+    VersionResponse, Wake,
 };
 
 fn assert_wire<T>(value: &T, json: &str)
@@ -943,6 +943,7 @@ fn update() -> Operation {
         started_at: 1_700_000_000,
         finished_at: None,
         error: None,
+        reason: None,
     }
 }
 
@@ -968,6 +969,20 @@ fn operation() {
         concat!(
             r#"{"id":"19a3b4c5d6e-1","app":"blog","action":"update","state":"failed","steps":[],"#,
             r#""started_at":1700000000,"finished_at":1700000030,"error":"pull access denied"}"#,
+        ),
+    );
+    let reconciled = Operation {
+        action: Action::Up,
+        steps: vec![],
+        reason: Some("was running before the computer slept".into()),
+        ..update()
+    };
+    assert_wire(
+        &reconciled,
+        concat!(
+            r#"{"id":"19a3b4c5d6e-1","app":"blog","action":"up","state":"running","steps":[],"#,
+            r#""started_at":1700000000,"finished_at":null,"error":null,"#,
+            r#""reason":"was running before the computer slept"}"#,
         ),
     );
     assert_wire(
@@ -1632,6 +1647,20 @@ fn privilege_list_and_event() {
 }
 
 #[test]
+fn wake_event() {
+    let wake = Wake {
+        slept_for: 3_600,
+        at: 1_700_000_000,
+    };
+    let json = r#"{"slept_for":3600,"at":1700000000}"#;
+    assert_wire(&wake, json);
+    let event = ApiEvent::Woke(wake);
+    assert_eq!(event.name(), "woke");
+    assert_eq!(serde_json::to_string(&event.data()).unwrap(), json);
+    assert_wire(&event, &format!(r#"{{"event":"woke","data":{json}}}"#));
+}
+
+#[test]
 fn privilege_request_and_change() {
     assert_wire(&PrivilegeRequest { grant: true }, r#"{"grant":true}"#);
     assert_wire(&PrivilegeRequest { grant: false }, r#"{"grant":false}"#);
@@ -1731,4 +1760,275 @@ fn unknown_privilege_values_decode_as_a_fallback() {
     for action in alchemy_api::privileges::Action::ALL {
         assert_eq!(PrivilegeAction::from(action).action(), Some(action));
     }
+}
+
+#[test]
+fn reconcile_status_and_event() {
+    use alchemy_api::reconcile::{
+        Reconcile, ReconcileApp, ReconcileOutcome, ReconcileStatus, ReconcileTrigger, SkipReason,
+    };
+    assert_wire(&ReconcileStatus::default(), r#"{"last":null}"#);
+    let app = |name: &str, outcome, operation: Option<&str>, reason, message: Option<&str>| {
+        ReconcileApp {
+            app: StackName::new(name).unwrap(),
+            outcome,
+            operation: operation.map(Into::into),
+            reason,
+            message: message.map(Into::into),
+        }
+    };
+    let status = ReconcileStatus {
+        last: Some(Reconcile {
+            trigger: ReconcileTrigger::Wake,
+            at: 1_700_000_000,
+            reason: "was running before the computer slept".into(),
+            apps: vec![
+                app("blog", ReconcileOutcome::Starting, Some("op1"), None, None),
+                app("chat", ReconcileOutcome::Started, Some("op2"), None, None),
+                app(
+                    "shop",
+                    ReconcileOutcome::Failed,
+                    Some("op3"),
+                    None,
+                    Some("port 80 is taken"),
+                ),
+                app(
+                    "wiki",
+                    ReconcileOutcome::Skipped,
+                    None,
+                    Some(SkipReason::StopIntent),
+                    Some("you stopped it in Alchemy"),
+                ),
+            ],
+        }),
+    };
+    let json = concat!(
+        r#"{"last":{"trigger":"wake","at":1700000000,"#,
+        r#""reason":"was running before the computer slept","apps":["#,
+        r#"{"app":"blog","outcome":"starting","operation":"op1","reason":null,"message":null},"#,
+        r#"{"app":"chat","outcome":"started","operation":"op2","reason":null,"message":null},"#,
+        r#"{"app":"shop","outcome":"failed","operation":"op3","reason":null,"message":"port 80 is taken"},"#,
+        r#"{"app":"wiki","outcome":"skipped","operation":null,"reason":"stop_intent","#,
+        r#""message":"you stopped it in Alchemy"}]}}"#,
+    );
+    assert_wire(&status, json);
+    let event = ApiEvent::Reconcile(status);
+    assert_eq!(event.name(), "reconcile");
+    assert_wire(&event, &format!(r#"{{"event":"reconcile","data":{json}}}"#));
+}
+
+#[test]
+fn reconcile_enums() {
+    use alchemy_api::reconcile::{ReconcileOutcome, ReconcileTrigger, SkipReason};
+    for (trigger, want) in [
+        (ReconcileTrigger::DaemonStart, r#""daemon_start""#),
+        (ReconcileTrigger::Wake, r#""wake""#),
+        (ReconcileTrigger::EngineReturned, r#""engine_returned""#),
+    ] {
+        assert_wire(&trigger, want);
+    }
+    for (reason, want) in [
+        (SkipReason::StopIntent, r#""stop_intent""#),
+        (SkipReason::NotRunningBefore, r#""not_running_before""#),
+        (SkipReason::AlreadyRunning, r#""already_running""#),
+        (SkipReason::PartlyRunning, r#""partly_running""#),
+        (SkipReason::StatusUnknown, r#""status_unknown""#),
+    ] {
+        assert_wire(&reason, want);
+    }
+    for (outcome, want) in [
+        (ReconcileOutcome::Starting, r#""starting""#),
+        (ReconcileOutcome::Started, r#""started""#),
+        (ReconcileOutcome::Failed, r#""failed""#),
+        (ReconcileOutcome::Skipped, r#""skipped""#),
+        (ReconcileOutcome::Other, r#""other""#),
+    ] {
+        assert_wire(&outcome, want);
+    }
+    assert_eq!(
+        serde_json::from_str::<ReconcileOutcome>(r#""retrying""#).unwrap(),
+        ReconcileOutcome::Other
+    );
+}
+
+#[test]
+fn engine_start() {
+    use alchemy_api::engine::{EngineStart, EngineStartResult};
+    assert_wire(
+        &EngineStart {
+            result: EngineStartResult::Starting,
+            message: "Docker Desktop is starting".into(),
+            command: None,
+        },
+        r#"{"result":"starting","message":"Docker Desktop is starting","command":null}"#,
+    );
+    assert_wire(
+        &EngineStart {
+            result: EngineStartResult::Unsupported,
+            message: "m".into(),
+            command: Some("sudo systemctl start docker".into()),
+        },
+        r#"{"result":"unsupported","message":"m","command":"sudo systemctl start docker"}"#,
+    );
+    for (result, want) in [
+        (EngineStartResult::Starting, r#""starting""#),
+        (EngineStartResult::AlreadyRunning, r#""already_running""#),
+        (EngineStartResult::Unsupported, r#""unsupported""#),
+        (EngineStartResult::Other, r#""other""#),
+    ] {
+        assert_wire(&result, want);
+    }
+    assert_eq!(
+        serde_json::from_str::<EngineStartResult>(r#""queued""#).unwrap(),
+        EngineStartResult::Other
+    );
+}
+
+fn autostart() -> alchemy_api::autostart::Autostart {
+    use alchemy_api::autostart::{Autostart, AutostartAttempt, AutostartMode, LogHint, Supervisor};
+    Autostart {
+        mode: AutostartMode::Login,
+        available_modes: vec![
+            AutostartMode::Off,
+            AutostartMode::Login,
+            AutostartMode::Boot,
+        ],
+        log_hint: LogHint::File {
+            path: "/Users/jo/Library/Logs/Alchemy/alchemyd.log".into(),
+        },
+        supervisor: Supervisor::UserService,
+        pending: Some(AutostartMode::Boot),
+        last: Some(AutostartAttempt {
+            mode: AutostartMode::Boot,
+            result: AttemptResult::Cancelled,
+            message: Some("c".into()),
+            at: 1_700_000_000,
+        }),
+        unavailable: vec![],
+    }
+}
+
+const AUTOSTART: &str = concat!(
+    r#"{"mode":"login","available_modes":["off","login","boot"],"#,
+    r#""log_hint":{"kind":"file","path":"/Users/jo/Library/Logs/Alchemy/alchemyd.log"},"#,
+    r#""supervisor":"user_service","pending":"boot","#,
+    r#""last":{"mode":"boot","result":"cancelled","message":"c","at":1700000000}}"#,
+);
+
+#[test]
+fn autostart_and_event() {
+    use alchemy_api::autostart::{Autostart, AutostartMode, LogHint, Supervisor};
+    assert_wire(&autostart(), AUTOSTART);
+    let event = ApiEvent::Autostart(autostart());
+    assert_eq!(event.name(), "autostart");
+    assert_wire(
+        &event,
+        &format!(r#"{{"event":"autostart","data":{AUTOSTART}}}"#),
+    );
+    let off = Autostart {
+        mode: AutostartMode::Off,
+        available_modes: vec![AutostartMode::Off],
+        log_hint: LogHint::Terminal,
+        supervisor: Supervisor::Manual,
+        pending: None,
+        last: None,
+        unavailable: vec![],
+    };
+    assert_wire(
+        &off,
+        concat!(
+            r#"{"mode":"off","available_modes":["off"],"log_hint":{"kind":"terminal"},"#,
+            r#""supervisor":"manual","pending":null,"last":null}"#,
+        ),
+    );
+    let boot = Autostart {
+        mode: AutostartMode::Boot,
+        log_hint: LogHint::Journal {
+            command: "journalctl -u alchemyd-1000.service".into(),
+        },
+        supervisor: Supervisor::SystemService,
+        ..off
+    };
+    assert_wire(
+        &boot,
+        concat!(
+            r#"{"mode":"boot","available_modes":["off"],"#,
+            r#""log_hint":{"kind":"journal","command":"journalctl -u alchemyd-1000.service"},"#,
+            r#""supervisor":"system_service","pending":null,"last":null}"#,
+        ),
+    );
+}
+
+#[test]
+fn autostart_unavailable_modes() {
+    use alchemy_api::autostart::{Autostart, AutostartMode, LogHint, Supervisor, UnavailableMode};
+    let appimage = Autostart {
+        mode: AutostartMode::Off,
+        available_modes: vec![AutostartMode::Off],
+        log_hint: LogHint::Terminal,
+        supervisor: Supervisor::Manual,
+        pending: None,
+        last: None,
+        unavailable: vec![
+            UnavailableMode {
+                mode: AutostartMode::Login,
+                message: "a".into(),
+            },
+            UnavailableMode {
+                mode: AutostartMode::Boot,
+                message: "b".into(),
+            },
+        ],
+    };
+    assert_wire(
+        &appimage,
+        concat!(
+            r#"{"mode":"off","available_modes":["off"],"log_hint":{"kind":"terminal"},"#,
+            r#""supervisor":"manual","pending":null,"last":null,"#,
+            r#""unavailable":[{"mode":"login","message":"a"},{"mode":"boot","message":"b"}]}"#,
+        ),
+    );
+}
+
+#[test]
+fn autostart_request_and_change() {
+    use alchemy_api::autostart::{
+        AutostartChange, AutostartMode, AutostartOutcome, AutostartRequest,
+    };
+    for (mode, json) in [
+        (AutostartMode::Off, r#"{"mode":"off"}"#),
+        (AutostartMode::Login, r#"{"mode":"login"}"#),
+        (AutostartMode::Boot, r#"{"mode":"boot"}"#),
+    ] {
+        assert_wire(&AutostartRequest { mode }, json);
+    }
+    let change = AutostartChange {
+        outcome: AutostartOutcome::NeedsTerminal,
+        command: low_ports().command,
+        message: Some("m".into()),
+        autostart: autostart(),
+    };
+    assert_wire(
+        &change,
+        &format!(
+            concat!(
+                r#"{{"outcome":"needs_terminal","command":{{"argv":["sudo","/opt/a/alchemy-helper","#,
+                r#""grant-low-ports"],"line":"sudo /opt/a/alchemy-helper grant-low-ports"}},"#,
+                r#""message":"m","autostart":{}}}"#,
+            ),
+            AUTOSTART
+        ),
+    );
+    for (outcome, want) in [
+        (AutostartOutcome::Done, r#""done""#),
+        (AutostartOutcome::Unchanged, r#""unchanged""#),
+        (AutostartOutcome::Pending, r#""pending""#),
+        (AutostartOutcome::NeedsTerminal, r#""needs_terminal""#),
+        (AutostartOutcome::Restarting, r#""restarting""#),
+        (AutostartOutcome::Other, r#""other""#),
+    ] {
+        assert_wire(&outcome, want);
+    }
+    let future: AutostartOutcome = serde_json::from_str(r#""queued""#).unwrap();
+    assert_eq!(future, AutostartOutcome::Other);
 }

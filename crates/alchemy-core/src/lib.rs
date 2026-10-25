@@ -5,6 +5,7 @@
 //! in as plain values.
 
 pub mod engine;
+pub mod lifecycle;
 pub mod logs;
 pub mod mdns;
 pub mod metrics;

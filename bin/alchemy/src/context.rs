@@ -4,9 +4,11 @@
 use std::io::Write;
 use std::path::Path;
 
+use alchemy_api::autostart::Autostart;
+use alchemy_api::sse::SseEvent;
 use alchemy_api::{
     ApiEvent, AppList, EngineStatus, ErrorCode, ErrorResponse, MetricsResponse, OperationList,
-    PrivilegeList, VersionResponse,
+    PrivilegeList, ReconcileStatus, VersionResponse, Wake,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -14,7 +16,6 @@ use serde::de::DeserializeOwned;
 use crate::daemon::{Daemon, DaemonInfo, EventStream, Method, Opened, Reply};
 use crate::error::{ClientError, ProtocolError};
 use crate::output::Output;
-use crate::sse::SseEvent;
 
 /// The route that reports the daemon's version, for the handshake.
 pub(crate) const VERSION_PATH: &str = "/api/version";
@@ -226,6 +227,13 @@ pub(crate) fn decode_event(raw: &SseEvent) -> Result<Option<ApiEvent>, ClientErr
         "privileges" => {
             decode::<PrivilegeList>(raw.data.as_bytes()).map(|p| Some(ApiEvent::Privileges(p)))
         }
+        "reconcile" => {
+            decode::<ReconcileStatus>(raw.data.as_bytes()).map(|r| Some(ApiEvent::Reconcile(r)))
+        }
+        "woke" => decode::<Wake>(raw.data.as_bytes()).map(|w| Some(ApiEvent::Woke(w))),
+        "autostart" => {
+            decode::<Autostart>(raw.data.as_bytes()).map(|a| Some(ApiEvent::Autostart(a)))
+        }
         _ => Ok(None),
     }
 }
@@ -316,6 +324,7 @@ impl<D: Daemon> Context<D, Vec<u8>> {
     clippy::indexing_slicing
 )]
 mod tests {
+    use alchemy_api::autostart::{AutostartMode, LogHint, Supervisor};
     use alchemy_api::{EngineState, HealthResponse, HealthStatus};
 
     use super::*;
@@ -524,6 +533,20 @@ mod tests {
             ApiEvent::Apps(AppList::default()),
             ApiEvent::Operations(OperationList::default()),
             ApiEvent::Privileges(PrivilegeList::default()),
+            ApiEvent::Reconcile(ReconcileStatus::default()),
+            ApiEvent::Woke(Wake {
+                slept_for: 600,
+                at: 1_700_000_000,
+            }),
+            ApiEvent::Autostart(Autostart {
+                mode: AutostartMode::Login,
+                available_modes: AutostartMode::ALL.to_vec(),
+                log_hint: LogHint::Terminal,
+                supervisor: Supervisor::Manual,
+                pending: None,
+                last: None,
+                unavailable: Vec::new(),
+            }),
         ];
         for event in events {
             let raw = SseEvent {

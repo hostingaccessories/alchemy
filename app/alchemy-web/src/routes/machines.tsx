@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { createRoute } from "@tanstack/react-router";
 import { useState } from "react";
 
+import { AutostartSection } from "../components/Autostart.tsx";
 import { EngineStatusView } from "../components/EngineStatus.tsx";
 import { Loading } from "../components/Loading.tsx";
 import { LocalNames } from "../components/LocalNames.tsx";
@@ -48,6 +49,7 @@ function MachinesPage() {
         {online && <NetworkWarnings />}
         {online && <ProxyWarnings />}
       </section>
+      {online && <AutostartSection />}
       {online && <PrivilegesSection />}
       {online && <LocalNames />}
       {online && <Usage />}

@@ -15,13 +15,17 @@
 //! types are in [`apps`], an app's log stream in [`logs`], the
 //! lifecycle operation routes in [`operations`], signing in to the TCP
 //! listener in [`session`], the port registry in [`ports`],
-//! `GET /api/network` in [`network`], and the machine's privileges in
-//! [`privileges`].
+//! `GET /api/network` in [`network`], the machine's privileges in
+//! [`privileges`], bringing apps back after a restart, wake, or Docker
+//! returning in [`reconcile`], starting Docker Desktop in [`engine`], the
+//! `woke` event in [`wake`], and autostart in [`autostart`].
 //!
 //! The default build is pure. Enable the `socket` feature for the daemon
 //! socket path shared by `alchemyd` and its local clients, and the
 //! `state-dir` feature for the state directory and the TCP token file in
-//! it, shared by `alchemyd` and the desktop shell.
+//! it, shared by `alchemyd` and the desktop shell. The `sse` feature adds
+//! [`sse`], a pure parser for the event streams, shared by the CLI and
+//! the desktop shell.
 
 pub use alchemy_core::engine::{
     ContainerStatus, EngineFlavor, EngineState, EngineStatus, StopReason,
@@ -33,23 +37,31 @@ pub use alchemy_core::ports::{PortRange, Protocol, PublishedPort};
 use serde::{Deserialize, Serialize, Serializer};
 
 pub mod apps;
+pub mod autostart;
+pub mod engine;
 pub mod logs;
 pub mod network;
 pub mod operations;
 pub mod ports;
 pub mod privileges;
+pub mod reconcile;
 pub mod session;
 #[cfg(feature = "socket")]
 mod socket;
+#[cfg(feature = "sse")]
+pub mod sse;
 #[cfg(feature = "state-dir")]
 mod state_dir;
+pub mod wake;
 
 pub use apps::AppList;
 pub use operations::OperationList;
 pub use privileges::PrivilegeList;
+pub use reconcile::ReconcileStatus;
+pub use wake::Wake;
 
 #[cfg(feature = "socket")]
-pub use socket::{SOCKET_ENV, SOCKET_FILE, default_socket_path, runtime_dir};
+pub use socket::{SOCKET_ENV, SOCKET_FILE, default_socket_path, runtime_dir, socket_candidates};
 #[cfg(feature = "state-dir")]
 pub use state_dir::{STATE_DIR_ENV, TCP_TOKEN_FILE, default_state_dir, tcp_token_path};
 
@@ -231,6 +243,16 @@ pub enum ApiEvent {
     /// Every privilege, as `GET /api/machine/privileges` returns them,
     /// sent once on connect and again on every change.
     Privileges(PrivilegeList),
+    /// The last reconcile, as `GET /api/reconcile` returns it, sent once
+    /// on connect and again on every change, including as each app's
+    /// operation ends.
+    Reconcile(ReconcileStatus),
+    /// The computer woke from sleep. Sent once per wake, and not on
+    /// connect: see [`wake`].
+    Woke(Wake),
+    /// Autostart, as `GET /api/machine/autostart` returns it, sent once on
+    /// connect and again on every change.
+    Autostart(autostart::Autostart),
 }
 
 impl ApiEvent {
@@ -242,6 +264,9 @@ impl ApiEvent {
             Self::Apps(_) => "apps",
             Self::Operations(_) => "operations",
             Self::Privileges(_) => "privileges",
+            Self::Reconcile(_) => "reconcile",
+            Self::Woke(_) => "woke",
+            Self::Autostart(_) => "autostart",
         }
     }
 
@@ -263,6 +288,9 @@ impl Serialize for EventData<'_> {
             ApiEvent::Apps(apps) => apps.serialize(serializer),
             ApiEvent::Operations(operations) => operations.serialize(serializer),
             ApiEvent::Privileges(privileges) => privileges.serialize(serializer),
+            ApiEvent::Reconcile(reconcile) => reconcile.serialize(serializer),
+            ApiEvent::Woke(wake) => wake.serialize(serializer),
+            ApiEvent::Autostart(autostart) => autostart.serialize(serializer),
         }
     }
 }

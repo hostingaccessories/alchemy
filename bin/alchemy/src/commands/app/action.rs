@@ -14,6 +14,7 @@ use alchemy_api::operations::{
     Action, ActionPlan, ActionRequest, Operation, OperationEvent, OperationResponse,
     OperationState, OutputLine, StepState,
 };
+use alchemy_api::sse::SseEvent;
 
 use super::path_segment;
 use crate::context::Context;
@@ -21,7 +22,6 @@ use crate::daemon::{Daemon, EventStream as _};
 use crate::error::{ClientError, ProtocolError};
 use crate::prompt::Prompt;
 use crate::safety::{self, Mode, Safety};
-use crate::sse::SseEvent;
 
 /// Arguments to every lifecycle action.
 #[derive(Debug, Clone, Default, clap::Args)]
@@ -331,6 +331,7 @@ mod tests {
             started_at: 0,
             finished_at: None,
             error: None,
+            reason: None,
         }
     }
 

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 
 import type {
   App,
+  Autostart,
   AppList,
   EngineStatus,
   MetricsHistory,
@@ -19,6 +20,7 @@ import type {
   PrivilegeList,
   ProxyListener,
 } from "../lib/api.ts";
+import { DOCKER_START_TIMEOUT_MS } from "../lib/engineStart.ts";
 import { FakeEventSource, renderAt } from "../test/render.tsx";
 
 const ready: EngineStatus = {
@@ -109,6 +111,26 @@ let noPrivileges = false;
 /** Whether the stubbed daemon refuses everything but its version as signed out. */
 let signedOut = false;
 
+const STARTING = {
+  status: 202,
+  body: { result: "starting", message: "Docker Desktop is starting", command: null },
+};
+
+/** How many times `POST /api/engine/start` was sent. */
+let engineStarts = 0;
+
+/** What the stubbed `POST /api/engine/start` answers. */
+let engineStartAnswer: { status: number; body: unknown } = STARTING;
+
+/** What the stubbed `GET /api/machine/autostart` answers; `null` for a daemon without it. */
+let autostartValue: Autostart | null = null;
+
+/** The bodies of every `PUT /api/machine/autostart`, in order. */
+let autostartPuts: unknown[] = [];
+
+/** The stubbed answers to the next PUTs, in order; then a 500. */
+let autostartAnswers: { status: number; body: unknown }[] = [];
+
 const GIB = 1024 ** 3;
 
 const sample: MetricsResponse = {
@@ -193,6 +215,11 @@ beforeEach(() => {
   privilegeAnswers = [];
   noPrivileges = false;
   signedOut = false;
+  engineStarts = 0;
+  engineStartAnswer = STARTING;
+  autostartValue = null;
+  autostartPuts = [];
+  autostartAnswers = [];
   FakeEventSource.instances = [];
   vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal(
@@ -222,6 +249,12 @@ beforeEach(() => {
         return portList === null
           ? new Promise<Response>(() => {})
           : new Response(JSON.stringify(portList), { status: 200 });
+      }
+      if (url === "/api/engine/start" && init?.method === "POST") {
+        engineStarts++;
+        return new Response(JSON.stringify(engineStartAnswer.body), {
+          status: engineStartAnswer.status,
+        });
       }
       if (url === "/api/engine" || url === "/api/metrics" || url === "/api/apps") {
         return new Promise<Response>(() => {});
@@ -255,6 +288,19 @@ beforeEach(() => {
       if (url === "/api/settings/network") {
         return new Response(JSON.stringify(networkSettings), { status: 200 });
       }
+      if (url === "/api/machine/autostart" && init?.method === "PUT") {
+        autostartPuts.push(typeof init.body === "string" ? JSON.parse(init.body) : null);
+        const reply = autostartAnswers.shift();
+        if (reply === undefined) {
+          return new Response(JSON.stringify({ error: "no answer", code: "internal" }), {
+            status: 500,
+          });
+        }
+        return new Response(JSON.stringify(reply.body), { status: reply.status });
+      }
+      if (url === "/api/machine/autostart" && autostartValue !== null) {
+        return new Response(JSON.stringify(autostartValue), { status: 200 });
+      }
       if (url === "/api/machine/privileges") {
         return new Response(JSON.stringify(privilegeList), { status: 200 });
       }
@@ -287,6 +333,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("Machines", () => {
@@ -319,7 +366,7 @@ describe("Machines", () => {
     [
       "Docker Desktop not running",
       { ...unknown, flavor: "docker_desktop" },
-      ["Docker Desktop isn't running. Open it to continue."],
+      ["Docker Desktop isn't running. Start it to continue."],
     ],
     [
       "Docker Engine not running",
@@ -385,7 +432,7 @@ describe("Machines", () => {
 
     await sendEngine({ ...unknown, flavor: "docker_desktop" });
     expect(
-      within(docker()).getByText("Docker Desktop isn't running. Open it to continue."),
+      within(docker()).getByText("Docker Desktop isn't running. Start it to continue."),
     ).toBeTruthy();
     expect(within(docker()).queryByText("Docker is ready")).toBeNull();
 
@@ -411,7 +458,7 @@ describe("Machines", () => {
     expect(await screen.findByText("alchemyd 9.9.9")).toBeTruthy();
     await sendEngine({ ...unknown, flavor: "docker_desktop" });
     expect(
-      within(docker()).getByText("Docker Desktop isn't running. Open it to continue."),
+      within(docker()).getByText("Docker Desktop isn't running. Start it to continue."),
     ).toBeTruthy();
   });
 
@@ -434,6 +481,89 @@ describe("Machines", () => {
     expect(opened.closed).toBe(false);
     unmount();
     expect(opened.closed).toBe(true);
+  });
+
+  it("starts Docker Desktop and shows its progress until Docker is ready", async () => {
+    await renderOnline();
+    await sendEngine({ ...unknown, flavor: "docker_desktop" });
+    await userEvent
+      .setup()
+      .click(within(docker()).getByRole("button", { name: "Start Docker Desktop" }));
+    expect(engineStarts).toBe(1);
+    expect(await within(docker()).findByText("Starting Docker Desktop…")).toBeTruthy();
+    const steps = within(docker()).getByRole("list", { name: "Starting Docker Desktop" });
+    expect(within(steps).getByText("Wait for Docker to answer…")).toBeTruthy();
+    expect(within(docker()).queryByRole("button", { name: "Start Docker Desktop" })).toBeNull();
+
+    await sendEngine({ ...unknown, flavor: "docker_desktop" });
+    expect(within(docker()).getByText("Starting Docker Desktop…")).toBeTruthy();
+
+    await sendEngine({ ...unknown, state: "starting", flavor: "docker_desktop" });
+    const answered = within(docker()).getByRole("list", { name: "Starting Docker Desktop" });
+    expect(within(answered).getByText("Docker answered")).toBeTruthy();
+    expect(within(answered).getByText("Wait for Docker to be ready…")).toBeTruthy();
+
+    await sendEngine(ready);
+    expect(within(docker()).getByText("Docker is ready")).toBeTruthy();
+
+    await sendEngine({ ...unknown, flavor: "docker_desktop" });
+    expect(
+      within(docker()).getByText("Docker Desktop isn't running. Start it to continue."),
+    ).toBeTruthy();
+  });
+
+  it("says when Docker Desktop hasn't started after two minutes", async () => {
+    await renderOnline();
+    await sendEngine({ ...unknown, flavor: "docker_desktop" });
+    await userEvent
+      .setup()
+      .click(within(docker()).getByRole("button", { name: "Start Docker Desktop" }));
+    expect(await within(docker()).findByText("Starting Docker Desktop…")).toBeTruthy();
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now + DOCKER_START_TIMEOUT_MS + 1);
+    await sendEngine({ ...unknown, flavor: "docker_desktop", endpoint: "unix:///docker.sock" });
+    expect(within(docker()).getByText("Docker Desktop hasn't started yet")).toBeTruthy();
+    expect(within(docker()).getByText(/more than two minutes/)).toBeTruthy();
+    expect(within(docker()).getByRole("button", { name: "Start Docker Desktop" })).toBeTruthy();
+  });
+
+  it("shows the command when alchemyd can't start this Docker", async () => {
+    engineStartAnswer = {
+      status: 200,
+      body: {
+        result: "unsupported",
+        message: "Docker Engine runs as a system service, so starting it needs your password",
+        command: "sudo systemctl start docker",
+      },
+    };
+    await renderOnline();
+    await sendEngine({ ...unknown, flavor: "docker_desktop" });
+    await userEvent
+      .setup()
+      .click(within(docker()).getByRole("button", { name: "Start Docker Desktop" }));
+    expect(
+      await within(docker()).findByText(
+        "Docker Engine runs as a system service, so starting it needs your password.",
+      ),
+    ).toBeTruthy();
+    expect(docker().querySelector("pre")?.textContent).toBe("sudo systemctl start docker");
+    expect(within(docker()).getByRole("button", { name: "Copy command" })).toBeTruthy();
+  });
+
+  it("says when Docker Desktop isn't installed after all", async () => {
+    engineStartAnswer = {
+      status: 422,
+      body: { error: "Docker Desktop isn't installed", code: "unsupported" },
+    };
+    await renderOnline();
+    await sendEngine({ ...unknown, flavor: "docker_desktop" });
+    await userEvent
+      .setup()
+      .click(within(docker()).getByRole("button", { name: "Start Docker Desktop" }));
+    const alert = await within(docker()).findByRole("alert");
+    expect(within(alert).getByText("Alchemy couldn't start Docker Desktop")).toBeTruthy();
+    expect(within(alert).getByText("Docker Desktop isn't installed.")).toBeTruthy();
+    expect(within(alert).getByText("docs.docker.com/get-started/get-docker")).toBeTruthy();
   });
 
   it("waits for the first metrics sample", async () => {
@@ -1204,5 +1334,170 @@ describe("Privileges", () => {
     await waitFor(() =>
       expect(screen.queryByRole("group", { name: "Web address warnings" })).toBeNull(),
     );
+  });
+});
+
+describe("Autostart", () => {
+  const off: Autostart = {
+    mode: "off",
+    available_modes: ["off", "login", "boot"],
+    log_hint: { kind: "terminal" },
+    supervisor: "manual",
+    pending: null,
+    last: null,
+  };
+  const login: Autostart = {
+    ...off,
+    mode: "login",
+    log_hint: { kind: "file", path: "/Users/me/Library/Logs/Alchemy/alchemyd.log" },
+  };
+  const bootLine = "sudo /opt/alchemy/alchemy-helper install-service --uid 501";
+  const appImage = "Alchemy runs from an AppImage. Install the .deb to start it on its own.";
+
+  async function sendAutostart(value: Autostart) {
+    await act(async () => {
+      source().emit("autostart", JSON.stringify(value));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+
+  async function section() {
+    const heading = await screen.findByRole("heading", { name: "Start automatically" });
+    return heading.parentElement!;
+  }
+
+  it("shows nothing about autostart when alchemyd is too old to report it", async () => {
+    await renderOnline();
+    await screen.findByRole("heading", { name: "Privileges" });
+    expect(screen.queryByRole("heading", { name: "Start automatically" })).toBeNull();
+  });
+
+  it("starts at login without a terminal, and says where the logs are", async () => {
+    autostartValue = off;
+    autostartAnswers = [
+      { status: 200, body: { outcome: "done", command: null, message: null, autostart: login } },
+    ];
+    await renderOnline();
+    const autostart = await section();
+    expect(within(autostart).getByRole("radio", { name: /Don't start on its own/ })).toHaveProperty(
+      "checked",
+      true,
+    );
+    expect(
+      within(autostart).getByText("Its log is in the terminal it was started from."),
+    ).toBeTruthy();
+
+    await userEvent.setup().click(within(autostart).getByRole("radio", { name: /Start at login/ }));
+    expect(autostartPuts).toEqual([{ mode: "login" }]);
+    expect(
+      await within(autostart).findByText("/Users/me/Library/Logs/Alchemy/alchemyd.log"),
+    ).toBeTruthy();
+    expect(within(autostart).getByRole("radio", { name: /Start at login/ })).toHaveProperty(
+      "checked",
+      true,
+    );
+  });
+
+  it("waits for the system prompt to start at boot, and says when it was cancelled", async () => {
+    autostartValue = login;
+    autostartAnswers = [
+      {
+        status: 202,
+        body: {
+          outcome: "pending",
+          command: null,
+          message: null,
+          autostart: { ...login, pending: "boot" },
+        },
+      },
+    ];
+    await renderOnline();
+    const autostart = await section();
+    await userEvent.setup().click(within(autostart).getByRole("radio", { name: /Start at boot/ }));
+    expect(
+      await within(autostart).findByText("Waiting for you to answer the system prompt…"),
+    ).toBeTruthy();
+    expect(within(autostart).getByRole("radio", { name: /Start at login/ })).toHaveProperty(
+      "disabled",
+      true,
+    );
+
+    await sendAutostart({
+      ...login,
+      last: { mode: "boot", result: "cancelled", message: null, at: 1 },
+    });
+    expect(
+      within(autostart).getByText(
+        "The last change to “Start at boot” was cancelled at the system prompt.",
+      ),
+    ).toBeTruthy();
+    expect(within(autostart).getByRole("radio", { name: /Start at login/ })).toHaveProperty(
+      "checked",
+      true,
+    );
+  });
+
+  it("shows the command to start at boot when there's no prompt, and tries again", async () => {
+    autostartValue = {
+      ...off,
+      log_hint: { kind: "journal", command: "journalctl --user -u alchemyd.service" },
+    };
+    const terminal = {
+      status: 200,
+      body: {
+        outcome: "needs_terminal",
+        command: { argv: bootLine.split(" "), line: bootLine },
+        message: "No polkit agent is running.",
+        autostart: autostartValue,
+      },
+    };
+    autostartAnswers = [terminal, terminal];
+    await renderOnline();
+    const autostart = await section();
+    expect(within(autostart).getByText("journalctl --user -u alchemyd.service")).toBeTruthy();
+    const user = userEvent.setup();
+    await user.click(within(autostart).getByRole("radio", { name: /Start at boot/ }));
+    expect(await within(autostart).findByText("No polkit agent is running.")).toBeTruthy();
+    expect(autostart.querySelector("pre")?.textContent).toBe(bootLine);
+    await user.click(within(autostart).getByRole("button", { name: "Try again" }));
+    expect(autostartPuts).toEqual([{ mode: "boot" }, { mode: "boot" }]);
+  });
+
+  it("says why a mode isn't available instead of offering it", async () => {
+    autostartValue = {
+      ...off,
+      available_modes: ["off"],
+      unavailable: [
+        { mode: "login", message: appImage },
+        { mode: "boot", message: appImage },
+      ],
+    };
+    await renderOnline();
+    const autostart = await section();
+    expect(within(autostart).getAllByRole("radio")).toHaveLength(1);
+    const unavailable = within(autostart).getByRole("list", { name: "Not available here" });
+    expect(
+      within(unavailable)
+        .getAllByRole("listitem")
+        .map((li) => li.textContent),
+    ).toEqual([
+      `Start at login isn't available here: ${appImage}`,
+      `Start at boot isn't available here: ${appImage}`,
+    ]);
+  });
+
+  it("says when alchemyd refused the change", async () => {
+    autostartValue = off;
+    autostartAnswers = [
+      {
+        status: 409,
+        body: { error: "Another change to autostart is in progress.", code: "conflict" },
+      },
+    ];
+    await renderOnline();
+    const autostart = await section();
+    await userEvent.setup().click(within(autostart).getByRole("radio", { name: /Start at login/ }));
+    const alert = await within(autostart).findByRole("alert");
+    expect(within(alert).getByText("Another change to autostart is in progress.")).toBeTruthy();
   });
 });

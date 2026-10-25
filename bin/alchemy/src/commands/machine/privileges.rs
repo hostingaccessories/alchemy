@@ -40,13 +40,13 @@ pub(crate) const PATH: &str = "/api/machine/privileges";
 
 /// How long to wait for a system prompt to be answered: alchemyd gives up
 /// on one after five minutes.
-const PROMPT_WAIT: Duration = Duration::from_secs(330);
+pub(crate) const PROMPT_WAIT: Duration = Duration::from_secs(330);
 
 /// How long to wait for alchemyd to answer again after it restarts.
 const RESTART_WAIT: Duration = Duration::from_secs(60);
 
 /// How often to ask whether alchemyd is back, or the action settled.
-const POLL: Duration = Duration::from_millis(250);
+pub(crate) const POLL: Duration = Duration::from_millis(250);
 
 /// The most requests one grant or revoke sends: a prompt that finds no
 /// polkit agent, then the terminal command, then the restart, with one
@@ -171,18 +171,25 @@ async fn change<D: Daemon, W: Write, S: Sudo>(
         let settled = match answer.outcome {
             ChangeOutcome::Unchanged => answer.privilege,
             ChangeOutcome::NeedsTerminal => {
-                let command = terminal_command(ctx, sudo, action, grant, &answer, &progress)?;
-                if !ctx.json() {
-                    ctx.out().progress(running_line(&answer, &command));
-                }
-                let args = sudo_args(&command)?;
-                sudo.run(args).await.map_err(|why| {
-                    ClientError::PrivilegeFailed(format!(
-                        "`{}` didn't succeed: {why}; nothing changed",
-                        command.line
-                    ))
-                })?;
-                progress.ran = Some(command);
+                let handed = Handed {
+                    command: answer
+                        .command
+                        .clone()
+                        .or_else(|| answer.privilege.command.clone()),
+                    why: answer
+                        .message
+                        .clone()
+                        .or_else(|| answer.privilege.message.clone()),
+                    retry: format!(
+                        "{} {}",
+                        if grant { GRANT_NAME } else { REVOKE_NAME },
+                        action.cli_name()
+                    ),
+                    check: NAME,
+                    answer: serde_json::to_string(&answer).map_err(std::io::Error::other)?,
+                };
+                let ran = run_handed(ctx, sudo, handed, progress.ran.as_ref()).await?;
+                progress.ran = Some(ran);
                 continue;
             }
             ChangeOutcome::Pending => {
@@ -225,52 +232,70 @@ async fn change<D: Daemon, W: Write, S: Sudo>(
     )))
 }
 
-/// The command to run for a `needs_terminal` answer, or the error when it
-/// can't be run here: no terminal, a command already run, or none given.
-/// Without a terminal, the command is printed on stdout first.
-fn terminal_command<D: Daemon, W: Write, S: Sudo>(
+/// A `sudo` command alchemyd handed over in a `needs_terminal` answer,
+/// and what it is for.
+pub(crate) struct Handed {
+    /// The command, if alchemyd gave one.
+    pub(crate) command: Option<HelperCommand>,
+    /// Why alchemyd can't show a system prompt instead.
+    pub(crate) why: Option<String>,
+    /// The command that asked, as typed after `alchemy`, to run again
+    /// once the `sudo` command has.
+    pub(crate) retry: String,
+    /// The command that shows where things stand, as typed after
+    /// `alchemy`, for when alchemyd keeps asking.
+    pub(crate) check: &'static str,
+    /// alchemyd's answer as JSON, printed in place of the command with
+    /// `--json` and no terminal.
+    pub(crate) answer: String,
+}
+
+/// Run the command in `handed` through `sudo` on the terminal, and return
+/// it. It is refused when one already ran (`ran`), since alchemyd asking
+/// again means it didn't work. Without a terminal, the command is printed
+/// on stdout and the error says to run it.
+pub(crate) async fn run_handed<D: Daemon, W: Write, S: Sudo>(
     ctx: &mut Context<D, W>,
-    sudo: &S,
-    action: Action,
-    grant: bool,
-    answer: &PrivilegeChange,
-    progress: &Progress,
+    sudo: &mut S,
+    handed: Handed,
+    ran: Option<&HelperCommand>,
 ) -> Result<HelperCommand, ClientError> {
-    let command = answer
-        .command
-        .clone()
-        .or_else(|| answer.privilege.command.clone())
-        .ok_or_else(|| {
-            ClientError::Unexpected("alchemyd asked for a terminal but gave no command".into())
-        })?;
-    if let Some(ran) = &progress.ran {
+    let command = handed.command.ok_or_else(|| {
+        ClientError::Unexpected("alchemyd asked for a terminal but gave no command".into())
+    })?;
+    if let Some(ran) = ran {
         return Err(ClientError::PrivilegeFailed(format!(
-            "alchemyd still asks for `{}` after `{}` ran; check `alchemy machine privileges`",
-            command.line, ran.line
+            "alchemyd still asks for `{}` after `{}` ran; check `alchemy {}`",
+            command.line, ran.line, handed.check
         )));
     }
-    if sudo.is_interactive() {
-        return Ok(command);
+    let why = handed.why.as_deref();
+    if !sudo.is_interactive() {
+        let shown = if ctx.json() {
+            handed.answer
+        } else {
+            command.line.clone()
+        };
+        ctx.out().line(shown)?;
+        return Err(ClientError::NeedsTerminal {
+            command: handed.retry,
+            why: why
+                .unwrap_or("alchemyd can't show a system prompt here.")
+                .to_owned(),
+            line: command.line,
+        });
     }
-    let shown = if ctx.json() {
-        serde_json::to_string(answer).map_err(std::io::Error::other)?
-    } else {
-        command.line.clone()
-    };
-    ctx.out().line(shown)?;
-    Err(ClientError::NeedsTerminal {
-        command: format!(
-            "{} {}",
-            if grant { GRANT_NAME } else { REVOKE_NAME },
-            action.cli_name()
-        ),
-        why: answer
-            .message
-            .clone()
-            .or_else(|| answer.privilege.message.clone())
-            .unwrap_or_else(|| "alchemyd can't show a system prompt here.".to_owned()),
-        line: command.line,
-    })
+    if !ctx.json() {
+        ctx.out().progress(running_line(why, &command));
+    }
+    let args = sudo_args(&command)?;
+    sudo.run(args).await.map_err(|why| {
+        ClientError::PrivilegeFailed(format!(
+            "`{}` didn't succeed: {why}; nothing changed",
+            command.line
+        ))
+    })?;
+    Ok(command)
 }
 
 /// `command`'s arguments after `sudo`. alchemyd only ever hands over a
@@ -287,8 +312,8 @@ pub(crate) fn sudo_args(command: &HelperCommand) -> Result<&[String], ClientErro
 
 /// The progress line before running `command`: why there is no prompt,
 /// and what runs.
-fn running_line(answer: &PrivilegeChange, command: &HelperCommand) -> String {
-    match answer.message.as_deref() {
+fn running_line(why: Option<&str>, command: &HelperCommand) -> String {
+    match why {
         Some(why) => format!("{why}\nRunning: {}", command.line),
         None => format!("Running: {}", command.line),
     }
@@ -377,10 +402,11 @@ async fn settle_now<D: Daemon, W: Write>(
 }
 
 /// Whether `err` means alchemyd is away for now, as while it restarts.
-fn is_away(err: &ClientError) -> bool {
+pub(crate) fn is_away(err: &ClientError) -> bool {
     matches!(
         err,
         ClientError::DaemonUnreachable(_)
+            | ClientError::NoDaemon { .. }
             | ClientError::ConnectionClosed
             | ClientError::Disconnected
             | ClientError::Protocol(ProtocolError::Io { .. })
@@ -710,7 +736,7 @@ mod tests {
     }
 
     #[allow(clippy::unnecessary_wraps)]
-    fn event(changed: &Privilege) -> Result<crate::sse::SseEvent, ClientError> {
+    fn event(changed: &Privilege) -> Result<alchemy_api::sse::SseEvent, ClientError> {
         Ok(sse(
             "privileges",
             &serde_json::to_string(&list_of(changed)).unwrap(),

@@ -4,6 +4,10 @@ CARGO := cargo
 
 ##@ Build
 
+.PHONY: bundle-desktop
+bundle-desktop: ## Bundle the desktop app with alchemyd and alchemy-helper inside
+	scripts/bundle-desktop.sh
+
 .PHONY: clean
 clean: clean-rs clean-worktrees ## Clean up all build artifacts and worktrees
 

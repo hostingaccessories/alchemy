@@ -62,7 +62,7 @@ const ACTIONS: Record<PrivilegeAction, ActionText> = {
     },
   },
   system_service: {
-    what: "A system service starts alchemyd when this machine starts, before anyone signs in.",
+    what: "A system service starts alchemyd at boot, before anyone logs in.",
     grant: "Install the service",
     undo: "Remove the service",
     titles: {
@@ -330,7 +330,7 @@ function RestartNote() {
  * The command to run when there's no system prompt to show, and the button
  * that asks alchemyd to check again once it has run.
  */
-function TerminalSteps({
+export function TerminalSteps({
   command,
   again,
   sending,

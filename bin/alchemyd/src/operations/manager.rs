@@ -245,6 +245,28 @@ impl Operations {
         action: Action,
         force: bool,
     ) -> Result<Operation, StartError> {
+        self.start_for(name, action, force, None).await
+    }
+
+    /// [`Self::start`], for an operation Alchemy starts on its own, with
+    /// the `reason` it shows, such as "was running before the computer
+    /// slept".
+    pub async fn start_because(
+        &self,
+        name: &str,
+        action: Action,
+        reason: &str,
+    ) -> Result<Operation, StartError> {
+        self.start_for(name, action, false, Some(reason)).await
+    }
+
+    async fn start_for(
+        &self,
+        name: &str,
+        action: Action,
+        force: bool,
+        reason: Option<&str>,
+    ) -> Result<Operation, StartError> {
         let prepared = self.prepare(name, action, force)?;
         if self.inner.state.engine().state != EngineState::Ready {
             return Err(StartError::DockerNotReady {
@@ -268,13 +290,16 @@ impl Operations {
             .iter()
             .map(ComposeStep::command)
             .collect();
-        let tracker = Tracker::new(
+        let mut tracker = Tracker::new(
             self.next_id(),
             prepared.app.clone(),
             action,
             &commands,
             now_secs(),
         );
+        if let Some(reason) = reason {
+            tracker = tracker.with_reason(reason);
+        }
         let operation = tracker.operation().clone();
         let (canceller, token) = cancellation();
         {
@@ -303,7 +328,7 @@ impl Operations {
                 },
             );
         }
-        tracing::info!(id = operation.id, app = name, %action, "operation started");
+        tracing::info!(id = operation.id, app = name, %action, reason, "operation started");
         self.inner.publish();
         if let Err(error) = self.inner.store.put_operation(&operation).await {
             tracing::warn!(%error, id = operation.id, "storing a started operation failed");

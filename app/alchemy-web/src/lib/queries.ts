@@ -56,8 +56,19 @@ export const networkSettingsQuery = queryOptions({
   queryFn: ({ signal }) => api.networkSettings(signal),
 });
 
+/** Events that report something that happened, not a current value, so no query keeps them. */
+const MOMENT_EVENTS = new Set<ApiEventName>(["woke"]);
+
+/** The events whose payload is a current value, each kept by a {@link liveQueries} entry. */
+export type LiveEventName = Exclude<ApiEventName, "woke">;
+
+/** Whether `name` is a {@link LiveEventName}. */
+export function isLiveEvent(name: ApiEventName): name is LiveEventName {
+  return !MOMENT_EVENTS.has(name);
+}
+
 /** A query whose data is one event's payload. */
-export interface LiveQuery<K extends ApiEventName> {
+export interface LiveQuery<K extends LiveEventName> {
   queryKey: DataTag<QueryKey, ApiEventData<K>, DefaultError>;
 }
 
@@ -96,14 +107,26 @@ export const liveQueries = {
     queryFn: ({ signal }) => api.privileges(signal),
     staleTime: Infinity,
   }),
-} satisfies { [K in ApiEventName]: LiveQuery<K> };
+  reconcile: queryOptions({
+    queryKey: ["reconcile"],
+    queryFn: ({ signal }) => api.reconcile(signal),
+    staleTime: Infinity,
+  }),
+  autostart: queryOptions({
+    queryKey: ["autostart"],
+    queryFn: ({ signal }) => api.autostart(signal),
+    staleTime: Infinity,
+  }),
+} satisfies { [K in LiveEventName]: LiveQuery<K> };
 
 /**
- * Store one event's payload as its {@link liveQueries} entry's data. The
- * `satisfies` above ties each entry's data type to its event's payload;
- * TypeScript can't carry that pairing through `event.event` here.
+ * Store one event's payload as its {@link liveQueries} entry's data, and
+ * ignore an event that isn't a current value. The `satisfies` above ties each
+ * entry's data type to its event's payload; TypeScript can't carry that
+ * pairing through `event.event` here.
  */
 export function writeLiveEvent(client: QueryClient, event: ApiEvent): void {
+  if (!isLiveEvent(event.event)) return;
   const { queryKey }: { queryKey: QueryKey } = liveQueries[event.event];
   client.setQueryData<ApiEvent["data"]>(queryKey, event.data);
 }

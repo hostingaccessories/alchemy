@@ -12,10 +12,12 @@ publish.workspace      = true
 alchemy-core = { workspace = true }
 serde        = { workspace = true }
 rustix       = { workspace = true, optional = true }
+thiserror    = { workspace = true, optional = true }
 
 [features]
 default   = []
 socket    = ["dep:rustix"]
+sse       = ["dep:thiserror"]
 state-dir = []
 
 [dev-dependencies]

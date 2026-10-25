@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "tauri dev",
-    "bundle": "tauri build",
+    "bundle": "../../scripts/bundle-desktop.sh",
     "tauri": "tauri"
   },
   "devDependencies": {

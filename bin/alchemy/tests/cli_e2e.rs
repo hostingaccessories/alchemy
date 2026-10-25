@@ -17,6 +17,7 @@ use std::time::Duration;
 use alchemy::commands::{safety_probe, status};
 use alchemy::prompt::FakePrompt;
 use alchemy::safety::Safety;
+use alchemy::sudo::FakeSudo;
 use alchemy::{Cli, ClientError, Color, Command, DAEMON_ENV};
 use alchemy_api::{
     API_VERSION, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, VersionResponse,
@@ -215,8 +216,16 @@ async fn status_reports_the_daemon_and_docker() {
         ],
         "{out}"
     );
-    assert!(lines[2].starts_with("Local names (mDNS): "), "{out}");
-    assert_eq!(lines.len(), 3, "{out}");
+    assert_eq!(
+        lines[2..4],
+        [
+            "Autostart: off (alchemyd starts only when you run it)",
+            "Logs: the terminal alchemyd was started from",
+        ],
+        "{out}"
+    );
+    assert!(lines[4].starts_with("Local names (mDNS): "), "{out}");
+    assert_eq!(lines.len(), 5, "{out}");
 
     daemon
         .state
@@ -289,6 +298,12 @@ async fn status_watch_prints_a_line_per_change_until_the_daemon_stops() {
     let mut watch = Watch::start(cli(&daemon.socket, false, true));
     assert_eq!(watch.line().await, daemon_line(&daemon.socket));
     assert_eq!(watch.line().await, "Docker isn't running");
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            watch.line().await,
+            "  Fix: run `sudo systemctl start docker`"
+        );
+    }
 
     daemon
         .state
@@ -912,6 +927,99 @@ async fn the_socket_flag_beats_the_daemon_env() {
     assert!(out.status.success(), "{stdout}");
     assert_eq!(stdout.lines().next().unwrap(), daemon_line(&daemon.socket));
     daemon.stop().await;
+}
+
+/// A socket file with nothing listening on it, as a crashed alchemyd
+/// leaves behind: connecting is refused.
+fn stale_socket(path: &Path) {
+    drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+    assert!(path.exists());
+}
+
+/// Runs `status` with no `--socket` and nothing in the environment naming
+/// alchemyd, looking for it at `sockets`.
+async fn status_searching(sockets: Vec<PathBuf>) -> Result<String, ClientError> {
+    let cli = Cli::try_parse_from(["alchemy", "status"]).unwrap();
+    let mut out = Vec::new();
+    let lookup = alchemy::Lookup {
+        daemon_env: None,
+        socket_env: None,
+        sockets,
+        installed: Box::new(|| None),
+    };
+    alchemy::run_with_lookup(
+        cli,
+        lookup,
+        &mut out,
+        Color::Off,
+        &mut FakePrompt::no_tty(),
+        &mut FakeSudo::no_tty(),
+    )
+    .await?;
+    Ok(String::from_utf8(out).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_default_lookup_uses_the_first_socket_that_answers() {
+    let daemon = Daemon::start(ready_desktop()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let stale = tmp.path().join("stale.sock");
+    stale_socket(&stale);
+    let out = status_searching(vec![stale, daemon.socket.clone()])
+        .await
+        .unwrap();
+    assert_eq!(out.lines().next().unwrap(), daemon_line(&daemon.socket));
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn the_default_lookup_names_every_socket_it_tried() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("missing.sock");
+    let stale = tmp.path().join("stale.sock");
+    stale_socket(&stale);
+    let err = status_searching(vec![missing.clone(), stale.clone()])
+        .await
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 69);
+    assert_eq!(err.kind(), "daemon_unreachable");
+    let msg = err.to_string();
+    let (first, second) = msg
+        .strip_prefix("cannot reach alchemyd: ")
+        .and_then(|rest| rest.split_once("; "))
+        .unwrap_or_else(|| panic!("{msg}"));
+    assert!(
+        first.starts_with(&format!("{}: ", missing.display())),
+        "{msg}"
+    );
+    assert!(
+        second.starts_with(&format!("{}: ", stale.display())),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn the_binary_looks_in_the_runtime_dir_without_a_socket_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path().to_str().unwrap();
+    let out = alchemy_bin(&["status"], &[("XDG_RUNTIME_DIR", xdg)]).await;
+    let stderr = text(out.stderr);
+    assert_eq!(out.status.code(), Some(69), "{stderr}");
+    let user = tmp.path().join("alchemy").join("alchemyd.sock");
+    assert!(
+        stderr.starts_with(&format!(
+            "alchemy: cannot reach alchemyd: {}: ",
+            user.display()
+        )),
+        "{stderr}"
+    );
+    let uid = std::os::unix::fs::MetadataExt::uid(&tmp.path().metadata().unwrap());
+    let system = format!("; /run/alchemy-{uid}/alchemyd.sock: ");
+    assert_eq!(
+        stderr.contains(&system),
+        cfg!(target_os = "linux"),
+        "{stderr}"
+    );
 }
 
 fn text(bytes: Vec<u8>) -> String {

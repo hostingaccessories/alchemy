@@ -2,7 +2,9 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useEffect } from "react";
 
 import { type ApiEvent, ApiError, NO_RESPONSE, api, isSignedOut } from "./api.ts";
+import { dockerStartDone } from "./engineStart.ts";
 import { invalidateOnReconnect, sessionQuery, versionQuery, writeLiveEvent } from "./queries.ts";
+import { noteWake } from "./recovery.ts";
 import { expectRestart, restartDone, restartsSoon } from "./restart.ts";
 
 /**
@@ -10,8 +12,10 @@ import { expectRestart, restartDone, restartsSoon } from "./restart.ts";
  * Query cache through `liveQueries`. When the stream drops it re-probes the
  * daemon and whether the page is signed in, and when it reconnects it
  * invalidates the cache and forgets any restart it expected. A `privileges`
- * event that says alchemyd is about to restart notes it, whichever page is
- * open. Must sit inside `QueryClientProvider`.
+ * event that says alchemyd is about to restart notes it, an `engine` event
+ * that says Docker is ready ends a start of Docker Desktop, and a `woke`
+ * event is kept for the recovery notice, whichever page is open. Must sit
+ * inside `QueryClientProvider`.
  */
 export function LiveProvider({ children }: { children: ReactNode }) {
   const client = useQueryClient();
@@ -22,6 +26,12 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       writeLiveEvent(client, event);
       if (event.event === "privileges" && restartsSoon(event.data)) {
         expectRestart(client);
+      }
+      if (event.event === "engine" && event.data.state === "ready") {
+        dockerStartDone(client);
+      }
+      if (event.event === "woke") {
+        noteWake(client, event.data);
       }
     };
     return api.subscribe(onEvent, {

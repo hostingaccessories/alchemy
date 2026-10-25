@@ -6,7 +6,7 @@
 //! a listener another program answers made unavailable, and `<app>.local`
 //! routed only while the `network.mdns` setting is on, announced through
 //! a fake announcer that follows the LAN address, the setting, conflicts,
-//! and shutdown.
+//! a wake, and shutdown.
 
 #![allow(
     clippy::unwrap_used,
@@ -146,14 +146,12 @@ async fn fake_app(tag: &'static str) -> SocketAddr {
     addr
 }
 
-/// A free port for a proxy port range, below the ephemeral range on
-/// Linux and macOS, so a listener another test binds to port `0` never
-/// takes it first.
-fn free_port() -> u16 {
-    free_ports(1)
-}
+/// How many times [`on_free_ports`] picks ports before giving up.
+const PICKS: usize = 10;
 
-/// The first of `count` free ports in a row, as [`free_port`] picks.
+/// The first of `count` free ports in a row for a proxy port range,
+/// below the ephemeral range on Linux and macOS, so a listener another
+/// test binds to port `0` never takes it first.
 fn free_ports(count: u16) -> u16 {
     use std::hash::{BuildHasher as _, Hasher as _};
 
@@ -167,6 +165,27 @@ fn free_ports(count: u16) -> u16 {
             (port..port + count).all(|p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok())
         })
         .unwrap()
+}
+
+/// The daemon `start` gives for a proxy range of `count` ports from
+/// [`free_ports`], and the first of them. A free port is free only until
+/// something binds it, and other tests, in this run and in any other on
+/// the machine, pick from the same ports, so when the proxy finds one in
+/// use this stops that daemon and picks again.
+async fn on_free_ports<F, Fut>(count: u16, mut start: F) -> (Daemon, u16)
+where
+    F: FnMut(u16) -> Fut,
+    Fut: Future<Output = Daemon>,
+{
+    for _ in 0..PICKS {
+        let first = free_ports(count);
+        let daemon = start(first).await;
+        if daemon.listens_on(first..first + count).await {
+            return (daemon, first);
+        }
+        daemon.stop().await;
+    }
+    panic!("another program took the proxy's ports {PICKS} times in a row");
 }
 
 async fn send(mut stream: impl AsyncRead + AsyncWrite + Unpin, request: &str) -> (String, String) {
@@ -301,6 +320,31 @@ impl Daemon {
         }
     }
 
+    /// Whether the proxy opened every port in `ports`, or `false` once it
+    /// finds one of them in use.
+    async fn listens_on(&self, ports: std::ops::Range<u16>) -> bool {
+        let in_use = |report: &NetworkReport| {
+            report.proxy.ports.iter().any(|p| {
+                ports.contains(&p.port)
+                    && p.message.as_deref()
+                        == Some(format!("Another program is using port {}.", p.port).as_str())
+            })
+        };
+        let report = self
+            .report_where(|report| {
+                in_use(report)
+                    || ports.clone().all(|port| {
+                        report
+                            .proxy
+                            .ports
+                            .iter()
+                            .any(|p| p.port == port && p.state == ListenerState::Listening)
+                    })
+            })
+            .await;
+        !in_use(&report)
+    }
+
     async fn stop(self) {
         self.stop.send(()).unwrap();
         tokio::time::timeout(TIMEOUT, self.task)
@@ -369,38 +413,43 @@ async fn serves_an_unpublished_app_on_its_reserved_port_once_attached() {
     let container_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, 2)), 80);
     let connector = FakeConnector::new();
     connector.redirect(container_ip, upstream);
-    let port = free_port();
     let networks = FakeEngineNetworks::new();
     networks.set_networks(vec![alchemy_network()]);
 
-    let dir = tempdir();
-    let apps = apps_home(
-        dir.path(),
-        vec![
-            ("blog", vec![service("web", &["80"], vec![])]),
-            (
-                "worker",
-                vec![service("queue", &[], vec![]), service("jobs", &[], vec![])],
-            ),
-        ],
-    );
-    let daemon = Daemon::start(
-        dir,
-        Engine {
-            facts: EngineFacts {
-                host_os: HostOs::Linux,
-                flavor: Some(EngineFlavor::DockerEngine),
-                rootless: false,
-            },
-            containers: vec![running("blog-web-1", "blog", "web")],
-        },
-        apps,
-        networks.clone(),
-        ProxyDeps::loopback()
-            .with_connector(Arc::new(connector))
-            .with_range(PortRange::single(port).unwrap())
-            .with_interval(Duration::from_millis(50)),
-    )
+    let (daemon, port) = on_free_ports(1, |port| {
+        let (connector, networks) = (connector.clone(), networks.clone());
+        async move {
+            let dir = tempdir();
+            let apps = apps_home(
+                dir.path(),
+                vec![
+                    ("blog", vec![service("web", &["80"], vec![])]),
+                    (
+                        "worker",
+                        vec![service("queue", &[], vec![]), service("jobs", &[], vec![])],
+                    ),
+                ],
+            );
+            Daemon::start(
+                dir,
+                Engine {
+                    facts: EngineFacts {
+                        host_os: HostOs::Linux,
+                        flavor: Some(EngineFlavor::DockerEngine),
+                        rootless: false,
+                    },
+                    containers: vec![running("blog-web-1", "blog", "web")],
+                },
+                apps,
+                networks,
+                ProxyDeps::loopback()
+                    .with_connector(Arc::new(connector))
+                    .with_range(PortRange::single(port).unwrap())
+                    .with_interval(Duration::from_millis(50)),
+            )
+            .await
+        }
+    })
     .await;
 
     let url = format!("http://127.0.0.1:{port}/");
@@ -456,39 +505,44 @@ async fn routes_published_ports_by_host_where_container_ips_are_out_of_reach() {
     let upstream = fake_app("wiki").await;
     let connector = FakeConnector::new();
     connector.redirect(upstream, upstream);
-    let port = free_port();
 
-    let dir = tempdir();
-    let apps = apps_home(
-        dir.path(),
-        vec![
-            (
-                "wiki",
-                vec![service("app", &[], vec![tcp(upstream.port(), 3000)])],
-            ),
-            ("blog", vec![service("web", &["80"], vec![])]),
-        ],
-    );
-    let mut wiki = running("wiki-app-1", "wiki", "app");
-    wiki.ports = vec![tcp(upstream.port(), 3000)];
-    let daemon = Daemon::start(
-        dir,
-        Engine {
-            facts: EngineFacts {
-                host_os: HostOs::MacOs,
-                flavor: Some(EngineFlavor::DockerDesktop),
-                rootless: false,
-            },
-            containers: vec![wiki],
-        },
-        apps,
-        FakeEngineNetworks::new(),
-        ProxyDeps::loopback()
-            .with_connector(Arc::new(connector))
-            .with_range(PortRange::single(port).unwrap())
-            .with_host_listen(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
-            .with_interval(Duration::from_millis(50)),
-    )
+    let (daemon, _) = on_free_ports(1, |port| {
+        let connector = connector.clone();
+        async move {
+            let dir = tempdir();
+            let apps = apps_home(
+                dir.path(),
+                vec![
+                    (
+                        "wiki",
+                        vec![service("app", &[], vec![tcp(upstream.port(), 3000)])],
+                    ),
+                    ("blog", vec![service("web", &["80"], vec![])]),
+                ],
+            );
+            let mut wiki = running("wiki-app-1", "wiki", "app");
+            wiki.ports = vec![tcp(upstream.port(), 3000)];
+            Daemon::start(
+                dir,
+                Engine {
+                    facts: EngineFacts {
+                        host_os: HostOs::MacOs,
+                        flavor: Some(EngineFlavor::DockerDesktop),
+                        rootless: false,
+                    },
+                    containers: vec![wiki],
+                },
+                apps,
+                FakeEngineNetworks::new(),
+                ProxyDeps::loopback()
+                    .with_connector(Arc::new(connector))
+                    .with_range(PortRange::single(port).unwrap())
+                    .with_host_listen(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+                    .with_interval(Duration::from_millis(50)),
+            )
+            .await
+        }
+    })
     .await;
 
     let wiki = daemon
@@ -547,39 +601,44 @@ async fn a_listener_another_program_answers_is_unavailable_and_open_uses_the_nex
     let upstream = fake_app("wiki").await;
     let connector = FakeConnector::new();
     connector.redirect(upstream, upstream);
-    let port = free_port();
     let probe = FakeProbe::new(FakeAnswer::Foreign(404));
-    probe.set(port, FakeAnswer::Ours);
 
-    let dir = tempdir();
-    let apps = apps_home(
-        dir.path(),
-        vec![(
-            "wiki",
-            vec![service("app", &[], vec![tcp(upstream.port(), 3000)])],
-        )],
-    );
-    let mut wiki = running("wiki-app-1", "wiki", "app");
-    wiki.ports = vec![tcp(upstream.port(), 3000)];
-    let daemon = Daemon::start(
-        dir,
-        Engine {
-            facts: EngineFacts {
-                host_os: HostOs::MacOs,
-                flavor: Some(EngineFlavor::DockerDesktop),
-                rootless: false,
-            },
-            containers: vec![wiki],
-        },
-        apps,
-        FakeEngineNetworks::new(),
-        ProxyDeps::loopback()
-            .with_connector(Arc::new(connector))
-            .with_probe(Arc::new(probe.clone()))
-            .with_range(PortRange::single(port).unwrap())
-            .with_host_listen(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
-            .with_interval(Duration::from_millis(50)),
-    )
+    let (daemon, port) = on_free_ports(1, |port| {
+        let (connector, probe) = (connector.clone(), probe.clone());
+        probe.set(port, FakeAnswer::Ours);
+        async move {
+            let dir = tempdir();
+            let apps = apps_home(
+                dir.path(),
+                vec![(
+                    "wiki",
+                    vec![service("app", &[], vec![tcp(upstream.port(), 3000)])],
+                )],
+            );
+            let mut wiki = running("wiki-app-1", "wiki", "app");
+            wiki.ports = vec![tcp(upstream.port(), 3000)];
+            Daemon::start(
+                dir,
+                Engine {
+                    facts: EngineFacts {
+                        host_os: HostOs::MacOs,
+                        flavor: Some(EngineFlavor::DockerDesktop),
+                        rootless: false,
+                    },
+                    containers: vec![wiki],
+                },
+                apps,
+                FakeEngineNetworks::new(),
+                ProxyDeps::loopback()
+                    .with_connector(Arc::new(connector))
+                    .with_probe(Arc::new(probe))
+                    .with_range(PortRange::single(port).unwrap())
+                    .with_host_listen(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+                    .with_interval(Duration::from_millis(50)),
+            )
+            .await
+        }
+    })
     .await;
 
     let wiki = daemon
@@ -702,56 +761,61 @@ async fn routes_local_names_while_mdns_is_on_except_for_apps_that_opt_out() {
     let connector = FakeConnector::new();
     connector.redirect(wiki_app, wiki_app);
     connector.redirect(notes_app, notes_app);
-    let port = free_port();
 
-    let dir = tempdir();
-    let (home, config) = apps_home(
-        dir.path(),
-        vec![
-            (
-                "wiki",
-                vec![service("app", &[], vec![tcp(wiki_app.port(), 3000)])],
-            ),
-            (
-                "notes",
-                vec![service("app", &[], vec![tcp(notes_app.port(), 3000)])],
-            ),
-        ],
-    );
-    config.set(
-        home.join("notes"),
-        FakeConfig::Config(ComposeConfig {
-            name: "notes".into(),
-            services: vec![service("app", &[], vec![tcp(notes_app.port(), 3000)])],
-            x_alchemy: Some(XAlchemyBlock::Read(XAlchemy {
-                mdns: false,
-                ..XAlchemy::default()
-            })),
-            ..ComposeConfig::default()
-        }),
-    );
-    let mut wiki = running("wiki-app-1", "wiki", "app");
-    wiki.ports = vec![tcp(wiki_app.port(), 3000)];
-    let mut notes = running("notes-app-1", "notes", "app");
-    notes.ports = vec![tcp(notes_app.port(), 3000)];
-    let daemon = Daemon::start(
-        dir,
-        Engine {
-            facts: EngineFacts {
-                host_os: HostOs::MacOs,
-                flavor: Some(EngineFlavor::DockerDesktop),
-                rootless: false,
-            },
-            containers: vec![wiki, notes],
-        },
-        (home, config),
-        FakeEngineNetworks::new(),
-        ProxyDeps::loopback()
-            .with_connector(Arc::new(connector))
-            .with_range(PortRange::single(port).unwrap())
-            .with_host_listen(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
-            .with_interval(Duration::from_millis(50)),
-    )
+    let (daemon, _) = on_free_ports(1, |port| {
+        let connector = connector.clone();
+        async move {
+            let dir = tempdir();
+            let (home, config) = apps_home(
+                dir.path(),
+                vec![
+                    (
+                        "wiki",
+                        vec![service("app", &[], vec![tcp(wiki_app.port(), 3000)])],
+                    ),
+                    (
+                        "notes",
+                        vec![service("app", &[], vec![tcp(notes_app.port(), 3000)])],
+                    ),
+                ],
+            );
+            config.set(
+                home.join("notes"),
+                FakeConfig::Config(ComposeConfig {
+                    name: "notes".into(),
+                    services: vec![service("app", &[], vec![tcp(notes_app.port(), 3000)])],
+                    x_alchemy: Some(XAlchemyBlock::Read(XAlchemy {
+                        mdns: false,
+                        ..XAlchemy::default()
+                    })),
+                    ..ComposeConfig::default()
+                }),
+            );
+            let mut wiki = running("wiki-app-1", "wiki", "app");
+            wiki.ports = vec![tcp(wiki_app.port(), 3000)];
+            let mut notes = running("notes-app-1", "notes", "app");
+            notes.ports = vec![tcp(notes_app.port(), 3000)];
+            Daemon::start(
+                dir,
+                Engine {
+                    facts: EngineFacts {
+                        host_os: HostOs::MacOs,
+                        flavor: Some(EngineFlavor::DockerDesktop),
+                        rootless: false,
+                    },
+                    containers: vec![wiki, notes],
+                },
+                (home, config),
+                FakeEngineNetworks::new(),
+                ProxyDeps::loopback()
+                    .with_connector(Arc::new(connector))
+                    .with_range(PortRange::single(port).unwrap())
+                    .with_host_listen(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+                    .with_interval(Duration::from_millis(50)),
+            )
+            .await
+        }
+    })
     .await;
 
     let settings: NetworkSettings = get_socket(&daemon.socket, "/api/settings/network").await;
@@ -839,8 +903,13 @@ async fn eventually(what: &str, ok: impl Fn() -> bool) {
 
 /// `wiki`, and `notes`, which opts out of `.local`, routed on two ports
 /// of their own, on a Mac whose LAN address `host` gives, announcing
-/// through `proxy`.
-async fn local_names_daemon(host: FakeNetwork, proxy: ProxyDeps) -> Daemon {
+/// through the proxy `proxy` gives, and what came with that proxy.
+/// `proxy` is called again for each daemon [`on_free_ports`] starts, so
+/// a fake announcer is fresh for the daemon that is kept.
+async fn local_names_daemon<T>(
+    host: FakeNetwork,
+    mut proxy: impl FnMut() -> (ProxyDeps, T),
+) -> (Daemon, T) {
     use alchemy_core::route::{XAlchemy, XAlchemyBlock};
 
     let wiki_app = fake_app("wiki").await;
@@ -848,57 +917,66 @@ async fn local_names_daemon(host: FakeNetwork, proxy: ProxyDeps) -> Daemon {
     let connector = FakeConnector::new();
     connector.redirect(wiki_app, wiki_app);
     connector.redirect(notes_app, notes_app);
-    let port = free_ports(2);
-    let dir = tempdir();
-    let (home, config) = apps_home(
-        dir.path(),
-        vec![
-            (
-                "wiki",
-                vec![service("app", &[], vec![tcp(wiki_app.port(), 3000)])],
-            ),
-            (
-                "notes",
-                vec![service("app", &[], vec![tcp(notes_app.port(), 3000)])],
-            ),
-        ],
-    );
-    config.set(
-        home.join("notes"),
-        FakeConfig::Config(ComposeConfig {
-            name: "notes".into(),
-            services: vec![service("app", &[], vec![tcp(notes_app.port(), 3000)])],
-            x_alchemy: Some(XAlchemyBlock::Read(XAlchemy {
-                mdns: false,
-                ..XAlchemy::default()
-            })),
-            ..ComposeConfig::default()
-        }),
-    );
-    let mut wiki = running("wiki-app-1", "wiki", "app");
-    wiki.ports = vec![tcp(wiki_app.port(), 3000)];
-    let mut notes = running("notes-app-1", "notes", "app");
-    notes.ports = vec![tcp(notes_app.port(), 3000)];
-    Daemon::start_on(
-        dir,
-        Engine {
-            facts: EngineFacts {
-                host_os: HostOs::MacOs,
-                flavor: Some(EngineFlavor::DockerDesktop),
-                rootless: false,
-            },
-            containers: vec![wiki, notes],
-        },
-        (home, config),
-        FakeEngineNetworks::new(),
-        proxy
-            .with_connector(Arc::new(connector))
-            .with_range(PortRange::new(port, port.saturating_add(1)).unwrap())
-            .with_host_listen(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
-            .with_interval(Duration::from_millis(50)),
-        host,
-    )
-    .await
+    let mut kept = None;
+    let (daemon, _) = on_free_ports(2, |port| {
+        let (connector, host) = (connector.clone(), host.clone());
+        let (proxy, with) = proxy();
+        kept = Some(with);
+        async move {
+            let dir = tempdir();
+            let (home, config) = apps_home(
+                dir.path(),
+                vec![
+                    (
+                        "wiki",
+                        vec![service("app", &[], vec![tcp(wiki_app.port(), 3000)])],
+                    ),
+                    (
+                        "notes",
+                        vec![service("app", &[], vec![tcp(notes_app.port(), 3000)])],
+                    ),
+                ],
+            );
+            config.set(
+                home.join("notes"),
+                FakeConfig::Config(ComposeConfig {
+                    name: "notes".into(),
+                    services: vec![service("app", &[], vec![tcp(notes_app.port(), 3000)])],
+                    x_alchemy: Some(XAlchemyBlock::Read(XAlchemy {
+                        mdns: false,
+                        ..XAlchemy::default()
+                    })),
+                    ..ComposeConfig::default()
+                }),
+            );
+            let mut wiki = running("wiki-app-1", "wiki", "app");
+            wiki.ports = vec![tcp(wiki_app.port(), 3000)];
+            let mut notes = running("notes-app-1", "notes", "app");
+            notes.ports = vec![tcp(notes_app.port(), 3000)];
+            Daemon::start_on(
+                dir,
+                Engine {
+                    facts: EngineFacts {
+                        host_os: HostOs::MacOs,
+                        flavor: Some(EngineFlavor::DockerDesktop),
+                        rootless: false,
+                    },
+                    containers: vec![wiki, notes],
+                },
+                (home, config),
+                FakeEngineNetworks::new(),
+                proxy
+                    .with_connector(Arc::new(connector))
+                    .with_range(PortRange::new(port, port.saturating_add(1)).unwrap())
+                    .with_host_listen(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+                    .with_interval(Duration::from_millis(50)),
+                host,
+            )
+            .await
+        }
+    })
+    .await;
+    (daemon, kept.unwrap())
 }
 
 /// The state of `app`'s address at `url`, if it has one.
@@ -923,11 +1001,11 @@ async fn announces_local_names_and_follows_the_lan_the_setting_and_conflicts() {
 
     let host = FakeNetwork::new();
     host.set_lan_addresses(vec![lan_address("en0", [192, 168, 1, 20])]);
-    let announcer = FakeAnnouncer::new(Backend::DnsSd);
-    let daemon = local_names_daemon(
-        host.clone(),
-        ProxyDeps::loopback().with_announcer(Arc::new(announcer.clone())),
-    )
+    let (daemon, announcer) = local_names_daemon(host.clone(), || {
+        let announcer = FakeAnnouncer::new(Backend::DnsSd);
+        let proxy = ProxyDeps::loopback().with_announcer(Arc::new(announcer.clone()));
+        (proxy, announcer)
+    })
     .await;
     let wiki_label = HostLabel::new("wiki").unwrap();
 
@@ -1092,19 +1170,79 @@ async fn announces_local_names_and_follows_the_lan_the_setting_and_conflicts() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_wake_announces_every_local_name_again() {
+    use alchemy_core::lifecycle::Woke;
+    use alchemy_core::route::HostLabel;
+    use alchemyd::mdns::{Backend, FakeAnnouncer, FakeCall};
+
+    let host = FakeNetwork::new();
+    host.set_lan_addresses(vec![lan_address("en0", [192, 168, 1, 20])]);
+    let (daemon, announcer) = local_names_daemon(host.clone(), || {
+        let announcer = FakeAnnouncer::new(Backend::Builtin);
+        let proxy = ProxyDeps::loopback().with_announcer(Arc::new(announcer.clone()));
+        (proxy, announcer)
+    })
+    .await;
+    let wiki = HostLabel::new("wiki").unwrap();
+    daemon
+        .app_where("wiki", |app| {
+            app.addresses
+                .iter()
+                .any(|a| a.url.starts_with("http://wiki.local:") && a.state == AddressState::Ready)
+        })
+        .await;
+    let before = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let calls = announcer.calls().len();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if announcer.published().len() == 1 && announcer.calls().len() == calls {
+                return calls;
+            }
+        }
+    })
+    .await
+    .expect("the announcements never settled");
+    let published = announcer.published();
+
+    daemon.state.record_wake(Woke {
+        slept_for: Duration::from_secs(3_600),
+        at_ms: 1_700_000_000_000,
+    });
+    eventually("wiki.local to be announced again", || {
+        announcer.calls().len() >= before + 2
+    })
+    .await;
+    let calls = announcer.calls();
+    assert_eq!(
+        calls[before..before + 2],
+        [
+            FakeCall::Withdraw(wiki.clone()),
+            FakeCall::Announce(published[0].clone())
+        ],
+        "{calls:?}"
+    );
+    assert_eq!(announcer.published(), published);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(announcer.calls().len(), before + 2, "once per wake");
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_responder_that_cannot_start_leaves_ip_port_addresses_working() {
     use alchemy_api::network::{MdnsBackend, MdnsState};
     use alchemyd::mdns::{AnnounceError, Backend, Responder};
 
     let host = FakeNetwork::new();
     host.set_lan_addresses(vec![lan_address("eth0", [192, 168, 1, 20])]);
-    let daemon = local_names_daemon(
-        host,
-        ProxyDeps::loopback().with_responder(Responder::Failed(AnnounceError::Responder {
+    let (daemon, ()) = local_names_daemon(host, || {
+        let failed = Responder::Failed(AnnounceError::Responder {
             backend: Backend::Builtin,
             message: "cannot open port 5353".into(),
-        })),
-    )
+        });
+        (ProxyDeps::loopback().with_responder(failed), ())
+    })
     .await;
 
     let report = daemon

@@ -11,6 +11,7 @@ import { Code } from "./Code.tsx";
 import { DaemonStatus } from "./DaemonStatus.tsx";
 import { Notice } from "./Notice.tsx";
 import { HeaderSlotContext } from "./PageHeader.tsx";
+import { ShellDaemon } from "./ShellDaemon.tsx";
 
 /** Sidebar entries, in the personas' words. */
 const NAV: { to: "/apps" | "/machines" | "/settings"; label: string; icon: LucideIcon }[] = [
@@ -64,7 +65,13 @@ export function Layout() {
           </div>
         </header>
         {daemon.kind === "offline" &&
-          (restart.restarting ? <Restarting /> : <DaemonUnreachable error={daemon.error} />)}
+          (restart.restarting ? (
+            <Restarting />
+          ) : isTauri() ? (
+            <ShellDaemon fallback={<DaemonUnreachable error={daemon.error} />} />
+          ) : (
+            <DaemonUnreachable error={daemon.error} />
+          ))}
         {daemon.kind === "online" && signedOut && <SignedOut restarted={restart.restarted} />}
         <main className="min-h-0 flex-1 overflow-y-auto px-6 py-6">
           <HeaderSlotContext value={slot}>

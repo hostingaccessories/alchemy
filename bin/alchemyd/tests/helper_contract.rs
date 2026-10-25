@@ -84,3 +84,27 @@ fn the_helper_refuses_what_alchemyd_never_builds() {
         assert!(error.is_usage(), "{args:?}");
     }
 }
+
+/// `GET /api/machine/autostart` points at the log the helper's launch
+/// daemon writes.
+#[test]
+fn the_boot_log_hint_is_where_the_launch_daemon_logs() {
+    use alchemy_core::lifecycle::{
+        AutostartMode, LogHint, SYSTEM_LOG_DIR, log_hint, system_log_path,
+    };
+    use alchemy_core::route::HostOs;
+    assert_eq!(SYSTEM_LOG_DIR, alchemy_helper::LAUNCH_DAEMON_LOG_DIR);
+    for uid in [1, 501, 1000, u32::MAX] {
+        let helper = std::path::PathBuf::from(alchemy_helper::launch_daemon_log(uid));
+        assert_eq!(system_log_path(uid), helper);
+        assert_eq!(
+            log_hint(
+                HostOs::MacOs,
+                AutostartMode::Boot,
+                std::path::Path::new("/Users/jo"),
+                uid
+            ),
+            LogHint::File { path: helper }
+        );
+    }
+}

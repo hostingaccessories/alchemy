@@ -22,7 +22,7 @@ path = "src/lib.rs"
 test-command = []
 
 [dependencies]
-alchemy-api    = { workspace = true, features = ["socket"] }
+alchemy-api    = { workspace = true, features = ["socket", "sse"] }
 alchemy-core   = { workspace = true }
 clap           = { workspace = true }
 clap_complete  = { workspace = true }

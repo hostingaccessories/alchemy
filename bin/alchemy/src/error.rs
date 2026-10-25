@@ -5,9 +5,11 @@
 //! `--json` it is one `{"error":{"kind","message","hint"}}` document.
 //! Both go to stderr and carry no ANSI codes.
 
-use thiserror::Error;
+use std::path::PathBuf;
 
-use crate::sse::{MAX_EVENT, SseError};
+use alchemy_api::autostart::{AutostartMode, LogHint};
+use alchemy_api::sse::{MAX_EVENT, SseError};
+use thiserror::Error;
 
 /// The process exit statuses `alchemy` uses. Each is a contract that
 /// scripts branch on.
@@ -61,6 +63,15 @@ pub enum ClientError {
     /// The daemon socket could not be reached.
     #[error("cannot reach alchemyd: {0}")]
     DaemonUnreachable(String),
+    /// Nothing named a daemon, and none of the default sockets answered.
+    #[error("cannot reach alchemyd: {}", tried_text(tried))]
+    NoDaemon {
+        /// Every default socket, in the order tried.
+        tried: Vec<Unreached>,
+        /// The autostart service installed on this machine, read from
+        /// its file on disk, or `None` when there is none.
+        service: Option<InstalledService>,
+    },
     /// The daemon closed the connection before answering.
     #[error("alchemyd closed the connection without responding")]
     ConnectionClosed,
@@ -168,6 +179,66 @@ pub enum ClientError {
     /// Granting or revoking a privilege did not succeed.
     #[error("{0}")]
     PrivilegeFailed(String),
+    /// Switching autostart did not succeed.
+    #[error("{0}")]
+    AutostartFailed(String),
+    /// Docker wasn't started, or didn't become ready in time.
+    #[error("{message}")]
+    DockerNotStarted {
+        /// Why, in a sentence.
+        message: String,
+        /// The command to run in a terminal instead, when there is one.
+        command: Option<String>,
+    },
+}
+
+/// An autostart service whose file is on disk, as the CLI finds it
+/// without asking alchemyd.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledService {
+    /// The mode the service puts alchemyd in: `login` or `boot`.
+    pub mode: AutostartMode,
+    /// Where the service's alchemyd logs.
+    pub logs: LogHint,
+}
+
+/// A default socket that didn't answer, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreached {
+    /// The socket's path.
+    pub socket: PathBuf,
+    /// Why connecting failed, as the OS put it.
+    pub reason: String,
+}
+
+/// What to suggest when no default socket answers: with no autostart
+/// service installed, starting alchemyd and then turning autostart on;
+/// with one, its logs, since it should have started alchemyd.
+fn no_daemon_hint(service: Option<&InstalledService>) -> String {
+    let Some(service) = service else {
+        return "start alchemyd by running `alchemyd`, then `alchemy machine autostart login` starts it whenever you log in; or point --socket at the socket it listens on".to_owned();
+    };
+    let at = match service.mode {
+        AutostartMode::Boot => "at boot",
+        AutostartMode::Login | AutostartMode::Off => "at login",
+    };
+    let logs = match &service.logs {
+        LogHint::File { path } => format!("see {}", path.display()),
+        LogHint::Journal { command } => format!("see `{command}`"),
+        LogHint::Terminal => "see the terminal it was started from".to_owned(),
+    };
+    format!("alchemyd is set to start {at} but isn't answering; to find out why, {logs}")
+}
+
+fn tried_text(tried: &[Unreached]) -> String {
+    if tried.is_empty() {
+        return "no socket to try".to_owned();
+    }
+    tried
+        .iter()
+        .map(|t| format!("{}: {}", t.socket.display(), t.reason))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Why an exchange with alchemyd failed below the API.
@@ -212,7 +283,9 @@ impl ClientError {
     /// The exit status for this error.
     pub fn exit(&self) -> Exit {
         match self {
-            Self::DaemonUnreachable(_) | Self::Disconnected => Exit::Unavailable,
+            Self::DaemonUnreachable(_) | Self::NoDaemon { .. } | Self::Disconnected => {
+                Exit::Unavailable
+            }
             Self::ConnectionClosed
             | Self::Protocol(_)
             | Self::Unexpected(_)
@@ -224,7 +297,9 @@ impl ClientError {
             | Self::NothingToCancel(_)
             | Self::Editor(_)
             | Self::File(_)
-            | Self::PrivilegeFailed(_) => Exit::Failure,
+            | Self::PrivilegeFailed(_)
+            | Self::AutostartFailed(_)
+            | Self::DockerNotStarted { .. } => Exit::Failure,
             Self::Usage { .. } | Self::RemoteDaemon { .. } | Self::InvalidTarget { .. } => {
                 Exit::Usage
             }
@@ -244,7 +319,7 @@ impl ClientError {
     /// its JSON form, for scripts to branch on.
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::DaemonUnreachable(_) => "daemon_unreachable",
+            Self::DaemonUnreachable(_) | Self::NoDaemon { .. } => "daemon_unreachable",
             Self::ConnectionClosed => "connection_closed",
             Self::Disconnected => "disconnected",
             Self::Protocol(_) => "protocol",
@@ -265,6 +340,8 @@ impl ClientError {
             Self::File(_) => "file",
             Self::NeedsTerminal { .. } => "needs_terminal",
             Self::PrivilegeFailed(_) => "privilege_failed",
+            Self::AutostartFailed(_) => "autostart_failed",
+            Self::DockerNotStarted { .. } => "docker_not_started",
         }
     }
 
@@ -274,6 +351,7 @@ impl ClientError {
             Self::DaemonUnreachable(_) => {
                 "start alchemyd, or point --socket at the socket it listens on"
             }
+            Self::NoDaemon { service, .. } => return Some(no_daemon_hint(service.as_ref())),
             Self::ConnectionClosed => "alchemyd may have crashed; check its logs",
             Self::Disconnected | Self::Protocol(ProtocolError::Io { .. }) => {
                 "check that alchemyd is still running with `alchemy status`"
@@ -293,6 +371,10 @@ impl ClientError {
             }
             Self::ConfirmationRequired { .. } => "pass --yes to go ahead without a prompt",
             Self::Editor(_) => "set VISUAL or EDITOR to the editor you use",
+            Self::DockerNotStarted {
+                command: Some(command),
+                ..
+            } => return Some(format!("run `{command}` in a terminal")),
             Self::NeedsTerminal { command, line, .. } => {
                 return Some(format!(
                     "run `{line}` in a terminal, then run `alchemy {command}` again"
@@ -307,7 +389,9 @@ impl ClientError {
             | Self::OperationFailed { .. }
             | Self::NothingToCancel(_)
             | Self::File(_)
-            | Self::PrivilegeFailed(_) => return None,
+            | Self::PrivilegeFailed(_)
+            | Self::AutostartFailed(_)
+            | Self::DockerNotStarted { command: None, .. } => return None,
         };
         Some(hint.to_owned())
     }
@@ -451,6 +535,82 @@ mod tests {
                 "daemon_unreachable",
                 "cannot reach alchemyd: /run/alchemyd.sock: refused".into(),
                 Some("start alchemyd, or point --socket at the socket it listens on"),
+            ),
+            (
+                ClientError::NoDaemon {
+                    tried: vec![
+                        Unreached {
+                            socket: "/run/user/1000/alchemy/alchemyd.sock".into(),
+                            reason: "not found".into(),
+                        },
+                        Unreached {
+                            socket: "/run/alchemy-1000/alchemyd.sock".into(),
+                            reason: "refused".into(),
+                        },
+                    ],
+                    service: None,
+                },
+                69,
+                "daemon_unreachable",
+                "cannot reach alchemyd: /run/user/1000/alchemy/alchemyd.sock: not found; /run/alchemy-1000/alchemyd.sock: refused".into(),
+                Some("start alchemyd by running `alchemyd`, then `alchemy machine autostart login` starts it whenever you log in; or point --socket at the socket it listens on"),
+            ),
+            (
+                ClientError::NoDaemon {
+                    tried: Vec::new(),
+                    service: Some(InstalledService {
+                        mode: AutostartMode::Login,
+                        logs: LogHint::Journal {
+                            command: "journalctl --user -u alchemyd.service".into(),
+                        },
+                    }),
+                },
+                69,
+                "daemon_unreachable",
+                "cannot reach alchemyd: no socket to try".into(),
+                Some("alchemyd is set to start at login but isn't answering; to find out why, see `journalctl --user -u alchemyd.service`"),
+            ),
+            (
+                ClientError::NoDaemon {
+                    tried: Vec::new(),
+                    service: Some(InstalledService {
+                        mode: AutostartMode::Boot,
+                        logs: LogHint::File {
+                            path: "/Library/Logs/Alchemy/alchemyd.501.log".into(),
+                        },
+                    }),
+                },
+                69,
+                "daemon_unreachable",
+                "cannot reach alchemyd: no socket to try".into(),
+                Some("alchemyd is set to start at boot but isn't answering; to find out why, see /Library/Logs/Alchemy/alchemyd.501.log"),
+            ),
+            (
+                ClientError::AutostartFailed("switching autostart to boot failed".into()),
+                1,
+                "autostart_failed",
+                "switching autostart to boot failed".into(),
+                None,
+            ),
+            (
+                ClientError::DockerNotStarted {
+                    message: "Docker Engine runs as a system service".into(),
+                    command: Some("sudo systemctl start docker".into()),
+                },
+                1,
+                "docker_not_started",
+                "Docker Engine runs as a system service".into(),
+                Some("run `sudo systemctl start docker` in a terminal"),
+            ),
+            (
+                ClientError::DockerNotStarted {
+                    message: "Docker Desktop didn't become ready".into(),
+                    command: None,
+                },
+                1,
+                "docker_not_started",
+                "Docker Desktop didn't become ready".into(),
+                None,
             ),
             (
                 ClientError::ConnectionClosed,

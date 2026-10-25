@@ -21,7 +21,8 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 ///
 /// It catches up whenever routing wants something else or the responder
 /// reports on a name, and every `interval`, which retries calls that
-/// failed. A responder that can't start leaves `.local` names
+/// failed. When [`Wanted::reannounce`] changes, after a wake, every name
+/// is withdrawn and announced again. A responder that can't start leaves `.local` names
 /// unavailable and the rest of the daemon running. On shutdown every name
 /// is withdrawn, for at most [`SHUTDOWN_GRACE`].
 pub async fn run(
@@ -63,6 +64,7 @@ pub async fn run(
         published: Published::default(),
         failure: None,
         seen: RecordStates::default(),
+        reannounced: 0,
     };
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -94,6 +96,8 @@ struct Announcing {
     failure: Option<String>,
     /// The record states last logged.
     seen: RecordStates,
+    /// The [`Wanted::reannounce`] last acted on.
+    reannounced: u64,
 }
 
 impl Announcing {
@@ -104,7 +108,19 @@ impl Announcing {
             return;
         };
         let mut failure = None;
-        for step in plan::steps(&self.published, wanted) {
+        let steps = if wanted.reannounce == self.reannounced {
+            plan::steps(&self.published, wanted)
+        } else {
+            self.reannounced = wanted.reannounce;
+            if !self.published.names.is_empty() {
+                tracing::info!(
+                    count = self.published.names.len(),
+                    "announcing .local names again after a wake"
+                );
+            }
+            plan::reannounce(&self.published, wanted)
+        };
+        for step in steps {
             let result = match &step {
                 Step::Announce(announcement, port) => {
                     self.announcer.announce(announcement.clone(), *port).await

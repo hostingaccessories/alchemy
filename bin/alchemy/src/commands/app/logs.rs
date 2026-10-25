@@ -144,10 +144,10 @@ pub(crate) fn log_line(line: &LogLine, json: bool, color: Option<u8>) -> String 
 )]
 mod tests {
     use alchemy_api::logs::LogStream;
+    use alchemy_api::sse::SseEvent;
 
     use super::*;
     use crate::daemon::fake::{FakeDaemon, sse};
-    use crate::sse::SseEvent;
 
     fn line(service: &str, text: &str) -> LogLine {
         LogLine {

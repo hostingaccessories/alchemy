@@ -24,6 +24,14 @@
 //! that never serve the API, with the routes [`routing`] plans for it,
 //! and their `.local` names are announced to the LAN through [`mdns`].
 //!
+//! After alchemyd starts, the computer wakes, or Docker returns, the
+//! [`reconcile`] task brings back the apps that were running, and
+//! [`desktop`] starts Docker Desktop when someone asks.
+//!
+//! It notices the computer waking from sleep through [`wake`], and then
+//! reads the LAN address again, announces `.local` names again, and
+//! subscribes to Docker's events again.
+//!
 //! What needs root, such as port 80 on Linux, is granted through
 //! `alchemy-helper` behind a system prompt by [`privileges`]. A change
 //! that only takes effect at exec makes [`run`] return
@@ -32,7 +40,9 @@
 
 pub mod apps;
 pub mod auth;
+pub mod autostart;
 pub mod compose;
+pub mod desktop;
 pub mod engine;
 pub mod events;
 pub mod guard;
@@ -46,6 +56,7 @@ pub mod operations;
 pub mod ports;
 pub mod privileges;
 pub mod proxy;
+pub mod reconcile;
 pub mod restart;
 pub mod routing;
 mod secure_fs;
@@ -54,15 +65,19 @@ pub mod socket;
 mod state;
 pub mod store;
 pub mod subnets;
+pub mod wake;
 mod web;
 
-pub use state::State;
+pub use state::{EngineLink, State};
 
 use std::future::{Future, IntoFuture as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
+use alchemy_core::lifecycle::Supervisor;
 use alchemy_core::privilege::ProxyPorts;
 use alchemy_core::route::RouteTable;
 use anyhow::Context as _;
@@ -70,6 +85,8 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::apps::{AppEditor, AppsDeps};
+use crate::autostart::{Autostart, AutostartDeps};
+use crate::desktop::{FakeLauncher, SharedLauncher, SystemLauncher};
 use crate::engine::{EngineMonitor, EngineSource, SystemConnector, SystemProbe};
 use crate::logs::{SharedLogSource, SystemLogs};
 use crate::metrics::{Collector, MetricsSource, SystemMetrics};
@@ -78,15 +95,21 @@ use crate::operations::{OperationRunner, Operations, SystemRunner};
 use crate::ports::PortRegistry;
 use crate::privileges::{PrivilegeDeps, Privileges};
 use crate::proxy::ProxyStatus;
+use crate::reconcile::ReconcileDeps;
 use crate::routing::{ProxyDeps, ProxyHandle};
 use crate::session::{Auth, TokenFile};
 use crate::store::{SharedStore, SqliteStore, StateLock};
 use crate::subnets::{EngineNetworks, FakeDaemonConfig, FakeEngineNetworks, SubnetsDeps};
+use crate::wake::WakeDeps;
 
 /// Default HTTP listen address. Loopback only: the TCP listener's token
 /// keeps out other processes and users on this machine, but there is no
 /// login fit for other machines yet.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7240";
+
+/// How often an alchemyd under a service tries the state directory again
+/// while another alchemyd holds it.
+pub const LOCK_POLL: Duration = Duration::from_millis(250);
 
 /// Runtime configuration for [`run`].
 #[derive(Debug, Clone)]
@@ -129,6 +152,15 @@ pub struct Deps<E, M = SystemMetrics> {
     /// Where the privileges' facts are read and how the helper is run as
     /// root.
     pub privileges: PrivilegeDeps,
+    /// How Docker Desktop is started when someone asks.
+    pub desktop: SharedLauncher,
+    /// How the reconcile task is tuned.
+    pub reconcile: ReconcileDeps,
+    /// Where the clocks that tell a wake from sleep are read.
+    pub wake: WakeDeps,
+    /// What runs this alchemyd, and where the per-user service is
+    /// installed.
+    pub autostart: AutostartDeps,
 }
 
 /// Why [`run`] returned.
@@ -139,6 +171,10 @@ pub enum Stopped {
     /// A privilege change takes effect only when alchemyd starts again,
     /// so the caller should re-execute it with [`restart::exec_self`].
     Restart,
+    /// Autostart switched from the per-user service running this alchemyd
+    /// to the system service, whose alchemyd takes over. The caller should
+    /// exit 0, so the service manager doesn't start this one again.
+    HandedOver,
 }
 
 impl<E> Deps<E> {
@@ -160,10 +196,15 @@ impl<E> Deps<E> {
     /// [`FakeEngineNetworks`] with none and no `daemon.json`. The proxy
     /// is [`ProxyDeps::loopback`]: app ports on loopback, no Host
     /// listener, and a connector that reaches nothing. Privileges are
-    /// [`PrivilegeDeps::fake`]. Use
-    /// [`Self::with_apps`], [`Self::with_runner`], [`Self::with_editor`],
+    /// [`PrivilegeDeps::fake`]. Docker Desktop is started through a
+    /// [`FakeLauncher`] that runs nothing, the reconcile task has its
+    /// default tuning, wakes are noticed on this machine's clocks, and
+    /// autostart is [`AutostartDeps::fake`]. Use [`Self::with_apps`],
+    /// [`Self::with_runner`], [`Self::with_editor`],
     /// [`Self::with_network`], [`Self::with_subnets`],
-    /// [`Self::with_proxy`], and [`Self::with_privileges`] to change them.
+    /// [`Self::with_proxy`], [`Self::with_privileges`],
+    /// [`Self::with_desktop`], [`Self::with_reconcile`],
+    /// [`Self::with_wake`], and [`Self::with_autostart`] to change them.
     pub fn new(engine: E) -> Self {
         Self {
             state: State::new(),
@@ -187,6 +228,10 @@ impl<E> Deps<E> {
             ),
             proxy: ProxyDeps::loopback(),
             privileges: PrivilegeDeps::fake(),
+            desktop: Arc::new(FakeLauncher::new()),
+            reconcile: ReconcileDeps::default(),
+            wake: WakeDeps::system(),
+            autostart: AutostartDeps::fake(),
         }
     }
 }
@@ -206,6 +251,10 @@ impl<E, M> Deps<E, M> {
             subnets: self.subnets,
             proxy: self.proxy,
             privileges: self.privileges,
+            desktop: self.desktop,
+            reconcile: self.reconcile,
+            wake: self.wake,
+            autostart: self.autostart,
         }
     }
 
@@ -264,12 +313,43 @@ impl<E, M> Deps<E, M> {
         self.privileges = privileges;
         self
     }
+
+    /// Start Docker Desktop through `desktop`.
+    #[must_use]
+    pub fn with_desktop(mut self, desktop: SharedLauncher) -> Self {
+        self.desktop = desktop;
+        self
+    }
+
+    /// Tune the reconcile task with `reconcile`.
+    #[must_use]
+    pub fn with_reconcile(mut self, reconcile: ReconcileDeps) -> Self {
+        self.reconcile = reconcile;
+        self
+    }
+
+    /// Tell a wake from sleep with `wake`.
+    #[must_use]
+    pub fn with_wake(mut self, wake: WakeDeps) -> Self {
+        self.wake = wake;
+        self
+    }
+
+    /// Read and change autostart through `autostart`.
+    #[must_use]
+    pub fn with_autostart(mut self, autostart: AutostartDeps) -> Self {
+        self.autostart = autostart;
+        self
+    }
 }
 
 impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
     /// The real engine monitor, apps task, `docker compose`, host
-    /// network, and Docker networks for this host.
+    /// network, Docker networks, privileges, Docker Desktop launcher, and
+    /// per-user service for this host.
     pub fn system() -> Self {
+        let autostart = AutostartDeps::system();
+        let supervisor = autostart.supervisor;
         Self::new(EngineMonitor::system())
             .with_apps(AppsDeps::system())
             .with_runner(Arc::new(SystemRunner::new()))
@@ -277,7 +357,9 @@ impl Deps<EngineMonitor<SystemProbe, SystemConnector>> {
             .with_network(Arc::new(SystemNetwork::new()))
             .with_subnets(SubnetsDeps::system())
             .with_proxy(ProxyDeps::system())
-            .with_privileges(PrivilegeDeps::system())
+            .with_privileges(PrivilegeDeps::system().with_supervisor(supervisor))
+            .with_desktop(Arc::new(SystemLauncher))
+            .with_autostart(autostart)
     }
 }
 
@@ -295,8 +377,8 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::
 /// or migrated; a corrupt or too-new one fails startup before either
 /// listener is bound, and the app and network settings in it are loaded
 /// into the state before anything is served. The engine task, the metrics collector, the apps
-/// task, the network check, the web address proxy, and the routing task
-/// that feeds it run alongside the listeners. An engine
+/// task, the network check, the wake task, the web address proxy, and the
+/// routing task that feeds it run alongside the listeners. An engine
 /// that is absent or broken never fails startup; it only shows up in the
 /// engine status. Neither does a missing or unreadable app folder, which
 /// shows up in the app list, nor a network that overlaps, which shows up
@@ -305,6 +387,9 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> anyhow::
 /// Once both listeners are bound, and before either serves a request, a
 /// new TCP token is written to [`alchemy_api::TCP_TOKEN_FILE`] in the
 /// state directory; it is removed again on shutdown.
+///
+/// The [`reconcile`] task starts alongside them, reading the apps last
+/// seen running from the state database.
 ///
 /// Operations a previous daemon left running are marked interrupted at
 /// startup. On shutdown, running operations are interrupted and stored
@@ -318,12 +403,15 @@ pub async fn run_with(
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<Stopped> {
     warn_if_exposed(config.listen);
-    let (_state_lock, sqlite) = open_state(&config.state_dir).await?;
+    let mut shutdown = std::pin::pin!(shutdown);
+    let supervisor = deps.autostart.supervisor;
+    let opened = open_state(&config.state_dir, supervisor, shutdown.as_mut());
+    let Some((_state_lock, sqlite)) = opened.await? else {
+        return Ok(Stopped::Shutdown);
+    };
     let db = sqlite.path().to_owned();
     let store: SharedStore = Arc::new(sqlite);
-    load_intents(&store, &deps.state).await;
-    apps::load_settings(&deps.apps, &deps.state, &store).await;
-    network::settings::load(&deps.state, &store).await;
+    load_stored(&store, &deps.apps, &deps.state).await;
 
     let ports = PortRegistry::new(deps.state.clone(), store.clone(), deps.network.clone());
     let operations = recovered_operations(deps.runner, &deps.state, &store, &ports).await;
@@ -335,18 +423,15 @@ pub async fn run_with(
         .with_context(|| format!("binding HTTP listener {}", config.listen))?;
     let (listen, auth, token_file) = sign_in_state(&http_listener, &config.state_dir)?;
 
-    tracing::info!(
-        version = alchemy_core::VERSION,
-        http = %listen,
-        socket = %config.socket.display(),
-        state = %db.display(),
-        token = %token_file.path().display(),
-        "alchemyd listening"
-    );
+    announce(listen, &config.socket, &db, token_file.path());
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (privileges, privileges_task) =
-        spawn_privileges(deps.privileges, &deps.state, deps.proxy.range, &shutdown_rx);
+    let (privileges, autostart, machine_tasks) = spawn_machine(
+        (deps.privileges, deps.autostart),
+        &deps.state,
+        deps.proxy.range,
+        &shutdown_rx,
+    );
     let mut background = Vec::from(spawn_proxy(
         deps.proxy,
         listen,
@@ -363,48 +448,51 @@ pub async fn run_with(
         &store,
         &shutdown_rx,
     ));
-    background.push(privileges_task);
+    background.extend(machine_tasks);
+    background.extend([
+        spawn_wake(deps.wake, &deps.state, &shutdown_rx),
+        spawn_reconcile(
+            deps.reconcile,
+            &deps.state,
+            &store,
+            &operations,
+            &shutdown_rx,
+        ),
+    ]);
+    let machine = (&privileges, &autostart);
+    let handlers = |router| with_handlers(router, &deps.editor, &ports, machine, &deps.desktop);
     let socket_task = serve(
         socket_listener,
-        with_handlers(
-            http::api_router(
-                deps.state.clone(),
-                store.clone(),
-                shutdown_rx.clone(),
-                deps.logs.clone(),
-                operations.clone(),
-                auth.clone(),
-            ),
-            &deps.editor,
-            &ports,
-            &privileges,
-        ),
+        handlers(http::api_router(
+            deps.state.clone(),
+            store.clone(),
+            shutdown_rx.clone(),
+            deps.logs.clone(),
+            operations.clone(),
+            auth.clone(),
+        )),
         &shutdown_rx,
     );
     let http_task = serve(
         http_listener,
-        with_handlers(
-            http::router(
-                deps.state,
-                store,
-                http::Tcp {
-                    listen: listen.ip(),
-                    auth,
-                },
-                shutdown_rx.clone(),
-                deps.logs,
-                operations.clone(),
-            ),
-            &deps.editor,
-            &ports,
-            &privileges,
-        ),
+        handlers(http::router(
+            deps.state,
+            store,
+            http::Tcp {
+                listen: listen.ip(),
+                auth,
+            },
+            shutdown_rx.clone(),
+            deps.logs,
+            operations.clone(),
+        )),
         &shutdown_rx,
     );
 
     let why = tokio::select! {
-        () = shutdown => Stopped::Shutdown,
+        () = shutdown.as_mut() => Stopped::Shutdown,
         () = privileges.restarting() => Stopped::Restart,
+        () = autostart.handing_over() => Stopped::HandedOver,
     };
     shutdown_tx.send_replace(true);
     operations.shutdown().await;
@@ -452,6 +540,14 @@ async fn load_intents(store: &SharedStore, state: &State) {
     }
 }
 
+/// Load the stop intents, app settings, and network settings in `store`
+/// into `state`.
+async fn load_stored(store: &SharedStore, apps: &AppsDeps, state: &State) {
+    load_intents(store, state).await;
+    apps::load_settings(apps, state, store).await;
+    network::settings::load(state, store).await;
+}
+
 /// The daemon's operations, with what a daemon that stopped mid-run left
 /// running marked interrupted.
 async fn recovered_operations(
@@ -467,22 +563,63 @@ async fn recovered_operations(
     operations
 }
 
-/// The daemon's [`Privileges`], read through `deps` with the firewall
-/// opening the proxy's `range`, and the task that keeps them current in
-/// `state`, with its name.
-fn spawn_privileges(
-    deps: PrivilegeDeps,
+/// The daemon's [`Privileges`], read through `deps.0` with the firewall
+/// opening the proxy's `range`, its [`Autostart`], through `deps.1`, and
+/// the tasks that keep both current in `state`, with their names.
+fn spawn_machine(
+    deps: (PrivilegeDeps, AutostartDeps),
     state: &State,
     range: alchemy_core::ports::PortRange,
     shutdown: &watch::Receiver<bool>,
-) -> (Privileges, (&'static str, JoinHandle<()>)) {
+) -> (Privileges, Autostart, [(&'static str, JoinHandle<()>); 2]) {
     let privileges = Privileges::new(
-        deps,
+        deps.0,
         state.clone(),
         ProxyPorts::try_from(range).unwrap_or_default(),
     );
-    let task = tokio::spawn(privileges.clone().run(shutdown.clone()));
-    (privileges, ("privileges", task))
+    let autostart = Autostart::new(deps.1, privileges.clone(), state.clone());
+    let tasks = [
+        (
+            "privileges",
+            tokio::spawn(privileges.clone().run(shutdown.clone())),
+        ),
+        (
+            "autostart",
+            tokio::spawn(autostart.clone().run(shutdown.clone())),
+        ),
+    ];
+    (privileges, autostart, tasks)
+}
+
+/// Start the [`reconcile`] task, tuned by `deps`, starting apps through
+/// `operations`, with its name.
+fn spawn_reconcile(
+    deps: ReconcileDeps,
+    state: &State,
+    store: &SharedStore,
+    operations: &Operations,
+    shutdown: &watch::Receiver<bool>,
+) -> (&'static str, JoinHandle<()>) {
+    let task = reconcile::run(
+        deps,
+        state.clone(),
+        store.clone(),
+        operations.clone(),
+        shutdown.clone(),
+    );
+    ("reconcile", tokio::spawn(task))
+}
+
+/// Start the [`wake`] task, with its name.
+fn spawn_wake(
+    deps: WakeDeps,
+    state: &State,
+    shutdown: &watch::Receiver<bool>,
+) -> (&'static str, JoinHandle<()>) {
+    (
+        "wake",
+        tokio::spawn(wake::run(deps, state.clone(), shutdown.clone())),
+    )
 }
 
 /// Serve `router` on `listener` until `shutdown` becomes `true`, letting
@@ -503,18 +640,20 @@ where
     )
 }
 
-/// Give `router` the app editor, the port registry, and the privileges
-/// its routes use.
+/// Give `router` the app editor, the port registry, the privileges and
+/// autostart in `machine`, and the Docker Desktop launcher its routes
+/// use.
 fn with_handlers(
     router: axum::Router,
     editor: &Arc<AppEditor>,
     ports: &PortRegistry,
-    privileges: &Privileges,
+    machine: (&Privileges, &Autostart),
+    desktop: &SharedLauncher,
 ) -> axum::Router {
-    http::with_privileges(
-        http::with_ports(http::with_editor(router, editor.clone()), ports.clone()),
-        privileges.clone(),
-    )
+    let router = http::with_ports(http::with_editor(router, editor.clone()), ports.clone());
+    let router = http::with_privileges(router, machine.0.clone());
+    let router = http::with_autostart(router, machine.1.clone());
+    http::with_desktop(router, desktop.clone())
 }
 
 /// Start the tasks that keep `state` current, each with its name: the
@@ -615,6 +754,18 @@ fn spawn_proxy(
     [("routing", routing), ("proxy", proxy), ("mdns", mdns)]
 }
 
+/// Log where this alchemyd listens and keeps its state.
+fn announce(listen: SocketAddr, socket: &Path, db: &Path, token: &Path) {
+    tracing::info!(
+        version = alchemy_core::VERSION,
+        http = %listen,
+        socket = %socket.display(),
+        state = %db.display(),
+        token = %token.display(),
+        "alchemyd listening"
+    );
+}
+
 fn warn_if_exposed(listen: SocketAddr) {
     if !listen.ip().is_loopback() {
         tracing::warn!(
@@ -626,12 +777,40 @@ fn warn_if_exposed(listen: SocketAddr) {
 
 /// Lock `state_dir`, then open its database. The database is never opened
 /// while another daemon holds the directory.
-async fn open_state(state_dir: &Path) -> anyhow::Result<(StateLock, SqliteStore)> {
-    let lock = store::lock_state_dir(state_dir).context("locking the state directory")?;
+///
+/// Under a service, as `supervisor` says, a directory another alchemyd
+/// holds is tried again every [`LOCK_POLL`] until it is free, as during a
+/// handover between services, or until `shutdown` resolves, which gives
+/// `None`.
+async fn open_state(
+    state_dir: &Path,
+    supervisor: Supervisor,
+    mut shutdown: Pin<&mut impl Future<Output = ()>>,
+) -> anyhow::Result<Option<(StateLock, SqliteStore)>> {
+    let mut told = false;
+    let lock = loop {
+        match store::lock_state_dir(state_dir) {
+            Ok(lock) => break lock,
+            Err(store::StoreError::InUse { .. }) if supervisor.waits_for_state() => {
+                if !told {
+                    tracing::info!(
+                        state = %state_dir.display(),
+                        "another alchemyd is using the state directory; waiting for it to exit"
+                    );
+                    told = true;
+                }
+                tokio::select! {
+                    () = shutdown.as_mut() => return Ok(None),
+                    () = tokio::time::sleep(LOCK_POLL) => {}
+                }
+            }
+            Err(error) => return Err(error).context("locking the state directory"),
+        }
+    };
     let sqlite = SqliteStore::open(state_dir)
         .await
         .context("opening the state database")?;
-    Ok((lock, sqlite))
+    Ok(Some((lock, sqlite)))
 }
 
 /// The address `listener` is bound to, and a new token for it, written to

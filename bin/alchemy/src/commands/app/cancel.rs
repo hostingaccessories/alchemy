@@ -123,6 +123,7 @@ mod tests {
             started_at: 0,
             finished_at: None,
             error: None,
+            reason: None,
         }
     }
 

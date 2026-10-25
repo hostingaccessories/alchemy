@@ -32,6 +32,17 @@ const LAUNCH_DAEMONS_DIR: &str = "/Library/LaunchDaemons";
 const LAUNCHD_LABEL_PREFIX: &str = "computer.alchemy.alchemyd";
 const SERVICE_FILE_MODE: u32 = 0o644;
 
+/// Where the launch daemon logs. Root-owned all the way up, so nobody
+/// but root can plant a symlink where the root launchd opens the log, as
+/// anything running as the user could under `~/Library/Logs`.
+pub const LAUNCH_DAEMON_LOG_DIR: &str = "/Library/Logs/Alchemy";
+const LOG_DIR_MODE: u32 = 0o755;
+
+/// The launch daemon's log file for `uid`, in [`LAUNCH_DAEMON_LOG_DIR`].
+pub fn launch_daemon_log(uid: u32) -> String {
+    format!("{LAUNCH_DAEMON_LOG_DIR}/alchemyd.{uid}.log")
+}
+
 /// The user a service runs as, from the user database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct User {
@@ -133,6 +144,7 @@ fn install_launchd<S: System>(system: &S, uid: NonZeroU32) -> Result<Outcome, He
     let user = lookup_user(system, Platform::MacOs, uid)?;
     confirm_name(system, &user)?;
     let plist = render_plist(uid, &user, &daemon)?;
+    log_dir(system)?;
     let path = plist_path(uid);
     let wrote = replace(system, &path, plist.as_bytes())?;
     let target = format!("system/{}", launchd_label(uid));
@@ -150,18 +162,60 @@ fn install_launchd<S: System>(system: &S, uid: NonZeroU32) -> Result<Outcome, He
     })
 }
 
+/// The plist goes first: when the daemon being removed asked for this,
+/// `bootout` stops it, and with it this helper (#112), so it must be the
+/// last step. Running it again boots out a job still loaded.
 fn remove_launchd<S: System>(system: &S, uid: NonZeroU32) -> Result<Outcome, HelperError> {
+    let path = plist_path(uid);
+    let existed = system
+        .remove_file(&path)
+        .map_err(|source| os("remove", &path, source))?;
     let target = format!("system/{}", launchd_label(uid));
     let loaded = query(system, LAUNCHCTL, &["print", &target])?;
     if loaded {
         must(system, LAUNCHCTL, &["bootout", &target])?;
     }
-    let path = plist_path(uid);
-    let existed = system
-        .remove_file(&path)
-        .map_err(|source| os("remove", &path, source))?;
     Ok(Outcome {
         changed: loaded || existed,
+    })
+}
+
+/// Create [`LAUNCH_DAEMON_LOG_DIR`] if it is missing, and check it is a
+/// directory only root can write to. launchd would otherwise create it
+/// with mode 0744, which the user can't enter to read the log (#112).
+fn log_dir<S: System>(system: &S) -> Result<(), HelperError> {
+    let path = Path::new(LAUNCH_DAEMON_LOG_DIR);
+    system
+        .create_dir(path, LOG_DIR_MODE)
+        .map_err(|source| os("create", path, source))?;
+    let dir = match system.open_nofollow(path) {
+        Ok(dir) => dir,
+        Err(OpenError::Symlink) => {
+            return Err(HelperError::Refused {
+                path: path.to_path_buf(),
+                why: "it is a symlink",
+            });
+        }
+        Err(OpenError::NotFound) => {
+            return Err(os("open", path, std::io::ErrorKind::NotFound.into()));
+        }
+        Err(OpenError::Io(source)) => return Err(os("open", path, source)),
+    };
+    let info = system
+        .inspect(&dir)
+        .map_err(|source| os("inspect", path, source))?;
+    let why = if !info.directory {
+        "it is not a directory"
+    } else if info.uid != 0 {
+        "it is not owned by root"
+    } else if info.mode & 0o022 != 0 {
+        "it is writable by its group or others"
+    } else {
+        return Ok(());
+    };
+    Err(HelperError::Refused {
+        path: path.to_path_buf(),
+        why,
     })
 }
 
@@ -380,10 +434,15 @@ fn render_plist(uid: NonZeroU32, user: &User, daemon: &Path) -> Result<String, H
 \t\t<key>SuccessfulExit</key>
 \t\t<false/>
 \t</dict>
+\t<key>StandardOutPath</key>
+\t<string>{log}</string>
+\t<key>StandardErrorPath</key>
+\t<string>{log}</string>
 </dict>
 </plist>
 ",
         label = launchd_label(uid),
+        log = launch_daemon_log(uid.get()),
         program = xml_escape(program),
         name = xml_escape(&user.name),
         home = xml_escape(&user.home),
@@ -462,6 +521,10 @@ WantedBy=multi-user.target
 		<key>SuccessfulExit</key>
 		<false/>
 	</dict>
+	<key>StandardOutPath</key>
+	<string>/Library/Logs/Alchemy/alchemyd.501.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Library/Logs/Alchemy/alchemyd.501.log</string>
 </dict>
 </plist>
 "#;
@@ -975,7 +1038,7 @@ WantedBy=multi-user.target
                 contents: None,
             },
             Case {
-                name: "macos remove keeps the plist when bootout fails",
+                name: "macos remove deletes the plist before a bootout that fails",
                 system: macos().with_file(PLIST, file(WANT_PLIST)).responding(
                     &[LAUNCHCTL, "bootout", "system/computer.alchemy.alchemyd.501"],
                     1,
@@ -990,7 +1053,7 @@ WantedBy=multi-user.target
                     "/bin/launchctl bootout system/computer.alchemy.alchemyd.501",
                 ],
                 path: PLIST,
-                contents: Some(WANT_PLIST),
+                contents: None,
             },
         ];
         for c in cases {
@@ -1019,6 +1082,43 @@ WantedBy=multi-user.target
                 assert_eq!(f.mode, 0o644, "{}", c.name);
             }
         }
+    }
+
+    #[test]
+    fn the_launch_daemon_log_dir_is_root_only() {
+        let sys = macos_unloaded();
+        install(&sys, Platform::MacOs, uid(501)).unwrap();
+        let dir = sys.file(LAUNCH_DAEMON_LOG_DIR).unwrap();
+        assert_eq!((dir.uid, dir.mode), (0, 0o755));
+        install(&sys, Platform::MacOs, uid(501)).unwrap();
+
+        let ok = macos_unloaded().with_file(LAUNCH_DAEMON_LOG_DIR, FakeFile::dir());
+        assert!(install(&ok, Platform::MacOs, uid(501)).is_ok());
+
+        let refused = [
+            ("a symlink", FakeFile::symlink()),
+            ("a file", FakeFile::regular()),
+            ("the user's", FakeFile::dir().owned_by(501)),
+            ("group-writable", FakeFile::dir().with_mode(0o775)),
+            ("world-writable", FakeFile::dir().with_mode(0o777)),
+        ];
+        for (name, dir) in refused {
+            let sys = macos_unloaded().with_file(LAUNCH_DAEMON_LOG_DIR, dir);
+            let err = install(&sys, Platform::MacOs, uid(501)).unwrap_err();
+            assert_eq!(err.kind(), "refused", "{name}");
+            assert_eq!(sys.file(PLIST).map(|f| f.contents), None, "{name}");
+        }
+        let failing = macos_unloaded().failing(Call::CreateDir);
+        assert_eq!(
+            install(&failing, Platform::MacOs, uid(501))
+                .unwrap_err()
+                .kind(),
+            "os_error"
+        );
+        assert_eq!(
+            launch_daemon_log(501),
+            "/Library/Logs/Alchemy/alchemyd.501.log"
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Engine edge wiring: the real `HostProbe`, `DockerCli`, and `DockerApi`
 //! implementations against a fake engine socket and a fake `docker` binary,
-//! and the `EngineMonitor` against a scripted host and engine.
+//! and the `EngineMonitor` against a scripted host and engine, including
+//! the idle ping on a quiet stream and subscribing again after a wake.
 
 #![allow(
     clippy::unwrap_used,
@@ -20,6 +21,7 @@ use alchemy_core::engine::{
     ContainerAction, ContainerEvent, ContainerState, ContainerStatus, Containers, EngineFlavor,
     EngineState, EngineStatus, Health, InspectedExit, StopReason, reconnect_delay,
 };
+use alchemy_core::lifecycle::{IDLE_PING, IDLE_PING_STOPPED, PING_TIMEOUT, Woke};
 use alchemy_core::network::Ipv4Net;
 use alchemy_core::ports::{Protocol, PublishedPort};
 use alchemy_core::route::{EngineFacts, HostOs, Reachability, reachability};
@@ -694,6 +696,7 @@ struct Host {
     executable: Vec<PathBuf>,
     connect: Option<SocketConnect>,
     ping_ok: bool,
+    hang_pings: usize,
     containers: Vec<ContainerStatus>,
     inspected: Vec<(String, InspectedExit)>,
     streams: Vec<mpsc::UnboundedSender<Result<ContainerEvent, ApiError>>>,
@@ -755,8 +758,17 @@ impl ScriptedApi {
 
 impl DockerApi for ScriptedApi {
     fn ping(&self) -> impl Future<Output = Result<(), ApiError>> + Send {
-        let ok = self.call("ping").ping_ok;
-        ready(if ok { Ok(()) } else { Err(ApiError::Timeout) })
+        let mut host = self.call("ping");
+        let ok = host.ping_ok;
+        let hang = host.hang_pings > 0;
+        host.hang_pings = host.hang_pings.saturating_sub(1);
+        drop(host);
+        async move {
+            if hang {
+                std::future::pending::<()>().await;
+            }
+            if ok { Ok(()) } else { Err(ApiError::Timeout) }
+        }
     }
 
     fn version(&self) -> impl Future<Output = Result<EngineVersion, ApiError>> + Send {
@@ -918,6 +930,21 @@ fn send(host: &SharedHost, event: ContainerEvent) {
 fn subscriptions(host: &SharedHost) -> usize {
     let host = host.lock().unwrap();
     host.calls.iter().filter(|c| **c == "events").count()
+}
+
+fn pings(host: &SharedHost) -> usize {
+    let host = host.lock().unwrap();
+    host.calls.iter().filter(|c| **c == "ping").count()
+}
+
+async fn subscriptions_until(host: &SharedHost, count: usize) {
+    tokio::time::timeout(Duration::from_mins(20), async {
+        while subscriptions(host) < count {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("never subscribed again");
 }
 
 fn unix(path: &str) -> String {
@@ -1110,6 +1137,12 @@ async fn monitor_reconnects_and_resyncs_when_the_stream_drops() {
     containers_until(&run.state, |c| !c.is_empty()).await;
     let mut engine_rx = run.state.watch_engine();
     assert_eq!(engine_rx.borrow_and_update().state, EngineState::Ready);
+    let link = |connection, listed| alchemyd::EngineLink {
+        connection,
+        listed,
+        resubscribed: false,
+    };
+    assert_eq!(run.state.engine_link(), link(1, true));
 
     {
         let mut h = host.lock().unwrap();
@@ -1125,6 +1158,7 @@ async fn monitor_reconnects_and_resyncs_when_the_stream_drops() {
     );
     assert_eq!(dropped.elapsed(), reconnect_delay(0));
     assert_eq!(subscriptions(&host), 2);
+    assert_eq!(run.state.engine_link(), link(2, true), "a new connection");
     assert!(
         !engine_rx.has_changed().unwrap(),
         "reconnecting to the same engine does not republish its status"
@@ -1141,11 +1175,118 @@ async fn monitor_reconnects_and_resyncs_when_the_stream_drops() {
     let status = engine_until(&run.state, |s| s.state != EngineState::Ready).await;
     assert_eq!(status.state, EngineState::NotRunning);
     assert!(run.state.containers().is_empty());
+    assert_eq!(run.state.engine_link(), link(2, false));
     assert_eq!(
         status.flavor,
         Some(EngineFlavor::DockerEngine),
         "keeps the flavor the endpoint reported while ready"
     );
+
+    run.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitor_pings_a_quiet_stream_and_reconnects_when_a_ping_hangs() {
+    let (host, monitor) = scripted_monitor(&unix(SOCKET));
+    ready_host(&host);
+    host.lock().unwrap().containers =
+        vec![ContainerStatus::new("abc", "web", ContainerState::Running)];
+    let run = spawn_monitor(monitor);
+    containers_until(&run.state, |c| !c.is_empty()).await;
+    let before = pings(&host);
+
+    tokio::time::sleep(IDLE_PING * 3 + Duration::from_secs(1)).await;
+    assert_eq!(pings(&host) - before, 3, "one ping a quiet minute");
+    assert_eq!(subscriptions(&host), 1, "an answered ping keeps the stream");
+
+    host.lock().unwrap().hang_pings = 1;
+    let hung = tokio::time::Instant::now();
+    subscriptions_until(&host, 2).await;
+    let took = hung.elapsed();
+    assert!(took >= PING_TIMEOUT, "{took:?}");
+    assert!(
+        took <= IDLE_PING + PING_TIMEOUT + reconnect_delay(0),
+        "{took:?}"
+    );
+    assert_eq!(run.state.engine().state, EngineState::Ready);
+
+    run.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitor_pings_less_often_while_no_container_runs() {
+    let (host, monitor) = scripted_monitor(&unix(SOCKET));
+    ready_host(&host);
+    let run = spawn_monitor(monitor);
+    subscriptions_until(&host, 1).await;
+    let before = pings(&host);
+
+    tokio::time::sleep(
+        IDLE_PING_STOPPED
+            .checked_sub(Duration::from_secs(1))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(pings(&host), before, "no ping before the longer wait");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(pings(&host), before + 1);
+
+    host.lock().unwrap().containers =
+        vec![ContainerStatus::new("abc", "web", ContainerState::Running)];
+    send(&host, ContainerEvent::new("abc", ContainerAction::Start));
+    containers_until(&run.state, |c| !c.is_empty()).await;
+    tokio::time::sleep(IDLE_PING + Duration::from_secs(1)).await;
+    assert_eq!(pings(&host), before + 2, "a running container pings sooner");
+
+    run.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitor_subscribes_again_at_once_after_a_wake() {
+    let (host, monitor) = scripted_monitor(&unix(SOCKET));
+    ready_host(&host);
+    host.lock().unwrap().containers =
+        vec![ContainerStatus::new("abc", "web", ContainerState::Running)];
+    let run = spawn_monitor(monitor);
+    containers_until(&run.state, |c| !c.is_empty()).await;
+    let mut engine_rx = run.state.watch_engine();
+    engine_rx.borrow_and_update();
+
+    host.lock().unwrap().containers =
+        vec![ContainerStatus::new("def", "db", ContainerState::Running)];
+    let woke = tokio::time::Instant::now();
+    run.state.record_wake(Woke {
+        slept_for: Duration::from_secs(3_600),
+        at_ms: 1_700_000_000_000,
+    });
+    subscriptions_until(&host, 2).await;
+    assert!(
+        woke.elapsed() < reconnect_delay(0),
+        "no backoff after a wake: {:?}",
+        woke.elapsed()
+    );
+    let containers = containers_until(&run.state, |c| c.get("def").is_some()).await;
+    assert_eq!(
+        states(&containers),
+        [("def".to_owned(), ContainerState::Running)],
+        "relisted after the wake"
+    );
+    assert!(
+        !engine_rx.has_changed().unwrap(),
+        "the same engine is not republished"
+    );
+    assert_eq!(
+        run.state.engine_link(),
+        alchemyd::EngineLink {
+            connection: 2,
+            listed: true,
+            resubscribed: true,
+        },
+        "not Docker returning"
+    );
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(subscriptions(&host), 2, "once per wake");
 
     run.stop().await;
 }

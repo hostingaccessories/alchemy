@@ -275,6 +275,11 @@ pub struct Operation {
     /// Why it did not succeed, in a sentence safe to show. `None` while
     /// it runs and when it succeeded.
     pub error: Option<String>,
+    /// Why Alchemy started it on its own, such as "was running before the
+    /// computer slept". `None`, and left off the wire, when someone asked
+    /// for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[cfg(test)]

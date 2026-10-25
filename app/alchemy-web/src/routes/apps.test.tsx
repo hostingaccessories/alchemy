@@ -2,7 +2,7 @@ import { act, cleanup, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import type { App, AppList, MetricsResponse } from "../lib/api.ts";
+import type { App, AppList, MetricsResponse, Reconcile, ReconcileStatus } from "../lib/api.ts";
 import { FakeEventSource, renderAt } from "../test/render.tsx";
 
 const blog: App = {
@@ -486,5 +486,141 @@ describe("App", () => {
     await renderAt("/apps/nope");
     expect(await screen.findByText("There's no app named “nope”.")).toBeTruthy();
     expect(screen.getByRole("link", { name: "Go to Apps" })).toBeTruthy();
+  });
+});
+
+describe("Docker and recovery", () => {
+  const away = {
+    state: "not_running" as const,
+    flavor: "docker_desktop" as const,
+    engine_version: null,
+    api_version: null,
+    compose_version: null,
+    desktop_version: null,
+    endpoint: null,
+  };
+  const ready = { ...away, state: "ready" as const, compose_version: "2.40.0" };
+
+  async function send(event: string, data: unknown) {
+    await act(async () => {
+      const events = FakeEventSource.instances.find((source) => source.url === "/api/events");
+      events?.emit(event, JSON.stringify(data));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+
+  function reconcile(extra: Partial<Reconcile> = {}): ReconcileStatus {
+    return {
+      last: {
+        trigger: "wake",
+        at: 1_790_000_000,
+        reason: "was running before the computer slept",
+        apps: [
+          { app: "blog", outcome: "started", operation: "op-1", reason: null, message: null },
+          {
+            app: "immich",
+            outcome: "failed",
+            operation: null,
+            reason: null,
+            message: "port 2283 is already in use",
+          },
+        ],
+        ...extra,
+      },
+    };
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("shows Docker's notice and waiting apps while Docker is away, and hides it once ready", async () => {
+    apps = { ...full, apps: [{ ...blog, status: "unknown" }] };
+    await renderAt("/apps");
+    const list = await screen.findByRole("list", { name: "Your apps" });
+    await send("engine", away);
+    const docker = screen.getByRole("status", { name: "Docker" });
+    expect(
+      within(docker).getByText("Docker Desktop isn't running. Start it to continue."),
+    ).toBeTruthy();
+    expect(within(docker).getByRole("button", { name: "Start Docker Desktop" })).toBeTruthy();
+    expect(within(list).getByText("Waiting for Docker")).toBeTruthy();
+
+    await send("engine", ready);
+    expect(screen.queryByRole("status", { name: "Docker" })).toBeNull();
+    expect(within(list).getByText("Status unknown")).toBeTruthy();
+  });
+
+  it("shows Docker's notice on an app's page too", async () => {
+    apps = { ...full, apps: [{ ...blog, status: "unknown" }] };
+    await renderAt("/apps/blog");
+    await screen.findByRole("heading", { name: "Services" });
+    await send("engine", away);
+    expect(screen.getByRole("status", { name: "Docker" })).toBeTruthy();
+    expect(within(screen.getByRole("banner")).getByText("Waiting for Docker")).toBeTruthy();
+  });
+
+  it("says what came back after a wake and what didn't, copyably, until dismissed", async () => {
+    apps = full;
+    await renderAt("/apps");
+    await screen.findByRole("list", { name: "Your apps" });
+    expect(screen.queryByRole("region", { name: "What came back" })).toBeNull();
+    await send("woke", { slept_for: 7200, at: 1_790_000_000 - 3 });
+    await send("reconcile", reconcile());
+
+    const notice = screen.getByRole("region", { name: "What came back" });
+    expect(
+      within(notice).getByText("1 app didn't come back after this computer slept for 2 hours"),
+    ).toBeTruthy();
+    expect(
+      within(notice).getByText(
+        "didn't come back: port 2283 is already in use. Open it to see what went wrong, then start it again.",
+        { exact: false },
+      ),
+    ).toBeTruthy();
+    expect(within(notice).getByRole("link", { name: "immich" }).getAttribute("href")).toBe(
+      "/apps/immich",
+    );
+    expect(within(notice).getByRole("link", { name: "blog" })).toBeTruthy();
+
+    const user = userEvent.setup();
+    await user.click(within(notice).getByRole("button", { name: "Copy report" }));
+    const copied = await navigator.clipboard.readText();
+    expect(copied).toContain("Alchemy, after this computer slept for 2 hours");
+    expect(copied).toContain("- blog came back.");
+    expect(copied).toContain("- immich didn't come back: port 2283 is already in use.");
+
+    await user.click(within(notice).getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("region", { name: "What came back" })).toBeNull();
+    await send("reconcile", reconcile());
+    expect(screen.queryByRole("region", { name: "What came back" })).toBeNull();
+
+    await send("reconcile", reconcile({ trigger: "daemon_start", at: 1_790_000_600 }));
+    expect(
+      within(screen.getByRole("region", { name: "What came back" })).getByText(
+        "1 app didn't come back after Alchemy restarted",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("says nothing when every app was already running", async () => {
+    apps = full;
+    await renderAt("/apps");
+    await screen.findByRole("list", { name: "Your apps" });
+    await send(
+      "reconcile",
+      reconcile({
+        apps: [
+          {
+            app: "blog",
+            outcome: "skipped",
+            operation: null,
+            reason: "already_running",
+            message: null,
+          },
+        ],
+      }),
+    );
+    expect(screen.queryByRole("region", { name: "What came back" })).toBeNull();
   });
 });

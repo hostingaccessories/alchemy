@@ -6,6 +6,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use alchemy_api::sse::{SseEvent, SseParser};
 use http_body_util::{BodyExt as _, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::client::conn::http1;
@@ -15,7 +16,6 @@ use tokio::net::UnixStream;
 
 use super::{Daemon, EventStream, Method, Opened, Reply};
 use crate::error::{ClientError, ProtocolError};
-use crate::sse::{SseEvent, SseParser};
 
 /// Upper bound on a single exchange so a wedged daemon cannot hang the CLI.
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);

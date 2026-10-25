@@ -106,6 +106,25 @@ function posts() {
 }
 
 describe("App actions", () => {
+  it("says why Alchemy started an app on its own", async () => {
+    operations = {
+      operations: [
+        update({
+          action: "up",
+          state: "succeeded",
+          finished_at: 130,
+          reason: "was running before the computer slept",
+        }),
+      ],
+    };
+    await renderAt("/apps/blog");
+    expect(
+      await screen.findByText(
+        "Alchemy did this on its own, because blog was running before the computer slept.",
+      ),
+    ).toBeTruthy();
+  });
+
   it("starts an action and shows its steps and output as they arrive", async () => {
     const user = userEvent.setup();
     await renderAt("/apps/blog");

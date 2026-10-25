@@ -49,6 +49,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -65,11 +66,21 @@ name = "alchemy-gui"
 version = "0.1.0"
 dependencies = [
  "alchemy-api",
+ "alchemy-core",
+ "axum",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "tauri-plugin-window-state",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

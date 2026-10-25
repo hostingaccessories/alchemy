@@ -4,12 +4,13 @@
 //! `--socket` and `ALCHEMY_SOCKET` name a local socket path and are
 //! aliases for a `unix://` URL. Only `unix://` is accepted. A remote
 //! daemon needs authentication (M13, #16), so every other scheme is
-//! refused here, before anything is opened.
+//! refused here, before anything is opened. With none of them, the CLI
+//! looks for alchemyd at each of `alchemy_api::socket_candidates` in turn.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::error::ClientError;
+use crate::error::{ClientError, InstalledService, Unreached};
 
 /// Environment variable that names the daemon by URL, as `--daemon` does.
 pub const DAEMON_ENV: &str = "ALCHEMY_DAEMON";
@@ -22,6 +23,9 @@ const SOCKET_FLAG: &str = "--socket";
 pub(crate) enum Target {
     /// A unix socket on this machine.
     Unix(PathBuf),
+    /// Nothing named a daemon: the first of these default sockets that
+    /// answers, as [`find`] picks it.
+    Search(Vec<PathBuf>),
 }
 
 /// Everything target resolution chooses between. Empty environment
@@ -32,24 +36,11 @@ pub(crate) struct Sources {
     pub(crate) socket_flag: Option<PathBuf>,
     pub(crate) daemon_env: Option<OsString>,
     pub(crate) socket_env: Option<OsString>,
-    pub(crate) default_socket: PathBuf,
-}
-
-impl Sources {
-    /// The given flags plus this process's environment and default socket.
-    pub(crate) fn from_env(daemon_flag: Option<String>, socket_flag: Option<PathBuf>) -> Self {
-        Self {
-            daemon_flag,
-            socket_flag,
-            daemon_env: std::env::var_os(DAEMON_ENV),
-            socket_env: std::env::var_os(alchemy_api::SOCKET_ENV),
-            default_socket: alchemy_api::runtime_dir().join(alchemy_api::SOCKET_FILE),
-        }
-    }
+    pub(crate) default_sockets: Vec<PathBuf>,
 }
 
 /// Pick the daemon target: `--daemon`, then `--socket`, then
-/// `ALCHEMY_DAEMON`, then `ALCHEMY_SOCKET`, then the default socket.
+/// `ALCHEMY_DAEMON`, then `ALCHEMY_SOCKET`, then the default sockets.
 ///
 /// The first source that is set decides, even when it is invalid; a bad
 /// value never falls through to a lower-precedence one. The CLI rejects
@@ -73,7 +64,33 @@ pub(crate) fn resolve(sources: Sources) -> Result<Target, ClientError> {
     if let Some(path) = non_empty(sources.socket_env) {
         return Ok(Target::Unix(PathBuf::from(path)));
     }
-    Ok(Target::Unix(sources.default_socket))
+    Ok(Target::Search(sources.default_sockets))
+}
+
+/// The first of `sockets` that `answers`, or every one tried and why it
+/// didn't, with the autostart service `installed` finds, asked only then.
+///
+/// Only the default lookup searches. A socket the user named is used as
+/// given, so its error comes from the request itself.
+pub(crate) fn find(
+    sockets: Vec<PathBuf>,
+    mut answers: impl FnMut(&Path) -> std::io::Result<()>,
+    installed: impl FnOnce() -> Option<InstalledService>,
+) -> Result<PathBuf, ClientError> {
+    let mut tried = Vec::with_capacity(sockets.len());
+    for socket in sockets {
+        match answers(&socket) {
+            Ok(()) => return Ok(socket),
+            Err(e) => tried.push(Unreached {
+                socket,
+                reason: e.to_string(),
+            }),
+        }
+    }
+    Err(ClientError::NoDaemon {
+        tried,
+        service: installed(),
+    })
 }
 
 fn non_empty(value: Option<OsString>) -> Option<OsString> {
@@ -202,8 +219,13 @@ mod tests {
             socket_flag: socket_flag.map(PathBuf::from),
             daemon_env: daemon_env.map(OsString::from),
             socket_env: socket_env.map(OsString::from),
-            default_socket: PathBuf::from("/default.sock"),
+            default_sockets: vec![PathBuf::from("/default.sock")],
         }
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn search(path: &str) -> Result<Target, String> {
+        Ok(Target::Search(vec![PathBuf::from(path)]))
     }
 
     #[test]
@@ -217,7 +239,7 @@ mod tests {
             (sources(None, s, de, se), unix("/flag-socket.sock")),
             (sources(None, None, de, se), unix("/env-daemon.sock")),
             (sources(None, None, None, se), unix("/env-socket.sock")),
-            (sources(None, None, None, None), unix("/default.sock")),
+            (sources(None, None, None, None), search("/default.sock")),
             (
                 sources(None, Some("rel.sock"), None, None),
                 unix("rel.sock"),
@@ -225,7 +247,7 @@ mod tests {
             (sources(None, None, Some(""), se), unix("/env-socket.sock")),
             (
                 sources(None, None, Some(""), Some("")),
-                unix("/default.sock"),
+                search("/default.sock"),
             ),
             (sources(None, Some(""), de, se), invalid("--socket")),
             (sources(Some(""), s, de, se), invalid("--daemon")),
@@ -249,6 +271,85 @@ mod tests {
         for (i, (sources, want)) in cases.into_iter().enumerate() {
             assert_eq!(summarize(resolve(sources)), want, "case {i}");
         }
+    }
+
+    #[test]
+    fn find_takes_the_first_socket_that_answers() {
+        use std::io::{Error, ErrorKind};
+        let answers = |live: &'static [&'static str]| {
+            move |p: &Path| {
+                if live.iter().any(|l| p == Path::new(l)) {
+                    Ok(())
+                } else {
+                    Err(Error::from(ErrorKind::NotFound))
+                }
+            }
+        };
+        let both = || vec![PathBuf::from("/a.sock"), PathBuf::from("/b.sock")];
+        let cases: [(&'static [&'static str], &str); 4] = [
+            (&["/a.sock", "/b.sock"], "found /a.sock"),
+            (&["/b.sock"], "found /b.sock"),
+            (&["/a.sock"], "found /a.sock"),
+            (&[], "tried /a.sock, /b.sock"),
+        ];
+        for (live, want) in cases {
+            let got = match find(both(), answers(live), || None) {
+                Ok(socket) => format!("found {}", socket.display()),
+                Err(ClientError::NoDaemon { tried, .. }) => {
+                    let tried: Vec<_> = tried
+                        .iter()
+                        .map(|t| t.socket.display().to_string())
+                        .collect();
+                    format!("tried {}", tried.join(", "))
+                }
+                Err(other) => panic!("unexpected error: {other}"),
+            };
+            assert_eq!(got, want, "{live:?}");
+        }
+    }
+
+    #[test]
+    fn find_asks_each_socket_once_in_order() {
+        let mut asked = Vec::new();
+        let err = find(
+            vec![PathBuf::from("/a.sock"), PathBuf::from("/b.sock")],
+            |p| {
+                asked.push(p.to_owned());
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+            },
+            || None,
+        )
+        .unwrap_err();
+        assert_eq!(asked, [PathBuf::from("/a.sock"), PathBuf::from("/b.sock")]);
+        assert_eq!(err.exit_code(), 69);
+    }
+
+    #[test]
+    fn find_looks_for_a_service_only_when_no_socket_answers() {
+        use alchemy_api::autostart::{AutostartMode, LogHint};
+        let service = InstalledService {
+            mode: AutostartMode::Login,
+            logs: LogHint::Terminal,
+        };
+        let found = find(
+            vec![PathBuf::from("/a.sock")],
+            |_| Ok(()),
+            || panic!("looked for a service with a daemon answering"),
+        );
+        assert_eq!(found.unwrap(), PathBuf::from("/a.sock"));
+        let err = find(
+            vec![PathBuf::from("/a.sock")],
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            || Some(service.clone()),
+        )
+        .unwrap_err();
+        let ClientError::NoDaemon {
+            service: Some(got), ..
+        } = err
+        else {
+            panic!("{err:?}");
+        };
+        assert_eq!(got, service);
     }
 
     #[cfg(unix)]

@@ -8,9 +8,12 @@ use std::sync::Arc;
 use alchemy_api::MetricsResponse;
 use alchemy_api::OperationList;
 use alchemy_api::apps::{AppList, AppSettings};
+use alchemy_api::autostart::Autostart;
 use alchemy_api::network::{NetworkReport, NetworkSettings};
 use alchemy_api::privileges::PrivilegeList;
+use alchemy_api::reconcile::ReconcileStatus;
 use alchemy_core::engine::{Containers, EngineState, EngineStatus};
+use alchemy_core::lifecycle::Woke;
 use alchemy_core::route::EngineFacts;
 use tokio::sync::watch;
 
@@ -47,7 +50,35 @@ struct Inner {
     mdns: watch::Sender<MdnsStatus>,
     routing: watch::Sender<Routing>,
     privileges: watch::Sender<PrivilegeList>,
+    engine_link: watch::Sender<EngineLink>,
+    wakes: watch::Sender<u64>,
+    reconcile: watch::Sender<ReconcileStatus>,
+    last_wake: watch::Sender<Option<Woke>>,
+    autostart: watch::Sender<Option<Autostart>>,
     log_streams: LogStreams,
+}
+
+/// Whether the engine monitor's containers can be trusted: which
+/// connection to the engine this is, and whether its first listing is in
+/// [`State::containers`].
+///
+/// `connection` rises each time a connection's first listing lands, so
+/// the first is 1. `listed` goes back to `false` when that connection
+/// ends, such as when Docker quits or its event stream breaks.
+///
+/// After a wake the monitor drops its connection itself and subscribes
+/// again, with no sign that Docker went away. `resubscribed` says so,
+/// from then until a connection is next lost, so that the new connection
+/// isn't taken for Docker returning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineLink {
+    /// The current or last connection, counting from 1, or 0 before any.
+    pub connection: u64,
+    /// Whether that connection is up and has listed every container.
+    pub listed: bool,
+    /// Whether the last connection was dropped by alchemyd to subscribe
+    /// again after a wake, rather than lost.
+    pub resubscribed: bool,
 }
 
 impl State {
@@ -79,6 +110,11 @@ impl State {
                 mdns: watch::Sender::new(MdnsStatus::default()),
                 routing: watch::Sender::new(Routing::default()),
                 privileges: watch::Sender::new(PrivilegeList::default()),
+                engine_link: watch::Sender::new(EngineLink::default()),
+                wakes: watch::Sender::new(0),
+                reconcile: watch::Sender::new(ReconcileStatus::default()),
+                last_wake: watch::Sender::new(None),
+                autostart: watch::Sender::new(None),
                 log_streams: LogStreams::default(),
             }),
         }
@@ -382,6 +418,129 @@ impl State {
         send_if_changed(&self.inner.privileges, privileges)
     }
 
+    /// Whether the engine's containers are listed, and on which
+    /// connection.
+    pub fn engine_link(&self) -> EngineLink {
+        *self.inner.engine_link.borrow()
+    }
+
+    /// Subscribe to changes to [`Self::engine_link`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_engine_link(&self) -> watch::Receiver<EngineLink> {
+        self.inner.engine_link.subscribe()
+    }
+
+    /// Record that a new connection to the engine has put its first
+    /// listing in [`Self::containers`]. Call it after the listing.
+    pub fn engine_listed(&self) {
+        self.inner.engine_link.send_modify(|link| {
+            link.connection = link.connection.saturating_add(1);
+            link.listed = true;
+        });
+    }
+
+    /// Record that the engine connection ended, or that the engine isn't
+    /// ready. Returns whether a listed connection ended.
+    pub fn engine_lost(&self) -> bool {
+        let mut was = false;
+        self.inner.engine_link.send_if_modified(|link| {
+            was = link.listed;
+            let changed = link.listed || link.resubscribed;
+            link.listed = false;
+            link.resubscribed = false;
+            changed
+        });
+        was
+    }
+
+    /// Record that the monitor dropped the engine connection itself, to
+    /// subscribe again after a wake. Unlike [`Self::engine_lost`], the
+    /// next connection doesn't count as Docker returning.
+    pub fn engine_resubscribing(&self) {
+        self.inner.engine_link.send_modify(|link| {
+            link.listed = false;
+            link.resubscribed = true;
+        });
+    }
+
+    /// How many wakes from sleep have been noticed since alchemyd started.
+    pub fn wakes(&self) -> u64 {
+        *self.inner.wakes.borrow()
+    }
+
+    /// Subscribe to [`Self::woke`], by count.
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_wakes(&self) -> watch::Receiver<u64> {
+        self.inner.wakes.subscribe()
+    }
+
+    /// Record that the computer woke from sleep. The reconcile task
+    /// brings back what was running, once the engine is listed.
+    pub fn woke(&self) {
+        self.inner.wakes.send_modify(|n| *n = n.saturating_add(1));
+    }
+
+    /// The last reconcile, and how each app it started is doing.
+    pub fn reconcile(&self) -> ReconcileStatus {
+        self.inner.reconcile.borrow().clone()
+    }
+
+    /// Subscribe to changes to [`Self::reconcile`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_reconcile(&self) -> watch::Receiver<ReconcileStatus> {
+        self.inner.reconcile.subscribe()
+    }
+
+    /// Replace the last reconcile. Returns whether it changed;
+    /// subscribers are only notified if it did.
+    pub fn set_reconcile(&self, reconcile: ReconcileStatus) -> bool {
+        send_if_changed(&self.inner.reconcile, reconcile)
+    }
+
+    /// The last wake [`Self::record_wake`] recorded, or `None` since the
+    /// daemon started.
+    pub fn last_wake(&self) -> Option<Woke> {
+        *self.inner.last_wake.borrow()
+    }
+
+    /// Subscribe to [`Self::last_wake`]. Each wake notifies, even one that
+    /// reads the same as the last. Tasks that only need to know a wake
+    /// happened use [`Self::watch_wakes`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_last_wake(&self) -> watch::Receiver<Option<Woke>> {
+        self.inner.last_wake.subscribe()
+    }
+
+    /// Record a wake the [`wake`](crate::wake) task noticed, with how long
+    /// the computer slept, then count it with [`Self::woke`].
+    pub fn record_wake(&self, woke: Woke) {
+        self.inner.last_wake.send_replace(Some(woke));
+        self.woke();
+    }
+
+    /// Autostart, as [`Autostart`](crate::autostart::Autostart) last read
+    /// it, or `None` before the first read.
+    pub fn autostart(&self) -> Option<Autostart> {
+        self.inner.autostart.borrow().clone()
+    }
+
+    /// Subscribe to changes to [`Self::autostart`].
+    ///
+    /// The receiver starts with the current value marked as seen.
+    pub fn watch_autostart(&self) -> watch::Receiver<Option<Autostart>> {
+        self.inner.autostart.subscribe()
+    }
+
+    /// Replace autostart. Returns whether it changed; subscribers are only
+    /// notified if it did.
+    pub fn set_autostart(&self, autostart: Autostart) -> bool {
+        send_if_changed(&self.inner.autostart, Some(autostart))
+    }
+
     /// The log streams open on either listener, held to
     /// [`MAX_STREAMS`](crate::logs::MAX_STREAMS). Unlike the parts above,
     /// it is a count to take a place in, not a value to watch.
@@ -532,6 +691,64 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn engine_link_counts_connections_and_notes_losses() {
+        let state = State::new();
+        let rx = state.watch_engine_link();
+        assert!(!state.engine_lost());
+        assert!(!rx.has_changed().unwrap());
+        state.engine_listed();
+        assert_eq!(
+            state.engine_link(),
+            EngineLink {
+                connection: 1,
+                listed: true,
+                resubscribed: false,
+            }
+        );
+        assert!(state.engine_lost());
+        assert!(!state.engine_lost());
+        state.engine_listed();
+        assert_eq!(
+            state.engine_link(),
+            EngineLink {
+                connection: 2,
+                listed: true,
+                resubscribed: false,
+            }
+        );
+
+        let mut rx = state.watch_engine_link();
+        state.engine_resubscribing();
+        assert!(rx.has_changed().unwrap());
+        state.engine_listed();
+        assert_eq!(
+            *rx.borrow_and_update(),
+            EngineLink {
+                connection: 3,
+                listed: true,
+                resubscribed: true,
+            },
+            "a connection made again after a wake says so"
+        );
+        assert!(state.engine_lost());
+        assert!(!state.engine_link().resubscribed, "until one is lost");
+        state.engine_resubscribing();
+        assert!(!state.engine_lost(), "nothing listed was lost");
+        assert!(rx.has_changed().unwrap(), "but the flag cleared");
+    }
+
+    #[test]
+    fn wakes_count_up() {
+        let state = State::new();
+        let mut rx = state.watch_wakes();
+        state.woke();
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow_and_update(), 1);
+        state.woke();
+        assert_eq!(state.wakes(), 2);
     }
 
     #[test]

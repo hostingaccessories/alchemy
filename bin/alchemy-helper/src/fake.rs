@@ -21,6 +21,7 @@ pub enum Call {
     ReadFile,
     WriteFile,
     RemoveFile,
+    CreateDir,
     Run,
 }
 
@@ -28,6 +29,7 @@ pub enum Call {
 enum Kind {
     Regular,
     Symlink,
+    Dir,
     Other,
 }
 
@@ -60,6 +62,10 @@ impl FakeFile {
 
     pub fn symlink() -> Self {
         Self::new(Kind::Symlink)
+    }
+
+    pub fn dir() -> Self {
+        Self::new(Kind::Dir)
     }
 
     /// A directory, device, FIFO, or socket.
@@ -234,6 +240,7 @@ impl System for FakeSystem {
         self.check(Call::Inspect)?;
         self.with_open(file, |f| FileInfo {
             regular: f.kind == Kind::Regular,
+            directory: f.kind == Kind::Dir,
             uid: f.uid,
             mode: f.mode,
             nosuid: f.nosuid,
@@ -280,6 +287,22 @@ impl System for FakeSystem {
     fn remove_file(&self, path: &Path) -> io::Result<bool> {
         self.check(Call::RemoveFile)?;
         Ok(self.files.borrow_mut().remove(path).is_some())
+    }
+
+    fn create_dir(&self, path: &Path, mode: u32) -> io::Result<bool> {
+        self.check(Call::CreateDir)?;
+        let mut files = self.files.borrow_mut();
+        if files.contains_key(path) {
+            return Ok(false);
+        }
+        files.insert(
+            path.to_path_buf(),
+            FakeFile {
+                mode,
+                ..FakeFile::dir()
+            },
+        );
+        Ok(true)
     }
 
     fn run(&self, command: &FixedCommand) -> io::Result<CommandOutput> {

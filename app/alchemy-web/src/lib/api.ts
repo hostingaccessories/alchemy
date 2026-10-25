@@ -517,6 +517,11 @@ export interface Operation {
   finished_at: number | null;
   /** Why it did not succeed, safe to show. */
   error: string | null;
+  /**
+   * Why Alchemy started it on its own, such as "was running before the
+   * computer slept". Absent when someone asked for it.
+   */
+  reason?: string;
 }
 
 /** Mirrors `alchemy_api::operations::ActionRequest`, the body of `POST /api/apps/{name}/actions`. */
@@ -579,6 +584,18 @@ export type OperationEvent =
 const OPERATION_EVENT_NAMES: readonly OperationEvent["event"][] = ["operation", "output", "done"];
 
 /**
+ * Mirrors `alchemy_api::wake::Wake`, sent as the `woke` event once per wake
+ * and never on connect. A Mac can wake briefly several times a night with the
+ * lid closed, so show it quietly.
+ */
+export interface Wake {
+  /** About how long the computer slept, in whole seconds. */
+  slept_for: number;
+  /** When alchemyd noticed, in Unix seconds. */
+  at: number;
+}
+
+/**
  * Mirrors `alchemy_api::ApiEvent`: one message on `GET /api/events`. The SSE
  * `event:` field is `event`, and its `data:` field is `data` as JSON.
  */
@@ -587,7 +604,10 @@ export type ApiEvent =
   | { event: "metrics"; data: MetricsResponse }
   | { event: "apps"; data: AppList }
   | { event: "operations"; data: OperationList }
-  | { event: "privileges"; data: PrivilegeList };
+  | { event: "privileges"; data: PrivilegeList }
+  | { event: "reconcile"; data: ReconcileStatus }
+  | { event: "woke"; data: Wake }
+  | { event: "autostart"; data: Autostart };
 
 /** Every SSE event name the daemon sends. */
 export type ApiEventName = ApiEvent["event"];
@@ -602,6 +622,9 @@ const EVENT_NAMES: { [K in ApiEventName]: K } = {
   apps: "apps",
   operations: "operations",
   privileges: "privileges",
+  reconcile: "reconcile",
+  woke: "woke",
+  autostart: "autostart",
 };
 
 /** The event names {@link subscribe} listens for. Others are ignored. */
@@ -906,6 +929,147 @@ export interface PrivilegeChange {
   privilege: Privilege;
 }
 
+/**
+ * Mirrors `alchemy_core::lifecycle::AutostartMode`: `off`, `login` (a
+ * per-user service, no root), or `boot` (the system service, behind a prompt).
+ */
+export type AutostartMode = "off" | "login" | "boot";
+
+/** Mirrors `alchemy_core::lifecycle::Supervisor`: what runs the alchemyd answering. */
+export type Supervisor = "manual" | "user_service" | "system_service";
+
+/** Mirrors `alchemy_core::lifecycle::LogHint`: where alchemyd logs, tagged by `kind`. */
+export type LogHint =
+  | { kind: "file"; path: string }
+  | { kind: "journal"; command: string }
+  | { kind: "terminal" };
+
+/** Mirrors `alchemy_api::autostart::AutostartAttempt`: how the last switch ended. */
+export interface AutostartAttempt {
+  mode: AutostartMode;
+  result: AttemptResult;
+  message: string | null;
+  /** Unix seconds. */
+  at: number;
+}
+
+/**
+ * Mirrors `alchemy_api::autostart::Autostart`, returned by
+ * `GET /api/machine/autostart` and sent as the `autostart` event.
+ */
+export interface Autostart {
+  /** The mode the installed services put alchemyd in. */
+  mode: AutostartMode;
+  /** The modes it can be switched to here, `mode` included. */
+  available_modes: AutostartMode[];
+  log_hint: LogHint;
+  supervisor: Supervisor;
+  /** The mode a switch in flight is going to, such as while a prompt is up. */
+  pending: AutostartMode | null;
+  last: AutostartAttempt | null;
+  /**
+   * The modes left out of `available_modes`, each with why. Absent when
+   * every mode is available, or from an older daemon.
+   */
+  unavailable?: UnavailableMode[];
+}
+
+/** Mirrors `alchemy_api::autostart::UnavailableMode`. `message` is safe to show as is. */
+export interface UnavailableMode {
+  mode: AutostartMode;
+  message: string;
+}
+
+/** Mirrors `alchemy_api::autostart::AutostartRequest`, the body of `PUT /api/machine/autostart`. */
+export interface AutostartRequest {
+  mode: AutostartMode;
+}
+
+/** Mirrors `alchemy_api::autostart::AutostartOutcome`; unknown outcomes arrive as `other`. */
+export type AutostartOutcome =
+  | "done"
+  | "unchanged"
+  | "pending"
+  | "needs_terminal"
+  | "restarting"
+  | "other";
+
+/**
+ * Mirrors `alchemy_api::autostart::AutostartChange`. `pending` (202): follow
+ * the `autostart` event until `pending` clears, then read `last`.
+ * `needs_terminal`: run `command`, then ask again. `restarting` (202): this
+ * alchemyd hands over to the system service; reconnect.
+ */
+export interface AutostartChange {
+  outcome: AutostartOutcome;
+  command: HelperCommand | null;
+  message: string | null;
+  autostart: Autostart;
+}
+
+/** Mirrors `alchemy_api::reconcile::ReconcileTrigger`: what set off a reconcile. */
+export type ReconcileTrigger = "daemon_start" | "wake" | "engine_returned";
+
+/** Mirrors `alchemy_api::reconcile::SkipReason`: why a reconcile left an app alone. */
+export type ReconcileSkipReason =
+  | "stop_intent"
+  | "not_running_before"
+  | "already_running"
+  | "partly_running"
+  | "status_unknown";
+
+/**
+ * Mirrors `alchemy_api::reconcile::ReconcileOutcome`; unknown outcomes arrive
+ * as `other`. `starting` follows its operation to `started` or `failed`.
+ */
+export type ReconcileOutcome = "starting" | "started" | "failed" | "skipped" | "other";
+
+/** Mirrors `alchemy_api::reconcile::ReconcileApp`: what a reconcile did with one app. */
+export interface ReconcileApp {
+  app: string;
+  outcome: ReconcileOutcome;
+  /** The `up` operation started for it, if one was. */
+  operation: string | null;
+  /** Why it was left alone, when `outcome` is `skipped`. */
+  reason: ReconcileSkipReason | null;
+  /** Why it was skipped, or what went wrong, safe to show. */
+  message: string | null;
+}
+
+/** Mirrors `alchemy_api::reconcile::Reconcile`: one reconcile, app by app. */
+export interface Reconcile {
+  trigger: ReconcileTrigger;
+  /** Unix seconds. */
+  at: number;
+  /** Why apps were started, as each operation's `reason` says. */
+  reason: string;
+  apps: ReconcileApp[];
+}
+
+/**
+ * Mirrors `alchemy_api::reconcile::ReconcileStatus`, returned by
+ * `GET /api/reconcile` and sent as the `reconcile` event. `last` is `null`
+ * until Docker is first ready.
+ */
+export interface ReconcileStatus {
+  last: Reconcile | null;
+}
+
+/** Mirrors `alchemy_api::engine::EngineStartResult`; unknown results arrive as `other`. */
+export type EngineStartResult = "starting" | "already_running" | "unsupported" | "other";
+
+/**
+ * Mirrors `alchemy_api::engine::EngineStart`, the answer to
+ * `POST /api/engine/start`. `starting` (202): follow the `engine` event.
+ * `unsupported`: show `message`, and `command` to run in a terminal when
+ * there is one. Docker Desktop missing is a 422 `unsupported` error.
+ */
+export interface EngineStart {
+  result: EngineStartResult;
+  message: string;
+  command: string | null;
+}
+
 /** Mirrors `alchemy_api::network::ProxyReport`. */
 export interface ProxyReport {
   /** `null` until the engine has been ready. */
@@ -1153,6 +1317,11 @@ export const api = {
     request<PrivilegeChange>("POST", `/machine/privileges/${encodeURIComponent(action)}`, {
       body,
     }),
+  reconcile: (signal?: AbortSignal) => request<ReconcileStatus>("GET", "/reconcile", { signal }),
+  startEngine: () => request<EngineStart>("POST", "/engine/start", { body: {} }),
+  autostart: (signal?: AbortSignal) => request<Autostart>("GET", "/machine/autostart", { signal }),
+  setAutostart: (body: AutostartRequest) =>
+    request<AutostartChange>("PUT", "/machine/autostart", { body }),
   cancelOperation: (id: string) =>
     request<OperationResponse>("POST", `/operations/${encodeURIComponent(id)}/cancel`),
   followOperation,
