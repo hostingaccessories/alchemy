@@ -584,6 +584,18 @@ export type OperationEvent =
 const OPERATION_EVENT_NAMES: readonly OperationEvent["event"][] = ["operation", "output", "done"];
 
 /**
+ * Mirrors `alchemy_api::wake::Wake`, sent as the `woke` event once per wake
+ * and never on connect. A Mac can wake briefly several times a night with the
+ * lid closed, so show it quietly.
+ */
+export interface Wake {
+  /** About how long the computer slept, in whole seconds. */
+  slept_for: number;
+  /** When alchemyd noticed, in Unix seconds. */
+  at: number;
+}
+
+/**
  * Mirrors `alchemy_api::ApiEvent`: one message on `GET /api/events`. The SSE
  * `event:` field is `event`, and its `data:` field is `data` as JSON.
  */
@@ -593,7 +605,8 @@ export type ApiEvent =
   | { event: "apps"; data: AppList }
   | { event: "operations"; data: OperationList }
   | { event: "privileges"; data: PrivilegeList }
-  | { event: "reconcile"; data: ReconcileStatus };
+  | { event: "reconcile"; data: ReconcileStatus }
+  | { event: "woke"; data: Wake };
 
 /** Every SSE event name the daemon sends. */
 export type ApiEventName = ApiEvent["event"];
@@ -609,6 +622,7 @@ const EVENT_NAMES: { [K in ApiEventName]: K } = {
   operations: "operations",
   privileges: "privileges",
   reconcile: "reconcile",
+  woke: "woke",
 };
 
 /** The event names {@link subscribe} listens for. Others are ignored. */

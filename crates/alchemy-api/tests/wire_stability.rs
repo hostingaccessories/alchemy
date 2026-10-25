@@ -26,7 +26,7 @@ use alchemy_api::{
     API_VERSION, ApiEvent, ContainerStatus, ContainerUsage, EngineFlavor, EngineState,
     EngineStatus, ErrorCode, ErrorResponse, HealthResponse, HealthStatus, MachineUsage,
     MetricsHistory, MetricsPoint, MetricsRange, MetricsResponse, ProjectUsage, StopReason,
-    VersionResponse,
+    VersionResponse, Wake,
 };
 
 fn assert_wire<T>(value: &T, json: &str)
@@ -1644,6 +1644,20 @@ fn privilege_list_and_event() {
         &event,
         &format!(r#"{{"event":"privileges","data":{json}}}"#),
     );
+}
+
+#[test]
+fn wake_event() {
+    let wake = Wake {
+        slept_for: 3_600,
+        at: 1_700_000_000,
+    };
+    let json = r#"{"slept_for":3600,"at":1700000000}"#;
+    assert_wire(&wake, json);
+    let event = ApiEvent::Woke(wake);
+    assert_eq!(event.name(), "woke");
+    assert_eq!(serde_json::to_string(&event.data()).unwrap(), json);
+    assert_wire(&event, &format!(r#"{{"event":"woke","data":{json}}}"#));
 }
 
 #[test]

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { FakeEventSource } from "../test/event-source.ts";
 import { API_EVENT_NAMES, type EngineStatus, request } from "./api.ts";
 import { LiveProvider, useDaemonConnection } from "./live.tsx";
-import { liveQueries } from "./queries.ts";
+import { isLiveEvent, liveQueries } from "./queries.ts";
 
 const ready: EngineStatus = {
   state: "ready",
@@ -94,8 +94,9 @@ afterEach(() => {
 });
 
 describe("liveQueries", () => {
-  it("has one entry per event name", () => {
-    expect(Object.keys(liveQueries).sort()).toEqual([...API_EVENT_NAMES].sort());
+  it("has one entry per event name that carries a current value", () => {
+    expect(Object.keys(liveQueries).sort()).toEqual(API_EVENT_NAMES.filter(isLiveEvent).sort());
+    expect(API_EVENT_NAMES.filter((name) => !isLiveEvent(name))).toEqual(["woke"]);
   });
 });
 
@@ -117,6 +118,14 @@ describe("LiveProvider", () => {
     emit("engine", ready);
     expect(await screen.findByText("ready")).toBeTruthy();
     expect(client.getQueryData(["stacks"])).toBeUndefined();
+  });
+
+  it("keeps no query for a woke event", async () => {
+    const { client } = renderLive();
+    emit("woke", { slept_for: 3600, at: 1700000000 });
+    emit("engine", ready);
+    expect(await screen.findByText("ready")).toBeTruthy();
+    expect(client.getQueryData(["woke"])).toBeUndefined();
   });
 
   it("opens one stream and closes it on unmount", () => {

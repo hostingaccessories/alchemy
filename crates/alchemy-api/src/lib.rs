@@ -17,7 +17,8 @@
 //! listener in [`session`], the port registry in [`ports`],
 //! `GET /api/network` in [`network`], the machine's privileges in
 //! [`privileges`], bringing apps back after a restart, wake, or Docker
-//! returning in [`reconcile`], and starting Docker Desktop in [`engine`].
+//! returning in [`reconcile`], starting Docker Desktop in [`engine`], and
+//! the `woke` event in [`wake`].
 //!
 //! The default build is pure. Enable the `socket` feature for the daemon
 //! socket path shared by `alchemyd` and its local clients, and the
@@ -46,11 +47,13 @@ pub mod session;
 mod socket;
 #[cfg(feature = "state-dir")]
 mod state_dir;
+pub mod wake;
 
 pub use apps::AppList;
 pub use operations::OperationList;
 pub use privileges::PrivilegeList;
 pub use reconcile::ReconcileStatus;
+pub use wake::Wake;
 
 #[cfg(feature = "socket")]
 pub use socket::{SOCKET_ENV, SOCKET_FILE, default_socket_path, runtime_dir, socket_candidates};
@@ -239,6 +242,9 @@ pub enum ApiEvent {
     /// on connect and again on every change, including as each app's
     /// operation ends.
     Reconcile(ReconcileStatus),
+    /// The computer woke from sleep. Sent once per wake, and not on
+    /// connect: see [`wake`].
+    Woke(Wake),
 }
 
 impl ApiEvent {
@@ -251,6 +257,7 @@ impl ApiEvent {
             Self::Operations(_) => "operations",
             Self::Privileges(_) => "privileges",
             Self::Reconcile(_) => "reconcile",
+            Self::Woke(_) => "woke",
         }
     }
 
@@ -273,6 +280,7 @@ impl Serialize for EventData<'_> {
             ApiEvent::Operations(operations) => operations.serialize(serializer),
             ApiEvent::Privileges(privileges) => privileges.serialize(serializer),
             ApiEvent::Reconcile(reconcile) => reconcile.serialize(serializer),
+            ApiEvent::Woke(wake) => wake.serialize(serializer),
         }
     }
 }
