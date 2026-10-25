@@ -19,6 +19,7 @@ import type {
   PrivilegeList,
   ProxyListener,
 } from "../lib/api.ts";
+import { DOCKER_START_TIMEOUT_MS } from "../lib/engineStart.ts";
 import { FakeEventSource, renderAt } from "../test/render.tsx";
 
 const ready: EngineStatus = {
@@ -109,6 +110,17 @@ let noPrivileges = false;
 /** Whether the stubbed daemon refuses everything but its version as signed out. */
 let signedOut = false;
 
+const STARTING = {
+  status: 202,
+  body: { result: "starting", message: "Docker Desktop is starting", command: null },
+};
+
+/** How many times `POST /api/engine/start` was sent. */
+let engineStarts = 0;
+
+/** What the stubbed `POST /api/engine/start` answers. */
+let engineStartAnswer: { status: number; body: unknown } = STARTING;
+
 const GIB = 1024 ** 3;
 
 const sample: MetricsResponse = {
@@ -193,6 +205,8 @@ beforeEach(() => {
   privilegeAnswers = [];
   noPrivileges = false;
   signedOut = false;
+  engineStarts = 0;
+  engineStartAnswer = STARTING;
   FakeEventSource.instances = [];
   vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal(
@@ -222,6 +236,12 @@ beforeEach(() => {
         return portList === null
           ? new Promise<Response>(() => {})
           : new Response(JSON.stringify(portList), { status: 200 });
+      }
+      if (url === "/api/engine/start" && init?.method === "POST") {
+        engineStarts++;
+        return new Response(JSON.stringify(engineStartAnswer.body), {
+          status: engineStartAnswer.status,
+        });
       }
       if (url === "/api/engine" || url === "/api/metrics" || url === "/api/apps") {
         return new Promise<Response>(() => {});
@@ -287,6 +307,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("Machines", () => {
@@ -319,7 +340,7 @@ describe("Machines", () => {
     [
       "Docker Desktop not running",
       { ...unknown, flavor: "docker_desktop" },
-      ["Docker Desktop isn't running. Open it to continue."],
+      ["Docker Desktop isn't running. Start it to continue."],
     ],
     [
       "Docker Engine not running",
@@ -385,7 +406,7 @@ describe("Machines", () => {
 
     await sendEngine({ ...unknown, flavor: "docker_desktop" });
     expect(
-      within(docker()).getByText("Docker Desktop isn't running. Open it to continue."),
+      within(docker()).getByText("Docker Desktop isn't running. Start it to continue."),
     ).toBeTruthy();
     expect(within(docker()).queryByText("Docker is ready")).toBeNull();
 
@@ -411,7 +432,7 @@ describe("Machines", () => {
     expect(await screen.findByText("alchemyd 9.9.9")).toBeTruthy();
     await sendEngine({ ...unknown, flavor: "docker_desktop" });
     expect(
-      within(docker()).getByText("Docker Desktop isn't running. Open it to continue."),
+      within(docker()).getByText("Docker Desktop isn't running. Start it to continue."),
     ).toBeTruthy();
   });
 
@@ -434,6 +455,89 @@ describe("Machines", () => {
     expect(opened.closed).toBe(false);
     unmount();
     expect(opened.closed).toBe(true);
+  });
+
+  it("starts Docker Desktop and shows its progress until Docker is ready", async () => {
+    await renderOnline();
+    await sendEngine({ ...unknown, flavor: "docker_desktop" });
+    await userEvent
+      .setup()
+      .click(within(docker()).getByRole("button", { name: "Start Docker Desktop" }));
+    expect(engineStarts).toBe(1);
+    expect(await within(docker()).findByText("Starting Docker Desktop…")).toBeTruthy();
+    const steps = within(docker()).getByRole("list", { name: "Starting Docker Desktop" });
+    expect(within(steps).getByText("Wait for Docker to answer…")).toBeTruthy();
+    expect(within(docker()).queryByRole("button", { name: "Start Docker Desktop" })).toBeNull();
+
+    await sendEngine({ ...unknown, flavor: "docker_desktop" });
+    expect(within(docker()).getByText("Starting Docker Desktop…")).toBeTruthy();
+
+    await sendEngine({ ...unknown, state: "starting", flavor: "docker_desktop" });
+    const answered = within(docker()).getByRole("list", { name: "Starting Docker Desktop" });
+    expect(within(answered).getByText("Docker answered")).toBeTruthy();
+    expect(within(answered).getByText("Wait for Docker to be ready…")).toBeTruthy();
+
+    await sendEngine(ready);
+    expect(within(docker()).getByText("Docker is ready")).toBeTruthy();
+
+    await sendEngine({ ...unknown, flavor: "docker_desktop" });
+    expect(
+      within(docker()).getByText("Docker Desktop isn't running. Start it to continue."),
+    ).toBeTruthy();
+  });
+
+  it("says when Docker Desktop hasn't started after two minutes", async () => {
+    await renderOnline();
+    await sendEngine({ ...unknown, flavor: "docker_desktop" });
+    await userEvent
+      .setup()
+      .click(within(docker()).getByRole("button", { name: "Start Docker Desktop" }));
+    expect(await within(docker()).findByText("Starting Docker Desktop…")).toBeTruthy();
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now + DOCKER_START_TIMEOUT_MS + 1);
+    await sendEngine({ ...unknown, flavor: "docker_desktop", endpoint: "unix:///docker.sock" });
+    expect(within(docker()).getByText("Docker Desktop hasn't started yet")).toBeTruthy();
+    expect(within(docker()).getByText(/more than two minutes/)).toBeTruthy();
+    expect(within(docker()).getByRole("button", { name: "Start Docker Desktop" })).toBeTruthy();
+  });
+
+  it("shows the command when alchemyd can't start this Docker", async () => {
+    engineStartAnswer = {
+      status: 200,
+      body: {
+        result: "unsupported",
+        message: "Docker Engine runs as a system service, so starting it needs your password",
+        command: "sudo systemctl start docker",
+      },
+    };
+    await renderOnline();
+    await sendEngine({ ...unknown, flavor: "docker_desktop" });
+    await userEvent
+      .setup()
+      .click(within(docker()).getByRole("button", { name: "Start Docker Desktop" }));
+    expect(
+      await within(docker()).findByText(
+        "Docker Engine runs as a system service, so starting it needs your password.",
+      ),
+    ).toBeTruthy();
+    expect(docker().querySelector("pre")?.textContent).toBe("sudo systemctl start docker");
+    expect(within(docker()).getByRole("button", { name: "Copy command" })).toBeTruthy();
+  });
+
+  it("says when Docker Desktop isn't installed after all", async () => {
+    engineStartAnswer = {
+      status: 422,
+      body: { error: "Docker Desktop isn't installed", code: "unsupported" },
+    };
+    await renderOnline();
+    await sendEngine({ ...unknown, flavor: "docker_desktop" });
+    await userEvent
+      .setup()
+      .click(within(docker()).getByRole("button", { name: "Start Docker Desktop" }));
+    const alert = await within(docker()).findByRole("alert");
+    expect(within(alert).getByText("Alchemy couldn't start Docker Desktop")).toBeTruthy();
+    expect(within(alert).getByText("Docker Desktop isn't installed.")).toBeTruthy();
+    expect(within(alert).getByText("docs.docker.com/get-started/get-docker")).toBeTruthy();
   });
 
   it("waits for the first metrics sample", async () => {
