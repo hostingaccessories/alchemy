@@ -28,6 +28,7 @@ dist/
 
 # Tauri
 /app/alchemy-gui/gen/
+/app/alchemy-gui/binaries/
 
 # 1Password CLI
 /docs/site/.op/

@@ -1019,6 +1019,43 @@ the CLI tries the daemon's default socket and then, on Linux, that one,
 and uses the first that answers. The LaunchDaemon's socket is the default
 one already.
 
+### Desktop app
+
+The shell (`app/alchemy-gui`) never runs alchemyd as its child. At launch
+it asks `GET /api/health` on `127.0.0.1:7240`. If nothing answers, it runs
+the bundled `alchemyd service install --start`, which installs the
+per-user login service, and waits up to 30 seconds for it. The window
+shows "Starting Alchemy…" meanwhile, and a plain error after that. A dev
+build (`pnpm gui`, `cargo run -p alchemy-gui`) never installs anything:
+start alchemyd yourself. An AppImage or a translocated `.app` can't back a
+service, so the shell only says why.
+
+The tray (the menu bar on macOS) follows `/api/events`: alchemyd, Docker,
+and how many apps run, Open Alchemy, Start Docker Desktop while it's down,
+Start at login (`PUT /api/machine/autostart` with `login` or `off`), and
+Quit. On Linux every action is a menu item, since tray icons there send no
+clicks, and the tray needs a StatusNotifier host (KDE, or GNOME with the
+AppIndicator extension). Closing the window hides it, and launching the app
+again or clicking the Dock icon shows it. Quit leaves alchemyd and the apps
+running. If alchemyd stops and isn't back within 20 seconds, the tray and
+the window offer Start Alchemy.
+
+Bundle with alchemyd and alchemy-helper inside:
+
+```sh
+scripts/bundle-desktop.sh                 # or: make bundle-desktop
+scripts/bundle-desktop.sh --bundles app   # one format only
+```
+
+It builds both in release mode, copies them to `app/alchemy-gui/binaries/`
+with the host target triple, and runs `tauri build` with
+`tauri.bundle.json`, which adds `externalBin`. That setting stays out of
+`tauri.conf.json`, because tauri-build would then need the binaries on
+every `cargo build`. They land next to the app's own binary:
+`Alchemy.app/Contents/MacOS/`, `/usr/bin/` in the `.deb`, and `usr/bin/`
+in the AppImage. The `.deb` depends on `libayatana-appindicator3-1`,
+which the tray loads at run time.
+
 ### Web UI in debug vs release
 
 The daemon serves `app/alchemy-web/dist`. Debug builds read it from disk, so
