@@ -967,6 +967,17 @@ export interface Autostart {
   /** The mode a switch in flight is going to, such as while a prompt is up. */
   pending: AutostartMode | null;
   last: AutostartAttempt | null;
+  /**
+   * The modes left out of `available_modes`, each with why. Absent when
+   * every mode is available, or from an older daemon.
+   */
+  unavailable?: UnavailableMode[];
+}
+
+/** Mirrors `alchemy_api::autostart::UnavailableMode`. `message` is safe to show as is. */
+export interface UnavailableMode {
+  mode: AutostartMode;
+  message: string;
 }
 
 /** Mirrors `alchemy_api::autostart::AutostartRequest`, the body of `PUT /api/machine/autostart`. */

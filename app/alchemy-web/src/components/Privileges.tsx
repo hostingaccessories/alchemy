@@ -330,7 +330,7 @@ function RestartNote() {
  * The command to run when there's no system prompt to show, and the button
  * that asks alchemyd to check again once it has run.
  */
-function TerminalSteps({
+export function TerminalSteps({
   command,
   again,
   sending,
