@@ -5,6 +5,8 @@
 //! `--json` it is one `{"error":{"kind","message","hint"}}` document.
 //! Both go to stderr and carry no ANSI codes.
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 use crate::sse::{MAX_EVENT, SseError};
@@ -61,6 +63,12 @@ pub enum ClientError {
     /// The daemon socket could not be reached.
     #[error("cannot reach alchemyd: {0}")]
     DaemonUnreachable(String),
+    /// Nothing named a daemon, and none of the default sockets answered.
+    #[error("cannot reach alchemyd: {}", tried_text(tried))]
+    NoDaemon {
+        /// Every default socket, in the order tried.
+        tried: Vec<Unreached>,
+    },
     /// The daemon closed the connection before answering.
     #[error("alchemyd closed the connection without responding")]
     ConnectionClosed,
@@ -170,6 +178,26 @@ pub enum ClientError {
     PrivilegeFailed(String),
 }
 
+/// A default socket that didn't answer, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreached {
+    /// The socket's path.
+    pub socket: PathBuf,
+    /// Why connecting failed, as the OS put it.
+    pub reason: String,
+}
+
+fn tried_text(tried: &[Unreached]) -> String {
+    if tried.is_empty() {
+        return "no socket to try".to_owned();
+    }
+    tried
+        .iter()
+        .map(|t| format!("{}: {}", t.socket.display(), t.reason))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Why an exchange with alchemyd failed below the API.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -212,7 +240,9 @@ impl ClientError {
     /// The exit status for this error.
     pub fn exit(&self) -> Exit {
         match self {
-            Self::DaemonUnreachable(_) | Self::Disconnected => Exit::Unavailable,
+            Self::DaemonUnreachable(_) | Self::NoDaemon { .. } | Self::Disconnected => {
+                Exit::Unavailable
+            }
             Self::ConnectionClosed
             | Self::Protocol(_)
             | Self::Unexpected(_)
@@ -244,7 +274,7 @@ impl ClientError {
     /// its JSON form, for scripts to branch on.
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::DaemonUnreachable(_) => "daemon_unreachable",
+            Self::DaemonUnreachable(_) | Self::NoDaemon { .. } => "daemon_unreachable",
             Self::ConnectionClosed => "connection_closed",
             Self::Disconnected => "disconnected",
             Self::Protocol(_) => "protocol",
@@ -271,7 +301,7 @@ impl ClientError {
     /// The next step to suggest, if there is one.
     pub fn hint(&self) -> Option<String> {
         let hint = match self {
-            Self::DaemonUnreachable(_) => {
+            Self::DaemonUnreachable(_) | Self::NoDaemon { .. } => {
                 "start alchemyd, or point --socket at the socket it listens on"
             }
             Self::ConnectionClosed => "alchemyd may have crashed; check its logs",
@@ -450,6 +480,24 @@ mod tests {
                 69,
                 "daemon_unreachable",
                 "cannot reach alchemyd: /run/alchemyd.sock: refused".into(),
+                Some("start alchemyd, or point --socket at the socket it listens on"),
+            ),
+            (
+                ClientError::NoDaemon {
+                    tried: vec![
+                        Unreached {
+                            socket: "/run/user/1000/alchemy/alchemyd.sock".into(),
+                            reason: "not found".into(),
+                        },
+                        Unreached {
+                            socket: "/run/alchemy-1000/alchemyd.sock".into(),
+                            reason: "refused".into(),
+                        },
+                    ],
+                },
+                69,
+                "daemon_unreachable",
+                "cannot reach alchemyd: /run/user/1000/alchemy/alchemyd.sock: not found; /run/alchemy-1000/alchemyd.sock: refused".into(),
                 Some("start alchemyd, or point --socket at the socket it listens on"),
             ),
             (

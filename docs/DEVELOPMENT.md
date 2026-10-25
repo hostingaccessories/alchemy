@@ -1013,9 +1013,11 @@ without root. Raw nftables or iptables rules are never edited and read as
 `UserName`) for the sibling `alchemyd`, and `remove-service --uid N`
 stops and removes it. The operations exist, but nothing offers them yet:
 `system_service` is `not_needed` unless a service is already installed.
-M9 wires them, and decides where the service's socket goes; today the
-unit sets `ALCHEMY_SOCKET=/run/alchemy-N/alchemyd.sock`, which the CLI
-only finds with `--socket`.
+M9 wires them. The unit sets `ALCHEMY_SOCKET=/run/alchemy-N/alchemyd.sock`,
+which outlives login sessions. With no `--socket`, `--daemon`, or variable,
+the CLI tries the daemon's default socket and then, on Linux, that one,
+and uses the first that answers. The LaunchDaemon's socket is the default
+one already.
 
 ### Web UI in debug vs release
 

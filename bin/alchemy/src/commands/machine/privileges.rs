@@ -381,6 +381,7 @@ fn is_away(err: &ClientError) -> bool {
     matches!(
         err,
         ClientError::DaemonUnreachable(_)
+            | ClientError::NoDaemon { .. }
             | ClientError::ConnectionClosed
             | ClientError::Disconnected
             | ClientError::Protocol(ProtocolError::Io { .. })

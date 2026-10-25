@@ -18,7 +18,7 @@ mod target;
 
 use std::ffi::OsStr;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use alchemy_api::operations::Action;
 use clap::{Parser, Subcommand};
@@ -32,7 +32,7 @@ use crate::prompt::{Prompt, TtyPrompt};
 use crate::sudo::{Sudo, TerminalSudo};
 use crate::target::{Sources, Target};
 
-pub use error::{ClientError, Exit, ProtocolError};
+pub use error::{ClientError, Exit, ProtocolError, Unreached};
 pub use output::Color;
 pub use target::DAEMON_ENV;
 
@@ -145,6 +145,21 @@ pub async fn run_with_sudo<W: Write, P: Prompt, S: Sudo>(
     prompt: &mut P,
     sudo: &mut S,
 ) -> Result<(), ClientError> {
+    let sockets = alchemy_api::socket_candidates();
+    run_with_sockets(cli, sockets, out, color, prompt, sudo).await
+}
+
+/// [`run_with_sudo`], looking for alchemyd at each of `sockets` in turn,
+/// instead of at `alchemy_api::socket_candidates`, when no flag or
+/// environment variable names it.
+pub async fn run_with_sockets<W: Write, P: Prompt, S: Sudo>(
+    cli: Cli,
+    sockets: Vec<PathBuf>,
+    out: &mut W,
+    color: Color,
+    prompt: &mut P,
+    sudo: &mut S,
+) -> Result<(), ClientError> {
     let Cli {
         json,
         daemon,
@@ -152,7 +167,10 @@ pub async fn run_with_sudo<W: Write, P: Prompt, S: Sudo>(
         command,
     } = cli;
     let context = |out, command| -> Result<_, ClientError> {
-        let Target::Unix(socket) = target::resolve(Sources::from_env(daemon, socket))?;
+        let socket = match target::resolve(Sources::from_env(daemon, socket, sockets))? {
+            Target::Unix(socket) => socket,
+            Target::Search(sockets) => target::find(sockets, answers)?,
+        };
         Ok(Context::new(
             HttpDaemon::new(socket),
             Output::new(out, json, color),
@@ -259,6 +277,13 @@ async fn run_machine<W: Write, S: Sudo>(
             machine::ports::run(&mut context(machine::ports::NAME)?, args).await
         }
     }
+}
+
+/// Whether alchemyd accepts a connection on `socket`. The connection is
+/// closed at once; a missing file, a stale socket, or one the user can't
+/// open all fail.
+fn answers(socket: &Path) -> std::io::Result<()> {
+    std::os::unix::net::UnixStream::connect(socket).map(drop)
 }
 
 /// Write `err` to `stderr`, as one JSON document when `json` is set and
