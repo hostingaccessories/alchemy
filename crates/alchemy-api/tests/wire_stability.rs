@@ -1882,4 +1882,118 @@ fn engine_start() {
         serde_json::from_str::<EngineStartResult>(r#""queued""#).unwrap(),
         EngineStartResult::Other
     );
+fn autostart() -> alchemy_api::autostart::Autostart {
+    use alchemy_api::autostart::{Autostart, AutostartAttempt, AutostartMode, LogHint, Supervisor};
+    Autostart {
+        mode: AutostartMode::Login,
+        available_modes: vec![
+            AutostartMode::Off,
+            AutostartMode::Login,
+            AutostartMode::Boot,
+        ],
+        log_hint: LogHint::File {
+            path: "/Users/jo/Library/Logs/Alchemy/alchemyd.log".into(),
+        },
+        supervisor: Supervisor::UserService,
+        pending: Some(AutostartMode::Boot),
+        last: Some(AutostartAttempt {
+            mode: AutostartMode::Boot,
+            result: AttemptResult::Cancelled,
+            message: Some("c".into()),
+            at: 1_700_000_000,
+        }),
+    }
+}
+
+const AUTOSTART: &str = concat!(
+    r#"{"mode":"login","available_modes":["off","login","boot"],"#,
+    r#""log_hint":{"kind":"file","path":"/Users/jo/Library/Logs/Alchemy/alchemyd.log"},"#,
+    r#""supervisor":"user_service","pending":"boot","#,
+    r#""last":{"mode":"boot","result":"cancelled","message":"c","at":1700000000}}"#,
+);
+
+#[test]
+fn autostart_and_event() {
+    use alchemy_api::autostart::{Autostart, AutostartMode, LogHint, Supervisor};
+    assert_wire(&autostart(), AUTOSTART);
+    let event = ApiEvent::Autostart(autostart());
+    assert_eq!(event.name(), "autostart");
+    assert_wire(
+        &event,
+        &format!(r#"{{"event":"autostart","data":{AUTOSTART}}}"#),
+    );
+    let off = Autostart {
+        mode: AutostartMode::Off,
+        available_modes: vec![AutostartMode::Off],
+        log_hint: LogHint::Terminal,
+        supervisor: Supervisor::Manual,
+        pending: None,
+        last: None,
+    };
+    assert_wire(
+        &off,
+        concat!(
+            r#"{"mode":"off","available_modes":["off"],"log_hint":{"kind":"terminal"},"#,
+            r#""supervisor":"manual","pending":null,"last":null}"#,
+        ),
+    );
+    let boot = Autostart {
+        mode: AutostartMode::Boot,
+        log_hint: LogHint::Journal {
+            command: "journalctl -u alchemyd-1000.service".into(),
+        },
+        supervisor: Supervisor::SystemService,
+        ..off
+    };
+    assert_wire(
+        &boot,
+        concat!(
+            r#"{"mode":"boot","available_modes":["off"],"#,
+            r#""log_hint":{"kind":"journal","command":"journalctl -u alchemyd-1000.service"},"#,
+            r#""supervisor":"system_service","pending":null,"last":null}"#,
+        ),
+    );
+}
+
+#[test]
+fn autostart_request_and_change() {
+    use alchemy_api::autostart::{
+        AutostartChange, AutostartMode, AutostartOutcome, AutostartRequest,
+    };
+    for (mode, json) in [
+        (AutostartMode::Off, r#"{"mode":"off"}"#),
+        (AutostartMode::Login, r#"{"mode":"login"}"#),
+        (AutostartMode::Boot, r#"{"mode":"boot"}"#),
+    ] {
+        assert_wire(&AutostartRequest { mode }, json);
+    }
+    let change = AutostartChange {
+        outcome: AutostartOutcome::NeedsTerminal,
+        command: low_ports().command,
+        message: Some("m".into()),
+        autostart: autostart(),
+    };
+    assert_wire(
+        &change,
+        &format!(
+            concat!(
+                r#"{{"outcome":"needs_terminal","command":{{"argv":["sudo","/opt/a/alchemy-helper","#,
+                r#""grant-low-ports"],"line":"sudo /opt/a/alchemy-helper grant-low-ports"}},"#,
+                r#""message":"m","autostart":{}}}"#,
+            ),
+            AUTOSTART
+        ),
+    );
+    for (outcome, want) in [
+        (AutostartOutcome::Done, r#""done""#),
+        (AutostartOutcome::Unchanged, r#""unchanged""#),
+        (AutostartOutcome::Pending, r#""pending""#),
+        (AutostartOutcome::NeedsTerminal, r#""needs_terminal""#),
+        (AutostartOutcome::Restarting, r#""restarting""#),
+        (AutostartOutcome::Other, r#""other""#),
+    ] {
+        assert_wire(&outcome, want);
+    }
+    let future: AutostartOutcome = serde_json::from_str(r#""queued""#).unwrap();
+    assert_eq!(future, AutostartOutcome::Other);
 }
