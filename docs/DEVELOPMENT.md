@@ -80,7 +80,8 @@ The CLI honours `--socket` and `ALCHEMY_SOCKET` the same way as the daemon.
 `--daemon unix:///path/to/alchemyd.sock` is the same as
 `--socket /path/to/alchemyd.sock`; passing both is a usage error. Precedence
 is `--daemon` or `--socket`, then `ALCHEMY_DAEMON`, then `ALCHEMY_SOCKET`,
-then the default. Other schemes, such as `https://`, are refused with exit 2
+then the default sockets ([Finding the socket](#finding-the-socket)).
+Other schemes, such as `https://`, are refused with exit 2
 and nothing is contacted: remote daemons need authentication, which arrives
 in M13 ([#16](https://github.com/hostingaccessories/alchemy/issues/16)).
 
@@ -265,6 +266,34 @@ or `Docker Desktop isn't running at …` when Docker Desktop is installed.
 `DOCKER_HOST=tcp://127.0.0.1:2375` exercises the unsupported path. Stopping
 Docker Desktop or the engine service while the daemon runs shows the
 transitions live.
+
+Alchemy starts Docker Desktop only when someone asks: `POST
+/api/engine/start` with `{}`. The decision is
+`alchemy_core::lifecycle::plan_docker_start`, and the command runs through
+the `DesktopLauncher` trait (`bin/alchemyd/src/desktop.rs`), with a fixed
+argv and a cleared environment:
+
+| OS    | Command                                          | Not installed |
+| ----- | ------------------------------------------------ | ------------- |
+| macOS | `/usr/bin/open -g -b com.docker.docker`          | exit 1        |
+| Linux | `/usr/bin/systemctl --user start docker-desktop` | exit 5        |
+
+On Linux it keeps `XDG_RUNTIME_DIR` (else `/run/user/<uid>`), `HOME`,
+`USER`, `LOGNAME`, and `DBUS_SESSION_BUS_ADDRESS`, which `systemctl
+--user` needs. Neither command waits for the engine, so the answer comes
+at once and the `engine` event reports the rest:
+
+| `result`          | Status | Meaning                                                                                 |
+| ----------------- | ------ | --------------------------------------------------------------------------------------- |
+| `starting`        | 202    | Launched, or already on its way. Follow the `engine` event until `ready`.               |
+| `already_running` | 200    | Nothing to do.                                                                          |
+| `unsupported`     | 200    | `message` says why. Docker Engine gets `command`: `sudo systemctl start docker`.        |
+| (error)           | 422    | `unsupported`, "Docker Desktop isn't installed": the launch exited with the code above. |
+
+The web UI's Docker Desktop notice has **Start Docker Desktop**, with its
+progress until Docker is ready and "Docker Desktop hasn't started yet"
+after two minutes. Tests use `FakeLauncher` (`Deps::new` has it), so no
+test starts Docker.
 
 The engine tests use fakes and run without Docker; the few that need the
 real engine are listed in [Tests that need Docker](#tests-that-need-docker).
@@ -1011,13 +1040,259 @@ without root. Raw nftables or iptables rules are never edited and read as
 `/etc/systemd/system/alchemyd-N.service` (with `User=N`) or
 `/Library/LaunchDaemons/computer.alchemy.alchemyd.N.plist` (with
 `UserName`) for the sibling `alchemyd`, and `remove-service --uid N`
-stops and removes it. The operations exist, but nothing offers them yet:
-`system_service` is `not_needed` unless a service is already installed.
-M9 wires them. The unit sets `ALCHEMY_SOCKET=/run/alchemy-N/alchemyd.sock`,
-which outlives login sessions. With no `--socket`, `--daemon`, or variable,
-the CLI tries the daemon's default socket and then, on Linux, that one,
-and uses the first that answers. The LaunchDaemon's socket is the default
-one already.
+stops and removes it. They are the `boot` mode of
+[autostart](#autostart), which is how the CLI and UI offer them:
+`system_service` is `wanted` when `boot` was the mode last asked for.
+The LaunchDaemon logs to `/Library/Logs/Alchemy/alchemyd.N.log`; the
+helper creates that directory root-owned and `0755`, and refuses if it is
+a symlink or anyone but root can write it, because the root launchd opens
+the log itself. On macOS, `remove-service` deletes the plist before
+`bootout`, since `bootout` stops the alchemyd that may have asked for the
+removal. The unit sets `ALCHEMY_SOCKET=/run/alchemy-N/alchemyd.sock`,
+which outlives login sessions; the CLI finds it on its own (see
+[Finding the socket](#finding-the-socket)).
+
+### Autostart
+
+Whether alchemyd starts on its own is one setting with three modes, and
+only one service is ever installed. alchemyd owns its services: the CLI,
+the web UI, and the desktop app only ask it through the API.
+
+| Mode    | What starts alchemyd                                                                | Installed by                                        | Logs                                                                           |
+| ------- | ----------------------------------------------------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `off`   | You, or the desktop app                                                             |                                                     | The terminal it runs in                                                        |
+| `login` | A per-user service, at sign-in: a LaunchAgent, or a `systemd --user` unit           | alchemyd, without root                              | `~/Library/Logs/Alchemy/alchemyd.log`; `journalctl --user -u alchemyd.service` |
+| `boot`  | The [system service](#firewall-and-system-service), at boot, running as you (UID N) | `alchemy-helper install-service`, behind one prompt | `/Library/Logs/Alchemy/alchemyd.N.log`; `journalctl -u alchemyd-N.service`     |
+
+The per-user service files, rendered by `alchemy_core::lifecycle`
+(`service_file.rs`) for alchemyd's canonical path:
+
+- **macOS:** `~/Library/LaunchAgents/computer.alchemy.alchemyd.plist`, in
+  the `gui/<uid>` domain, with `RunAtLoad`, `KeepAlive` with
+  `SuccessfulExit=false`, stdout and stderr to the log above, and
+  `AssociatedBundleIdentifiers` naming the desktop app
+  (`computer.alchemy.desktop`).
+- **Linux:** `$XDG_CONFIG_HOME/systemd/user/alchemyd.service` (else
+  `~/.config/...`), `Type=exec`, `Restart=on-failure`, `WantedBy=default.target`.
+  A path with spaces, `%`, `$`, quotes, or non-ASCII is refused rather
+  than quoted, as the helper does. Nothing turns on linger, so the user
+  manager, and alchemyd with it, stops at the last logout: that is what
+  `login` means.
+
+Either service restarts alchemyd after a crash but not after a clean
+exit, so alchemyd exits 0 after a graceful `SIGTERM`.
+
+`GET /api/machine/autostart` reports the setting, and the `autostart`
+event carries the same on connect and on every change:
+
+- `mode`, from the files installed (the system service wins if both are);
+- `available_modes`, in display order, always including `mode`, and
+  `unavailable` with a sentence for each mode left out (omitted when
+  empty);
+- `log_hint`, where the installed mode logs: `{"kind":"file","path"}`,
+  `{"kind":"journal","command"}`, or `{"kind":"terminal"}`;
+- `supervisor`, what runs the alchemyd that answered: `manual`,
+  `user_service`, or `system_service`. Linux reads it from
+  `/proc/self/cgroup`, macOS from `XPC_SERVICE_NAME`;
+- `pending`, the mode of a switch in flight, and `last`, how the latest
+  one through this alchemyd ended (as `last` on a privilege).
+
+`PUT /api/machine/autostart` with `{"mode":"off"|"login"|"boot"}`
+answers `done`, `unchanged`, `needs_terminal` with the `command` to run
+(then send the `PUT` again), `pending` (202) while a prompt is up, or
+`restarting` (202) when this alchemyd hands over and exits. A mode not
+in `available_modes` is 422 `unsupported` with the reason, and a second
+switch while one is in flight is 409.
+
+`login` is unavailable on Linux without a user manager
+(`$XDG_RUNTIME_DIR/systemd/private` missing), and both `login` and `boot`
+are unavailable from an AppImage or a translocated `.app` (a service
+can't point into either). `boot` is unavailable whenever the
+`system_service` privilege is `unsupported`, such as for `cargo run` with
+no helper beside it, and in development it is `needs_terminal`, like
+every [privilege](#privileges).
+
+**Switching.** The new mode's service is installed and started first,
+then the old one is removed. A supervised alchemyd waits for the state
+directory's lock (every 250 ms, honouring `SIGTERM`) instead of failing
+as a hand-started one does, so the new service's alchemyd takes over the
+moment the old one exits. When the alchemyd being replaced is the one
+that answered:
+
+- `login` to `boot` from the per-user service unregisters it without
+  stopping it (`disable`, or deleting the plist), answers `restarting`,
+  and exits 0 half a second later, which neither launchd nor systemd
+  restarts. Stopping it through `systemctl` or `launchctl` would kill
+  that call along with the service before it returned.
+- `off` from the per-user service unregisters it and keeps running
+  until it exits.
+- Leaving `boot` from the system service runs `remove-service` last,
+  which stops it with `SIGTERM`. On Linux that is always `needs_terminal`:
+  a system service has no polkit agent to prompt with.
+- From a hand-started alchemyd, the new service starts and waits until
+  this process exits.
+
+The per-user service managers (`bin/alchemyd/src/autostart/system.rs`)
+follow what #112 measured. macOS creates `~/Library/Logs/Alchemy` and
+`~/Library/LaunchAgents` itself (launchd would create the log directory
+`0744`), boots out a loaded job and waits for `launchctl print` to exit
+113 before `bootstrap` (`bootout` returns before the old process exits),
+and retries a `bootstrap` exit 5 once. An unchanged plist is never
+rewritten: every rewrite posts a new "can run in the background"
+notification. Linux runs `daemon-reload`, `enable`, then `start`, or
+`restart` when the file changed under a running unit, keeping
+`XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` for `systemctl --user`.
+
+`alchemyd service install [--start]` and `alchemyd service remove` do
+the same for the per-user service from the command line, for the
+binary's own canonical path. They print one line and exit 0, or print
+`alchemyd: <why>` on stderr and exit 1, and running either twice changes
+nothing the second time. Install is refused while the system service is
+installed, and from an AppImage or a translocated `.app`. On macOS,
+install without `--start` only writes the plist, which loads at the next
+login. To try a service with a development build:
+
+```sh
+cargo build --release -p alchemyd
+target/release/alchemyd service install --start
+alchemy status                                   # finds it, no --socket needed
+systemctl --user restart alchemyd                # after a rebuild (Linux)
+launchctl kickstart -k "gui/$(id -u)/computer.alchemy.alchemyd"   # (macOS)
+target/release/alchemyd service remove
+```
+
+The service runs whatever binary is at that path, so a rebuild changes
+it under the service, and on macOS each build is a new identity to Local
+Network privacy (below). Building from another checkout rewrites the
+plist and posts another notification.
+
+**macOS Local Network privacy.** A LaunchAgent isn't exempt the way a
+launchd daemon, a root process, or a program run from Terminal is, so
+under `login` the first `.local` announcement asks for Local Network
+access, and `.local` names stop working until it is allowed. `boot` runs
+as a LaunchDaemon, which is exempt. Each unsigned build is a new identity
+and may ask again, until signing in M14.
+
+#### Finding the socket
+
+The CLI with no `--socket`, `--daemon`, or variable asks
+`alchemy_api::socket_candidates()` (`socket` feature) and uses the first
+socket that accepts a connection:
+
+1. the daemon's default, `$XDG_RUNTIME_DIR/alchemy/alchemyd.sock` when
+   that is an absolute path, else `<temp>/alchemy-<uid>/alchemyd.sock`;
+2. on Linux only, the system unit's `/run/alchemy-<uid>/alchemyd.sock`,
+   which outlives login sessions.
+
+`ALCHEMY_SOCKET`, when set, is the only candidate. Under `login`, systemd
+and launchd give alchemyd the same `XDG_RUNTIME_DIR` or `TMPDIR` a login
+shell has, so the default matches; the LaunchDaemon has no `TMPDIR` and
+falls back to the user's `confstr` temp directory, which is the default
+too. When none answers, the CLI exits 69 (`daemon_unreachable`) and names
+every socket it tried and why. The pure decision is the private
+`socket_candidates_from(platform, xdg, temp, uid)`.
+
+### Recovery after a restart, sleep, or Docker returning
+
+Apps come back by reconciling to what was running. The pure rules are
+`alchemy_core::lifecycle` (`last_seen.rs`, `reconcile.rs`); the task is
+`bin/alchemyd/src/reconcile.rs`.
+
+**Triggers.** A reconcile runs once per trigger, once Docker's containers
+are listed and the apps have been read again (or after 60 seconds):
+
+| Trigger           | When                                                               | `reason` on each start                  |
+| ----------------- | ------------------------------------------------------------------ | --------------------------------------- |
+| `daemon_start`    | Docker is first listed after alchemyd starts                       | "was running before Alchemy restarted"  |
+| `wake`            | The computer [woke](#wake-detection)                               | "was running before the computer slept" |
+| `engine_returned` | A new connection to Docker after it went away or stopped answering | "was running before Docker stopped"     |
+
+Triggers that arrive before one can run merge into one, `daemon_start`
+over `wake` over `engine_returned`. Docker's own restart policies still
+apply underneath; a reconcile covers the apps with none.
+
+**Rules.** An app is started when it has no stop intent, was running
+when last seen before the disruption, and is `stopped` now. Otherwise it
+is skipped with a `reason`:
+
+| `reason`             | Why                                                                                             |
+| -------------------- | ----------------------------------------------------------------------------------------------- |
+| `stop_intent`        | Alchemy's last action on it was `stop` or `down`, even if it was later started outside Alchemy. |
+| `not_running_before` | It wasn't in the last-seen set: never seen running, or stopped by hand (below).                 |
+| `already_running`    | It is running.                                                                                  |
+| `partly_running`     | Some services run. `up` would also start the ones someone stopped by hand, so it is left alone. |
+| `status_unknown`     | Compose can't read it, or Docker isn't ready.                                                   |
+
+Each start is an ordinary `up` operation, with no force, and its
+`Operation.reason` says why Alchemy started it. It is never retried: an
+app that fails stays down until the next trigger, and the report says
+why.
+
+**The last-seen set** is persisted in the `last_seen` table. An app joins
+it as soon as it is seen running or partly running. It leaves only when
+it was seen running since the last disruption, then stopped, and Docker
+stayed up with no disruption for `STOP_GRACE` (20 seconds); a stop within
+20 seconds after a disruption doesn't count. That is how a stop by hand,
+or a crash, stays down while a stop caused by Docker quitting, a
+shutdown, or sleep doesn't: Docker stops containers one by one, and
+their `die` events arrive while it still reads as ready. The cost is that
+an app stopped by hand less than 20 seconds before a reboot comes back.
+An app that no longer exists is forgotten, so a new app with its name
+isn't started; one whose folder can't be read, such as on an unmounted
+drive, is kept.
+
+`GET /api/reconcile` returns `{"last": Reconcile | null}`, `null` until
+Docker is first ready, and the `reconcile` event carries the same on
+connect and on every change. `Reconcile` has `trigger`, `at` (Unix
+seconds), `reason`, and `apps`, each with an `outcome` of `starting`,
+`started`, `failed`, or `skipped`, the `operation` id, the skip `reason`,
+and a `message` for people. `failed` with no `operation` means the start
+was refused (Docker gone, a conflict). The web UI shows it as a notice on
+Apps: what came back, what didn't and why, with **Copy report** and
+**Dismiss**, and nothing when nothing needs a look.
+
+To see it, run a few apps, stop one with `alchemy app stop` and one with
+`docker compose stop`, wait 20 seconds, then restart alchemyd after
+stopping the rest with `docker compose stop` (as a reboot would), or quit
+and reopen Docker Desktop. The [recovery test](#recovery-test) does the
+restart against real Docker.
+
+#### Wake detection
+
+There are no OS power listeners. `bin/alchemyd/src/wake.rs` samples
+`Instant` and `SystemTime` every 2 seconds (`WAKE_TICK`) through the
+`Clock` trait, and `alchemy_core::lifecycle::WakeDetector` reads a wake
+when the wall clock moved at least 10 seconds (`WAKE_THRESHOLD`) more
+than the monotonic one. Rust's `Instant` stops during suspend on both
+OSes (`CLOCK_UPTIME_RAW` on macOS, `CLOCK_MONOTONIC` on Linux), and the
+wall clock doesn't. Jitter and NTP slews are far below the threshold; a
+clock set backwards is ignored, and a large forward step reads as a wake,
+which is harmless because everything a wake does is idempotent. Mac dark
+wakes can give several a night.
+
+On each wake alchemyd:
+
+- sends the `woke` event, `{"slept_for","at"}` in seconds, once, to the
+  streams open at the time, never on connect;
+- runs a `wake` reconcile;
+- reads the LAN address again at once, rather than at the next 10-second
+  tick, and withdraws and announces every `.local` name again;
+- subscribes to Docker's events again, with no backoff. That reconnect
+  isn't Docker returning, so one wake gives one reconcile.
+
+**Docker liveness.** A stream that goes quiet may be dead, such as when
+Docker Desktop's proxy loses its VM after a long sleep. After 60 seconds
+with no event while a container runs (`IDLE_PING`), or 10 minutes while
+none does (`IDLE_PING_STOPPED`, so Resource Saver can still pause the
+VM), the engine follower sends `/_ping` with a 5-second timeout. A ping
+that fails or times out drops the stream with the usual backoff, and the
+next connection is `engine_returned`.
+
+The fake-clock test, `bin/alchemyd/tests/wake.rs`, runs the daemon with a
+`FakeClock`, a Docker whose event stream hangs, and a fake network, then
+jumps the wall clock. It checks for one `woke` event, one `wake`
+reconcile, a fresh LAN read, and a new subscription, within 5 seconds,
+and that nothing repeats. It runs in `cargo test` on Linux and macOS.
 
 ### Desktop app
 
@@ -1295,6 +1570,59 @@ It can run in the same privileged container as the home-network test, but
 inside Docker Desktop's VM the engine reports a `linuxkit` kernel, so
 alchemyd takes it for Docker Desktop (`published_only`) and the test stops
 at the first check. Use a Linux machine or VM.
+
+### Recovery test
+
+```sh
+RECOVERY_CONFIRM=1 scripts/recovery.sh
+```
+
+This proves [recovery](#recovery-after-a-restart-sleep-or-docker-returning)
+after a restart against real Docker, on Linux. It writes four apps, each
+one `busybox` service that sleeps, starts `alchemyd` with a fresh state
+directory and app home, and brings them all up with `alchemy app up`.
+Then it:
+
+1. stops `recovery-intent` with `alchemy app stop` and `recovery-hand`
+   with `docker compose stop`, and waits for alchemyd's log to say
+   `recovery-hand` left the last-seen set (after the 20-second grace);
+2. kills alchemyd with `SIGKILL`, stops `recovery-back` and
+   `recovery-broken` with `docker compose stop` as a reboot would, and
+   points `recovery-broken` at an image that doesn't exist, with
+   `pull_policy: never`;
+3. starts alchemyd again on the same state directory and waits for the
+   `daemon_start` reconcile to finish.
+
+It checks that:
+
+- `recovery-back` is `started`, its operation is a successful `up` with
+  the reason "was running before Alchemy restarted", and it runs;
+- `recovery-intent` is skipped with `stop_intent` and `recovery-hand`
+  with `not_running_before`, and both stay down;
+- `recovery-broken` is `failed` with Docker's error, its operation failed,
+  and 5 seconds later it is still down with no second try and no second
+  reconcile.
+
+It needs `jq`, `curl`, and a user that can reach Docker, and pulls
+`busybox:1.37.0`. It runs Compose projects named `recovery-*`, which it
+removes on exit, and lets the daemon create the `alchemy` network, so it
+refuses to run unless `CI=true` or `RECOVERY_CONFIRM=1`. Set
+`RECOVERY_SKIP_BUILD=1` to reuse `target/release`. CI runs it on Linux in
+the smoke job, reusing its build. A wake and Docker returning are covered
+by `bin/alchemyd/tests/wake.rs` and `reconcile.rs`, on both OSes.
+
+It doesn't depend on the engine's flavor or publish any ports, so on a Mac
+it runs in a Linux container against Docker Desktop's engine, with the
+Docker CLI and Compose plugin installed and the web build stubbed (a
+release build embeds it):
+
+```sh
+docker run --rm -it -v "$PWD:/src:ro" -v /var/run/docker.sock:/var/run/docker.sock \
+  -e CARGO_TARGET_DIR=/target -v recovery-target:/target rust:1.99.1 bash
+# inside: install jq and Docker's docker-ce-cli and docker-compose-plugin, then
+cp -a /src /work && cd /work && mkdir -p app/alchemy-web/dist
+RECOVERY_CONFIRM=1 scripts/recovery.sh
+```
 
 ### mDNS test
 

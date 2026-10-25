@@ -144,7 +144,13 @@ Why each needs root:
   firewall. Raw nftables and iptables are never edited.
 - **System service:** writes a fixed-template systemd unit (numeric
   `User=N`) or LaunchDaemon (`UserName`) for the sibling `alchemyd` and
-  starts it. alchemyd itself never runs as root.
+  starts it. alchemyd itself never runs as root. The LaunchDaemon logs to
+  `/Library/Logs/Alchemy/alchemyd.N.log`, never under the user's home:
+  the root launchd opens the log, so a user-writable path would let
+  malware point it at a root-owned file with a symlink. The helper creates
+  that directory root-owned and `0755`, and refuses if it is a symlink or
+  writable by anyone else. Removal deletes the plist before `bootout`,
+  because `bootout` stops the alchemyd that may have asked for it.
 
 `check` only reports whether the helper runs as root. Docker group
 membership is root-equivalent, so Alchemy explains it and never automates
