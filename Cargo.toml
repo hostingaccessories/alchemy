@@ -37,7 +37,7 @@ hyper              = { version = "1.12", default-features = false }
 hyper-util         = { version = "0.1.21", default-features = false }
 mdns-sd            = { version = "0.21", default-features = false, features = ["async"] }
 rust-embed         = { version = "8", features = ["mime-guess"] }
-rusqlite           = { version = "0.40", default-features = false, features = ["bundled"] }
+rusqlite           = { version = "0.41", default-features = false, features = ["bundled"] }
 rustix             = { version = "1", default-features = false, features = ["std", "process"] }
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
